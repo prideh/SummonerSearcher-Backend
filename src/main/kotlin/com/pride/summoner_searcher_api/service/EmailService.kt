@@ -25,46 +25,41 @@ class EmailService(
     fun sendVerificationEmail(to: String, token: String) {
         val subject = "Verify Your Account"
         val verificationLink = "$frontendUrl/verify-email?token=$token"
-        val body = """
-            <html>
-                <body>
-                    <h2>Welcome to Summoner Searcher!</h2>
-                    <p>Please click the button below to verify your email address.</p>
-                    <a href="$verificationLink" style="background-color:#007bff;color:white;padding:10px 15px;text-decoration:none;border-radius:5px;">Verify Email</a>
-                    <p>If you cannot click the button, copy and paste this link into your browser:</p>
-                    <p>$verificationLink</p>
-                </body>
-            </html>
-        """.trimIndent()
         
-        sendEmail(to, subject, body)
+        val htmlBody = """
+            <html>...</html>
+        """.trimIndent() // Keep your pretty HTML body here
+
+        val textBody = "Please click the following link to verify your email: $verificationLink"
+        
+        sendEmail(to, subject, textBody, htmlBody)
     }
 
     @Async
     fun sendPasswordResetEmail(to: String, token: String) {
         val subject = "Password Reset Request"
         val resetLink = "$frontendUrl/reset-password?token=$token"
-        val body = """
-            <html>
-                <body>
-                    <h2>Password Reset Request</h2>
-                    <p>You requested a password reset. Please click the button below to set a new password.</p>
-                    <a href="$resetLink" style="background-color:#007bff;color:white;padding:10px 15px;text-decoration:none;border-radius:5px;">Reset Password</a>
-                    <p>If you did not request a password reset, please ignore this email.</p>
-                    <p>If you cannot click the button, copy and paste this link into your browser:</p>
-                    <p>$resetLink</p>
-                </body>
-            </html>
-        """.trimIndent()
 
-        sendEmail(to, subject, body)
+        val htmlBody = """
+            <html>...</html>
+        """.trimIndent() // Keep your pretty HTML body here
+
+        val textBody = "Please click the following link to reset your password: $resetLink"
+
+        sendEmail(to, subject, textBody, htmlBody)
     }
 
-    private fun sendEmail(to: String, subject: String, body: String) {
+    private fun sendEmail(to: String, subject: String, textBody: String, htmlBody: String) {
         val from = Email(fromEmail)
         val toEmail = Email(to)
-        val content = Content("text/html", body)
-        val mail = Mail(from, subject, toEmail, content)
+        
+        // Create both a plain text and an HTML content part
+        val textContent = Content("text/plain", textBody)
+        val htmlContent = Content("text/html", htmlBody)
+
+        // The SendGrid library correctly handles creating a multipart email when you add more than one content type.
+        val mail = Mail(from, subject, toEmail, textContent)
+        mail.addContent(htmlContent)
 
         val sg = SendGrid(sendGridApiKey)
         val request = Request()
