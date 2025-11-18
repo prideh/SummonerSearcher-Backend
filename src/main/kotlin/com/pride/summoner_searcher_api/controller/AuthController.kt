@@ -99,32 +99,36 @@ class AuthController(
     @Transactional
     fun registerUser(@RequestBody authRequest: AuthRequest): ResponseEntity<String> {
         val existingUser = userRepository.findByEmail(authRequest.email)
-        if (existingUser != null) {
-            if (existingUser.verified) {
-                logger.warn("Registration attempt with existing, verified email: {}", authRequest.email)
-                return ResponseEntity.status(HttpStatus.CONFLICT).body("Email already in use")
-            } else {
-                // If user exists but is not verified, allow re-registration by deleting the old record
-                logger.info("Allowing re-registration for unverified email: {}", authRequest.email)
-                userRepository.delete(existingUser)
+
+        val userToSave = if (existingUser != null && !existingUser.verified) {
+            // User exists but is not verified, update their record
+            logger.info("Updating existing unverified user: {}", authRequest.email)
+            existingUser.apply {
+                password = passwordEncoder.encode(authRequest.password)
+                verificationToken = UUID.randomUUID().toString()
+                verificationTokenExpiry = LocalDateTime.now().plusHours(24)
             }
+        } else if (existingUser != null && existingUser.verified) {
+            // User exists and is verified, deny registration
+            logger.warn("Registration attempt with existing, verified email: {}", authRequest.email)
+            return ResponseEntity.status(HttpStatus.CONFLICT).body("Email already in use")
+        } else {
+            // No user exists, create a new one
+            logger.info("Registering new user: {}", authRequest.email)
+            User(
+                email = authRequest.email,
+                password = passwordEncoder.encode(authRequest.password),
+                darkmodePreference = false,
+                verified = false,
+                verificationToken = UUID.randomUUID().toString(),
+                verificationTokenExpiry = LocalDateTime.now().plusHours(24),
+                recentSearches = mutableListOf()
+            )
         }
 
-        val encodedPassword = passwordEncoder.encode(authRequest.password)
-        val verificationToken = UUID.randomUUID().toString()
-        val newUser = User(
-            email = authRequest.email,
-            password = encodedPassword,
-            darkmodePreference = false,
-            verified = false,
-            verificationToken = verificationToken,
-            verificationTokenExpiry = LocalDateTime.now().plusHours(24),
-            recentSearches = mutableListOf()
-        )
-        userRepository.save(newUser)
-
-        emailService.sendVerificationEmail(newUser.email, verificationToken)
-        logger.info("New user registered: {}. Verification email sent.", newUser.email)
+        val savedUser = userRepository.save(userToSave)
+        emailService.sendVerificationEmail(savedUser.email, savedUser.verificationToken!!)
+        logger.info("Verification email sent for user: {}", savedUser.email)
 
         return ResponseEntity.status(HttpStatus.CREATED).body("Registration successful. Please check your email to verify your account.")
     }
@@ -154,7 +158,6 @@ class AuthController(
     fun forgotPassword(@RequestBody request: ForgotPasswordRequest): ResponseEntity<String> {
         val user = userRepository.findByEmail(request.email)
         if (user != null) {
-            // FIX: Do not allow password reset for unverified users
             if (!user.verified) {
                 logger.warn("Password reset attempt for unverified user: {}", user.email)
                 return ResponseEntity.status(HttpStatus.FORBIDDEN).body("Please verify your email address before resetting your password.")
@@ -169,7 +172,6 @@ class AuthController(
             return ResponseEntity.ok("A password reset link has been sent to your email.")
         } else {
             logger.warn("Password reset requested for non-existent email: {}", request.email)
-            // Return a generic success message to prevent email enumeration
             return ResponseEntity.ok("If an account with this email exists, a password reset link has been sent.")
         }
     }
