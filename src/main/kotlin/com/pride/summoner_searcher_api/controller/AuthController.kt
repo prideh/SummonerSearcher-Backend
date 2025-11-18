@@ -98,9 +98,16 @@ class AuthController(
     @PostMapping("/register")
     @Transactional
     fun registerUser(@RequestBody authRequest: AuthRequest): ResponseEntity<String> {
-        if (userRepository.findByEmail(authRequest.email) != null) {
-            logger.warn("Registration attempt with existing email: {}", authRequest.email)
-            return ResponseEntity.status(HttpStatus.CONFLICT).body("Email already in use")
+        val existingUser = userRepository.findByEmail(authRequest.email)
+        if (existingUser != null) {
+            if (existingUser.verified) {
+                logger.warn("Registration attempt with existing, verified email: {}", authRequest.email)
+                return ResponseEntity.status(HttpStatus.CONFLICT).body("Email already in use")
+            } else {
+                // If user exists but is not verified, allow re-registration by deleting the old record
+                logger.info("Allowing re-registration for unverified email: {}", authRequest.email)
+                userRepository.delete(existingUser)
+            }
         }
 
         val encodedPassword = passwordEncoder.encode(authRequest.password)
@@ -147,6 +154,12 @@ class AuthController(
     fun forgotPassword(@RequestBody request: ForgotPasswordRequest): ResponseEntity<String> {
         val user = userRepository.findByEmail(request.email)
         if (user != null) {
+            // FIX: Do not allow password reset for unverified users
+            if (!user.verified) {
+                logger.warn("Password reset attempt for unverified user: {}", user.email)
+                return ResponseEntity.status(HttpStatus.FORBIDDEN).body("Please verify your email address before resetting your password.")
+            }
+
             val token = UUID.randomUUID().toString()
             user.passwordResetToken = token
             user.passwordResetTokenExpiry = LocalDateTime.now().plusHours(1)
@@ -156,7 +169,8 @@ class AuthController(
             return ResponseEntity.ok("A password reset link has been sent to your email.")
         } else {
             logger.warn("Password reset requested for non-existent email: {}", request.email)
-            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("No account found with this email address.")
+            // Return a generic success message to prevent email enumeration
+            return ResponseEntity.ok("If an account with this email exists, a password reset link has been sent.")
         }
     }
 
