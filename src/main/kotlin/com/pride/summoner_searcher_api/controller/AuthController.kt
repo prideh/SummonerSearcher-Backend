@@ -2,7 +2,7 @@ package com.pride.summoner_searcher_api.controller
 
 import com.pride.summoner_searcher_api.model.User
 import com.pride.summoner_searcher_api.repository.UserRepository
-import com.pride.summoner_searcher_api.service.EmailService
+import com.pride.summoner_searcher_api.service.EmailSender
 import com.pride.summoner_searcher_api.service.EncryptionService
 import com.pride.summoner_searcher_api.service.TwoFactorAuthService
 import com.pride.summoner_searcher_api.util.JwtUtil
@@ -41,7 +41,7 @@ class AuthController(
     private val jwtUtil: JwtUtil,
     private val userRepository: UserRepository,
     private val passwordEncoder: PasswordEncoder,
-    private val emailService: EmailService,
+    private val emailSender: EmailSender, // Use the interface
     private val twoFactorAuthService: TwoFactorAuthService,
     private val encryptionService: EncryptionService
 ) {
@@ -101,7 +101,6 @@ class AuthController(
         val existingUser = userRepository.findByEmail(authRequest.email)
 
         val userToSave = if (existingUser != null && !existingUser.verified) {
-            // User exists but is not verified, update their record
             logger.info("Updating existing unverified user: {}", authRequest.email)
             existingUser.apply {
                 password = passwordEncoder.encode(authRequest.password)
@@ -109,11 +108,9 @@ class AuthController(
                 verificationTokenExpiry = LocalDateTime.now().plusHours(24)
             }
         } else if (existingUser != null && existingUser.verified) {
-            // User exists and is verified, deny registration
             logger.warn("Registration attempt with existing, verified email: {}", authRequest.email)
             return ResponseEntity.status(HttpStatus.CONFLICT).body("Email already in use")
         } else {
-            // No user exists, create a new one
             logger.info("Registering new user: {}", authRequest.email)
             User(
                 email = authRequest.email,
@@ -127,7 +124,7 @@ class AuthController(
         }
 
         val savedUser = userRepository.save(userToSave)
-        emailService.sendVerificationEmail(savedUser.email, savedUser.verificationToken!!)
+        emailSender.sendVerificationEmail(savedUser.email, savedUser.verificationToken!!)
         logger.info("Verification email sent for user: {}", savedUser.email)
 
         return ResponseEntity.status(HttpStatus.CREATED).body("Registration successful. Please check your email to verify your account.")
@@ -167,7 +164,7 @@ class AuthController(
             user.passwordResetToken = token
             user.passwordResetTokenExpiry = LocalDateTime.now().plusHours(1)
             userRepository.save(user)
-            emailService.sendPasswordResetEmail(user.email, token)
+            emailSender.sendPasswordResetEmail(user.email, token)
             logger.info("Password reset token generated for user: {}", user.email)
             return ResponseEntity.ok("A password reset link has been sent to your email.")
         } else {
