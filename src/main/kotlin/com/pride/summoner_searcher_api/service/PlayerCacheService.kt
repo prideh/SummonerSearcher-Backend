@@ -1,6 +1,7 @@
 package com.pride.summoner_searcher_api.service
 
 import com.pride.summoner_searcher_api.dto.SummonerProfileDto
+import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import java.time.Duration
 
@@ -9,6 +10,8 @@ class PlayerCacheService(
     private val redisCacheService: RedisCacheService,
     private val riotApiService: RiotApiService
 ) {
+
+    private val logger = LoggerFactory.getLogger(javaClass)
 
     private fun getProfileCacheKey(puuid: String) = "player:profile:$puuid"
 
@@ -20,7 +23,7 @@ class PlayerCacheService(
 
         // 2. Handle Cache Miss (first time ever seeing this player)
         if (cachedProfile == null || cachedProfile.recentMatches.isNullOrEmpty()) {
-            println("[Cache MISS] for $puuid. Fetching full profile and initial 20 matches...")
+            logger.info("[Cache MISS] for {}. Fetching full profile and initial 20 matches...", puuid)
             val freshProfile = riotApiService.fetchSummonerProfile(puuid, region)
             val initialMatches = riotApiService.fetchMatchHistory(puuid, region, 20)
 
@@ -48,12 +51,12 @@ class PlayerCacheService(
 
         // 3a. If there are no new matches, return the cached data.
         if (trulyNewMatches.isNullOrEmpty()) {
-            println("[Cache HIT] for $puuid. No new matches found.")
+            logger.info("[Cache HIT] for {}. No new matches found.", puuid)
             return cachedProfile.copy(gameName = summonerName, tagLine = tagLine)
         }
 
         // 3b. If there are new matches, prepend them and update the cache.
-        println("[Cache UPDATE] for $puuid. Found ${trulyNewMatches.size} new matches. Prepending to list.")
+        logger.info("[Cache UPDATE] for {}. Found {} new matches. Prepending to list.", puuid, trulyNewMatches.size)
         val combinedMatches = trulyNewMatches + cachedProfile.recentMatches
 
         val updatedProfile = cachedProfile.copy(

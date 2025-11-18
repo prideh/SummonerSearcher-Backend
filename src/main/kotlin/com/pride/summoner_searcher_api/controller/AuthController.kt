@@ -6,11 +6,12 @@ import com.pride.summoner_searcher_api.service.EmailService
 import com.pride.summoner_searcher_api.service.EncryptionService
 import com.pride.summoner_searcher_api.service.TwoFactorAuthService
 import com.pride.summoner_searcher_api.util.JwtUtil
+import org.slf4j.LoggerFactory
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.security.authentication.AuthenticationManager
+import org.springframework.security.authentication.BadCredentialsException
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken
-import org.springframework.security.core.userdetails.UserDetails
 import org.springframework.security.core.userdetails.UserDetailsService
 import org.springframework.security.crypto.password.PasswordEncoder
 import org.springframework.transaction.annotation.Transactional
@@ -23,7 +24,6 @@ data class TwoFactorLoginRequest(val tempToken: String, val code: Int)
 data class ForgotPasswordRequest(val email: String)
 data class ResetPasswordRequest(val token: String, val newPassword: String)
 
-// The definitive successful login response
 data class AuthResponse(
     val jwt: String,
     val twoFactorEnabled: Boolean,
@@ -31,7 +31,6 @@ data class AuthResponse(
     val recentSearches: List<String>
 )
 
-// A response used only to signal that 2FA is required
 data class TwoFactorRequiredResponse(val twoFactorRequired: Boolean, val tempToken: String)
 
 @RestController
@@ -47,22 +46,30 @@ class AuthController(
     private val encryptionService: EncryptionService
 ) {
 
+    private val logger = LoggerFactory.getLogger(javaClass)
+
     @PostMapping("/login")
     fun createAuthenticationToken(@RequestBody authRequest: AuthRequest): ResponseEntity<Any> {
-        authenticationManager.authenticate(
-            UsernamePasswordAuthenticationToken(authRequest.email, authRequest.password)
-        )
+        try {
+            authenticationManager.authenticate(
+                UsernamePasswordAuthenticationToken(authRequest.email, authRequest.password)
+            )
+        } catch (e: BadCredentialsException) {
+            logger.warn("Failed login attempt for email: {}", authRequest.email)
+            throw e
+        }
+
         val user = userRepository.findByEmail(authRequest.email)
             ?: throw RuntimeException("User not found after authentication")
 
-        return if (user.twoFactorEnabled) {
-            // User has 2FA enabled, return a temporary token
+        if (user.twoFactorEnabled) {
+            logger.info("Successful primary authentication for user: {}. 2FA required.", user.email)
             val tempToken = jwtUtil.generateToken(user.email)
-            ResponseEntity.ok(TwoFactorRequiredResponse(twoFactorRequired = true, tempToken = tempToken))
+            return ResponseEntity.ok(TwoFactorRequiredResponse(twoFactorRequired = true, tempToken = tempToken))
         } else {
-            // User does not have 2FA, return the full AuthResponse
+            logger.info("Successful login for user: {}", user.email)
             val jwt = jwtUtil.generateToken(user.email)
-            ResponseEntity.ok(AuthResponse(jwt, user.twoFactorEnabled, user.darkmodePreference, user.recentSearches))
+            return ResponseEntity.ok(AuthResponse(jwt, user.twoFactorEnabled, user.darkmodePreference, user.recentSearches))
         }
     }
 
@@ -73,15 +80,17 @@ class AuthController(
             ?: return ResponseEntity.status(HttpStatus.NOT_FOUND).body("User not found.")
 
         if (!user.twoFactorEnabled || user.twoFactorSecret == null) {
+            logger.warn("2FA login attempt for user {} where 2FA is not enabled.", email)
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("2FA is not enabled for this user.")
         }
 
         val decryptedSecret = encryptionService.decrypt(user.twoFactorSecret!!)
         if (!twoFactorAuthService.isCodeValid(decryptedSecret, request.code)) {
+            logger.warn("Invalid 2FA code attempt for user: {}", email)
             return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Invalid 2FA code.")
         }
 
-        // 2FA code is valid, generate the full AuthResponse
+        logger.info("Successful 2FA login for user: {}", email)
         val jwt = jwtUtil.generateToken(user.email)
         return ResponseEntity.ok(AuthResponse(jwt, user.twoFactorEnabled, user.darkmodePreference, user.recentSearches))
     }
@@ -90,6 +99,7 @@ class AuthController(
     @Transactional
     fun registerUser(@RequestBody authRequest: AuthRequest): ResponseEntity<String> {
         if (userRepository.findByEmail(authRequest.email) != null) {
+            logger.warn("Registration attempt with existing email: {}", authRequest.email)
             return ResponseEntity.status(HttpStatus.CONFLICT).body("Email already in use")
         }
 
@@ -107,6 +117,7 @@ class AuthController(
         userRepository.save(newUser)
 
         emailService.sendVerificationEmail(newUser.email, verificationToken)
+        logger.info("New user registered: {}. Verification email sent.", newUser.email)
 
         return ResponseEntity.status(HttpStatus.CREATED).body("Registration successful. Please check your email to verify your account.")
     }
@@ -118,6 +129,7 @@ class AuthController(
             ?: return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Invalid verification token.")
 
         if (user.verificationTokenExpiry?.isBefore(LocalDateTime.now()) == true) {
+            logger.warn("Expired verification token used for email: {}", user.email)
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Verification token has expired. Please register again.")
         }
 
@@ -125,6 +137,7 @@ class AuthController(
         user.verificationToken = null
         user.verificationTokenExpiry = null
         userRepository.save(user)
+        logger.info("Account verified for user: {}", user.email)
 
         return ResponseEntity.ok("Your account has been verified. You can now log in.")
     }
@@ -136,12 +149,14 @@ class AuthController(
         if (user != null) {
             val token = UUID.randomUUID().toString()
             user.passwordResetToken = token
-            user.passwordResetTokenExpiry = LocalDateTime.now().plusHours(1) // 1-hour expiry
+            user.passwordResetTokenExpiry = LocalDateTime.now().plusHours(1)
             userRepository.save(user)
             emailService.sendPasswordResetEmail(user.email, token)
-            return ResponseEntity.ok("A password reset link has been sent to your email.") // Specific success message
+            logger.info("Password reset token generated for user: {}", user.email)
+            return ResponseEntity.ok("A password reset link has been sent to your email.")
         } else {
-            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("No account found with this email address.") // Specific error message
+            logger.warn("Password reset requested for non-existent email: {}", request.email)
+            return ResponseEntity.status(HttpStatus.NOT_FOUND).body("No account found with this email address.")
         }
     }
 
@@ -152,6 +167,7 @@ class AuthController(
             ?: return ResponseEntity.status(HttpStatus.NOT_FOUND).body("Invalid or expired password reset token.")
 
         if (user.passwordResetTokenExpiry?.isBefore(LocalDateTime.now()) == true) {
+            logger.warn("Expired password reset token used for user: {}", user.email)
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Invalid or expired password reset token.")
         }
 
@@ -159,6 +175,7 @@ class AuthController(
         user.passwordResetToken = null
         user.passwordResetTokenExpiry = null
         userRepository.save(user)
+        logger.info("Password successfully reset for user: {}", user.email)
 
         return ResponseEntity.ok("Your password has been reset successfully. You can now log in.")
     }
