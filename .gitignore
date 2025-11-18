@@ -1,0 +1,16 @@
+# Gradle
+.gradle
+build/
+!build/cache/
+
+# IntelliJ
+.idea/
+*.iml
+*.iws
+
+# Logs
+*.log
+
+# OS-specific
+.DS_Store
+Thumbs.db
