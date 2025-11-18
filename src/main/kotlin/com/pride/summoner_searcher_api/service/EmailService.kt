@@ -25,41 +25,23 @@ class EmailService(
     fun sendVerificationEmail(to: String, token: String) {
         val subject = "Verify Your Account"
         val verificationLink = "$frontendUrl/verify-email?token=$token"
-        
-        val htmlBody = """
-            <html>...</html>
-        """.trimIndent() // Keep your pretty HTML body here
-
-        val textBody = "Please click the following link to verify your email: $verificationLink"
-        
-        sendEmail(to, subject, textBody, htmlBody)
+        val body = "Please click the following link to verify your email: $verificationLink"
+        sendEmail(to, subject, body)
     }
 
     @Async
     fun sendPasswordResetEmail(to: String, token: String) {
         val subject = "Password Reset Request"
         val resetLink = "$frontendUrl/reset-password?token=$token"
-
-        val htmlBody = """
-            <html>...</html>
-        """.trimIndent() // Keep your pretty HTML body here
-
-        val textBody = "Please click the following link to reset your password: $resetLink"
-
-        sendEmail(to, subject, textBody, htmlBody)
+        val body = "Please click the following link to reset your password: $resetLink"
+        sendEmail(to, subject, body)
     }
 
-    private fun sendEmail(to: String, subject: String, textBody: String, htmlBody: String) {
+    private fun sendEmail(to: String, subject: String, body: String) {
         val from = Email(fromEmail)
         val toEmail = Email(to)
-        
-        // Create both a plain text and an HTML content part
-        val textContent = Content("text/plain", textBody)
-        val htmlContent = Content("text/html", htmlBody)
-
-        // The SendGrid library correctly handles creating a multipart email when you add more than one content type.
-        val mail = Mail(from, subject, toEmail, textContent)
-        mail.addContent(htmlContent)
+        val content = Content("text/plain", body)
+        val mail = Mail(from, subject, toEmail, content)
 
         val sg = SendGrid(sendGridApiKey)
         val request = Request()
