@@ -28,7 +28,9 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-security")
     implementation("org.springframework.security:spring-security-crypto")
     implementation("org.springframework.boot:spring-boot-starter-validation")
-    implementation("org.springframework.boot:spring-boot-starter-mail")
+
+    // SendGrid for Email
+    implementation("com.sendgrid:sendgrid-java:4.10.0")
 
     // Redis
     implementation("org.springframework.boot:spring-boot-starter-data-redis")
