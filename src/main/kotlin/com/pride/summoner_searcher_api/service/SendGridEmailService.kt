@@ -16,7 +16,6 @@ import java.io.IOException
 @Service
 @Profile("prod")
 class SendGridEmailService(
-    // By adding a default value of "", the app won't crash if the env var is missing in dev
     @Value("\${SENDGRID_API_KEY:}") private val sendGridApiKey: String,
     @Value("\${sendgrid.from.email}") private val fromEmail: String,
     @Value("\${app.frontend.url}") private val frontendUrl: String
@@ -30,8 +29,16 @@ class SendGridEmailService(
         val verificationLink = "$frontendUrl/verify-email?token=$token"
         
         val htmlBody = """
-            <html>...</html>
-        """.trimIndent() // Your HTML body
+            <html>
+                <body>
+                    <h2>Welcome to Summoner Searcher!</h2>
+                    <p>Please click the button below to verify your email address.</p>
+                    <a href="$verificationLink" style="background-color:#007bff;color:white;padding:10px 15px;text-decoration:none;border-radius:5px;">Verify Email</a>
+                    <p>If you cannot click the button, copy and paste this link into your browser:</p>
+                    <p>$verificationLink</p>
+                </body>
+            </html>
+        """.trimIndent()
 
         val textBody = "Please click the following link to verify your email: $verificationLink"
         
@@ -44,8 +51,17 @@ class SendGridEmailService(
         val resetLink = "$frontendUrl/reset-password?token=$token"
 
         val htmlBody = """
-            <html>...</html>
-        """.trimIndent() // Your HTML body
+            <html>
+                <body>
+                    <h2>Password Reset Request</h2>
+                    <p>You requested a password reset. Please click the button below to set a new password.</p>
+                    <a href="$resetLink" style="background-color:#007bff;color:white;padding:10px 15px;text-decoration:none;border-radius:5px;">Reset Password</a>
+                    <p>If you did not request a password reset, please ignore this email.</p>
+                    <p>If you cannot click the button, copy and paste this link into your browser:</p>
+                    <p>$resetLink</p>
+                </body>
+            </html>
+        """.trimIndent()
 
         val textBody = "Please click the following link to reset your password: $resetLink"
 
