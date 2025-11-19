@@ -15,6 +15,7 @@ data class StatusItemDto(
     val status: String?,
     val severity: String?,
     val title: String,
+    val description: String?, // The detailed description
     val platforms: List<String>
 )
 
@@ -93,6 +94,7 @@ data class RiotMaintenance(
     @JsonProperty("incident_severity")
     val incidentSeverity: String?,
     val titles: List<RiotContent>,
+    val updates: List<RiotUpdate>,
     val platforms: List<String>
 )
 
@@ -101,9 +103,17 @@ data class RiotIncident(
     @JsonProperty("incident_severity")
     val incidentSeverity: String?,
     val titles: List<RiotContent>,
+    val updates: List<RiotUpdate>,
     val platforms: List<String>
 )
 
+data class RiotUpdate(
+    val id: Int,
+    val author: String,
+    val translations: List<RiotContent>
+)
+
 data class RiotContent(
+    val locale: String,
     val content: String
 )

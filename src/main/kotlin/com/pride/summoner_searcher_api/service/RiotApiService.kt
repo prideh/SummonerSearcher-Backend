@@ -80,6 +80,11 @@ class RiotApiService(
         return leagueList?.copy(entries = enrichedEntries)
     }
 
+    private fun getPreferredContent(translations: List<RiotContent>): String? {
+        return translations.find { it.locale.equals("en_US", ignoreCase = true) }?.content
+            ?: translations.firstOrNull()?.content
+    }
+
     fun getPlatformData(region: String): PlatformStatusDto? {
         val baseUrl = "https://${region}.api.riotgames.com"
         val uri = "$baseUrl/lol/status/v4/platform-data"
@@ -97,20 +102,22 @@ class RiotApiService(
         return riotPlatformData?.let {
             PlatformStatusDto(
                 name = it.name,
-                maintenances = it.maintenances.map {
+                maintenances = it.maintenances.map { maintenance ->
                     StatusItemDto(
-                        status = it.maintenanceStatus,
-                        severity = it.incidentSeverity,
-                        title = it.titles.firstOrNull()?.content ?: "No Title",
-                        platforms = it.platforms
+                        status = maintenance.maintenanceStatus,
+                        severity = maintenance.incidentSeverity,
+                        title = getPreferredContent(maintenance.titles) ?: "No Title",
+                        description = maintenance.updates.firstOrNull()?.let { update -> getPreferredContent(update.translations) },
+                        platforms = maintenance.platforms
                     )
                 },
-                incidents = it.incidents.map {
+                incidents = it.incidents.map { incident ->
                     StatusItemDto(
-                        status = if (it.active) "Active" else "Resolved",
-                        severity = it.incidentSeverity,
-                        title = it.titles.firstOrNull()?.content ?: "No Title",
-                        platforms = it.platforms
+                        status = if (incident.active) "Active" else "Resolved",
+                        severity = incident.incidentSeverity,
+                        title = getPreferredContent(incident.titles) ?: "No Title",
+                        description = incident.updates.firstOrNull()?.let { update -> getPreferredContent(update.translations) },
+                        platforms = incident.platforms
                     )
                 }
             )
