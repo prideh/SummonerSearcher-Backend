@@ -143,46 +143,44 @@ class RiotApiService(
 
     fun fetchSummonerProfile(puuid: String, region: String): SummonerProfileDto? {
         val platformBaseUrl = "https://${region}.api.riotgames.com"
-
         val summonerUri = "$platformBaseUrl/lol/summoner/v4/summoners/by-puuid/{puuid}"
         val summonerDto = riotRestClient.get()
             .uri(summonerUri, puuid)
             .retrieve()
             .body<SummonerDto>()
 
+        val soloQueueRank = fetchLeagueRank(puuid, region)
+
+        return SummonerProfileDto(
+            puuid = puuid,
+            gameName = null,
+            tagLine = null,
+            summonerLevel = summonerDto?.summonerLevel,
+            profileIconId = summonerDto?.profileIconId,
+            soloQueueRank = soloQueueRank,
+            recentMatches = null
+        )
+    }
+
+    fun fetchLeagueRank(puuid: String, region: String): LeagueEntryDto? {
+        val platformBaseUrl = "https://${region}.api.riotgames.com"
         val leagueUri = "$platformBaseUrl/lol/league/v4/entries/by-puuid/{puuid}"
         val leagueEntriesType = object : ParameterizedTypeReference<List<LeagueEntryDto>>() {}
         val allLeagueEntries = riotRestClient.get()
             .uri(leagueUri, puuid)
             .retrieve()
             .body(leagueEntriesType)
-
-        val soloQueueRank = allLeagueEntries?.find { it.queueType == "RANKED_SOLO_5x5" }
-
-        return SummonerProfileDto(
-            puuid = puuid,
-            gameName = null, // This will be populated by the caching service
-            tagLine = null, // This will be populated by the caching service
-            summonerLevel = summonerDto?.summonerLevel,
-            profileIconId = summonerDto?.profileIconId,
-            soloQueueRank = soloQueueRank,
-            recentMatches = null // Match history is handled separately
-        )
+        
+        return allLeagueEntries?.find { it.queueType == "RANKED_SOLO_5x5" }
     }
 
     fun fetchMatchHistory(puuid: String, region: String, count: Int): List<MatchDto>? {
         val matchIds = getMatchIdsByPuuid(puuid, region, 420, 0, count) ?: listOf()
-
-        return matchIds.mapNotNull { matchId ->
-            riotMatchService.getMatchById(matchId, region)
-        }
+        return matchIds.mapNotNull { riotMatchService.getMatchById(it, region) }
     }
 
     fun fetchNewMatches(puuid: String, region: String, startTime: Long): List<MatchDto>? {
         val matchIds = getMatchIdsByPuuid(puuid, region, 420, startTime, 100) ?: listOf()
-
-        return matchIds.mapNotNull { matchId ->
-            riotMatchService.getMatchById(matchId, region)
-        }
+        return matchIds.mapNotNull { riotMatchService.getMatchById(it, region) }
     }
 }

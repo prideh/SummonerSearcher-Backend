@@ -17,55 +17,60 @@ class PlayerCacheService(
 
     fun getPlayerProfile(puuid: String, region: String, summonerName: String, tagLine: String): SummonerProfileDto? {
         val cacheKey = getProfileCacheKey(puuid)
-
-        // 1. Try to get the profile from the cache
         val cachedProfile = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
 
-        // 2. Handle Cache Miss (first time ever seeing this player)
-        if (cachedProfile == null || cachedProfile.recentMatches.isNullOrEmpty()) {
-            logger.info("[Cache MISS] for {}. Fetching full profile and initial 20 matches...", puuid)
+        // Handle Cache Miss (first time ever seeing this player)
+        if (cachedProfile == null) {
+            logger.info("[Cache MISS] for {}. Fetching full profile.", puuid)
             val freshProfile = riotApiService.fetchSummonerProfile(puuid, region)
             val initialMatches = riotApiService.fetchMatchHistory(puuid, region, 20)
-
             val completeProfile = freshProfile?.copy(
                 gameName = summonerName,
                 tagLine = tagLine,
                 recentMatches = initialMatches
             )
-
             if (completeProfile != null) {
                 redisCacheService.set(cacheKey, completeProfile, Duration.ZERO)
             }
             return completeProfile
         }
 
-        // 3. Handle Cache Hit: Perform the "Smart Update"
-        val lastKnownGameTimestamp = cachedProfile.recentMatches.first().info?.gameCreation ?: 0
+        // Handle Cache Hit: Always check for fresh data
+        var needsUpdate = false
+        var updatedProfile = cachedProfile
+
+        // 1. Check for new matches
+        val lastKnownGameTimestamp = cachedProfile.recentMatches?.firstOrNull()?.info?.gameCreation ?: 0
         val startTimeForApi = lastKnownGameTimestamp / 1000
-
         val potentialNewMatches = riotApiService.fetchNewMatches(puuid, region, startTimeForApi)
-
-        // Filter out any matches we already have in the cache to find the truly new ones.
-        val existingMatchIds = cachedProfile.recentMatches.mapNotNull { it.info?.gameId }.toSet()
+        val existingMatchIds = cachedProfile.recentMatches?.mapNotNull { it.info?.gameId }?.toSet() ?: emptySet()
         val trulyNewMatches = potentialNewMatches?.filterNot { existingMatchIds.contains(it.info?.gameId) }
 
-        // 3a. If there are no new matches, return the cached data.
-        if (trulyNewMatches.isNullOrEmpty()) {
-            logger.info("[Cache HIT] for {}. No new matches found.", puuid)
-            return cachedProfile.copy(gameName = summonerName, tagLine = tagLine)
+        if (!trulyNewMatches.isNullOrEmpty()) {
+            logger.info("[Cache STALE] Found {} new matches for {}.", trulyNewMatches.size, puuid)
+            val combinedMatches = trulyNewMatches + cachedProfile.recentMatches.orEmpty()
+            updatedProfile = updatedProfile.copy(recentMatches = combinedMatches)
+            needsUpdate = true
         }
 
-        // 3b. If there are new matches, prepend them and update the cache.
-        logger.info("[Cache UPDATE] for {}. Found {} new matches. Prepending to list.", puuid, trulyNewMatches.size)
-        val combinedMatches = trulyNewMatches + cachedProfile.recentMatches
+        // 2. Check for rank/LP changes
+        val freshRank = riotApiService.fetchLeagueRank(puuid, region)
+        if (freshRank != cachedProfile.soloQueueRank) {
+            logger.info("[Cache STALE] Found rank update for {}.", puuid)
+            updatedProfile = updatedProfile.copy(soloQueueRank = freshRank)
+            needsUpdate = true
+        }
 
-        val updatedProfile = cachedProfile.copy(
-            gameName = summonerName,
-            tagLine = tagLine,
-            recentMatches = combinedMatches
-        )
+        // 3. Update name and tagline (in case they changed)
+        updatedProfile = updatedProfile.copy(gameName = summonerName, tagLine = tagLine)
 
-        redisCacheService.set(cacheKey, updatedProfile, Duration.ZERO)
+        // 4. Save to cache if any part of the profile was updated
+        if (needsUpdate || updatedProfile.gameName != cachedProfile.gameName || updatedProfile.tagLine != cachedProfile.tagLine) {
+            logger.info("[Cache WRITE] Saving updated profile for {}.", puuid)
+            redisCacheService.set(cacheKey, updatedProfile, Duration.ZERO)
+        } else {
+            logger.info("[Cache HIT] Profile for {} is up-to-date.", puuid)
+        }
 
         return updatedProfile
     }
