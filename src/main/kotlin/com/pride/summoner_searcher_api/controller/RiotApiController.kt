@@ -1,8 +1,10 @@
 package com.pride.summoner_searcher_api.controller
 
+import com.pride.summoner_searcher_api.annotation.CurrentUser
 import com.pride.summoner_searcher_api.dto.LeagueListDTO
 import com.pride.summoner_searcher_api.dto.PlatformStatusDto
 import com.pride.summoner_searcher_api.dto.SummonerProfileDto
+import com.pride.summoner_searcher_api.model.User
 import com.pride.summoner_searcher_api.service.ChallengerLeagueService
 import com.pride.summoner_searcher_api.service.RiotApiService
 import com.pride.summoner_searcher_api.service.SummonerProfileService
@@ -12,7 +14,6 @@ import org.springframework.web.bind.annotation.GetMapping
 import org.springframework.web.bind.annotation.PathVariable
 import org.springframework.web.bind.annotation.RequestMapping
 import org.springframework.web.bind.annotation.RestController
-import java.security.Principal
 
 /**
  * Controller for handling all public-facing requests related to the Riot Games API.
@@ -58,7 +59,7 @@ class RiotApiController(
      * @param region The server region to search on.
      * @param summonerName The game name part of the Riot ID.
      * @param tagLine The tag line part of the Riot ID.
-     * @param principal Injected by Spring Security, represents the currently authenticated user.
+     * @param user The currently authenticated user, injected by our custom [@CurrentUser] annotation.
      * @return A [SummonerProfileDto] if the summoner is found, or null if they are not.
      */
     @GetMapping("/summoner/{region}/{summonerName}/{tagLine}")
@@ -66,16 +67,14 @@ class RiotApiController(
         @PathVariable region: String,
         @PathVariable summonerName: String,
         @PathVariable tagLine: String,
-        principal: Principal
+        @CurrentUser user: User
     ): ResponseEntity<SummonerProfileDto?> {
         val summonerProfile = summonerProfileService.getSummonerProfile(region, summonerName, tagLine)
 
         // If the summoner was found, add the search to the user's recent search history.
         if (summonerProfile != null) {
-            userService.findByEmail(principal.name)?.let { user ->
-                val searchQuery = "$summonerName#$tagLine"
-                userService.addRecentSearch(user, searchQuery)
-            }
+            val searchQuery = "$summonerName#$tagLine"
+            userService.addRecentSearch(user, searchQuery)
         }
 
         return ResponseEntity.ok(summonerProfile)

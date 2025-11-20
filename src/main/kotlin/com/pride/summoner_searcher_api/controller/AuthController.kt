@@ -12,42 +12,48 @@ import org.springframework.http.ResponseEntity
 import org.springframework.security.authentication.AuthenticationManager
 import org.springframework.security.authentication.BadCredentialsException
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken
-import org.springframework.security.core.userdetails.UserDetailsService
 import org.springframework.security.crypto.password.PasswordEncoder
 import org.springframework.transaction.annotation.Transactional
 import org.springframework.web.bind.annotation.*
 import java.time.LocalDateTime
 import java.util.UUID
 
+// --- DTOs for Authentication ---
 data class AuthRequest(val email: String, val password: String)
 data class TwoFactorLoginRequest(val tempToken: String, val code: Int)
 data class ForgotPasswordRequest(val email: String)
 data class ResetPasswordRequest(val token: String, val newPassword: String)
 
+// --- DTOs for Authentication Responses ---
 data class AuthResponse(
     val jwt: String,
     val twoFactorEnabled: Boolean,
     val darkmodePreference: Boolean,
     val recentSearches: List<String>
 )
-
 data class TwoFactorRequiredResponse(val twoFactorRequired: Boolean, val tempToken: String)
 
+/**
+ * Controller for handling all public authentication endpoints, such as login, registration, and password reset.
+ */
 @RestController
 @RequestMapping("/api/auth")
 class AuthController(
     private val authenticationManager: AuthenticationManager,
-    private val userDetailsService: UserDetailsService,
     private val jwtUtil: JwtUtil,
     private val userRepository: UserRepository,
     private val passwordEncoder: PasswordEncoder,
-    private val emailSender: EmailSender, // Use the interface
+    private val emailSender: EmailSender,
     private val twoFactorAuthService: TwoFactorAuthService,
     private val encryptionService: EncryptionService
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
 
+    /**
+     * Authenticates a user with their email and password.
+     * If 2FA is enabled, it returns a temporary token. Otherwise, it returns the final authentication response.
+     */
     @PostMapping("/login")
     fun createAuthenticationToken(@RequestBody authRequest: AuthRequest): ResponseEntity<Any> {
         try {
@@ -73,6 +79,11 @@ class AuthController(
         }
     }
 
+    /**
+     * Completes the login process for a user with 2FA enabled.
+     * @param request The request containing the temporary token and the 2FA code.
+     * @return The final [AuthResponse] upon successful verification.
+     */
     @PostMapping("/2fa-login")
     fun twoFactorLogin(@RequestBody request: TwoFactorLoginRequest): ResponseEntity<Any> {
         val email = jwtUtil.getEmailFromToken(request.tempToken)
@@ -95,6 +106,10 @@ class AuthController(
         return ResponseEntity.ok(AuthResponse(jwt, user.twoFactorEnabled, user.darkmodePreference, user.recentSearches))
     }
 
+    /**
+     * Registers a new user account.
+     * If a user with the same email exists but is not verified, it updates their record and resends the verification email.
+     */
     @PostMapping("/register")
     @Transactional
     fun registerUser(@RequestBody authRequest: AuthRequest): ResponseEntity<String> {
@@ -103,7 +118,7 @@ class AuthController(
         val userToSave = if (existingUser != null && !existingUser.verified) {
             logger.info("Updating existing unverified user: {}", authRequest.email)
             existingUser.apply {
-                password = passwordEncoder.encode(authRequest.password)
+                hashedPassword = passwordEncoder.encode(authRequest.password)
                 verificationToken = UUID.randomUUID().toString()
                 verificationTokenExpiry = LocalDateTime.now().plusHours(24)
             }
@@ -114,7 +129,7 @@ class AuthController(
             logger.info("Registering new user: {}", authRequest.email)
             User(
                 email = authRequest.email,
-                password = passwordEncoder.encode(authRequest.password),
+                hashedPassword = passwordEncoder.encode(authRequest.password),
                 darkmodePreference = false,
                 verified = false,
                 verificationToken = UUID.randomUUID().toString(),
@@ -130,6 +145,9 @@ class AuthController(
         return ResponseEntity.status(HttpStatus.CREATED).body("Registration successful. Please check your email to verify your account.")
     }
 
+    /**
+     * Verifies a user's account using the token sent to their email.
+     */
     @GetMapping("/verify")
     @Transactional
     fun verifyAccount(@RequestParam("token") token: String): ResponseEntity<String> {
@@ -150,6 +168,9 @@ class AuthController(
         return ResponseEntity.ok("Your account has been verified. You can now log in.")
     }
 
+    /**
+     * Initiates the password reset process for a user.
+     */
     @PostMapping("/forgot-password")
     @Transactional
     fun forgotPassword(@RequestBody request: ForgotPasswordRequest): ResponseEntity<String> {
@@ -166,13 +187,16 @@ class AuthController(
             userRepository.save(user)
             emailSender.sendPasswordResetEmail(user.email, token)
             logger.info("Password reset token generated for user: {}", user.email)
-            return ResponseEntity.ok("A password reset link has been sent to your email.")
         } else {
             logger.warn("Password reset requested for non-existent email: {}", request.email)
-            return ResponseEntity.ok("If an account with this email exists, a password reset link has been sent.")
         }
+        // Always return a generic success message to prevent email enumeration attacks.
+        return ResponseEntity.ok("If an account with this email exists, a password reset link has been sent.")
     }
 
+    /**
+     * Resets the user's password using a valid reset token.
+     */
     @PostMapping("/reset-password")
     @Transactional
     fun resetPassword(@RequestBody request: ResetPasswordRequest): ResponseEntity<String> {
@@ -184,7 +208,7 @@ class AuthController(
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Invalid or expired password reset token.")
         }
 
-        user.password = passwordEncoder.encode(request.newPassword)
+        user.hashedPassword = passwordEncoder.encode(request.newPassword)
         user.passwordResetToken = null
         user.passwordResetTokenExpiry = null
         userRepository.save(user)
@@ -193,6 +217,9 @@ class AuthController(
         return ResponseEntity.ok("Your password has been reset successfully. You can now log in.")
     }
 
+    /**
+     * Validates a password reset token to check if it's still valid for use.
+     */
     @GetMapping("/validate-reset-token")
     fun validateResetToken(@RequestParam("token") token: String): ResponseEntity<String> {
         val user = userRepository.findByPasswordResetToken(token)
