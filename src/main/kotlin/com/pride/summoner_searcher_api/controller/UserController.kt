@@ -4,6 +4,7 @@ import com.pride.summoner_searcher_api.repository.UserRepository
 import com.pride.summoner_searcher_api.service.EncryptionService
 import com.pride.summoner_searcher_api.service.TwoFactorAuthService
 import com.pride.summoner_searcher_api.service.UserService
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.security.core.context.SecurityContextHolder
@@ -25,8 +26,13 @@ class UserController(
     private val passwordEncoder: PasswordEncoder,
     private val twoFactorAuthService: TwoFactorAuthService,
     private val encryptionService: EncryptionService,
-    private val userService: UserService
+    private val userService: UserService,
+    @Value("\${dummy.user.email}") private val dummyUserEmail: String
 ) {
+
+    private fun isDummyUser(principal: Principal): Boolean {
+        return principal.name.equals(dummyUserEmail, ignoreCase = true)
+    }
 
     @GetMapping("/recent-searches")
     fun getRecentSearches(): ResponseEntity<List<String>> {
@@ -53,6 +59,10 @@ class UserController(
     @PostMapping("/change-password")
     @Transactional
     fun changePassword(principal: Principal, @RequestBody request: ChangePasswordRequest): ResponseEntity<String> {
+        if (isDummyUser(principal)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("The dummy account's password cannot be changed.")
+        }
+
         val user = userRepository.findByEmail(principal.name)
             ?: return ResponseEntity.status(HttpStatus.NOT_FOUND).body("User not found.")
 
@@ -69,8 +79,16 @@ class UserController(
     @PostMapping("/delete-account")
     @Transactional
     fun deleteAccount(principal: Principal, @RequestBody request: DeleteAccountRequest): ResponseEntity<String> {
+        if (isDummyUser(principal)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("The dummy account cannot be deleted.")
+        }
+
         val user = userRepository.findByEmail(principal.name)
             ?: return ResponseEntity.status(HttpStatus.NOT_FOUND).body("User not found.")
+
+        if (user.twoFactorEnabled) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("Please disable Two-Factor Authentication before deleting your account.")
+        }
 
         if (!passwordEncoder.matches(request.password, user.password)) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Incorrect password.")
@@ -82,7 +100,11 @@ class UserController(
     }
 
     @GetMapping("/2fa/enable")
-    fun enableTwoFactorAuth(principal: Principal): ResponseEntity<TwoFactorEnableResponse> {
+    fun enableTwoFactorAuth(principal: Principal): ResponseEntity<Any> {
+        if (isDummyUser(principal)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("2FA cannot be enabled for the dummy account.")
+        }
+
         val user = userRepository.findByEmail(principal.name)
             ?: return ResponseEntity.status(HttpStatus.NOT_FOUND).build()
 
@@ -94,7 +116,11 @@ class UserController(
 
     @PostMapping("/2fa/verify-enable")
     @Transactional
-    fun verifyTwoFactorAuth(@RequestBody request: TwoFactorEnableRequest, principal: Principal): ResponseEntity<String> {
+    fun verifyAndEnableTwoFactorAuth(@RequestBody request: TwoFactorEnableRequest, principal: Principal): ResponseEntity<String> {
+        if (isDummyUser(principal)) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("2FA cannot be enabled for the dummy account.")
+        }
+
         val user = userRepository.findByEmail(principal.name)
             ?: return ResponseEntity.status(HttpStatus.NOT_FOUND).body("User not found.")
 
