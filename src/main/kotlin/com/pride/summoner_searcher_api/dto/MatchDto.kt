@@ -3,11 +3,23 @@ package com.pride.summoner_searcher_api.dto
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties
 import com.fasterxml.jackson.annotation.JsonProperty
 
+// This file contains all the DTOs needed to deserialize the complex response from Riot's Match API.
+// The `@JsonIgnoreProperties(ignoreUnknown = true)` annotation is crucial here. It tells the JSON parser
+// to simply ignore any fields in the JSON response that we haven't defined in our data classes.
+// This makes our DTOs resilient to changes in the Riot API; if Riot adds new fields, our app won't crash.
+
+/**
+ * The top-level object for a single match response from the Riot API.
+ * We are primarily interested in the `info` property.
+ */
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class MatchDto(
     val info: MatchInfo?
 )
 
+/**
+ * Contains the core metadata and participant list for a match.
+ */
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class MatchInfo(
     val gameId: Long?,
@@ -18,6 +30,10 @@ data class MatchInfo(
     val participants: List<ParticipantDto> = listOf()
 )
 
+/**
+ * Represents a single participant in a match. This is a massive object containing
+ * all the stats for one player in one game.
+ */
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class ParticipantDto(
     val assists: Int?,
@@ -129,6 +145,9 @@ data class ParticipantDto(
     val win: Boolean?
 )
 
+/**
+ * Represents the "challenges" object within a participant's data, containing highly specific in-game stats.
+ */
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class ChallengesDto(
     val controlWardTimeCoverageInRiverOrEnemyHalf: Float?,
@@ -181,12 +200,18 @@ data class ChallengesDto(
     val turretPlatesTaken: Int?,
 )
 
+/**
+ * Represents the runes and perks selected by a participant.
+ */
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class PerksDto(
     @JsonProperty("statPerks") val statPerks: PerkStatsDto?,
     val styles: List<PerkStyleDto>?
 )
 
+/**
+ * The small, tertiary runes (e.g., Attack Speed, Armor).
+ */
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class PerkStatsDto(
     val defense: Int?,
@@ -194,6 +219,9 @@ data class PerkStatsDto(
     val offense: Int?
 )
 
+/**
+ * Represents a single rune tree (e.g., Precision, Domination).
+ */
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class PerkStyleDto(
     val description: String?,
@@ -201,6 +229,9 @@ data class PerkStyleDto(
     val selections: List<PerkStyleSelectionDto>?
 )
 
+/**
+ * Represents a single rune selection within a tree.
+ */
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class PerkStyleSelectionDto(
     val perk: Int?,
