@@ -10,12 +10,15 @@ class SummonerProfileService(
 ) {
 
     fun getSummonerProfile(region: String, summonerName: String, tagLine: String): SummonerProfileDto? {
-        // This call is not cached, as a user can change their Riot ID.
-        // It's the entry point to get the permanent PUUID.
-        val accountDto = riotApiService.getAccountByRiotId(summonerName, tagLine, region) ?: return null
-        val puuid = accountDto.puuid!!
+        // Step 1: Get the global account PUUID.
+        val accountDto = riotApiService.getAccountByRiotId(summonerName, tagLine, region)
+        val puuid = accountDto?.puuid?.takeIf { it.isNotBlank() } ?: return null
 
-        // All subsequent calls use the PUUID and are handled by the intelligent cache service.
+        // Step 2: Verify that this PUUID has a summoner on the requested region.
+        // If not, it's a valid global account but not on this server, so return "not found".
+        riotApiService.getSummonerByPuuid(puuid, region) ?: return null
+
+        // Only if both are successful, proceed to the caching layer.
         return playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine)
     }
 }
