@@ -130,7 +130,7 @@ class AuthController(
             User(
                 email = authRequest.email,
                 hashedPassword = passwordEncoder.encode(authRequest.password),
-                darkmodePreference = false,
+                darkmodePreference = true, // Default to true for new users
                 verified = false,
                 verificationToken = UUID.randomUUID().toString(),
                 verificationTokenExpiry = LocalDateTime.now().plusHours(24),

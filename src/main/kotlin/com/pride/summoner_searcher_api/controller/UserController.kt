@@ -18,6 +18,7 @@ data class DeleteAccountRequest(val password: String)
 data class TwoFactorEnableRequest(val secret: String, val code: Int)
 data class TwoFactorDisableRequest(val code: Int)
 data class TwoFactorEnableResponse(val secret: String, val qrCodeDataUri: String)
+data class DarkModeRequest(val enabled: Boolean)
 
 /**
  * Controller for handling all user-specific actions, such as managing profile settings and account details.
@@ -57,6 +58,17 @@ class UserController(
     fun clearRecentSearches(@CurrentUser user: User): ResponseEntity<String> {
         userService.clearRecentSearches(user)
         return ResponseEntity.ok("Recent searches cleared successfully.")
+    }
+
+    /**
+     * Updates the dark mode preference for the currently authenticated user.
+     */
+    @PostMapping("/settings/darkmode")
+    @Transactional
+    fun updateDarkMode(@CurrentUser user: User, @RequestBody request: DarkModeRequest): ResponseEntity<String> {
+        user.darkmodePreference = request.enabled
+        userRepository.save(user)
+        return ResponseEntity.ok("Dark mode preference updated successfully.")
     }
 
     /**
