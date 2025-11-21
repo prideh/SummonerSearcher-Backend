@@ -24,11 +24,15 @@ repositories {
 dependencies {
     implementation("org.springframework.boot:spring-boot-starter-web")
     implementation("org.springframework.boot:spring-boot-starter-data-jpa")
-    implementation("org.postgresql:postgresql")     // JDBC Postgres driver (runtime)
+    implementation("org.postgresql:postgresql")
 
     implementation("org.springframework.boot:spring-boot-starter-security")
     implementation("org.springframework.security:spring-security-crypto")
     implementation("org.springframework.boot:spring-boot-starter-validation")
+    implementation("org.springframework.boot:spring-boot-starter-aop") // Required for Resilience4J
+
+    // Resilience4J for Rate Limiting
+    implementation("io.github.resilience4j:resilience4j-spring-boot3:2.2.0")
 
     // SendGrid for Email
     implementation("com.sendgrid:sendgrid-java:4.10.0")

@@ -2,6 +2,7 @@ package com.pride.summoner_searcher_api.service
 
 import com.pride.summoner_searcher_api.dto.*
 import com.pride.summoner_searcher_api.util.mapToRegionRouting
+import io.github.resilience4j.ratelimiter.annotation.RateLimiter
 import org.slf4j.LoggerFactory
 import org.springframework.core.ParameterizedTypeReference
 import org.springframework.stereotype.Service
@@ -11,11 +12,14 @@ import org.springframework.web.client.body
 
 /**
  * A service dedicated to interacting with the Riot Games API.
- * This class abstracts away the details of making HTTP requests and handles errors gracefully
- * by catching 404 Not Found exceptions and returning null instead of crashing.
+ * This class abstracts away the details of making HTTP requests, handles errors gracefully,
+ * and manages API rate limiting using Resilience4J.
+ *
+ * The `open` keyword is required on the class and its public methods so that Spring AOP
+ * can create a proxy to apply the @RateLimiter annotations.
  */
 @Service
-class RiotApiService(
+open class RiotApiService(
     private val riotRestClient: RestClient,
     private val riotMatchService: RiotMatchService
 ) {
@@ -24,9 +28,11 @@ class RiotApiService(
 
     /**
      * Fetches a player's global account details using their PUUID. Used by the challenger cache warmer.
+     * This call is rate-limited.
      * @return An [AccountDto] containing the Riot ID, or null if not found.
      */
-    private fun getAccountByPuuid(puuid: String, region: String): AccountDto? {
+    @RateLimiter(name = "riot")
+    open fun getAccountByPuuid(puuid: String, region: String): AccountDto? {
         val regionalRouting = mapToRegionRouting(region)
         val accountBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val uri = "$accountBaseUrl/riot/account/v1/accounts/by-puuid/{puuid}"
@@ -43,10 +49,11 @@ class RiotApiService(
 
     /**
      * Fetches a player's global account details using their Riot ID (game name + tagline).
-     * This is the primary entry point for finding a player.
+     * This is the primary entry point for finding a player. This call is rate-limited.
      * @return An [AccountDto] containing the global PUUID, or null if not found.
      */
-    fun getAccountByRiotId(summonerName: String, tagLine: String, region: String): AccountDto? {
+    @RateLimiter(name = "riot")
+    open fun getAccountByRiotId(summonerName: String, tagLine: String, region: String): AccountDto? {
         val regionalRouting = mapToRegionRouting(region)
         val accountBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val accountUri = "$accountBaseUrl/riot/account/v1/accounts/by-riot-id/{summonerName}/{tagLine}"
@@ -63,10 +70,11 @@ class RiotApiService(
 
     /**
      * Fetches a player's summoner details (level, icon, etc.) for a specific region using their PUUID.
-     * This is used to verify a player exists on a specific server.
+     * This is used to verify a player exists on a specific server. This call is rate-limited.
      * @return A [SummonerDto] if found on the specified region, otherwise null.
      */
-    fun getSummonerByPuuid(puuid: String, region: String): SummonerDto? {
+    @RateLimiter(name = "riot")
+    open fun getSummonerByPuuid(puuid: String, region: String): SummonerDto? {
         val platformBaseUrl = "https://${region}.api.riotgames.com"
         val summonerUri = "$platformBaseUrl/lol/summoner/v4/summoners/by-puuid/{puuid}"
         return try {
@@ -82,9 +90,10 @@ class RiotApiService(
     
     /**
      * Assembles the initial, uncached summoner profile by fetching summoner data and rank data.
+     * The underlying calls to get summoner and rank data are rate-limited.
      * @return A [SummonerProfileDto] ready to be cached, or null if the summoner doesn't exist.
      */
-    fun fetchSummonerProfile(puuid: String, region: String): SummonerProfileDto? {
+    open fun fetchSummonerProfile(puuid: String, region: String): SummonerProfileDto? {
         val summonerDto = getSummonerByPuuid(puuid, region) ?: return null
         val soloQueueRank = fetchLeagueRank(puuid, region)
 
@@ -101,9 +110,11 @@ class RiotApiService(
 
     /**
      * Fetches a player's ranked information (specifically for Ranked Solo/Duo).
+     * This call is rate-limited.
      * @return A [LeagueEntryDto] for the solo queue, or null if the player is unranked.
      */
-    fun fetchLeagueRank(puuid: String, region: String): LeagueEntryDto? {
+    @RateLimiter(name = "riot")
+    open fun fetchLeagueRank(puuid: String, region: String): LeagueEntryDto? {
         val platformBaseUrl = "https://${region}.api.riotgames.com"
         val leagueUri = "$platformBaseUrl/lol/league/v4/entries/by-puuid/{puuid}"
         val leagueEntriesType = object : ParameterizedTypeReference<List<LeagueEntryDto>>() {}
@@ -122,10 +133,11 @@ class RiotApiService(
 
     /**
      * Fetches the list of challenger players for a given region and enriches it with their Riot IDs.
-     * This is a slow, rate-limited process used by the cache warmer.
+     * This is a slow process where each sub-call is rate-limited.
      * @return A [LeagueListDTO] containing the enriched list of challenger players.
      */
-    fun fetchChallengerLeague(region: String, queue: String): LeagueListDTO? {
+    @RateLimiter(name = "riot-long") // Apply the long-term rate limit to the initial call
+    open fun fetchChallengerLeague(region: String, queue: String): LeagueListDTO? {
         val baseUrl = "https://${region}.api.riotgames.com"
         val uri = "$baseUrl/lol/league/v4/challengerleagues/by-queue/{queue}"
         val leagueList = try {
@@ -143,8 +155,7 @@ class RiotApiService(
             if ((index + 1) % 50 == 0) {
                 logger.info("[Cache Warmer] $region: Processed ${index + 1} / $totalEntries players...")
             }
-            // Respect Riot's rate limits.
-            Thread.sleep(1300)
+            // Each call to getAccountByPuuid is individually rate-limited by the 'riot' limiter.
             val account = entry.puuid?.let { getAccountByPuuid(it, region) }
             entry.copy(
                 gameName = account?.gameName,
@@ -156,10 +167,11 @@ class RiotApiService(
     }
 
     /**
-     * Fetches a list of match IDs for a given player.
+     * Fetches a list of match IDs for a given player. This call is rate-limited.
      * @return A list of match ID strings, or null if not found.
      */
-    fun getMatchIdsByPuuid(puuid: String, region: String, queueId: Int, startTime: Long, count: Int): List<String>? {
+    @RateLimiter(name = "riot")
+    open fun getMatchIdsByPuuid(puuid: String, region: String, queueId: Int, startTime: Long, count: Int): List<String>? {
         val regionalRouting = mapToRegionRouting(region)
         val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val uri = "$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&startTime={startTime}&count={count}"
@@ -177,18 +189,20 @@ class RiotApiService(
     
     /**
      * Fetches a specified number of full match details for a player.
+     * The underlying calls to get match IDs and match details are rate-limited.
      * @return A list of [MatchDto] objects.
      */
-    fun fetchMatchHistory(puuid: String, region: String, count: Int): List<MatchDto>? {
+    open fun fetchMatchHistory(puuid: String, region: String, count: Int): List<MatchDto>? {
         val matchIds = getMatchIdsByPuuid(puuid, region, 420, 0, count) ?: return emptyList()
         return matchIds.mapNotNull { riotMatchService.getMatchById(it, region) }
     }
 
     /**
      * Fetches new matches for a player that have occurred after a given timestamp.
+     * The underlying calls to get match IDs and match details are rate-limited.
      * @return A list of new [MatchDto] objects.
      */
-    fun fetchNewMatches(puuid: String, region: String, startTime: Long): List<MatchDto>? {
+    open fun fetchNewMatches(puuid: String, region: String, startTime: Long): List<MatchDto>? {
         val matchIds = getMatchIdsByPuuid(puuid, region, 420, startTime, 100) ?: return emptyList()
         return matchIds.mapNotNull { riotMatchService.getMatchById(it, region) }
     }
@@ -203,10 +217,11 @@ class RiotApiService(
     }
 
     /**
-     * Fetches the live server status for a given region.
+     * Fetches the live server status for a given region. This call is rate-limited.
      * @return A simplified [PlatformStatusDto] for the frontend.
      */
-    fun getPlatformData(region: String): PlatformStatusDto? {
+    @RateLimiter(name = "riot")
+    open fun getPlatformData(region: String): PlatformStatusDto? {
         val baseUrl = "https://${region}.api.riotgames.com"
         val uri = "$baseUrl/lol/status/v4/platform-data"
         return try {
