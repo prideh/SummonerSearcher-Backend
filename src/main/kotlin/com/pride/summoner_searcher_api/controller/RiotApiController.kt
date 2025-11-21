@@ -9,6 +9,7 @@ import com.pride.summoner_searcher_api.service.ChallengerLeagueService
 import com.pride.summoner_searcher_api.service.RiotApiService
 import com.pride.summoner_searcher_api.service.SummonerProfileService
 import com.pride.summoner_searcher_api.service.UserService
+import kotlinx.coroutines.runBlocking
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.GetMapping
 import org.springframework.web.bind.annotation.PathVariable
@@ -47,9 +48,9 @@ class RiotApiController(
      * @return A [PlatformStatusDto] containing the simplified status, or null if not found.
      */
     @GetMapping("/status/{region}")
-    fun getPlatformData(@PathVariable region: String): ResponseEntity<PlatformStatusDto?> {
+    fun getPlatformData(@PathVariable region: String): ResponseEntity<PlatformStatusDto?> = runBlocking {
         val platformData = riotApiService.getPlatformData(region)
-        return ResponseEntity.ok(platformData)
+        ResponseEntity.ok(platformData)
     }
 
     /**
@@ -68,7 +69,7 @@ class RiotApiController(
         @PathVariable summonerName: String,
         @PathVariable tagLine: String,
         @CurrentUser user: User
-    ): ResponseEntity<SummonerProfileDto?> {
+    ): ResponseEntity<SummonerProfileDto?> = runBlocking {
         val summonerProfile = summonerProfileService.getSummonerProfile(region, summonerName, tagLine)
 
         // If the summoner was found, add the search to the user's recent search history.
@@ -77,6 +78,6 @@ class RiotApiController(
             userService.addRecentSearch(user, searchQuery)
         }
 
-        return ResponseEntity.ok(summonerProfile)
+        ResponseEntity.ok(summonerProfile)
     }
 }

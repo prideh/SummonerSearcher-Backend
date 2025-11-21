@@ -22,7 +22,7 @@ class SummonerProfileService(
      * @param tagLine The tag line part of the Riot ID.
      * @return A [SummonerProfileDto] if the summoner is found on the specified region, otherwise null.
      */
-    fun getSummonerProfile(region: String, summonerName: String, tagLine: String): SummonerProfileDto? {
+    suspend fun getSummonerProfile(region: String, summonerName: String, tagLine: String): SummonerProfileDto? {
         // Step 1: Get the global account PUUID from the Riot ID. This call is not cached.
         val accountDto = riotApiService.getAccountByRiotId(summonerName, tagLine, region)
         val puuid = accountDto?.puuid?.takeIf { it.isNotBlank() } ?: return null

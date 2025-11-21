@@ -41,7 +41,7 @@ class ChallengerLeagueService(
      * This method uses a "time-to-refresh" strategy. It will only perform the expensive API
      * fetch if the cached data is missing, malformed, or is older than 24 hours.
      */
-    fun warmChallengerLeagueCache(region: String, queue: String) {
+    suspend fun warmChallengerLeagueCache(region: String, queue: String) {
         val cacheKey = getCacheKey(region, queue)
         val cachedData = redisCacheService.get(cacheKey, CachedLeaderboardDto::class.java)
 

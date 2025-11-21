@@ -34,7 +34,7 @@ class PlayerCacheService(
      * @param tagLine The player's current tag line.
      * @return A [SummonerProfileDto] containing the player's up-to-date profile.
      */
-    fun getPlayerProfile(puuid: String, region: String, summonerName: String, tagLine: String): SummonerProfileDto? {
+    suspend fun getPlayerProfile(puuid: String, region: String, summonerName: String, tagLine: String): SummonerProfileDto? {
         val cacheKey = getProfileCacheKey(puuid, region)
         val cachedProfile = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
 
