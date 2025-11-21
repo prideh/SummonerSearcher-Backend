@@ -32,21 +32,22 @@ class ChallengerLeagueService(
     fun getChallengerLeagueFromCache(region: String, queue: String): LeagueListDTO? {
         val cacheKey = getCacheKey(region, queue)
         logger.info("Frontend requested challenger leaderboard for key: {}", cacheKey)
-        // Fetch the wrapper object and return only the leaderboard data.
+        // Fetch the wrapper object and safely return only the leaderboard data.
         return redisCacheService.get(cacheKey, CachedLeaderboardDto::class.java)?.leaderboard
     }
 
     /**
      * Fetches the challenger leaderboard from the Riot API and populates the cache.
      * This method uses a "time-to-refresh" strategy. It will only perform the expensive API
-     * fetch if the cached data is missing or is older than 24 hours.
+     * fetch if the cached data is missing, malformed, or is older than 24 hours.
      */
     fun warmChallengerLeagueCache(region: String, queue: String) {
         val cacheKey = getCacheKey(region, queue)
         val cachedData = redisCacheService.get(cacheKey, CachedLeaderboardDto::class.java)
 
-        // Check if the data exists and is less than 24 hours old.
-        if (cachedData != null && Duration.between(cachedData.lastRefreshed, Instant.now()).toHours() < 24) {
+        // Safely check the last refreshed time. If the data or the timestamp is null, treat it as stale.
+        val lastRefreshed = cachedData?.lastRefreshed
+        if (lastRefreshed != null && Duration.between(lastRefreshed, Instant.now()).toHours() < 24) {
             logger.info("[Cache Warmer] HIT for key: {}. Data is fresh. No refresh needed.", cacheKey)
             return // Exit if cache is fresh.
         }

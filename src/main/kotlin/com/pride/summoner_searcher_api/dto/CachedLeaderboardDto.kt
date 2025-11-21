@@ -7,10 +7,10 @@ import java.time.Instant
  * This allows us to store a timestamp along with the data, so our application
  * can manage its own refresh logic instead of relying on Redis's TTL expiration.
  *
- * @property lastRefreshed The timestamp of when the data was last fetched from the Riot API.
- * @property leaderboard The actual leaderboard data.
+ * The fields are nullable to prevent deserialization errors if the cache ever contains
+ * old or malformed data.
  */
 data class CachedLeaderboardDto(
-    val lastRefreshed: Instant,
-    val leaderboard: LeagueListDTO
+    val lastRefreshed: Instant? = null,
+    val leaderboard: LeagueListDTO? = null
 )
