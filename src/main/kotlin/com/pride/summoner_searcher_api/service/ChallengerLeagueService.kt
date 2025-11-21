@@ -1,9 +1,11 @@
 package com.pride.summoner_searcher_api.service
 
+import com.pride.summoner_searcher_api.dto.CachedLeaderboardDto
 import com.pride.summoner_searcher_api.dto.LeagueListDTO
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import java.time.Duration
+import java.time.Instant
 
 /**
  * A service responsible for managing the challenger leaderboard data.
@@ -30,33 +32,39 @@ class ChallengerLeagueService(
     fun getChallengerLeagueFromCache(region: String, queue: String): LeagueListDTO? {
         val cacheKey = getCacheKey(region, queue)
         logger.info("Frontend requested challenger leaderboard for key: {}", cacheKey)
-        return redisCacheService.get(cacheKey, LeagueListDTO::class.java)
+        // Fetch the wrapper object and return only the leaderboard data.
+        return redisCacheService.get(cacheKey, CachedLeaderboardDto::class.java)?.leaderboard
     }
 
     /**
      * Fetches the challenger leaderboard from the Riot API and populates the cache.
-     * This method is designed to be called by a background scheduler. It will only perform the
-     * expensive API fetch if the data is not already present in the cache.
+     * This method uses a "time-to-refresh" strategy. It will only perform the expensive API
+     * fetch if the cached data is missing or is older than 24 hours.
      */
     fun warmChallengerLeagueCache(region: String, queue: String) {
         val cacheKey = getCacheKey(region, queue)
+        val cachedData = redisCacheService.get(cacheKey, CachedLeaderboardDto::class.java)
 
-        // Check if the data already exists to avoid unnecessary API calls.
-        val existingData = redisCacheService.get(cacheKey, LeagueListDTO::class.java)
-        if (existingData != null) {
-            logger.info("[Cache Warmer] HIT for key: {}. No refresh needed.", cacheKey)
-            return // Exit if cache is already warm.
+        // Check if the data exists and is less than 24 hours old.
+        if (cachedData != null && Duration.between(cachedData.lastRefreshed, Instant.now()).toHours() < 24) {
+            logger.info("[Cache Warmer] HIT for key: {}. Data is fresh. No refresh needed.", cacheKey)
+            return // Exit if cache is fresh.
         }
 
-        // If data is not in the cache, perform the slow, rate-limited fetch.
-        logger.info("[Cache Warmer] MISS for key: {}. Fetching from API...", cacheKey)
+        // If data is missing or stale, perform the slow, rate-limited fetch.
+        val logMessage = if (cachedData == null) "MISS" else "STALE"
+        logger.info("[Cache Warmer] {} for key: {}. Fetching from API...", logMessage, cacheKey)
+        
         val freshLeague = riotApiService.fetchChallengerLeague(region, queue)
 
         if (freshLeague != null) {
             logger.info("[Cache Warmer] Populating cache with fresh data for key: {}", cacheKey)
-            // Set a 25-hour expiration. This ensures the data is always available, even if the
-            // daily refresh job fails once, but will be gone for the subsequent day's check.
-            redisCacheService.set(cacheKey, freshLeague, Duration.ofHours(25))
+            val newCachedData = CachedLeaderboardDto(
+                lastRefreshed = Instant.now(),
+                leaderboard = freshLeague
+            )
+            // Store the data indefinitely. Our service now manages the refresh logic.
+            redisCacheService.set(cacheKey, newCachedData, Duration.ZERO)
         }
     }
 }
