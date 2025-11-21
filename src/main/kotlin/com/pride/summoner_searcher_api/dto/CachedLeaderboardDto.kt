@@ -8,7 +8,7 @@ import java.time.Instant
  * can manage its own refresh logic instead of relying on Redis's TTL expiration.
  *
  * The fields are nullable to prevent deserialization errors if the cache ever contains
- * old or malformed data.
+ * old or malformed data from a previous deployment.
  */
 data class CachedLeaderboardDto(
     val lastRefreshed: Instant? = null,
