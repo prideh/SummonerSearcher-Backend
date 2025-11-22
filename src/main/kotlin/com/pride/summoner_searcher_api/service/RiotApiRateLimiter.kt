@@ -32,6 +32,24 @@ class SystemTimeProvider : TimeProvider {
  */
 @Component
 class RiotApiRateLimiter(
+    private val timeProvider: TimeProvider
+) {
+
+    private val logger = LoggerFactory.getLogger(javaClass)
+
+    // Enforce 55ms gap between requests (approx 18 reqs/s)
+    private val shortTermPacer = PacedBucket(
+        intervalMs = 55, 
+        name = "1s-Pacer"
+    )
+
+    // 70 requests per 2 minutes (reduced from 90 to prevent burst overshoot)
+    // Math: 70 (initial) + ~20 (refill during 30s burst) = 90 < 100
+    private val longTermBucket = PriorityTokenBucket(
+        maxTokens = 70.0, 
+        refillPeriod = Duration.ofMinutes(2), 
+        name = "2m-Bucket"
+    )
 
     /**
      * Acquires a permit to make a Riot API request.
