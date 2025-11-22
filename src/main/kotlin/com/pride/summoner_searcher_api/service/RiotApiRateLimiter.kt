@@ -69,17 +69,13 @@ class RiotApiRateLimiter {
 
                 if (waitTime > 0) {
                     // We must wait to maintain pacing
-                    // We hold the lock to ensure strict FIFO ordering and prevent others from jumping the queue
-                    // Since waitTime is usually small (max 50ms), holding lock is acceptable
+                    logger.debug("[{}] Pacing: Waiting {}ms to maintain 50ms gap", name, waitTime)
                     delay(waitTime)
-                } else {
-                    waitTime = 0
                 }
 
                 // Update next allowed time
-                // If we are late (now > nextAllowedTime), we reset to now + interval
-                // This prevents "catching up" with a burst
                 nextAllowedTime = max(now, nextAllowedTime) + intervalMs
+                logger.info("[{}] Request permitted at {}", name, System.currentTimeMillis())
             }
         }
     }
