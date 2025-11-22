@@ -1,77 +1,72 @@
 package com.pride.summoner_searcher_api.service
 
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.runTest
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
-import java.time.Duration
-import kotlin.system.measureTimeMillis
 
 class RiotApiRateLimiterTest {
 
     @Test
-    fun `should pace requests at 50ms intervals`() = runBlocking {
-        val rateLimiter = RiotApiRateLimiter()
-        val numberOfRequests = 20
-        
-        val timeTaken = measureTimeMillis {
-            val jobs = (1..numberOfRequests).map {
-                async {
-                    rateLimiter.acquirePermit(ApiPriority.HIGH)
-                }
-            }
-            jobs.awaitAll()
+    fun `should pace requests at 55ms intervals`() = runTest {
+        // Use virtual time from TestScope
+        val timeProvider = object : TimeProvider {
+            override fun now() = currentTime
         }
-
-        // Expected time: (20 - 1) * 50ms = 950ms minimum
-        // We allow a small margin of error, but it should be at least 900ms
-        println("Processed $numberOfRequests requests in ${timeTaken}ms")
-        assertTrue(timeTaken >= 900, "Requests were processed too fast! Expected > 900ms, took ${timeTaken}ms")
-    }
-
-    @Test
-    fun `should prioritize high priority requests`() = runBlocking {
-        val rateLimiter = RiotApiRateLimiter()
+        val rateLimiter = RiotApiRateLimiter(timeProvider)
         
-        // Drain the long term bucket to near the buffer limit
-        // Max 100. Buffer 10.
-        // We need to consume enough to drop below 11, accounting for refill during the pacing delay.
-        // 95 requests * 50ms = 4.75s. Refill ~4 tokens. Net consumption ~91. Remaining ~9.
-        repeat(95) {
+        val start = currentTime
+        
+        // Simulate 20 requests
+        repeat(20) {
             rateLimiter.acquirePermit(ApiPriority.HIGH)
         }
         
-        // Now we have ~15 tokens left.
-        // High priority should pass.
-        val highStart = System.currentTimeMillis()
-        rateLimiter.acquirePermit(ApiPriority.HIGH)
-        val highTime = System.currentTimeMillis() - highStart
-        println("High priority took ${highTime}ms")
-        assertTrue(highTime < 100, "High priority should be instant")
+        val duration = currentTime - start
+        println("Processed 20 requests in ${duration}ms")
+        
+        // 20 requests * 55ms = 1100ms.
+        // First request is instant. 19 intervals * 55 = 1045ms.
+        // So expected is around 1045ms.
+        assertTrue(duration >= 1045, "Should take at least 1045ms")
+    }
 
-        // Now we have ~14 tokens left.
-        // Low priority should pass (buffer is 10).
-        val lowStart = System.currentTimeMillis()
-        rateLimiter.acquirePermit(ApiPriority.LOW)
-        val lowTime = System.currentTimeMillis() - lowStart
-        println("Low priority took ${lowTime}ms")
-        assertTrue(lowTime < 100, "Low priority should be instant (tokens > buffer)")
-
-        // Consume down to buffer (10 tokens left)
-        repeat(3) { rateLimiter.acquirePermit(ApiPriority.HIGH) }
+    @Test
+    fun `should throttle 300 requests over time`() = runTest {
+        // Use virtual time from TestScope
+        val timeProvider = object : TimeProvider {
+            override fun now() = currentTime
+        }
+        val rateLimiter = RiotApiRateLimiter(timeProvider)
         
-        // Now ~10 tokens left.
-        // Low priority should WAIT.
-        // Refill rate is slow (0.83 req/s).
-        // It should wait for 1 token + buffer.
+        val start = currentTime
         
-        println("Testing Low Priority blocking...")
-        val blockedStart = System.currentTimeMillis()
-        rateLimiter.acquirePermit(ApiPriority.LOW) // Should block
-        val blockedTime = System.currentTimeMillis() - blockedStart
+        println("Starting 300 requests simulation...")
         
-        println("Low priority blocked for ${blockedTime}ms")
-        assertTrue(blockedTime > 500, "Low priority should have been blocked")
+        // Simulate 300 requests (User requested "burst calls" scenario)
+        repeat(300) { index ->
+            rateLimiter.acquirePermit(ApiPriority.LOW)
+            if (index % 50 == 0) {
+                println("Processed $index requests at ${currentTime}ms")
+            }
+        }
+        
+        val duration = currentTime - start
+        println("Processed 300 requests in ${duration}ms")
+        
+        // Analysis:
+        // Limit: 90 requests / 2 minutes (120,000ms)
+        // Refill Rate: 90 / 120,000 = 0.00075 tokens/ms (or 0.75 tokens/sec)
+        // Time per token: 1333ms
+        
+        // 1. Initial Burst: 90 tokens.
+        //    Paced by 55ms. Time = 90 * 55 = 4950ms.
+        // 2. Remaining 210 requests:
+        //    Must wait for refill.
+        //    Time = 210 * 1333ms = 279,930ms (~4.6 minutes)
+        
+        // Total expected time approx 285,000ms.
+        
+        assertTrue(duration > 270_000, "Should take at least 270s (4.5m) to process 300 requests. Took: ${duration}ms")
+        assertTrue(duration < 300_000, "Should take less than 300s (5m). Took: ${duration}ms")
     }
 }

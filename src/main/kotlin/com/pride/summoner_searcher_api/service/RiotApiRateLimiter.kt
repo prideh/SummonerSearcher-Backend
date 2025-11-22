@@ -14,27 +14,40 @@ enum class ApiPriority {
     LOW   // Cache warmer / background tasks
 }
 
+interface TimeProvider {
+    fun now(): Long
+}
+
+@Component
+class SystemTimeProvider : TimeProvider {
+    override fun now() = System.currentTimeMillis()
+}
+
 /**
  * A centralized rate limiter for the Riot API.
  * 
  * Strategies:
- * - Short Term (20/1s): Uses "Strict Pacing" (1 req every 50ms) to prevent bursts.
- * - Long Term (100/2m): Uses "Token Bucket" with Priority Reservation.
+ * - Short Term (20/1s): Uses "Strict Pacing" (1 req every 55ms) to prevent bursts.
+ * - Long Term (90/2m): Uses "Token Bucket" with Priority Reservation.
  */
 @Component
-class RiotApiRateLimiter {
+class RiotApiRateLimiter(
+    private val timeProvider: TimeProvider
+) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
 
-    // Enforce 50ms gap between requests (1000ms / 20 reqs)
+    // Enforce 55ms gap between requests (approx 18 reqs/s)
+    // Conservative pacing to ensure we never exceed 20/1s even with jitter
     private val shortTermPacer = PacedBucket(
-        intervalMs = 50, 
+        intervalMs = 55, 
         name = "1s-Pacer"
     )
 
-    // 100 requests per 2 minutes
+    // 90 requests per 2 minutes (90% of 100 limit)
+    // Safety buffer for clock drift and strict enforcement
     private val longTermBucket = PriorityTokenBucket(
-        maxTokens = 100.0, 
+        maxTokens = 90.0, 
         refillPeriod = Duration.ofMinutes(2), 
         name = "2m-Bucket"
     )
@@ -59,23 +72,25 @@ class RiotApiRateLimiter {
         private val intervalMs: Long,
         private val name: String
     ) {
-        private var nextAllowedTime = System.currentTimeMillis()
+        private var nextAllowedTime = timeProvider.now()
         private val mutex = Mutex()
 
         suspend fun acquire() {
             mutex.withLock {
-                val now = System.currentTimeMillis()
+                val now = timeProvider.now()
                 var waitTime = nextAllowedTime - now
 
                 if (waitTime > 0) {
                     // We must wait to maintain pacing
-                    logger.debug("[{}] Pacing: Waiting {}ms to maintain 50ms gap", name, waitTime)
+                    logger.debug("[{}] Pacing: Waiting {}ms to maintain 55ms gap", name, waitTime)
                     delay(waitTime)
                 }
 
                 // Update next allowed time
+                // We use max(now, nextAllowedTime) to ensure we don't accumulate "credit" for past idle time
+                // We must always space out future requests
                 nextAllowedTime = max(now, nextAllowedTime) + intervalMs
-                logger.info("[{}] Request permitted at {}", name, System.currentTimeMillis())
+                logger.info("[{}] Request permitted at {}", name, timeProvider.now())
             }
         }
     }
@@ -90,11 +105,11 @@ class RiotApiRateLimiter {
         private val name: String
     ) {
         private var tokens = maxTokens
-        private var lastRefillTime = System.currentTimeMillis()
+        private var lastRefillTime = timeProvider.now()
         private val refillRatePerMs = maxTokens / refillPeriod.toMillis()
         private val mutex = Mutex()
         
-        // Reserve 10 tokens (10%) for High Priority requests
+        // Reserve 10 tokens for High Priority requests
         private val reservedBuffer = 10.0
 
         suspend fun acquire(priority: ApiPriority) {
@@ -122,12 +137,16 @@ class RiotApiRateLimiter {
                     // If LOW priority, we wait until we have (1 + buffer) tokens
                     val targetTokens = if (priority == ApiPriority.HIGH) 1.0 else (1.0 + reservedBuffer)
                     val tokensNeeded = targetTokens - tokens
+                    
+                    // Time needed = Tokens needed / Refill rate
                     val waitTimeMs = (tokensNeeded / refillRatePerMs).toLong() + 50 // +50ms buffer
 
                     if (waitTimeMs > 0) {
                         logger.debug("[{}] Waiting {}ms (Priority: {}, Tokens: {:.2f})...", name, waitTimeMs, priority, tokens)
                         
                         // Release lock and wait
+                        // We must release the lock so other threads (e.g. High Priority) can acquire tokens
+                        // or so that we can re-acquire and check refill again
                         mutex.unlock()
                         try {
                             delay(waitTimeMs)
@@ -144,7 +163,7 @@ class RiotApiRateLimiter {
         }
 
         private fun refill() {
-            val now = System.currentTimeMillis()
+            val now = timeProvider.now()
             val elapsed = now - lastRefillTime
             if (elapsed > 0) {
                 val newTokens = elapsed * refillRatePerMs
