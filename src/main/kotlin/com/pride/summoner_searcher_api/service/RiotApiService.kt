@@ -30,10 +30,34 @@ class RiotApiService(
 
     /**
      * Wrapper function that enforces rate limiting for all Riot API calls.
+     * 
+     * BAND-AID FIX: Implements graceful retries for 429 Too Many Requests.
+     * This is necessary because the Development Key limits are strict and sometimes inconsistent.
+     * Once a Production Key is obtained, this logic can be simplified or removed if the higher limits resolve the issue.
      */
     private suspend fun <T> makeRateLimitedApiCall(priority: ApiPriority = ApiPriority.HIGH, apiCall: () -> T): T {
-        rateLimiter.acquirePermit(priority)
-        return apiCall()
+        var attempts = 0
+        val maxRetries = 3
+        
+        while (true) {
+            rateLimiter.acquirePermit(priority)
+            try {
+                return apiCall()
+            } catch (e: HttpClientErrorException.TooManyRequests) {
+                attempts++
+                if (attempts > maxRetries) {
+                    logger.error("Exceeded max retries ($maxRetries) for rate limit. Giving up.")
+                    throw e
+                }
+                
+                // Parse Retry-After header (in seconds)
+                val retryAfterSeconds = e.responseHeaders?.get("Retry-After")?.firstOrNull()?.toLongOrNull() ?: 1L
+                val waitMs = (retryAfterSeconds * 1000) + 100 // Add 100ms buffer
+                
+                logger.warn("Hit 429 Rate Limit! Waiting {}ms before retry {}/{}. (Band-aid for Dev Key)", waitMs, attempts, maxRetries)
+                kotlinx.coroutines.delay(waitMs)
+            }
+        }
     }
 
     private suspend fun getAccountByPuuid(puuid: String, region: String, priority: ApiPriority = ApiPriority.HIGH): AccountDto? {
