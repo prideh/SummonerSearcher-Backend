@@ -6,52 +6,89 @@ import kotlinx.coroutines.sync.withLock
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Component
 import java.time.Duration
+import kotlin.math.max
 import kotlin.math.min
 
+enum class ApiPriority {
+    HIGH, // User requests
+    LOW   // Cache warmer / background tasks
+}
+
 /**
- * A centralized rate limiter for the Riot API that enforces multiple rate limits simultaneously.
- * Uses a "Continuous Refill" Token Bucket algorithm to prevent bursts at window boundaries.
- *
- * Limits:
- * - 20 requests per 1 second (Short term)
- * - 100 requests per 2 minutes (Long term)
+ * A centralized rate limiter for the Riot API.
+ * 
+ * Strategies:
+ * - Short Term (20/1s): Uses "Strict Pacing" (1 req every 50ms) to prevent bursts.
+ * - Long Term (100/2m): Uses "Token Bucket" with Priority Reservation.
  */
 @Component
 class RiotApiRateLimiter {
 
     private val logger = LoggerFactory.getLogger(javaClass)
 
-    // Short term: 20 req / 1s = 0.02 req/ms
-    private val shortTermBucket = RateLimitBucket(
-        maxTokens = 20.0, 
-        refillPeriod = Duration.ofSeconds(1), 
-        name = "1s"
+    // Enforce 50ms gap between requests (1000ms / 20 reqs)
+    private val shortTermPacer = PacedBucket(
+        intervalMs = 50, 
+        name = "1s-Pacer"
     )
 
-    // Long term: 100 req / 120s = ~0.000833 req/ms
-    private val longTermBucket = RateLimitBucket(
+    // 100 requests per 2 minutes
+    private val longTermBucket = PriorityTokenBucket(
         maxTokens = 100.0, 
         refillPeriod = Duration.ofMinutes(2), 
-        name = "2m"
+        name = "2m-Bucket"
     )
 
     /**
      * Acquires a permit to make a Riot API request.
-     * Suspends until both rate limits can be satisfied.
+     * @param priority The priority of the request. LOW priority requests yield to HIGH.
      */
-    suspend fun acquirePermit() {
-        // We must satisfy BOTH buckets.
-        // Note: This is a simplification. Ideally we'd check both, wait for the max wait time, then consume from both.
-        // But acquiring sequentially is safer to ensure we don't over-consume one while waiting for the other.
-        // The order matters: satisfy the fast bucket first, then the slow one.
-        shortTermBucket.acquire()
-        longTermBucket.acquire()
+    suspend fun acquirePermit(priority: ApiPriority) {
+        // 1. Pass the long-term limit first (capacity check)
+        longTermBucket.acquire(priority)
+        
+        // 2. Pass the short-term pacer (strict timing)
+        shortTermPacer.acquire()
     }
 
     /**
-     * Inner class representing a single rate limit bucket using Continuous Refill.
+     * Enforces a strict minimum interval between requests.
+     * No bursts allowed.
      */
-    inner class RateLimitBucket(
+    inner class PacedBucket(
+        private val intervalMs: Long,
+        private val name: String
+    ) {
+        private var nextAllowedTime = System.currentTimeMillis()
+        private val mutex = Mutex()
+
+        suspend fun acquire() {
+            mutex.withLock {
+                val now = System.currentTimeMillis()
+                var waitTime = nextAllowedTime - now
+
+                if (waitTime > 0) {
+                    // We must wait to maintain pacing
+                    // We hold the lock to ensure strict FIFO ordering and prevent others from jumping the queue
+                    // Since waitTime is usually small (max 50ms), holding lock is acceptable
+                    delay(waitTime)
+                } else {
+                    waitTime = 0
+                }
+
+                // Update next allowed time
+                // If we are late (now > nextAllowedTime), we reset to now + interval
+                // This prevents "catching up" with a burst
+                nextAllowedTime = max(now, nextAllowedTime) + intervalMs
+            }
+        }
+    }
+
+    /**
+     * Token Bucket with Priority Reservation.
+     * LOW priority requests must leave a buffer of tokens for HIGH priority requests.
+     */
+    inner class PriorityTokenBucket(
         private val maxTokens: Double,
         private val refillPeriod: Duration,
         private val name: String
@@ -60,37 +97,53 @@ class RiotApiRateLimiter {
         private var lastRefillTime = System.currentTimeMillis()
         private val refillRatePerMs = maxTokens / refillPeriod.toMillis()
         private val mutex = Mutex()
+        
+        // Reserve 10 tokens (10%) for High Priority requests
+        private val reservedBuffer = 10.0
 
-        suspend fun acquire() {
+        suspend fun acquire(priority: ApiPriority) {
             mutex.withLock {
                 refill()
 
-                while (tokens < 1.0) {
-                    val tokensNeeded = 1.0 - tokens
-                    val waitTimeMs = (tokensNeeded / refillRatePerMs).toLong() + 1 // +1 buffer
+                while (true) {
+                    val available = tokens
+                    val required = 1.0
+                    
+                    // Check if we can proceed based on priority
+                    val canProceed = if (priority == ApiPriority.HIGH) {
+                        available >= required
+                    } else {
+                        available >= (required + reservedBuffer)
+                    }
+
+                    if (canProceed) {
+                        tokens -= required
+                        logger.trace("Token acquired from [{}] (Priority: {}). Remaining: {:.2f}", name, priority, tokens)
+                        return
+                    }
+
+                    // Calculate wait time
+                    // If LOW priority, we wait until we have (1 + buffer) tokens
+                    val targetTokens = if (priority == ApiPriority.HIGH) 1.0 else (1.0 + reservedBuffer)
+                    val tokensNeeded = targetTokens - tokens
+                    val waitTimeMs = (tokensNeeded / refillRatePerMs).toLong() + 50 // +50ms buffer
 
                     if (waitTimeMs > 0) {
-                        logger.debug("Bucket [{}] depleted ({:.2f}). Waiting {}ms...", name, tokens, waitTimeMs)
-                        // Unlock to allow other coroutines (though they'll likely also wait)
-                        // In this specific implementation, we hold the lock to ensure strict ordering 
-                        // and prevent "thundering herd" where everyone wakes up and races.
-                        // However, holding the lock blocks everyone. 
-                        // Better pattern: release lock, delay, re-acquire.
-                    }
-                    
-                    // We must release the lock while waiting, otherwise no one else can process
-                    mutex.unlock()
-                    try {
-                        delay(waitTimeMs)
-                    } finally {
-                        mutex.lock()
-                        // Must refill again after waking up
+                        logger.debug("[{}] Waiting {}ms (Priority: {}, Tokens: {:.2f})...", name, waitTimeMs, priority, tokens)
+                        
+                        // Release lock and wait
+                        mutex.unlock()
+                        try {
+                            delay(waitTimeMs)
+                        } finally {
+                            mutex.lock()
+                            refill()
+                        }
+                    } else {
+                        // Should not happen if logic is correct, but safety refill
                         refill()
                     }
                 }
-
-                tokens -= 1.0
-                logger.trace("Token acquired from bucket [{}]. Remaining: {:.2f}", name, tokens)
             }
         }
 

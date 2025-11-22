@@ -31,16 +31,16 @@ class RiotApiService(
     /**
      * Wrapper function that enforces rate limiting for all Riot API calls.
      */
-    private suspend fun <T> makeRateLimitedApiCall(apiCall: () -> T): T {
-        rateLimiter.acquirePermit()
+    private suspend fun <T> makeRateLimitedApiCall(priority: ApiPriority = ApiPriority.HIGH, apiCall: () -> T): T {
+        rateLimiter.acquirePermit(priority)
         return apiCall()
     }
 
-    private suspend fun getAccountByPuuid(puuid: String, region: String): AccountDto? {
+    private suspend fun getAccountByPuuid(puuid: String, region: String, priority: ApiPriority = ApiPriority.HIGH): AccountDto? {
         val regionalRouting = mapToRegionRouting(region)
         val accountBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val uri = "$accountBaseUrl/riot/account/v1/accounts/by-puuid/{puuid}"
-        return makeRateLimitedApiCall {
+        return makeRateLimitedApiCall(priority) {
             try {
                 riotRestClient.get()
                     .uri(uri, puuid)
@@ -57,7 +57,7 @@ class RiotApiService(
         val regionalRouting = mapToRegionRouting(region)
         val accountBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val accountUri = "$accountBaseUrl/riot/account/v1/accounts/by-riot-id/{summonerName}/{tagLine}"
-        return makeRateLimitedApiCall {
+        return makeRateLimitedApiCall(ApiPriority.HIGH) {
             try {
                 riotRestClient.get()
                     .uri(accountUri, summonerName, tagLine)
@@ -73,7 +73,7 @@ class RiotApiService(
     suspend fun getSummonerByPuuid(puuid: String, region: String): SummonerDto? {
         val platformBaseUrl = "https://${region}.api.riotgames.com"
         val summonerUri = "$platformBaseUrl/lol/summoner/v4/summoners/by-puuid/{puuid}"
-        return makeRateLimitedApiCall {
+        return makeRateLimitedApiCall(ApiPriority.HIGH) {
             try {
                 riotRestClient.get()
                     .uri(summonerUri, puuid)
@@ -105,7 +105,7 @@ class RiotApiService(
         val platformBaseUrl = "https://${region}.api.riotgames.com"
         val leagueUri = "$platformBaseUrl/lol/league/v4/entries/by-puuid/{puuid}"
         val leagueEntriesType = object : ParameterizedTypeReference<List<LeagueEntryDto>>() {}
-        val allLeagueEntries = makeRateLimitedApiCall {
+        val allLeagueEntries = makeRateLimitedApiCall(ApiPriority.HIGH) {
             try {
                 riotRestClient.get()
                     .uri(leagueUri, puuid)
@@ -124,7 +124,9 @@ class RiotApiService(
         val baseUrl = "https://${region}.api.riotgames.com"
         val uri = "$baseUrl/lol/league/v4/challengerleagues/by-queue/{queue}"
         
-        val leagueList = makeRateLimitedApiCall {
+        // Fetching the list itself is a background task but infrequent, can be HIGH or LOW. 
+        // Let's keep it LOW since it's part of the warmer.
+        val leagueList = makeRateLimitedApiCall(ApiPriority.LOW) {
             try {
                 riotRestClient.get()
                     .uri(uri, queue)
@@ -146,11 +148,13 @@ class RiotApiService(
         // Process entries in parallel with rate limiting automatically handled by the rate limiter
         val enrichedEntries = leagueList.entries.mapIndexed { index, entry ->
             async {
+                // Use LOW priority for cache warming to avoid blocking user requests
+                val account = entry.puuid?.let { getAccountByPuuid(it, region, ApiPriority.LOW) }
+                
                 if ((index + 1) % 50 == 0) {
                     logger.info("[Cache Warmer] $region: Processed ${index + 1} / $totalEntries players...")
                 }
                 
-                val account = entry.puuid?.let { getAccountByPuuid(it, region) }
                 entry.copy(
                     gameName = account?.gameName,
                     tagLine = account?.tagLine
