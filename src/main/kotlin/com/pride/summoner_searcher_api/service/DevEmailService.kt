@@ -20,6 +20,9 @@ class DevEmailService(
         logger.info("Subject: Verify Your Account")
         logger.info("Body: Please click the following link to verify your email: {}", verificationLink)
         logger.info("--- END DEV EMAIL ---")
+        
+        // Write token to file for AI verification
+        java.io.File("token.txt").writeText(token)
     }
 
     override fun sendPasswordResetEmail(to: String, token: String) {

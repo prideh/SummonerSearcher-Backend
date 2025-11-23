@@ -25,16 +25,25 @@ class UserService(private val userRepository: UserRepository) {
      * This method ensures that the list does not exceed 5 entries and that the most recent search is at the top.
      * @param user The user to update.
      * @param searchQuery The new search query to add.
+     * @param server The server region where the search was performed.
      */
     @Transactional
-    fun addRecentSearch(user: User, searchQuery: String) {
+    fun addRecentSearch(user: User, searchQuery: String, server: String) {
         val searches = user.recentSearches
-        // Remove the query if it already exists to avoid duplicates and to move it to the top.
-        searches.remove(searchQuery)
+        val newSearch = com.pride.summoner_searcher_api.model.RecentSearch(searchQuery, server)
+        
+        // Remove the query if it already exists (same query AND same server) to avoid duplicates and to move it to the top.
+        searches.removeIf { it.query == searchQuery && it.server == server }
+        
         // Add the new query to the beginning of the list.
-        searches.add(0, searchQuery)
+        searches.add(0, newSearch)
+        
         // Trim the list to the 5 most recent searches.
-        user.recentSearches = searches.take(5).toMutableList()
+        if (searches.size > 5) {
+            user.recentSearches = searches.take(5).toMutableList()
+        } else {
+            user.recentSearches = searches
+        }
         userRepository.save(user)
     }
 

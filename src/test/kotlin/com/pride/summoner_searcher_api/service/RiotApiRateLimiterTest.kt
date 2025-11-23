@@ -10,18 +10,18 @@ class RiotApiRateLimiterTest {
     fun `should pace requests at 55ms intervals`() = runTest {
         // Use virtual time from TestScope
         val timeProvider = object : TimeProvider {
-            override fun now() = currentTime
+            override fun now() = testScheduler.currentTime
         }
         val rateLimiter = RiotApiRateLimiter(timeProvider)
         
-        val start = currentTime
+        val start = testScheduler.currentTime
         
         // Simulate 20 requests
         repeat(20) {
             rateLimiter.acquirePermit(ApiPriority.HIGH)
         }
         
-        val duration = currentTime - start
+        val duration = testScheduler.currentTime - start
         println("Processed 20 requests in ${duration}ms")
         
         // 20 requests * 55ms = 1100ms.
@@ -34,11 +34,11 @@ class RiotApiRateLimiterTest {
     fun `should throttle 300 requests over time`() = runTest {
         // Use virtual time from TestScope
         val timeProvider = object : TimeProvider {
-            override fun now() = currentTime
+            override fun now() = testScheduler.currentTime
         }
         val rateLimiter = RiotApiRateLimiter(timeProvider)
         
-        val start = currentTime
+        val start = testScheduler.currentTime
         
         println("Starting 300 requests simulation...")
         
@@ -46,27 +46,26 @@ class RiotApiRateLimiterTest {
         repeat(300) { index ->
             rateLimiter.acquirePermit(ApiPriority.LOW)
             if (index % 50 == 0) {
-                println("Processed $index requests at ${currentTime}ms")
+                println("Processed $index requests at ${testScheduler.currentTime}ms")
             }
         }
         
-        val duration = currentTime - start
+        val duration = testScheduler.currentTime - start
         println("Processed 300 requests in ${duration}ms")
         
         // Analysis:
-        // Limit: 90 requests / 2 minutes (120,000ms)
-        // Refill Rate: 90 / 120,000 = 0.00075 tokens/ms (or 0.75 tokens/sec)
-        // Time per token: 1333ms
+        // Limit: 100 requests / 2 minutes (120,000ms)
+        // Config: Capacity 20, Refill 80/2min (1 token every 1500ms)
         
-        // 1. Initial Burst: 90 tokens.
-        //    Paced by 55ms. Time = 90 * 55 = 4950ms.
-        // 2. Remaining 210 requests:
+        // 1. Initial Burst: 20 tokens.
+        //    Paced by 55ms. Time = 20 * 55 = 1100ms.
+        // 2. Remaining 280 requests:
         //    Must wait for refill.
-        //    Time = 210 * 1333ms = 279,930ms (~4.6 minutes)
+        //    Time = 280 * 1500ms = 420,000ms (7 minutes)
         
-        // Total expected time approx 285,000ms.
+        // Total expected time approx 420,000ms + small buffer.
         
-        assertTrue(duration > 270_000, "Should take at least 270s (4.5m) to process 300 requests. Took: ${duration}ms")
-        assertTrue(duration < 300_000, "Should take less than 300s (5m). Took: ${duration}ms")
+        assertTrue(duration > 415_000, "Should take at least 415s (6.9m) to process 300 requests. Took: ${duration}ms")
+        assertTrue(duration < 450_000, "Should take less than 450s (7.5m). Took: ${duration}ms")
     }
 }

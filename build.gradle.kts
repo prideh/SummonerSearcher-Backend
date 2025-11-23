@@ -1,10 +1,10 @@
 plugins {
-	kotlin("jvm") version "1.9.25"
-	kotlin("plugin.spring") version "1.9.25"
+	kotlin("jvm") version "2.0.21"
+	kotlin("plugin.spring") version "2.0.21"
 	id("org.springframework.boot") version "3.5.6"
 	id("io.spring.dependency-management") version "1.1.7"
     id("org.jetbrains.dokka") version "2.1.0"
-	kotlin("plugin.jpa") version "1.9.25"
+	kotlin("plugin.jpa") version "2.0.21"
 }
 
 group = "com.pride"
@@ -29,10 +29,6 @@ dependencies {
     implementation("org.springframework.boot:spring-boot-starter-security")
     implementation("org.springframework.security:spring-security-crypto")
     implementation("org.springframework.boot:spring-boot-starter-validation")
-    implementation("org.springframework.boot:spring-boot-starter-aop") // Required for Resilience4J
-
-    // Resilience4J for Rate Limiting
-    implementation("io.github.resilience4j:resilience4j-spring-boot3:2.2.0")
 
     // SendGrid for Email
     implementation("com.sendgrid:sendgrid-java:4.10.0")

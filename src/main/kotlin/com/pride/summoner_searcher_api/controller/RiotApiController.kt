@@ -75,7 +75,7 @@ class RiotApiController(
         // If the summoner was found, add the search to the user's recent search history.
         if (summonerProfile != null) {
             val searchQuery = "$summonerName#$tagLine"
-            userService.addRecentSearch(user, searchQuery)
+            userService.addRecentSearch(user, searchQuery, region)
         }
 
         ResponseEntity.ok(summonerProfile)

@@ -46,7 +46,7 @@ class UserController(
      * Retrieves the recent search history for the currently authenticated user.
      */
     @GetMapping("/recent-searches")
-    fun getRecentSearches(@CurrentUser user: User): ResponseEntity<List<String>> {
+    fun getRecentSearches(@CurrentUser user: User): ResponseEntity<List<com.pride.summoner_searcher_api.model.RecentSearch>> {
         return ResponseEntity.ok(user.recentSearches)
     }
 

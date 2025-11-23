@@ -43,11 +43,11 @@ class RiotApiRateLimiter(
         name = "1s-Pacer"
     )
 
-    // 70 requests per 2 minutes (reduced from 90 to prevent burst overshoot)
-    // Math: 70 (initial) + ~20 (refill during 30s burst) = 90 < 100
+    // 20 requests burst capacity + 80 requests refill over 2 minutes = 100 total
+    // This ensures we NEVER exceed the 100/2min fixed window limit, even if the burst is slow.
     private val longTermBucket = PriorityTokenBucket(
-        maxTokens = 70.0, 
-        refillPeriod = Duration.ofMinutes(2), 
+        maxTokens = 20.0, 
+        refillPeriod = Duration.ofSeconds(30), // Refill 20 tokens every 30s -> 40 tokens/min -> 80 tokens/2min
         name = "2m-Bucket"
     )
 

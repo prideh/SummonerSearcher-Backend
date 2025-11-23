@@ -65,8 +65,7 @@ class User(
     /** A list of the user's recent search queries. Stored in a separate `user_recent_searches` table. */
     @ElementCollection(fetch = FetchType.EAGER)
     @CollectionTable(name = "user_recent_searches", joinColumns = [JoinColumn(name = "user_id")])
-    @Column(name = "search_query")
-    var recentSearches: MutableList<String> = mutableListOf()
+    var recentSearches: MutableList<RecentSearch> = mutableListOf()
 
 ) : UserDetails {
     

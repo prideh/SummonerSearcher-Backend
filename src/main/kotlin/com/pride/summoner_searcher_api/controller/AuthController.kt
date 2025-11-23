@@ -29,7 +29,7 @@ data class AuthResponse(
     val jwt: String,
     val twoFactorEnabled: Boolean,
     val darkmodePreference: Boolean,
-    val recentSearches: List<String>
+    val recentSearches: List<com.pride.summoner_searcher_api.model.RecentSearch>
 )
 data class TwoFactorRequiredResponse(val twoFactorRequired: Boolean, val tempToken: String)
 
