@@ -1,6 +1,6 @@
 🏗️ Technical Architecture
 
-The backend is a **Kotlin + Spring Boot 3.5** service structured around classic **MVC architecture**, supported by additional enterprise patterns such as **Singleton Beans**, **DTO Mapping**, **Filter Chains**, and **Repository Patterns** via Spring Data JPA.
+The backend is a **Kotlin + Spring Boot 3.5** service structured around classic **MVC architecture**, supported by additional enterprise patterns such as **Singleton Beans**, **DTO Mapping**, **Filter Chains**, and **Repository Patterns** via Spring Data JPA, hosted on Render, including both databases.
 
 The system is split into three primary layers:
 
