@@ -1,65 +1,272 @@
-## 🏗 Technical Architecture
+🏗️ Technical Architecture
 
-This application is built as a **Layered Monolith** using **Kotlin** and **Spring Boot 3.5**. It is designed to serve as a robust, fault-tolerant middleware between a frontend client and the Riot Games public API. The architecture emphasizes type safety, asynchronous concurrency, and strict resource management.
+The backend is a Kotlin + Spring Boot 3.5 service structured around classic MVC architecture, supported by additional enterprise patterns such as Singleton Beans, DTO Mapping, Filter Chains, and Repository Patterns via Spring Data JPA.
 
+The system is split into three primary layers:
 
+1. Controller Layer (Presentation Layer — MVC “C”)
 
-### Design Patterns & Principles
+Controllers expose REST endpoints under:
 
-* **Controller-Service-Repository (MVC):** The core separation of concerns. Controllers (`/api/riot`, `/api/auth`) handle HTTP mapping, Services contain business logic and transaction boundaries, and Repositories manage PostgreSQL persistence.
-* **Facade Pattern:**
-    * `RiotApiService`: Acts as a facade, encapsulating the complexity of regional routing, error handling (404/429), and DTO mapping, providing a clean interface for the rest of the application.
-    * `RedisCacheService`: A generic wrapper around `StringRedisTemplate` that abstracts JSON serialization/deserialization using Jackson, simplifying cache interactions.
-* **Cache-Aside Strategy:** Implemented in `PlayerCacheService`. Data is requested from the cache first; on a miss, it is fetched from the source of truth (Riot API), stored in Redis, and then returned.
-* **Strategy Pattern (Implicit):** The `RegionUtil` routes requests to different Riot regional endpoints (Americas, Europe, Asia) based on the input string, effectively switching strategies for API URL construction.
-* **Decorator/Interceptor:**
-    * `JwtAuthenticationFilter`: Intercepts requests to validate Stateless JWTs before they reach the security chain.
-    * `RestClientConfig`: Uses a request interceptor to inject the `X-Riot-Token` header and log rate-limit headers globally.
-* **Observer/Scheduler:** `ChallengerCacheWarmer` observes the system time via `@Scheduled` (Cron) to trigger background data refreshing tasks.
+/api/auth
 
-### Infrastructure & Persistence
-* **Database:** PostgreSQL is used for persistent user data (Accounts, Preferences, 2FA Secrets).
-* **Caching:** Redis (via Docker) is used for storing ephemeral, high-cost external API data (Summoner Profiles, Match History, Challenger Leaderboards).
-* **Concurrency:** Kotlin Coroutines (`suspend` functions) and `kotlinx-coroutines-reactor` are used for non-blocking I/O, particularly within the Rate Limiter and asynchronous API aggregation.
+/api/user
 
----
+/api/riot
 
-## ⚙️ How it Works
+Each controller is intentionally thin and delegates business logic to service classes.
+Custom annotation @CurrentUser integrates with Spring Security's @AuthenticationPrincipal to inject the authenticated User entity directly into controller methods.
 
-### 1. Intelligent Riot API Integration
-The core value of this backend is its ability to normalize and cache data from the Riot Games API while strictly adhering to rate limits.
+Key Patterns:
 
-#### **Dual-Layer Rate Limiter**
-To prevent 429 (Too Many Requests) errors, the application implements a custom, thread-safe `RiotApiRateLimiter` using Kotlin Coroutines and Mutexes. It employs two distinct algorithms running in parallel:
+Annotation-driven dependency injection
 
+Request/Response DTO pattern
 
+Thin controller, fat service philosophy
 
-1.  **Short-Term Pacing (Leaky Bucket):** Enforces a strict ~55ms interval between outgoing requests to prevent micro-bursts.
-2.  **Long-Term throttling (Priority Token Bucket):** Manages the global quota (e.g., 100 requests/2 minutes).
-    * **Priority Queuing:** The limiter distinguishes between `HIGH` priority (User real-time requests) and `LOW` priority (Cache warming). Low-priority tasks must leave a "buffer" of tokens available for user traffic, ensuring background tasks never degrade the user experience.
+Coroutine-based async endpoints (runBlocking) for Riot API calls
 
-#### **Graceful Retries**
-The `RiotApiService` wraps calls in a retry loop that detects `429` responses. If the rate limiter desyncs or a specific upstream shard is overloaded, it parses the `Retry-After` header and suspends the coroutine (non-blocking delay) before retrying.
+2. Service Layer (Business Logic — MVC “M”)
 
-### 2. Summoner Profile Data Flow
-Resolving a "Riot ID" (Name + Tagline) to a playable profile involves a complex orchestration of calls to handle Riot's global account system vs. regional game servers.
+Service classes encapsulate core business rules such as:
 
+Two-Factor Authentication orchestration
 
+Summoner profile assembly from multiple Riot API endpoints
 
-1.  **Resolution:** `getAccountByRiotId` resolves `Name#Tag` to a global `PUUID` (Account-V1).
-2.  **Validation:** The system verifies the `PUUID` exists on the requested specific region (Summoner-V4). This prevents returning data for a user who exists globally but doesn't play on the queried server.
-3.  **Cache "Always-Check" Strategy:**
-    * If the profile exists in Redis, the system performs a "light" check against the API for new matches (checking the `gameCreation` timestamp).
-    * If new matches are found, they are appended to the cached list, and the TTL is reset. This creates a "Self-Healing" cache that keeps data fresh without blowing away the entire history.
+Challenger leaderboard caching & invalidation
 
-### 3. Background Cache Warming
-The `ChallengerCacheWarmer` runs on a scheduled CRON job (02:00 CET) to pre-fetch high-volume data (Top 300 players per region).
-* It iterates through major regions (EUW, NA, KR).
-* It utilizes `ApiPriority.LOW` to fetch data, ensuring that if a real user logs in during the warming phase, their requests take precedence over the background job.
-* It utilizes `async/awaitAll` to enrich player data in parallel batches, significantly reducing the total execution time of the warming job.
+User preference & recent-search management
 
-### 4. Security & 2FA
-* **Authentication:** Stateless JWT (JSON Web Tokens) signed with HMAC-SHA.
-* **Two-Factor Authentication:** Implemented using TOTP (Time-Based One-Time Password).
-    * Secrets are generated via `GoogleAuthenticator`.
-    * **Encryption:** 2FA secrets are **not** stored in plain text. They are encrypted using `AES/GCM/NoPadding` (Galois/Counter Mode) before being saved to PostgreSQL. This ensures that even if the database is compromised, the 2FA seeds remain secure without the separate encryption key.
+Secure email-based flows (verification, password reset)
+
+Key Components & Patterns:
+
+Singleton Beans (@Bean) for:
+
+RestClient (Riot API client)
+
+GoogleAuthenticator
+
+Password encoder
+
+Strategy-like operations (e.g., different verification flows: login, 2FA, reset-token validation)
+
+Composition over inheritance — services orchestrate multiple external or internal calls to build final DTOs
+
+Async Capabilities:
+
+@EnableAsync for background tasks (e.g., sending emails)
+
+@EnableScheduling for periodic leaderboard refresh jobs
+
+3. Repository Layer
+
+Built on Spring Data JPA, the Repository layer provides:
+
+User lookup by email, verification token, password reset token
+
+Persistence for recent search history
+
+Transparent transaction boundaries via @Transactional
+
+Key Patterns:
+
+Repository pattern
+
+JPA Entity + Embedded Relationship structure
+
+Lazy-loading of user search history via ORM mapping
+
+4. Security Architecture
+
+Security is implemented via a custom chain in SecurityConfig:
+
+Components:
+
+JWT Authentication Filter (custom filter in front of Spring’s default auth)
+
+CustomAccessDeniedHandler
+
+CustomAuthenticationEntryPoint
+
+Stateless Session Management
+
+URL-level Authorization Rules
+
+JWT authentication is fully stateless; user identity is determined per request through the filter.
+
+Design Patterns:
+
+Filter Chain pattern
+
+Token-based authentication
+
+Custom principal resolver via @CurrentUser
+
+5. External Integrations
+Riot Games API
+
+Provided through a dedicated singleton RestClient with global header injection:
+
+Automatic X-Riot-Token insertion
+
+Response interceptors for rate-limit logging
+
+Redis Caching
+
+Used by challenger leaderboard and Summoner Profile caching logic (via dedicated DTO wrappers).
+
+Email (SendGrid)
+
+Used for:
+
+Verification email flow
+
+Password reset flow
+
+🔄 How It Works
+
+This section describes the high-level data flow between frontend → backend → external APIs.
+
+1. Authentication Flow
+Login Without 2FA
+
+User posts { email, password } → /api/auth/login
+
+Spring AuthenticationManager validates credentials via UserDetailsService
+
+If success:
+
+Backend issues a JWT
+
+Returns AuthResponse containing:
+
+JWT
+
+Dark mode preference
+
+Recent searches (entity list)
+
+JWT is stored client-side and attached as Authorization: Bearer <token>
+
+Login With 2FA
+
+User posts login credentials.
+
+Backend validates credentials → generates temp JWT.
+
+Returns { twoFactorRequired: true, tempToken: ... }.
+
+User submits a 2FA code via /api/auth/2fa-login.
+
+Temp JWT validated → 2FA code validated via TOTP (GoogleAuthenticator).
+
+Issue final JWT.
+
+Under the hood:
+
+Secrets are encrypted before persistence using EncryptionService (AES).
+
+Codes are validated with a configurable time window (to mitigate drift).
+
+2. Riot ID → Summoner Search Flow
+Request:
+
+GET /api/riot/summoner/{region}/{name}/{tagline}
+
+Internal Steps:
+
+Account API lookup
+Convert Riot ID → permanent PUUID.
+
+Summoner API lookup
+Fetch persistent player metadata (level, icon).
+
+League API lookup
+Fetch Solo Queue rank.
+
+Match API lookup (batch)
+Fetch and deserialize full match history (MatchDto structure).
+
+DTO Assembly
+SummonerProfileService composes all pieces into a clean SummonerProfileDto.
+
+Caching Logic
+Summaries (and sometimes leaderboard data) are checked against Redis:
+
+If cached: return cached result
+
+If stale/missing: fetch fresh data & update cache
+
+Recent Search Update
+The user’s search query is persisted via UserService.addRecentSearch.
+
+Complex Logic Involved:
+
+Multi-step, multi-endpoint API orchestration
+
+Resilience to Riot API changes (via @JsonIgnoreProperties)
+
+Heavy DTO → domain → DTO transformations
+
+Non-blocking HTTP client via Spring RestClient
+
+Coroutines (runBlocking) for controlled concurrency
+
+3. Challenger Leaderboard Flow
+
+A scheduled background job (via @EnableScheduling) periodically refreshes leaderboard data:
+
+Fetches LeagueListDTO for a region/queue
+
+Wraps it into CachedLeaderboardDto
+
+Writes it to Redis
+
+User request simply returns cached leaderboard
+
+Benefits:
+
+Extremely low-latency reads
+
+No load on Riot API during peak frontend use
+
+Controlled refresh windows
+
+4. User Settings Flow (Dark Mode, Recent Searches, Password Changes)
+
+All /api/user/** routes require authentication.
+
+Dark Mode
+
+Simple boolean flag stored in the User entity.
+
+Recent Searches
+
+Stored as a list of embedded objects.
+
+Capped or trimmed by service logic (if implemented in UserService).
+
+Account Modification
+
+Change password, delete account, enable/disable 2FA
+
+Most endpoints guarded by:
+
+Password check
+
+Dummy-account protection
+
+2FA-validation when disabling 2FA
+
+⚙️ Summary of Core Design Patterns Used
+Pattern	Where Used	Purpose
+MVC	Controllers → Services → Repositories	Clear separation of concerns
+Singleton Beans	API client, authenticator, encoders	Shared global services
+Filter Chain Pattern	JWTAuthenticationFilter	Token-based security
+Repository Pattern	UserRepository	Abstract persistence
+DTO Pattern	All API responses	Clean separation between API and domain model
+Strategy-like orchestration	Two-factor flows, login flows	Encapsulates different authentication paths
+Cache-aside pattern	Challenger leaderboard & summoner profile	Low-latency data access
