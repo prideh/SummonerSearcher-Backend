@@ -237,5 +237,3 @@ All `/api/user/**` routes require authentication.
 | **DTO Pattern**                 | All API responses                         | Clean separation between API and domain model |
 | **Strategy-like orchestration** | Two-factor flows, login flows             | Encapsulates different authentication paths   |
 | **Cache-aside pattern**         | Challenger leaderboard & summoner profile | Low-latency data access                       |
-✅ Architecture diagrams (mermaid.js)
-Just tell me!
