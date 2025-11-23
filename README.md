@@ -5,13 +5,10 @@
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-316192?style=for-the-badge&logo=postgresql&logoColor=white)](https://www.postgresql.org/)
 [![Redis](https://img.shields.io/badge/Redis-DC382D?style=for-the-badge&logo=redis&logoColor=white)](https://redis.io/)
 [![Render](https://img.shields.io/badge/Render-46E3B7?style=for-the-badge&logo=render&logoColor=white)](https://render.com/)
-
-<br />
-<div align="center">
   <a href="PUT_YOUR_FRONTEND_GITHUB_URL_HERE">
     <img src="https://img.shields.io/badge/🔗_View_Frontend_Repo-React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB" alt="View Frontend Repo" />
   </a>
-</div>
+
 
 The backend is a **Kotlin + Spring Boot 3.5** service structured around classic **MVC architecture**, supported by enterprise patterns including Singleton Beans, Filter Chains, and Repository Patterns.
 
