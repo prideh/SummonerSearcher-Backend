@@ -1,7 +1,3 @@
-Here are the **Technical Architecture** and **How it Works** sections, tailored for a senior engineering audience and formatted for your `README.md`.
-
-***
-
 ## 🏗 Technical Architecture
 
 This application is built as a **Layered Monolith** using **Kotlin** and **Spring Boot 3.5**. It is designed to serve as a robust, fault-tolerant middleware between a frontend client and the Riot Games public API. The architecture emphasizes type safety, asynchronous concurrency, and strict resource management.
