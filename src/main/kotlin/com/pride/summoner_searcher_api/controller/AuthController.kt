@@ -61,6 +61,9 @@ class AuthController(
     @Value("\${jwt.cookie.same-site:Strict}")
     private var cookieSameSite: String = "Strict"
 
+    @Value("\${jwt.cookie.domain:}")
+    private var cookieDomain: String = ""
+
     /**
      * Authenticates a user with their email and password.
      * If 2FA is enabled, it returns a temporary token. Otherwise, it returns the final authentication response.
@@ -88,13 +91,18 @@ class AuthController(
             val jwt = jwtUtil.generateToken(user.email)
             val refreshToken = refreshTokenService.createRefreshToken(user.email)
             
-            val jwtCookie = ResponseCookie.from("refreshToken", refreshToken.token)
+            val cookieBuilder = ResponseCookie.from("refreshToken", refreshToken.token)
                 .httpOnly(true)
-                .secure(isCookieSecure) // Configurable for production
+                .secure(isCookieSecure)
                 .path("/")
                 .maxAge(2592000) // 30 days
-                .sameSite(cookieSameSite) // Configurable for production
-                .build()
+                .sameSite(cookieSameSite)
+
+            if (cookieDomain.isNotEmpty()) {
+                cookieBuilder.domain(cookieDomain)
+            }
+
+            val jwtCookie = cookieBuilder.build()
 
             return ResponseEntity.ok()
                 .header(HttpHeaders.SET_COOKIE, jwtCookie.toString())
@@ -128,13 +136,18 @@ class AuthController(
         val jwt = jwtUtil.generateToken(user.email)
         val refreshToken = refreshTokenService.createRefreshToken(user.email)
 
-        val jwtCookie = ResponseCookie.from("refreshToken", refreshToken.token)
+        val cookieBuilder = ResponseCookie.from("refreshToken", refreshToken.token)
             .httpOnly(true)
-            .secure(isCookieSecure) // Configurable for production
+            .secure(isCookieSecure)
             .path("/")
             .maxAge(2592000) // 30 days
-            .sameSite(cookieSameSite) // Configurable for production
-            .build()
+            .sameSite(cookieSameSite)
+
+        if (cookieDomain.isNotEmpty()) {
+            cookieBuilder.domain(cookieDomain)
+        }
+
+        val jwtCookie = cookieBuilder.build()
 
         return ResponseEntity.ok()
             .header(HttpHeaders.SET_COOKIE, jwtCookie.toString())
@@ -164,13 +177,18 @@ class AuthController(
 
     @PostMapping("/logout")
     fun logoutUser(): ResponseEntity<Any> {
-        val jwtCookie = ResponseCookie.from("refreshToken", "")
+        val cookieBuilder = ResponseCookie.from("refreshToken", "")
             .httpOnly(true)
             .secure(isCookieSecure)
             .path("/")
             .maxAge(0)
             .sameSite(cookieSameSite)
-            .build()
+
+        if (cookieDomain.isNotEmpty()) {
+            cookieBuilder.domain(cookieDomain)
+        }
+
+        val jwtCookie = cookieBuilder.build()
         
         return ResponseEntity.ok()
             .header(HttpHeaders.SET_COOKIE, jwtCookie.toString())
