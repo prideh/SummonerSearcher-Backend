@@ -7,6 +7,7 @@ import com.pride.summoner_searcher_api.service.EncryptionService
 import com.pride.summoner_searcher_api.service.RefreshTokenService
 import com.pride.summoner_searcher_api.service.TwoFactorAuthService
 import com.pride.summoner_searcher_api.util.JwtUtil
+import org.springframework.beans.factory.annotation.Value
 import org.slf4j.LoggerFactory
 import org.springframework.http.HttpHeaders
 import org.springframework.http.ResponseCookie
@@ -54,6 +55,9 @@ class AuthController(
 
     private val logger = LoggerFactory.getLogger(javaClass)
 
+    @Value("\${jwt.cookie.secure:false}")
+    private var isCookieSecure: Boolean = false
+
     /**
      * Authenticates a user with their email and password.
      * If 2FA is enabled, it returns a temporary token. Otherwise, it returns the final authentication response.
@@ -83,7 +87,7 @@ class AuthController(
             
             val jwtCookie = ResponseCookie.from("refreshToken", refreshToken.token)
                 .httpOnly(true)
-                .secure(false) // Set to true in production with HTTPS
+                .secure(isCookieSecure) // Configurable for production
                 .path("/")
                 .maxAge(2592000) // 30 days
                 .sameSite("Strict")
@@ -123,7 +127,7 @@ class AuthController(
 
         val jwtCookie = ResponseCookie.from("refreshToken", refreshToken.token)
             .httpOnly(true)
-            .secure(false) // Set to true in production with HTTPS
+            .secure(isCookieSecure) // Configurable for production
             .path("/")
             .maxAge(2592000) // 30 days
             .sameSite("Strict")
@@ -159,7 +163,7 @@ class AuthController(
     fun logoutUser(): ResponseEntity<Any> {
         val jwtCookie = ResponseCookie.from("refreshToken", "")
             .httpOnly(true)
-            .secure(false)
+            .secure(isCookieSecure)
             .path("/")
             .maxAge(0)
             .sameSite("Strict")
