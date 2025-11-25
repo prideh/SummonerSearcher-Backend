@@ -55,6 +55,7 @@ class SecurityConfig(
                 auth
                     // Public endpoints: Allow all requests to authentication-related paths.
                     .requestMatchers("/api/auth/**").permitAll()
+                    .requestMatchers("/api/auth/refresh-token", "/api/auth/logout").permitAll()
                     // Protected endpoints: Require authentication for all other API paths.
                     .requestMatchers("/api/user/**").authenticated()
                     .requestMatchers("/api/riot/**").authenticated()

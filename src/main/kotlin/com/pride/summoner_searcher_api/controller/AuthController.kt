@@ -4,9 +4,12 @@ import com.pride.summoner_searcher_api.model.User
 import com.pride.summoner_searcher_api.repository.UserRepository
 import com.pride.summoner_searcher_api.service.EmailSender
 import com.pride.summoner_searcher_api.service.EncryptionService
+import com.pride.summoner_searcher_api.service.RefreshTokenService
 import com.pride.summoner_searcher_api.service.TwoFactorAuthService
 import com.pride.summoner_searcher_api.util.JwtUtil
 import org.slf4j.LoggerFactory
+import org.springframework.http.HttpHeaders
+import org.springframework.http.ResponseCookie
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.security.authentication.AuthenticationManager
@@ -45,7 +48,8 @@ class AuthController(
     private val passwordEncoder: PasswordEncoder,
     private val emailSender: EmailSender,
     private val twoFactorAuthService: TwoFactorAuthService,
-    private val encryptionService: EncryptionService
+    private val encryptionService: EncryptionService,
+    private val refreshTokenService: RefreshTokenService
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
@@ -75,7 +79,19 @@ class AuthController(
         } else {
             logger.info("Successful login for user: {}", user.email)
             val jwt = jwtUtil.generateToken(user.email)
-            return ResponseEntity.ok(AuthResponse(jwt, user.twoFactorEnabled, user.darkmodePreference, user.recentSearches))
+            val refreshToken = refreshTokenService.createRefreshToken(user.email)
+            
+            val jwtCookie = ResponseCookie.from("refreshToken", refreshToken.token)
+                .httpOnly(true)
+                .secure(false) // Set to true in production with HTTPS
+                .path("/")
+                .maxAge(2592000) // 30 days
+                .sameSite("Strict")
+                .build()
+
+            return ResponseEntity.ok()
+                .header(HttpHeaders.SET_COOKIE, jwtCookie.toString())
+                .body(AuthResponse(jwt, user.twoFactorEnabled, user.darkmodePreference, user.recentSearches))
         }
     }
 
@@ -103,7 +119,55 @@ class AuthController(
 
         logger.info("Successful 2FA login for user: {}", email)
         val jwt = jwtUtil.generateToken(user.email)
-        return ResponseEntity.ok(AuthResponse(jwt, user.twoFactorEnabled, user.darkmodePreference, user.recentSearches))
+        val refreshToken = refreshTokenService.createRefreshToken(user.email)
+
+        val jwtCookie = ResponseCookie.from("refreshToken", refreshToken.token)
+            .httpOnly(true)
+            .secure(false) // Set to true in production with HTTPS
+            .path("/")
+            .maxAge(2592000) // 30 days
+            .sameSite("Strict")
+            .build()
+
+        return ResponseEntity.ok()
+            .header(HttpHeaders.SET_COOKIE, jwtCookie.toString())
+            .body(AuthResponse(jwt, user.twoFactorEnabled, user.darkmodePreference, user.recentSearches))
+    }
+
+    @PostMapping("/refresh-token")
+    fun refreshToken(@CookieValue(name = "refreshToken") requestRefreshToken: String?): ResponseEntity<Any> {
+        if (requestRefreshToken == null) {
+            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Refresh Token is empty!")
+        }
+
+        return try {
+            val refreshToken = refreshTokenService.findByToken(requestRefreshToken)
+                ?: throw RuntimeException("Refresh token is not in database!")
+            
+            refreshTokenService.verifyExpiration(refreshToken)
+            val user = refreshToken.user
+            val token = jwtUtil.generateToken(user.email)
+            
+            ResponseEntity.ok(mapOf("jwt" to token))
+        } catch (e: Exception) {
+            logger.error("Cannot refresh token: {}", e.message)
+            ResponseEntity.status(HttpStatus.FORBIDDEN).body(e.message)
+        }
+    }
+
+    @PostMapping("/logout")
+    fun logoutUser(): ResponseEntity<Any> {
+        val jwtCookie = ResponseCookie.from("refreshToken", "")
+            .httpOnly(true)
+            .secure(false)
+            .path("/")
+            .maxAge(0)
+            .sameSite("Strict")
+            .build()
+        
+        return ResponseEntity.ok()
+            .header(HttpHeaders.SET_COOKIE, jwtCookie.toString())
+            .body("You've been signed out!")
     }
 
     /**

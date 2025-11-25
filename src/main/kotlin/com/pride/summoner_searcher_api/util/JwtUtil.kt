@@ -13,8 +13,8 @@ class JwtUtil {
     @Value("\${jwt.secret:defaultSecretKeyForDevelopmentAndTestingOnlyPleaseChangeMeInProduction}")
     private lateinit var secret: String
 
-    @Value("\${jwt.expiration:3600000}") // 1 hour
-    private var expiration: Long = 3600000
+    @Value("\${jwt.expiration:900000}") // 15 minutes
+    private var expiration: Long = 900000
 
     private val key: SecretKey by lazy { Keys.hmacShaKeyFor(secret.toByteArray()) }
 
