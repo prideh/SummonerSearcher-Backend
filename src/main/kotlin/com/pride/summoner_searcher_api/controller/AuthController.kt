@@ -58,6 +58,9 @@ class AuthController(
     @Value("\${jwt.cookie.secure:false}")
     private var isCookieSecure: Boolean = false
 
+    @Value("\${jwt.cookie.same-site:Strict}")
+    private var cookieSameSite: String = "Strict"
+
     /**
      * Authenticates a user with their email and password.
      * If 2FA is enabled, it returns a temporary token. Otherwise, it returns the final authentication response.
@@ -90,7 +93,7 @@ class AuthController(
                 .secure(isCookieSecure) // Configurable for production
                 .path("/")
                 .maxAge(2592000) // 30 days
-                .sameSite("Strict")
+                .sameSite(cookieSameSite) // Configurable for production
                 .build()
 
             return ResponseEntity.ok()
@@ -130,7 +133,7 @@ class AuthController(
             .secure(isCookieSecure) // Configurable for production
             .path("/")
             .maxAge(2592000) // 30 days
-            .sameSite("Strict")
+            .sameSite(cookieSameSite) // Configurable for production
             .build()
 
         return ResponseEntity.ok()
@@ -166,7 +169,7 @@ class AuthController(
             .secure(isCookieSecure)
             .path("/")
             .maxAge(0)
-            .sameSite("Strict")
+            .sameSite(cookieSameSite)
             .build()
         
         return ResponseEntity.ok()
