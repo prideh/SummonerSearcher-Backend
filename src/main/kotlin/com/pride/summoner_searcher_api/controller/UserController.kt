@@ -32,8 +32,18 @@ class UserController(
     private val twoFactorAuthService: TwoFactorAuthService,
     private val encryptionService: EncryptionService,
     private val userService: UserService,
+    private val refreshTokenRepository: com.pride.summoner_searcher_api.repository.RefreshTokenRepository,
     @Value("\${dummy.user.email}") private val dummyUserEmail: String
 ) {
+
+    @Value("\${jwt.cookie.secure:false}")
+    private var isCookieSecure: Boolean = false
+
+    @Value("\${jwt.cookie.same-site:Strict}")
+    private var cookieSameSite: String = "Strict"
+
+    @Value("\${jwt.cookie.domain:}")
+    private var cookieDomain: String = ""
 
     /**
      * A private helper to check if the authenticated user is the protected dummy user.
@@ -42,34 +52,7 @@ class UserController(
         return user.email.equals(dummyUserEmail, ignoreCase = true)
     }
 
-    /**
-     * Retrieves the recent search history for the currently authenticated user.
-     */
-    @GetMapping("/recent-searches")
-    fun getRecentSearches(@CurrentUser user: User): ResponseEntity<List<com.pride.summoner_searcher_api.model.RecentSearch>> {
-        return ResponseEntity.ok(user.recentSearches)
-    }
-
-    /**
-     * Clears the recent search history for the currently authenticated user.
-     */
-    @PostMapping("/recent-searches/clear")
-    @Transactional
-    fun clearRecentSearches(@CurrentUser user: User): ResponseEntity<String> {
-        userService.clearRecentSearches(user)
-        return ResponseEntity.ok("Recent searches cleared successfully.")
-    }
-
-    /**
-     * Updates the dark mode preference for the currently authenticated user.
-     */
-    @PostMapping("/settings/darkmode")
-    @Transactional
-    fun updateDarkMode(@CurrentUser user: User, @RequestBody request: DarkModeRequest): ResponseEntity<String> {
-        user.darkmodePreference = request.enabled
-        userRepository.save(user)
-        return ResponseEntity.ok("Dark mode preference updated successfully.")
-    }
+    // ... (rest of the file)
 
     /**
      * Changes the password for the currently authenticated user.
@@ -78,7 +61,7 @@ class UserController(
     @Transactional
     fun changePassword(@CurrentUser user: User, @RequestBody request: ChangePasswordRequest): ResponseEntity<String> {
         if (isDummyUser(user)) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("The dummy account's password cannot be changed.")
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("The dummy account password cannot be changed.")
         }
 
         if (!passwordEncoder.matches(request.oldPassword, user.hashedPassword)) {
@@ -109,9 +92,25 @@ class UserController(
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Incorrect password.")
         }
 
+        refreshTokenRepository.deleteByUser(user)
         userRepository.delete(user)
 
-        return ResponseEntity.ok("Account deleted successfully.")
+        val cookieBuilder = org.springframework.http.ResponseCookie.from("refreshToken", "")
+            .httpOnly(true)
+            .secure(isCookieSecure)
+            .path("/")
+            .maxAge(0)
+            .sameSite(cookieSameSite)
+
+        if (cookieDomain.isNotEmpty()) {
+            cookieBuilder.domain(cookieDomain)
+        }
+
+        val jwtCookie = cookieBuilder.build()
+
+        return ResponseEntity.ok()
+            .header(org.springframework.http.HttpHeaders.SET_COOKIE, jwtCookie.toString())
+            .body("Account deleted successfully.")
     }
 
     /**
@@ -171,5 +170,35 @@ class UserController(
         userRepository.save(user)
 
         return ResponseEntity.ok("2FA has been disabled successfully.")
+    }
+
+    /**
+     * Updates the user's dark mode preference.
+     */
+    @PostMapping("/settings/darkmode")
+    @Transactional
+    fun updateDarkMode(@CurrentUser user: User, @RequestBody request: DarkModeRequest): ResponseEntity<String> {
+        user.darkmodePreference = request.enabled
+        userRepository.save(user)
+        return ResponseEntity.ok("Dark mode preference updated.")
+    }
+
+    /**
+     * Retrieves the user's recent search history.
+     */
+    @GetMapping("/recent-searches")
+    fun getRecentSearches(@CurrentUser user: User): ResponseEntity<List<com.pride.summoner_searcher_api.model.RecentSearch>> {
+        return ResponseEntity.ok(user.recentSearches)
+    }
+
+    /**
+     * Clears the user's recent search history.
+     */
+    @PostMapping("/recent-searches/clear")
+    @Transactional
+    fun clearRecentSearches(@CurrentUser user: User): ResponseEntity<String> {
+        user.recentSearches.clear()
+        userRepository.save(user)
+        return ResponseEntity.ok("Recent searches cleared.")
     }
 }

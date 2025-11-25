@@ -157,7 +157,7 @@ class AuthController(
     @PostMapping("/refresh-token")
     fun refreshToken(@CookieValue(name = "refreshToken") requestRefreshToken: String?): ResponseEntity<Any> {
         if (requestRefreshToken == null) {
-            return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Refresh Token is empty!")
+            return ResponseEntity.status(HttpStatus.UNAUTHORIZED).body("Refresh Token is missing or expired.")
         }
 
         return try {

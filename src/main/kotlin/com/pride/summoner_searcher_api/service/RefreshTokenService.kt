@@ -42,8 +42,8 @@ class RefreshTokenService(
     }
 
     @Transactional
-    fun deleteByUserId(userId: Long): Int {
+    fun deleteByUserId(userId: Long) {
         val user = userRepository.findById(userId).orElseThrow { RuntimeException("User not found") }
-        return refreshTokenRepository.deleteByUser(user)
+        refreshTokenRepository.deleteByUser(user)
     }
 }

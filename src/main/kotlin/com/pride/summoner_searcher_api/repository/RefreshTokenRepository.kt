@@ -9,5 +9,8 @@ import java.util.Optional
 @Repository
 interface RefreshTokenRepository : JpaRepository<RefreshToken, Long> {
     fun findByToken(token: String): Optional<RefreshToken>
-    fun deleteByUser(user: User): Int
+
+    @org.springframework.data.jpa.repository.Modifying
+    @org.springframework.data.jpa.repository.Query("DELETE FROM RefreshToken r WHERE r.user = :user")
+    fun deleteByUser(user: User)
 }

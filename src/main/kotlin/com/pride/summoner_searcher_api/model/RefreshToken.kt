@@ -18,5 +18,6 @@ class RefreshToken(
 
     @ManyToOne
     @JoinColumn(name = "user_id", referencedColumnName = "id")
+    @org.hibernate.annotations.OnDelete(action = org.hibernate.annotations.OnDeleteAction.CASCADE)
     var user: User
 )
