@@ -43,7 +43,7 @@ class PlayerCacheService(
         if (cachedProfile == null) {
             logger.info("[Cache MISS] for key: {}. Fetching full profile.", cacheKey)
             val freshProfile = riotApiService.fetchSummonerProfile(puuid, region) ?: return null
-            val initialMatches = riotApiService.fetchMatchHistory(puuid, region, 20)
+            val initialMatches = riotApiService.fetchMatchHistory(puuid, region, 10)
             val completeProfile = freshProfile.copy(
                 gameName = summonerName,
                 tagLine = tagLine,

@@ -2,9 +2,11 @@ package com.pride.summoner_searcher_api.service
 
 import com.pride.summoner_searcher_api.dto.*
 import com.pride.summoner_searcher_api.util.mapToRegionRouting
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import org.springframework.core.ParameterizedTypeReference
 import org.springframework.stereotype.Service
@@ -22,7 +24,6 @@ import org.springframework.web.client.body
 @Service
 class RiotApiService(
     private val riotRestClient: RestClient,
-    private val riotMatchService: RiotMatchService,
     private val rateLimiter: RiotApiRateLimiter
 ) {
 
@@ -35,14 +36,16 @@ class RiotApiService(
      * This is necessary because the Development Key limits are strict and sometimes inconsistent.
      * Once a Production Key is obtained, this logic can be simplified or removed if the higher limits resolve the issue.
      */
-    private suspend fun <T> makeRateLimitedApiCall(priority: ApiPriority = ApiPriority.HIGH, apiCall: () -> T): T {
+    private suspend fun <T> executeRateLimitedCall(region: String, priority: ApiPriority = ApiPriority.HIGH, apiCall: () -> T): T {
         var attempts = 0
         val maxRetries = 3
         
         while (true) {
-            rateLimiter.acquirePermit(priority)
+            rateLimiter.acquirePermit(region, priority)
             try {
-                return apiCall()
+                return withContext(Dispatchers.IO) {
+                    apiCall()
+                }
             } catch (e: HttpClientErrorException.TooManyRequests) {
                 attempts++
                 if (attempts > maxRetries) {
@@ -64,7 +67,7 @@ class RiotApiService(
         val regionalRouting = mapToRegionRouting(region)
         val accountBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val uri = "$accountBaseUrl/riot/account/v1/accounts/by-puuid/{puuid}"
-        return makeRateLimitedApiCall(priority) {
+        return executeRateLimitedCall(region, priority) {
             try {
                 riotRestClient.get()
                     .uri(uri, puuid)
@@ -81,7 +84,7 @@ class RiotApiService(
         val regionalRouting = mapToRegionRouting(region)
         val accountBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val accountUri = "$accountBaseUrl/riot/account/v1/accounts/by-riot-id/{summonerName}/{tagLine}"
-        return makeRateLimitedApiCall(ApiPriority.HIGH) {
+        return executeRateLimitedCall(region, ApiPriority.HIGH) {
             try {
                 riotRestClient.get()
                     .uri(accountUri, summonerName, tagLine)
@@ -97,7 +100,7 @@ class RiotApiService(
     suspend fun getSummonerByPuuid(puuid: String, region: String): SummonerDto? {
         val platformBaseUrl = "https://${region}.api.riotgames.com"
         val summonerUri = "$platformBaseUrl/lol/summoner/v4/summoners/by-puuid/{puuid}"
-        return makeRateLimitedApiCall(ApiPriority.HIGH) {
+        return executeRateLimitedCall(region, ApiPriority.HIGH) {
             try {
                 riotRestClient.get()
                     .uri(summonerUri, puuid)
@@ -129,7 +132,7 @@ class RiotApiService(
         val platformBaseUrl = "https://${region}.api.riotgames.com"
         val leagueUri = "$platformBaseUrl/lol/league/v4/entries/by-puuid/{puuid}"
         val leagueEntriesType = object : ParameterizedTypeReference<List<LeagueEntryDto>>() {}
-        val allLeagueEntries = makeRateLimitedApiCall(ApiPriority.HIGH) {
+        val allLeagueEntries = executeRateLimitedCall(region, ApiPriority.HIGH) {
             try {
                 riotRestClient.get()
                     .uri(leagueUri, puuid)
@@ -150,7 +153,7 @@ class RiotApiService(
         
         // Fetching the list itself is a background task but infrequent, can be HIGH or LOW. 
         // Let's keep it LOW since it's part of the warmer.
-        val leagueList = makeRateLimitedApiCall(ApiPriority.LOW) {
+        val leagueList = executeRateLimitedCall(region, ApiPriority.LOW) {
             try {
                 riotRestClient.get()
                     .uri(uri, queue)
@@ -190,13 +193,12 @@ class RiotApiService(
         leagueList.copy(entries = enrichedEntries)
     }
 
-
     suspend fun getMatchIdsByPuuid(puuid: String, region: String, queueId: Int, startTime: Long, count: Int): List<String>? {
         val regionalRouting = mapToRegionRouting(region)
         val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val uri = "$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&startTime={startTime}&count={count}"
         val responseType = object : ParameterizedTypeReference<List<String>>() {}
-        return makeRateLimitedApiCall {
+        return executeRateLimitedCall(region) {
             try {
                 riotRestClient.get()
                     .uri(uri, puuid, queueId, startTime, count)
@@ -209,14 +211,42 @@ class RiotApiService(
         }
     }
     
-    suspend fun fetchMatchHistory(puuid: String, region: String, count: Int): List<MatchDto>? {
-        val matchIds = getMatchIdsByPuuid(puuid, region, 420, 0, count) ?: return emptyList()
-        return matchIds.mapNotNull { riotMatchService.getMatchById(it, region) }
+    suspend fun fetchMatchHistory(puuid: String, region: String, count: Int): List<MatchDto>? = coroutineScope {
+        val matchIds = getMatchIdsByPuuid(puuid, region, 420, 0, count) ?: return@coroutineScope emptyList()
+        
+        matchIds.map { matchId ->
+            async {
+                getMatchById(matchId, region)
+            }
+        }.awaitAll().filterNotNull()
     }
 
-    suspend fun fetchNewMatches(puuid: String, region: String, startTime: Long): List<MatchDto>? {
-        val matchIds = getMatchIdsByPuuid(puuid, region, 420, startTime, 100) ?: return emptyList()
-        return matchIds.mapNotNull { riotMatchService.getMatchById(it, region) }
+    suspend fun fetchNewMatches(puuid: String, region: String, startTime: Long): List<MatchDto>? = coroutineScope {
+        val matchIds = getMatchIdsByPuuid(puuid, region, 420, startTime, 100) ?: return@coroutineScope emptyList()
+        
+        matchIds.map { matchId ->
+            async {
+                getMatchById(matchId, region)
+            }
+        }.awaitAll().filterNotNull()
+    }
+
+    private suspend fun getMatchById(matchId: String, region: String): MatchDto? {
+        val regionalRouting = mapToRegionRouting(region)
+        val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
+        val uri = "$matchBaseUrl/lol/match/v5/matches/{matchId}"
+        
+        return executeRateLimitedCall(region) {
+            try {
+                riotRestClient.get()
+                    .uri(uri, matchId)
+                    .retrieve()
+                    .body<MatchDto>()
+            } catch (e: HttpClientErrorException.NotFound) {
+                // Don't throw an error for 404s on individual matches
+                null
+            }
+        }
     }
 
     private fun getPreferredContent(translations: List<RiotContent>): String? {
@@ -227,7 +257,7 @@ class RiotApiService(
     suspend fun getPlatformData(region: String): PlatformStatusDto? {
         val baseUrl = "https://${region}.api.riotgames.com"
         val uri = "$baseUrl/lol/status/v4/platform-data"
-        return makeRateLimitedApiCall {
+        return executeRateLimitedCall(region) {
             try {
                 riotRestClient.get()
                     .uri(uri)
@@ -262,3 +292,4 @@ class RiotApiService(
         }
     }
 }
+
