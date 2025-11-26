@@ -1,0 +1,26 @@
+> Task :checkKotlinGradlePluginConfigurationErrors SKIPPED
+> Task :compileKotlin UP-TO-DATE
+> Task :compileJava NO-SOURCE
+> Task :processResources UP-TO-DATE
+> Task :classes UP-TO-DATE
+> Task :jar UP-TO-DATE
+
+> Task :compileTestKotlin FAILED
+e: file:///C:/Users/Nasse/Downloads/SummonerSearcher/backend/src/test/kotlin/com/pride/summoner_searcher_api/service/UserServiceTest.kt:17:44 No parameter with name 'password' found.
+e: file:///C:/Users/Nasse/Downloads/SummonerSearcher/backend/src/test/kotlin/com/pride/summoner_searcher_api/service/UserServiceTest.kt:17:44 No value passed for parameter 'hashedPassword'.
+
+FAILURE: Build failed with an exception.
+
+* What went wrong:
+Execution failed for task ':compileTestKotlin'.
+> A failure occurred while executing org.jetbrains.kotlin.compilerRunner.GradleCompilerRunnerWithWorkers$GradleKotlinCompilerWorkAction
+   > Compilation error. See log for more details
+
+* Try:
+> Run with --stacktrace option to get the stack trace.
+> Run with --info or --debug option to get more log output.
+> Run with --scan to get full insights.
+> Get more help at https://help.gradle.org.
+
+BUILD FAILED in 1s
+4 actionable tasks: 1 executed, 3 up-to-date

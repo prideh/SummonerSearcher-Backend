@@ -54,6 +54,13 @@ dependencies {
     testImplementation("org.jetbrains.kotlin:kotlin-test-junit5")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test")
     testImplementation("org.springframework.security:spring-security-test")
+
+    // Kotest and MockK
+    testImplementation("io.kotest:kotest-runner-junit5:5.9.0")
+    testImplementation("io.kotest:kotest-assertions-core:5.9.0")
+    testImplementation("io.mockk:mockk:1.13.10")
+    testImplementation("com.h2database:h2")
+    testImplementation("org.mockito:mockito-core")
 }
 
 kotlin {

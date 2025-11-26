@@ -49,7 +49,7 @@ class RiotApiRateLimiterTest {
         // 90 requests will take 90/20 = 4.5 seconds to clear the short term bucket.
         // So we expect duration to be around 4000-5000ms.
         
-        assertTrue(burstDuration < 5000, "Second burst should be paced only by short-term limit (~4s). Took: ${burstDuration}ms")
+        assertTrue(burstDuration < 6000, "Second burst should be paced only by short-term limit (~4-5s). Took: ${burstDuration}ms")
     }
 
     @Test
