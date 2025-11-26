@@ -38,12 +38,13 @@ class UserService(private val userRepository: UserRepository) {
         // Add the new query to the beginning of the list.
         searches.add(0, newSearch)
         
-        // Trim the list to the 5 most recent searches.
-        if (searches.size > 5) {
-            user.recentSearches = searches.take(5).toMutableList()
-        } else {
-            user.recentSearches = searches
-        }
+        // Group by server and keep only the top 5 for each server
+        val limitedSearches = searches
+            .groupBy { it.server }
+            .flatMap { (_, serverSearches) -> serverSearches.take(5) }
+            .toMutableList()
+
+        user.recentSearches = limitedSearches
         userRepository.save(user)
     }
 
