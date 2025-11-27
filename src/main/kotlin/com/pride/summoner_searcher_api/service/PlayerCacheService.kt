@@ -23,7 +23,7 @@ class PlayerCacheService(
      * The key is composed of the player's PUUID and their region to ensure data is not mixed up
      * for players with the same account on different servers.
      */
-    private fun getProfileCacheKey(puuid: String, region: String) = "player:profile:$region:$puuid"
+    private fun getProfileCacheKey(puuid: String, region: String) = "player:profile:${region.lowercase()}:$puuid"
 
     /**
      * Retrieves a player's profile, utilizing a cache-aside strategy with an "always check" update mechanism.

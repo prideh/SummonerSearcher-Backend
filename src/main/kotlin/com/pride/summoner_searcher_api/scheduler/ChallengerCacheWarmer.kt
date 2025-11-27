@@ -29,6 +29,10 @@ class ChallengerCacheWarmer(
      * It ensures the cache is populated on deployment without waiting for the first scheduled run.
      */
     override fun run(args: ApplicationArguments?) {
+        if (args != null && args.containsOption("fetch-player")) {
+            logger.info("Skipping Challenger Cache Warmer because 'fetch-player' argument is present.")
+            return
+        }
         logger.info("Initial cache check on application startup...")
         refreshCacheIfNeeded()
     }

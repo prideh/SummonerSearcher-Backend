@@ -59,6 +59,15 @@ class RiotApiService(
                 
                 logger.warn("Hit 429 Rate Limit! Waiting {}ms before retry {}/{}. (Band-aid for Dev Key)", waitMs, attempts, maxRetries)
                 kotlinx.coroutines.delay(waitMs)
+            } catch (e: org.springframework.web.client.ResourceAccessException) {
+                attempts++
+                if (attempts > maxRetries) {
+                    logger.error("Exceeded max retries ($maxRetries) for network timeout. Giving up.")
+                    throw e
+                }
+                val waitMs = 1000L * attempts // Exponential backoff: 1s, 2s, 3s
+                logger.warn("Network timeout (ReadTimeout). Waiting {}ms before retry {}/{}.", waitMs, attempts, maxRetries)
+                kotlinx.coroutines.delay(waitMs)
             }
         }
     }
@@ -193,15 +202,23 @@ class RiotApiService(
         leagueList.copy(entries = enrichedEntries)
     }
 
-    suspend fun getMatchIdsByPuuid(puuid: String, region: String, queueId: Int, startTime: Long, count: Int): List<String>? {
+    suspend fun getMatchIdsByPuuid(puuid: String, region: String, queueId: Int, startTime: Long, endTime: Long? = null, count: Int): List<String>? {
         val regionalRouting = mapToRegionRouting(region)
         val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
-        val uri = "$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&startTime={startTime}&count={count}"
+        val uri = if (endTime != null) {
+            "$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&startTime={startTime}&endTime={endTime}&count={count}"
+        } else {
+            "$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&startTime={startTime}&count={count}"
+        }
         val responseType = object : ParameterizedTypeReference<List<String>>() {}
         return executeRateLimitedCall(region) {
             try {
-                riotRestClient.get()
-                    .uri(uri, puuid, queueId, startTime, count)
+                val request = riotRestClient.get()
+                if (endTime != null) {
+                    request.uri(uri, puuid, queueId, startTime, endTime, count)
+                } else {
+                    request.uri(uri, puuid, queueId, startTime, count)
+                }
                     .retrieve()
                     .body(responseType)
             } catch (e: HttpClientErrorException.NotFound) {
@@ -212,7 +229,7 @@ class RiotApiService(
     }
     
     suspend fun fetchMatchHistory(puuid: String, region: String, count: Int): List<MatchDto>? = coroutineScope {
-        val matchIds = getMatchIdsByPuuid(puuid, region, 420, 0, count) ?: return@coroutineScope emptyList()
+        val matchIds = getMatchIdsByPuuid(puuid, region, 420, 0, null, count) ?: return@coroutineScope emptyList()
         
         matchIds.map { matchId ->
             async {
@@ -222,7 +239,7 @@ class RiotApiService(
     }
 
     suspend fun fetchNewMatches(puuid: String, region: String, startTime: Long): List<MatchDto>? = coroutineScope {
-        val matchIds = getMatchIdsByPuuid(puuid, region, 420, startTime, 100) ?: return@coroutineScope emptyList()
+        val matchIds = getMatchIdsByPuuid(puuid, region, 420, startTime, null, 100) ?: return@coroutineScope emptyList()
         
         matchIds.map { matchId ->
             async {
@@ -231,7 +248,7 @@ class RiotApiService(
         }.awaitAll().filterNotNull()
     }
 
-    private suspend fun getMatchById(matchId: String, region: String): MatchDto? {
+    suspend fun getMatchById(matchId: String, region: String): MatchDto? {
         val regionalRouting = mapToRegionRouting(region)
         val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val uri = "$matchBaseUrl/lol/match/v5/matches/{matchId}"
