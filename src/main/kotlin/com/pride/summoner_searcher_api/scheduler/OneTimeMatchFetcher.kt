@@ -78,7 +78,7 @@ class OneTimeMatchFetcher(
         // 3. Fetch all match IDs
         val allMatchIds = mutableSetOf<String>()
         var endTime: Long? = null
-        val maxMatches = 5000
+        val maxMatches = 1000 // Reduced from 5000 to prevent OOM on small instances
         
         // Limit to matches starting from Jan 1, 2025
         val startTime = java.time.LocalDate.of(2025, 1, 1)
