@@ -7,7 +7,7 @@ import reactor.core.publisher.Mono
 
 @Service
 class AiAnalysisService(
-    @Value("\${GEMINI_API_KEY}") private val apiKey: String
+    @Value("\${GEMINI_API_KEY:}") private val apiKey: String
 ) {
 
     private val webClient = WebClient.builder()
