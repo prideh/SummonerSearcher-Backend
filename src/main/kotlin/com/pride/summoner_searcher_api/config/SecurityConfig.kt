@@ -59,6 +59,7 @@ class SecurityConfig(
                     // Protected endpoints: Require authentication for all other API paths.
                     .requestMatchers("/api/user/**").authenticated()
                     .requestMatchers("/api/riot/**").authenticated()
+                    .requestMatchers("/api/ai/**").authenticated()
                     // Default security rule: Deny any request that doesn't match the rules above.
                     .anyRequest().denyAll()
             }

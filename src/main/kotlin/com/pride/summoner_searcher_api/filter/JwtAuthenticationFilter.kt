@@ -33,6 +33,13 @@ class JwtAuthenticationFilter(
         response: HttpServletResponse,
         filterChain: FilterChain
     ) {
+        val requestUri = request.requestURI
+        
+        // Log all /api/ai requests for debugging
+        if (requestUri.startsWith("/api/ai")) {
+            log.info("JWT Filter processing /api/ai request: $requestUri")
+        }
+        
         // 1. Extract the "Authorization" header, which should contain the JWT.
         val authHeader: String? = request.getHeader("Authorization")
 
@@ -40,6 +47,9 @@ class JwtAuthenticationFilter(
         //    In this case, we simply continue the filter chain without setting any authentication.
         //    If the endpoint is protected, a later filter will block the request.
         if (authHeader == null || !authHeader.startsWith("Bearer ")) {
+            if (requestUri.startsWith("/api/ai")) {
+                log.warn("AI endpoint request missing or invalid Authorization header")
+            }
             filterChain.doFilter(request, response)
             return
         }
@@ -72,6 +82,10 @@ class JwtAuthenticationFilter(
                     // 10. Set the authentication object in the SecurityContextHolder.
                     //     Spring Security now considers this request to be authenticated.
                     SecurityContextHolder.getContext().authentication = authToken
+                    
+                    if (request.requestURI.startsWith("/api/ai")) {
+                        log.info("AI endpoint authentication successful for user: $userEmail")
+                    }
                 }
             }
         } catch (e: Exception) {
