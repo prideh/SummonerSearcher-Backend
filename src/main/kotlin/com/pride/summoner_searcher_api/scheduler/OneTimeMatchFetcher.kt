@@ -116,7 +116,7 @@ class OneTimeMatchFetcher(
             }
 
             // Get details of the last match to update endTime
-            val lastMatchId = ids.last()
+            val lastMatchId = ids[ids.size - 1]
             val lastMatch = riotApiService.getMatchById(lastMatchId, region)
             
             if (lastMatch?.info?.gameCreation != null) {

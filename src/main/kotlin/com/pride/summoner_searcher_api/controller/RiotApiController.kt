@@ -1,6 +1,7 @@
 package com.pride.summoner_searcher_api.controller
 
 import com.pride.summoner_searcher_api.annotation.CurrentUser
+import com.pride.summoner_searcher_api.dto.CurrentGameInfo
 import com.pride.summoner_searcher_api.dto.LeagueListDTO
 import com.pride.summoner_searcher_api.dto.PlatformStatusDto
 import com.pride.summoner_searcher_api.dto.SummonerProfileDto
@@ -26,7 +27,8 @@ class RiotApiController(
     private val riotApiService: RiotApiService,
     private val challengerLeagueService: ChallengerLeagueService,
     private val userService: UserService,
-    private val summonerProfileService: SummonerProfileService
+    private val summonerProfileService: SummonerProfileService,
+    private val redisCacheService: com.pride.summoner_searcher_api.service.RedisCacheService
 ) {
 
     /**
@@ -79,5 +81,31 @@ class RiotApiController(
         }
 
         ResponseEntity.ok(summonerProfile)
+    }
+    /**
+     * Fetches the live game for a summoner.
+     * Caches the result for 5 minutes.
+     */
+    @GetMapping("/live-game/{region}/{puuid}")
+    fun getLiveGame(
+        @PathVariable region: String,
+        @PathVariable puuid: String
+    ): ResponseEntity<CurrentGameInfo?> = runBlocking {
+        val cacheKey = "live-game:$region:$puuid"
+        val cachedGame = redisCacheService.get(cacheKey, CurrentGameInfo::class.java)
+
+        if (cachedGame != null) {
+            org.slf4j.LoggerFactory.getLogger(javaClass).info("Live Game Cache HIT for $puuid in $region")
+            return@runBlocking ResponseEntity.ok(cachedGame)
+        }
+
+        org.slf4j.LoggerFactory.getLogger(javaClass).info("Live Game Cache MISS for $puuid in $region. Fetching from API...")
+        val liveGame = riotApiService.getActiveGameByPuuid(puuid, region)
+
+        if (liveGame != null) {
+            redisCacheService.set(cacheKey, liveGame, java.time.Duration.ofMinutes(10))
+        }
+
+        ResponseEntity.ok(liveGame)
     }
 }

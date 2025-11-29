@@ -308,5 +308,54 @@ class RiotApiService(
             }
         }
     }
-}
 
+    suspend fun getActiveGameByPuuid(puuid: String, region: String): CurrentGameInfo? = coroutineScope {
+        val platformBaseUrl = "https://${region}.api.riotgames.com"
+        val uri = "$platformBaseUrl/lol/spectator/v5/active-games/by-summoner/{puuid}"
+        
+        val gameInfo = executeRateLimitedCall(region) {
+            try {
+                riotRestClient.get()
+                    .uri(uri, puuid)
+                    .retrieve()
+                    .body<CurrentGameInfo>()
+            } catch (e: HttpClientErrorException.NotFound) {
+                // 404 means the summoner is not in an active game
+                null
+            }
+        } ?: return@coroutineScope null
+
+        // Filter for Ranked Solo/Duo (Queue ID 420)
+        if (gameInfo.gameQueueConfigId != 420L) {
+            logger.info("Player $puuid is in game but not Ranked Solo (Queue ${gameInfo.gameQueueConfigId}). Returning null.")
+            return@coroutineScope null
+        }
+
+        // Enrich participants with Rank (Tier/Division/LP)
+        val enrichedParticipants = gameInfo.participants.map { participant ->
+            async {
+                // Skip bots or players without PUUID
+                if (participant.puuid != null) {
+                    try {
+                        // Use PUUID to fetch rank, as summonerId is deprecated
+                        val rank = fetchLeagueRank(participant.puuid, region)
+                        participant.copy(
+                            tier = rank?.tier,
+                            rank = rank?.rank,
+                            leaguePoints = rank?.leaguePoints,
+                            wins = rank?.wins,
+                            losses = rank?.losses
+                        )
+                    } catch (e: Exception) {
+                        logger.error("Failed to fetch rank for participant ${participant.riotId}", e)
+                        participant
+                    }
+                } else {
+                    participant
+                }
+            }
+        }.awaitAll()
+
+        return@coroutineScope gameInfo.copy(participants = enrichedParticipants)
+    }
+}
