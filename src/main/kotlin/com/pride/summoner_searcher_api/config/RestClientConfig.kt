@@ -27,8 +27,25 @@ class RestClientConfig {
     @Bean
     fun riotRestClient(): RestClient {
         val logger = org.slf4j.LoggerFactory.getLogger(RestClientConfig::class.java)
+
+        val provider = reactor.netty.resources.ConnectionProvider.builder("riot-api-pool")
+            .maxConnections(1000)
+            .maxIdleTime(java.time.Duration.ofSeconds(10))
+            .maxLifeTime(java.time.Duration.ofSeconds(50))
+            .pendingAcquireTimeout(java.time.Duration.ofSeconds(60))
+            .evictInBackground(java.time.Duration.ofSeconds(30))
+            .build()
+
+        val httpClient = reactor.netty.http.client.HttpClient.create(provider)
+            .responseTimeout(java.time.Duration.ofSeconds(10))
+            .option(io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+            .protocol(reactor.netty.http.HttpProtocol.HTTP11)
+            .headers { it.set(org.springframework.http.HttpHeaders.USER_AGENT, "SummonerSearcher/1.0") }
+
+        val requestFactory = org.springframework.http.client.ReactorNettyClientRequestFactory(httpClient)
         
         return RestClient.builder()
+            .requestFactory(requestFactory)
             .defaultHeader("X-Riot-Token", riotApiKey)
             .requestInterceptor { request, body, execution ->
                 val response = execution.execute(request, body)
