@@ -27,9 +27,7 @@ class SummonerProfileService(
         val accountDto = riotApiService.getAccountByRiotId(summonerName, tagLine, region)
         val puuid = accountDto?.puuid?.takeIf { it.isNotBlank() } ?: return null
 
-        // Step 2: Crucially, verify that this global PUUID has a summoner profile on the requested region.
-        // This prevents returning data from the wrong server if a Riot ID exists globally but not on the searched region.
-        riotApiService.getSummonerByPuuid(puuid, region) ?: return null
+
 
         // Step 3: Only if both checks pass, proceed to the caching layer to get the full profile.
         return playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine)
