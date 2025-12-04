@@ -37,8 +37,8 @@ class RestClientConfig {
             .build()
 
         val httpClient = reactor.netty.http.client.HttpClient.create(provider)
-            .responseTimeout(java.time.Duration.ofSeconds(10))
-            .option(io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+            .responseTimeout(java.time.Duration.ofSeconds(30))
+            .option(io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS, 30000)
             .protocol(reactor.netty.http.HttpProtocol.HTTP11)
             .headers { it.set(org.springframework.http.HttpHeaders.USER_AGENT, "SummonerSearcher/1.0") }
 

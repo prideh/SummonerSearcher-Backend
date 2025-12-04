@@ -20,4 +20,14 @@ class GlobalExceptionHandler {
         )
         return ResponseEntity.status(ex.statusCode).body(errorDetails)
     }
+    @ExceptionHandler(org.springframework.web.client.ResourceAccessException::class)
+    fun handleResourceAccessException(ex: org.springframework.web.client.ResourceAccessException): ResponseEntity<Map<String, Any>> {
+        val errorDetails = mapOf(
+            "timestamp" to LocalDateTime.now().toString(),
+            "status" to org.springframework.http.HttpStatus.GATEWAY_TIMEOUT.value(),
+            "error" to "Gateway Timeout",
+            "message" to "The Riot API is taking too long to respond. Please try again later."
+        )
+        return ResponseEntity.status(org.springframework.http.HttpStatus.GATEWAY_TIMEOUT).body(errorDetails)
+    }
 }

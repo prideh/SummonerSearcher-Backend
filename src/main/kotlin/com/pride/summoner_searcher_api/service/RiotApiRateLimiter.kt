@@ -76,8 +76,9 @@ class RiotApiRateLimiter(
         // Initial conservative defaults (Dev Key) until we hear otherwise
         init {
             buckets = listOf(
-                SlidingWindowBucket(20, Duration.ofSeconds(1), "$regionName-default-short"),
-                SlidingWindowBucket(100, Duration.ofMinutes(2), "$regionName-default-long")
+                SlidingWindowBucket(20, Duration.ofSeconds(1), "$regionName-default-short")
+                // Removed default long-term limit (100/2m) to avoid throttling Production keys on startup.
+                // The first response will populate the correct long-term limits from headers.
             )
         }
 
@@ -209,27 +210,8 @@ class RiotApiRateLimiter(
                         // Factor > 1.0 means we allow some burst. Factor 1.0 is strict pacing.
                         // Let's use a factor of 1.2 to allow slight bursting but keep it smooth.
                         
-                        if (timestamps.isNotEmpty()) {
-                            val reqPerSec = capacity.toDouble() / windowSeconds
-                            // Only enforce spacing for short windows (e.g. < 60s) to allow bursting on long windows
-                            if (windowSeconds < 60) {
-                                val minSpacing = (1000.0 / (reqPerSec * 1.2)).toLong().coerceAtLeast(5L) // Min 5ms
-                                
-                                val lastRequest = timestamps.last()
-                                val timeSinceLast = now - lastRequest
-                                
-                                if (timeSinceLast < minSpacing) {
-                                    val waitTime = minSpacing - timeSinceLast
-                                    mutex.unlock()
-                                    try {
-                                        delay(waitTime)
-                                    } finally {
-                                        mutex.lock()
-                                    }
-                                    continue
-                                }
-                            }
-                        }
+                        // Removed artificial spacing to allow full bursting.
+                        // The capacity check above is sufficient to respect the rate limit.
                         
                         timestamps.addLast(timeProvider.now())
                         return

@@ -224,23 +224,33 @@ class RiotApiService(
         leagueList.copy(entries = enrichedEntries)
     }
 
-    suspend fun getMatchIdsByPuuid(puuid: String, region: String, queueId: Int, startTime: Long, endTime: Long? = null, count: Int, start: Int = 0): List<String>? {
+    suspend fun getMatchIdsByPuuid(puuid: String, region: String, queueId: Int, startTime: Long? = null, endTime: Long? = null, count: Int, start: Int = 0): List<String>? {
+        logger.info("API Request: getMatchIdsByPuuid - region=$region, queue=$queueId, startTime=$startTime, count=$count, start=$start")
         val regionalRouting = mapToRegionRouting(region)
         val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
-        val uri = if (endTime != null) {
-            "$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&startTime={startTime}&endTime={endTime}&count={count}&start={start}"
-        } else {
-            "$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&startTime={startTime}&count={count}&start={start}"
+        
+        val uriBuilder = StringBuilder("$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&count={count}&start={start}")
+        val uriVariables = mutableMapOf<String, Any>(
+            "puuid" to puuid,
+            "queueId" to queueId,
+            "count" to count,
+            "start" to start
+        )
+
+        if (startTime != null) {
+            uriBuilder.append("&startTime={startTime}")
+            uriVariables["startTime"] = startTime
         }
+        if (endTime != null) {
+            uriBuilder.append("&endTime={endTime}")
+            uriVariables["endTime"] = endTime
+        }
+
         val responseType = object : ParameterizedTypeReference<List<String>>() {}
         return executeRateLimitedCall(region) {
             try {
-                val request = riotRestClient.get()
-                if (endTime != null) {
-                    request.uri(uri, puuid, queueId, startTime, endTime, count, start)
-                } else {
-                    request.uri(uri, puuid, queueId, startTime, count, start)
-                }
+                riotRestClient.get()
+                    .uri(uriBuilder.toString(), uriVariables)
                     .retrieve()
                     .toEntity(responseType)
             } catch (e: HttpClientErrorException.NotFound) {
@@ -248,37 +258,48 @@ class RiotApiService(
                 null
             }
         }
+
     }
     
-    suspend fun fetchAllMatchesSince(puuid: String, region: String, startTime: Long): List<MatchDto> = coroutineScope {
+    suspend fun fetchAllMatchesSince(puuid: String, region: String, startTime: Long? = null): List<MatchDto> = coroutineScope {
         val allMatchIds = mutableListOf<String>()
         var start = 0
         val count = 100
         
         while (true) {
+            logger.info("Fetching matches for $puuid: start=$start, count=$count")
             val matchIds = getMatchIdsByPuuid(puuid, region, 420, startTime, null, count, start)
-            if (matchIds.isNullOrEmpty()) break
             
+            if (matchIds.isNullOrEmpty()) {
+                logger.info("Fetched empty list or null. Stopping. (Total: ${allMatchIds.size})")
+                break
+            }
+            
+            logger.info("Fetched ${matchIds.size} matches. (Total before add: ${allMatchIds.size})")
             allMatchIds.addAll(matchIds)
-            if (matchIds.size < count) break // Less than 100 returned means we reached the end
+            
+            if (matchIds.size < count) {
+                logger.info("Fetched fewer than requested ($count). Reached end of history. (Total: ${allMatchIds.size})")
+                break 
+            }
             
             start += count
             // Safety break to prevent infinite loops if something goes wrong
-            if (allMatchIds.size > 2000) break 
+            if (allMatchIds.size > 2000) {
+                logger.warn("Hit safety limit of 2000 matches. Stopping.")
+                break 
+            }
         }
         
         logger.info("Found ${allMatchIds.size} matches since $startTime for $puuid")
         
         // Fetch details in batches to avoid overwhelming the rate limiter or memory
-        val matches = mutableListOf<MatchDto>()
-        allMatchIds.chunked(20).forEach { batch ->
-            val batchMatches = batch.map { matchId ->
-                async {
-                    getMatchById(matchId, region)
-                }
-            }.awaitAll().filterNotNull()
-            matches.addAll(batchMatches)
-        }
+        // Fetch details in parallel. The rate limiter handles the flow.
+        val matches = allMatchIds.map { matchId ->
+            async {
+                getMatchById(matchId, region)
+            }
+        }.awaitAll().filterNotNull()
         
         matches
     }
