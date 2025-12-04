@@ -43,6 +43,9 @@ data class SummonerProfileDto(
     val profileIconId: Int?,
     val soloQueueRank: LeagueEntryDto?,
     val recentMatches: List<MatchDto>?,
+    val championStats: List<ChampionStatsDto> = emptyList(),
+    val overallStats: OverallStatsDto? = null,
+    val totalMatches: Int = 0,
     val lastRefreshed: Instant? = null
 )
 

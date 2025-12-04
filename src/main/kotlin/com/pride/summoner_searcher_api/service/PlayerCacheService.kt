@@ -13,7 +13,8 @@ import java.time.Duration
 @Service
 class PlayerCacheService(
     private val redisCacheService: RedisCacheService,
-    private val riotApiService: RiotApiService
+    private val riotApiService: RiotApiService,
+    private val statsCalculator: StatsCalculator
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
@@ -38,29 +39,44 @@ class PlayerCacheService(
         val cacheKey = getProfileCacheKey(puuid, region)
         val cachedProfile = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
 
+        // Calculate Start of Year (Jan 1st) in Epoch Seconds
+        val startOfYear = java.time.Year.now().atDay(1).atStartOfDay(java.time.ZoneOffset.UTC).toEpochSecond()
+
         // --- Cache Miss ---
-        // If the player is not in the cache, fetch their full profile and initial match history for the first time.
         if (cachedProfile == null) {
             logger.info("[Cache MISS] for key: {}. Fetching full profile.", cacheKey)
             val freshProfile = riotApiService.fetchSummonerProfile(puuid, region) ?: return null
-            val initialMatches = riotApiService.fetchMatchHistory(puuid, region, 10)
+            
+            // Fetch ALL matches since start of year
+            val allMatches = riotApiService.fetchAllMatchesSince(puuid, region, startOfYear)
+            
+            // Calculate Stats
+            val (championStats, overallStats) = statsCalculator.calculateStats(allMatches, puuid)
+            
             val completeProfile = freshProfile.copy(
                 gameName = summonerName,
                 tagLine = tagLine,
-                recentMatches = initialMatches
+                recentMatches = allMatches,
+                championStats = championStats,
+                overallStats = overallStats,
+                totalMatches = allMatches.size,
+                lastRefreshed = java.time.Instant.now()
             )
             redisCacheService.set(cacheKey, completeProfile, Duration.ZERO) // Store indefinitely
             return completeProfile
         }
 
         // --- Cache Hit: "Always Check" Update Strategy ---
-        // If a profile is found in the cache, always check for fresh data to ensure information is up-to-date.
         var needsUpdate = false
         var updatedProfile = cachedProfile
 
         // 1. Check for new matches played since the last cached game.
         val lastKnownGameTimestamp = cachedProfile.recentMatches?.firstOrNull()?.info?.gameCreation ?: 0
-        val startTimeForApi = lastKnownGameTimestamp / 1000
+        val startTimeForApi = (lastKnownGameTimestamp / 1000) + 1 // +1 to avoid fetching the same game
+        
+        // If the cached profile is old (e.g. from before we added stats), we might need to re-fetch everything
+        // But for now, let's assume we just append new matches.
+        
         val potentialNewMatches = riotApiService.fetchNewMatches(puuid, region, startTimeForApi)
         val existingMatchIds = cachedProfile.recentMatches?.mapNotNull { it.info?.gameId }?.toSet() ?: emptySet()
         val trulyNewMatches = potentialNewMatches?.filterNot { existingMatchIds.contains(it.info?.gameId) }
@@ -68,11 +84,29 @@ class PlayerCacheService(
         if (!trulyNewMatches.isNullOrEmpty()) {
             logger.info("[Cache STALE] Found {} new matches for key: {}", trulyNewMatches.size, cacheKey)
             val combinedMatches = trulyNewMatches + cachedProfile.recentMatches.orEmpty()
-            updatedProfile = updatedProfile.copy(recentMatches = combinedMatches)
+            
+            // Re-calculate stats with new matches
+            val (championStats, overallStats) = statsCalculator.calculateStats(combinedMatches, puuid)
+            
+            updatedProfile = updatedProfile.copy(
+                recentMatches = combinedMatches,
+                championStats = championStats,
+                overallStats = overallStats,
+                totalMatches = combinedMatches.size,
+                lastRefreshed = java.time.Instant.now()
+            )
+            needsUpdate = true
+        } else if (cachedProfile.championStats.isEmpty() && !cachedProfile.recentMatches.isNullOrEmpty()) {
+             // If we have matches but no stats (migration case), calculate them
+             val (championStats, overallStats) = statsCalculator.calculateStats(cachedProfile.recentMatches, puuid)
+             updatedProfile = updatedProfile.copy(
+                championStats = championStats,
+                overallStats = overallStats
+            )
             needsUpdate = true
         }
 
-        // 2. Check for rank/LP changes (e.g., from dodging or decay).
+        // 2. Check for rank/LP changes
         val freshRank = riotApiService.fetchLeagueRank(puuid, region)
         if (freshRank != cachedProfile.soloQueueRank) {
             logger.info("[Cache STALE] Found rank update for key: {}", cacheKey)
@@ -80,10 +114,10 @@ class PlayerCacheService(
             needsUpdate = true
         }
 
-        // 3. Always update the name and tagline in case they have changed.
+        // 3. Always update the name and tagline
         updatedProfile = updatedProfile.copy(gameName = summonerName, tagLine = tagLine)
 
-        // 4. Write to the cache only if there was an actual change to the data.
+        // 4. Write to the cache only if there was an actual change
         if (needsUpdate || updatedProfile.gameName != cachedProfile.gameName || updatedProfile.tagLine != cachedProfile.tagLine) {
             logger.info("[Cache WRITE] Saving updated profile for key: {}", cacheKey)
             redisCacheService.set(cacheKey, updatedProfile, Duration.ZERO)
@@ -92,5 +126,10 @@ class PlayerCacheService(
         }
 
         return updatedProfile
+    }
+
+    fun getCachedProfile(puuid: String, region: String): SummonerProfileDto? {
+        val cacheKey = getProfileCacheKey(puuid, region)
+        return redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
     }
 }

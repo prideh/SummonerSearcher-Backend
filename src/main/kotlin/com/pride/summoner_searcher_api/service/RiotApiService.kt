@@ -224,22 +224,22 @@ class RiotApiService(
         leagueList.copy(entries = enrichedEntries)
     }
 
-    suspend fun getMatchIdsByPuuid(puuid: String, region: String, queueId: Int, startTime: Long, endTime: Long? = null, count: Int): List<String>? {
+    suspend fun getMatchIdsByPuuid(puuid: String, region: String, queueId: Int, startTime: Long, endTime: Long? = null, count: Int, start: Int = 0): List<String>? {
         val regionalRouting = mapToRegionRouting(region)
         val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val uri = if (endTime != null) {
-            "$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&startTime={startTime}&endTime={endTime}&count={count}"
+            "$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&startTime={startTime}&endTime={endTime}&count={count}&start={start}"
         } else {
-            "$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&startTime={startTime}&count={count}"
+            "$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&startTime={startTime}&count={count}&start={start}"
         }
         val responseType = object : ParameterizedTypeReference<List<String>>() {}
         return executeRateLimitedCall(region) {
             try {
                 val request = riotRestClient.get()
                 if (endTime != null) {
-                    request.uri(uri, puuid, queueId, startTime, endTime, count)
+                    request.uri(uri, puuid, queueId, startTime, endTime, count, start)
                 } else {
-                    request.uri(uri, puuid, queueId, startTime, count)
+                    request.uri(uri, puuid, queueId, startTime, count, start)
                 }
                     .retrieve()
                     .toEntity(responseType)
@@ -250,8 +250,41 @@ class RiotApiService(
         }
     }
     
+    suspend fun fetchAllMatchesSince(puuid: String, region: String, startTime: Long): List<MatchDto> = coroutineScope {
+        val allMatchIds = mutableListOf<String>()
+        var start = 0
+        val count = 100
+        
+        while (true) {
+            val matchIds = getMatchIdsByPuuid(puuid, region, 420, startTime, null, count, start)
+            if (matchIds.isNullOrEmpty()) break
+            
+            allMatchIds.addAll(matchIds)
+            if (matchIds.size < count) break // Less than 100 returned means we reached the end
+            
+            start += count
+            // Safety break to prevent infinite loops if something goes wrong
+            if (allMatchIds.size > 2000) break 
+        }
+        
+        logger.info("Found ${allMatchIds.size} matches since $startTime for $puuid")
+        
+        // Fetch details in batches to avoid overwhelming the rate limiter or memory
+        val matches = mutableListOf<MatchDto>()
+        allMatchIds.chunked(20).forEach { batch ->
+            val batchMatches = batch.map { matchId ->
+                async {
+                    getMatchById(matchId, region)
+                }
+            }.awaitAll().filterNotNull()
+            matches.addAll(batchMatches)
+        }
+        
+        matches
+    }
+
     suspend fun fetchMatchHistory(puuid: String, region: String, count: Int): List<MatchDto>? = coroutineScope {
-        val matchIds = getMatchIdsByPuuid(puuid, region, 420, 0, null, count) ?: return@coroutineScope emptyList()
+        val matchIds = getMatchIdsByPuuid(puuid, region, 420, 0, null, count, 0) ?: return@coroutineScope emptyList()
         
         matchIds.map { matchId ->
             async {
@@ -261,7 +294,7 @@ class RiotApiService(
     }
 
     suspend fun fetchNewMatches(puuid: String, region: String, startTime: Long): List<MatchDto>? = coroutineScope {
-        val matchIds = getMatchIdsByPuuid(puuid, region, 420, startTime, null, 100) ?: return@coroutineScope emptyList()
+        val matchIds = getMatchIdsByPuuid(puuid, region, 420, startTime, null, 100, 0) ?: return@coroutineScope emptyList()
         
         matchIds.map { matchId ->
             async {

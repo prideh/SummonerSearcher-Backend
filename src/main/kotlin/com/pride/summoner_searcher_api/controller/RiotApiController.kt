@@ -82,6 +82,23 @@ class RiotApiController(
 
         ResponseEntity.ok(summonerProfile)
     }
+
+    /**
+     * Fetches a specific page of matches for a summoner.
+     * @param region The server region.
+     * @param puuid The player's PUUID.
+     * @param page The page number (1-indexed).
+     * @return A list of [MatchDto] for that page.
+     */
+    @GetMapping("/matches/{region}/{puuid}")
+    fun getMatches(
+        @PathVariable region: String,
+        @PathVariable puuid: String,
+        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "1") page: Int
+    ): ResponseEntity<List<com.pride.summoner_searcher_api.dto.MatchDto>> = runBlocking {
+        val matches = summonerProfileService.getMatches(region, puuid, page)
+        ResponseEntity.ok(matches)
+    }
     /**
      * Fetches the live game for a summoner.
      * Caches the result for 5 minutes.
