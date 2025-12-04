@@ -9,10 +9,10 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withContext
 import org.slf4j.LoggerFactory
 import org.springframework.core.ParameterizedTypeReference
+import org.springframework.http.ResponseEntity
 import org.springframework.stereotype.Service
 import org.springframework.web.client.HttpClientErrorException
 import org.springframework.web.client.RestClient
-import org.springframework.web.client.body
 
 /**
  * A service dedicated to interacting with the Riot Games API.
@@ -32,32 +32,54 @@ class RiotApiService(
     /**
      * Wrapper function that enforces rate limiting for all Riot API calls.
      * 
-     * BAND-AID FIX: Implements graceful retries for 429 Too Many Requests.
-     * This is necessary because the Development Key limits are strict and sometimes inconsistent.
-     * Once a Production Key is obtained, this logic can be simplified or removed if the higher limits resolve the issue.
+     * Now supports Dynamic Rate Limiting by parsing response headers.
      */
-    private suspend fun <T> executeRateLimitedCall(region: String, priority: ApiPriority = ApiPriority.HIGH, apiCall: () -> T): T {
+    private suspend fun <T> executeRateLimitedCall(
+        region: String, 
+        priority: ApiPriority = ApiPriority.HIGH, 
+        apiCall: () -> ResponseEntity<T>?
+    ): T? {
         var attempts = 0
         val maxRetries = 3
         
         while (true) {
             rateLimiter.acquirePermit(region, priority)
             try {
-                return withContext(Dispatchers.IO) {
+                val response = withContext(Dispatchers.IO) {
                     apiCall()
+                }
+                
+                if (response != null) {
+                    val headers = response.headers
+                    rateLimiter.updateLimits(
+                        region,
+                        headers.getFirst("X-App-Rate-Limit"),
+                        headers.getFirst("X-App-Rate-Limit-Count")
+                    )
+                    return response.body
+                } else {
+                    return null
                 }
             } catch (e: HttpClientErrorException.TooManyRequests) {
                 attempts++
+                
+                // Update limits from the 429 response as well
+                rateLimiter.updateLimits(
+                    region,
+                    e.responseHeaders?.getFirst("X-App-Rate-Limit"),
+                    e.responseHeaders?.getFirst("X-App-Rate-Limit-Count")
+                )
+
                 if (attempts > maxRetries) {
                     logger.error("Exceeded max retries ($maxRetries) for rate limit. Giving up.")
                     throw e
                 }
                 
                 // Parse Retry-After header (in seconds)
-                val retryAfterSeconds = e.responseHeaders?.get("Retry-After")?.firstOrNull()?.toLongOrNull() ?: 1L
+                val retryAfterSeconds = e.responseHeaders?.getFirst("Retry-After")?.toLongOrNull() ?: 1L
                 val waitMs = (retryAfterSeconds * 1000) + 100 // Add 100ms buffer
                 
-                logger.warn("Hit 429 Rate Limit! Waiting {}ms before retry {}/{}. (Band-aid for Dev Key)", waitMs, attempts, maxRetries)
+                logger.warn("Hit 429 Rate Limit! Waiting {}ms before retry {}/{}.", waitMs, attempts, maxRetries)
                 kotlinx.coroutines.delay(waitMs)
             } catch (e: org.springframework.web.client.ResourceAccessException) {
                 attempts++
@@ -81,7 +103,7 @@ class RiotApiService(
                 riotRestClient.get()
                     .uri(uri, puuid)
                     .retrieve()
-                    .body<AccountDto>()
+                    .toEntity(AccountDto::class.java)
             } catch (e: HttpClientErrorException.NotFound) {
                 logger.warn("getAccountByPuuid returned 404 for puuid: {}", puuid)
                 null
@@ -98,7 +120,7 @@ class RiotApiService(
                 riotRestClient.get()
                     .uri(accountUri, summonerName, tagLine)
                     .retrieve()
-                    .body<AccountDto>()
+                    .toEntity(AccountDto::class.java)
             } catch (e: HttpClientErrorException.NotFound) {
                 logger.warn("getAccountByRiotId returned 404 for {}#{}", summonerName, tagLine)
                 null
@@ -114,7 +136,7 @@ class RiotApiService(
                 riotRestClient.get()
                     .uri(summonerUri, puuid)
                     .retrieve()
-                    .body<SummonerDto>()
+                    .toEntity(SummonerDto::class.java)
             } catch (e: HttpClientErrorException.NotFound) {
                 logger.warn("getSummonerByPuuid returned 404 for puuid {} in region {}", puuid, region)
                 null
@@ -146,7 +168,7 @@ class RiotApiService(
                 riotRestClient.get()
                     .uri(leagueUri, puuid)
                     .retrieve()
-                    .body(leagueEntriesType)
+                    .toEntity(leagueEntriesType)
             } catch (e: HttpClientErrorException.NotFound) {
                 logger.info("fetchLeagueRank returned 404 for puuid {} in region {}. Player is likely unranked.", puuid, region)
                 null
@@ -167,7 +189,7 @@ class RiotApiService(
                 riotRestClient.get()
                     .uri(uri, queue)
                     .retrieve()
-                    .body<LeagueListDTO>()
+                    .toEntity(LeagueListDTO::class.java)
             } catch (e: HttpClientErrorException.NotFound) {
                 logger.warn("fetchChallengerLeague returned 404 for region {} queue {}", region, queue)
                 null
@@ -220,7 +242,7 @@ class RiotApiService(
                     request.uri(uri, puuid, queueId, startTime, count)
                 }
                     .retrieve()
-                    .body(responseType)
+                    .toEntity(responseType)
             } catch (e: HttpClientErrorException.NotFound) {
                 logger.warn("getMatchIdsByPuuid returned 404")
                 null
@@ -258,7 +280,7 @@ class RiotApiService(
                 riotRestClient.get()
                     .uri(uri, matchId)
                     .retrieve()
-                    .body<MatchDto>()
+                    .toEntity(MatchDto::class.java)
             } catch (e: HttpClientErrorException.NotFound) {
                 // Don't throw an error for 404s on individual matches
                 null
@@ -279,33 +301,33 @@ class RiotApiService(
                 riotRestClient.get()
                     .uri(uri)
                     .retrieve()
-                    .body<RiotPlatformData>()?.let {
-                        PlatformStatusDto(
-                            name = it.name,
-                            maintenances = it.maintenances.map { maintenance ->
-                                StatusItemDto(
-                                    status = maintenance.maintenanceStatus,
-                                    severity = maintenance.incidentSeverity,
-                                    title = getPreferredContent(maintenance.titles) ?: "No Title",
-                                    description = maintenance.updates.firstOrNull()?.let { update -> getPreferredContent(update.translations) },
-                                    platforms = maintenance.platforms
-                                )
-                            },
-                            incidents = it.incidents.map { incident ->
-                                StatusItemDto(
-                                    status = if (incident.active) "Active" else "Resolved",
-                                    severity = incident.incidentSeverity,
-                                    title = getPreferredContent(incident.titles) ?: "No Title",
-                                    description = incident.updates.firstOrNull()?.let { update -> getPreferredContent(update.translations) },
-                                    platforms = incident.platforms
-                                )
-                            }
-                        )
-                    }
+                    .toEntity(RiotPlatformData::class.java)
             } catch (e: HttpClientErrorException.NotFound) {
                 logger.warn("getPlatformData returned 404 for region {}", region)
                 null
             }
+        }?.let {
+            PlatformStatusDto(
+                name = it.name,
+                maintenances = it.maintenances.map { maintenance ->
+                    StatusItemDto(
+                        status = maintenance.maintenanceStatus,
+                        severity = maintenance.incidentSeverity,
+                        title = getPreferredContent(maintenance.titles) ?: "No Title",
+                        description = maintenance.updates.firstOrNull()?.let { update -> getPreferredContent(update.translations) },
+                        platforms = maintenance.platforms
+                    )
+                },
+                incidents = it.incidents.map { incident ->
+                    StatusItemDto(
+                        status = if (incident.active) "Active" else "Resolved",
+                        severity = incident.incidentSeverity,
+                        title = getPreferredContent(incident.titles) ?: "No Title",
+                        description = incident.updates.firstOrNull()?.let { update -> getPreferredContent(update.translations) },
+                        platforms = incident.platforms
+                    )
+                }
+            )
         }
     }
 
@@ -318,7 +340,7 @@ class RiotApiService(
                 riotRestClient.get()
                     .uri(uri, puuid)
                     .retrieve()
-                    .body<CurrentGameInfo>()
+                    .toEntity(CurrentGameInfo::class.java)
             } catch (e: HttpClientErrorException.NotFound) {
                 // 404 means the summoner is not in an active game
                 null
