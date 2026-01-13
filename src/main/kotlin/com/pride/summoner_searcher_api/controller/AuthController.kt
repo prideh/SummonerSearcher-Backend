@@ -82,6 +82,11 @@ class AuthController(
         val user = userRepository.findByEmail(authRequest.email)
             ?: throw RuntimeException("User not found after authentication")
 
+        if (!user.verified) {
+            logger.warn("Login attempt for unverified user: {}", user.email)
+            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("Account not verified. Please check your email to verify your account.")
+        }
+
         if (user.twoFactorEnabled) {
             logger.info("Successful primary authentication for user: {}. 2FA required.", user.email)
             val tempToken = jwtUtil.generateToken(user.email)

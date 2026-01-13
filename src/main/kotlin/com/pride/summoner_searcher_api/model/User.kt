@@ -91,7 +91,8 @@ class User(
 
     /**
      * Indicates whether the user is enabled or disabled.
-     * We have mapped this to our `verified` flag, so an unverified user is considered "disabled".
+     * We have decoupled this from the `verified` flag to allow custom error messages in the controller.
+     * Spring Security will not block login based on this, so we must check `verified` manually.
      */
-    override fun isEnabled(): Boolean = this.verified
+    override fun isEnabled(): Boolean = true
 }
