@@ -62,6 +62,10 @@ class User(
     /** The encrypted 2FA secret key for the user, used to verify authentication codes. */
     var twoFactorSecret: String? = null,
 
+    /** User role for authorization (USER or ADMIN). Defaults to USER for regular users. */
+    @Column(nullable = false, length = 20, columnDefinition = "VARCHAR(20) DEFAULT 'USER'")
+    var role: String = "USER",
+
     /** A list of the user's recent search queries. Stored in a separate `user_recent_searches` table. */
     @ElementCollection(fetch = FetchType.EAGER)
     @CollectionTable(name = "user_recent_searches", joinColumns = [JoinColumn(name = "user_id")])
