@@ -28,4 +28,14 @@ interface AiInteractionRepository : JpaRepository<AiInteraction, UUID> {
         ORDER BY f.createdAt DESC
     """)
     fun findCandidatesForLearning(since: Instant): List<AiInteraction>
+    
+    /**
+     * Count total interactions by user (for abuse protection)
+     */
+    fun countByUserId(userId: Long): Long
+    
+    /**
+     * Count interactions in a session (for session depth detection)
+     */
+    fun countByContextFingerprint(sessionId: String): Long
 }

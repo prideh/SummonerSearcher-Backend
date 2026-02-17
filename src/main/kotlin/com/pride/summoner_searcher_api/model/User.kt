@@ -3,6 +3,7 @@ package com.pride.summoner_searcher_api.model
 import jakarta.persistence.*
 import org.springframework.security.core.GrantedAuthority
 import org.springframework.security.core.userdetails.UserDetails
+import java.time.Instant
 import java.time.LocalDateTime
 
 /**
@@ -65,6 +66,10 @@ class User(
     /** User role for authorization (USER or ADMIN). Defaults to USER for regular users. */
     @Column(nullable = false, length = 20, columnDefinition = "VARCHAR(20) DEFAULT 'USER'")
     var role: String = "USER",
+    
+    /** Timestamp when the user account was created */
+    @Column(nullable = false, columnDefinition = "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP")
+    val createdAt: Instant = Instant.now(),
 
     /** A list of the user's recent search queries. Stored in a separate `user_recent_searches` table. */
     @ElementCollection(fetch = FetchType.EAGER)

@@ -96,7 +96,8 @@ class AiController(
         val abuseScore = feedbackProtectionService.calculateAbuseScore(
             user?.id,
             request.feedbackType,
-            request.engagementTimeMs
+            request.engagementTimeMs,
+            request.sessionId
         )
         
         val isValidated = feedbackProtectionService.isValidForTraining(abuseScore)
@@ -214,7 +215,8 @@ data class AiChatResponse(
 data class FeedbackRequest(
     val interactionId: String,
     val feedbackType: String,
-    val engagementTimeMs: Long
+    val engagementTimeMs: Long,
+    val sessionId: String? = null
 )
 
 data class FeedbackResponse(

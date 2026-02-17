@@ -291,17 +291,89 @@ class RiotApiService(
             }
         }
         
-        logger.info("Found ${allMatchIds.size} matches since $startTime for $puuid")
+        logger.info("Found ${allMatchIds.size} match IDs since $startTime for $puuid")
         
-        // Fetch details in batches to avoid overwhelming the rate limiter or memory
-        // Fetch details in parallel. The rate limiter handles the flow.
-        val matches = allMatchIds.map { matchId ->
-            async {
-                getMatchById(matchId, region)
+        // EARLY TERMINATION WITH BATCH SAMPLING
+        // Since Riot's startTime parameter is broken, we need to manually check timestamps.
+        // To avoid fetching 800+ match details when only 3 are from 2026, we:
+        // 1. Sample first 10 matches from each batch of 100 IDs
+        // 2. If sample contains old matches, stop fetching entirely
+        // 3. Otherwise, fetch the rest of the batch
+        
+        val validMatches = mutableListOf<MatchDto>()
+        val sampleSize = 10
+        
+        if (startTime != null) {
+            val startTimeMs = startTime * 1000
+            logger.info("OPTIMIZATION: Using batch sampling with early termination (startTime=${startTime})")
+            
+            var currentIndex = 0
+            
+            while (currentIndex < allMatchIds.size) {
+                val batchEnd = minOf(currentIndex + 100, allMatchIds.size)
+                val batchIds = allMatchIds.subList(currentIndex, batchEnd)
+                
+                // Sample first matches of this batch
+                val sampleIds = batchIds.take(sampleSize)
+                logger.info("Sampling ${sampleIds.size} matches from batch starting at index $currentIndex")
+                
+                val sampleMatches = sampleIds.map { matchId ->
+                    async { getMatchById(matchId, region) }
+                }.awaitAll().filterNotNull()
+                
+                // Check if any sampled matches are old
+                val hasOldMatches = sampleMatches.any { match ->
+                    val gameCreation = match.info?.gameCreation ?: 0
+                    gameCreation < startTimeMs
+                }
+                
+                if (hasOldMatches) {
+                    logger.warn("EARLY TERMINATION: Detected old matches in sample. Stopping at index $currentIndex (saved ${allMatchIds.size - currentIndex} API calls)")
+                    
+                    // Add only the valid matches from sample
+                    sampleMatches.forEach { match ->
+                        val gameCreation = match.info?.gameCreation ?: 0
+                        if (gameCreation >= startTimeMs) {
+                            validMatches.add(match)
+                        }
+                    }
+                    break
+                }
+                
+                // All samples are recent, add them to valid matches
+                validMatches.addAll(sampleMatches)
+                
+                // Fetch remaining matches in this batch (if any)
+                val remainingIds = batchIds.drop(sampleSize)
+                if (remainingIds.isNotEmpty()) {
+                    logger.info("Sample passed. Fetching ${remainingIds.size} remaining matches in batch")
+                    val remainingMatches = remainingIds.map { matchId ->
+                        async { getMatchById(matchId, region) }
+                    }.awaitAll().filterNotNull()
+                    
+                    // Double-check these are also recent (defense in depth)
+                    remainingMatches.forEach { match ->
+                        val gameCreation = match.info?.gameCreation ?: 0
+                        if (gameCreation >= startTimeMs) {
+                            validMatches.add(match)
+                        }
+                    }
+                }
+                
+                currentIndex = batchEnd
             }
-        }.awaitAll().filterNotNull()
+            
+            logger.info("Returning ${validMatches.size} valid matches after early termination optimization")
+        } else {
+            // No startTime filter, fetch all matches normally
+            logger.info("No startTime specified. Fetching all ${allMatchIds.size} matches")
+            val allMatches = allMatchIds.map { matchId ->
+                async { getMatchById(matchId, region) }
+            }.awaitAll().filterNotNull()
+            validMatches.addAll(allMatches)
+        }
         
-        matches
+        validMatches.toList()
     }
 
     suspend fun fetchMatchHistory(puuid: String, region: String, count: Int): List<MatchDto>? = coroutineScope {
