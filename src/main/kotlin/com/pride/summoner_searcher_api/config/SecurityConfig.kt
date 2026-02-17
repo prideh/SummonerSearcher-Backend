@@ -56,10 +56,11 @@ class SecurityConfig(
                     // Public endpoints: Allow all requests to authentication-related paths.
                     .requestMatchers("/api/auth/**").permitAll()
                     .requestMatchers("/api/auth/refresh-token", "/api/auth/logout").permitAll()
+                    // Allow public access to Riot API endpoints (Leaderboard, Search, Matches, Status)
+                    .requestMatchers("/api/riot/**").permitAll()
                     // Protected endpoints: Require authentication for all other API paths.
                     .requestMatchers("/api/user/**").authenticated()
-                    .requestMatchers("/api/riot/**").authenticated()
-                    .requestMatchers("/api/ai/**").authenticated()
+                    .requestMatchers("/api/ai/**").permitAll()
                     // Default security rule: Deny any request that doesn't match the rules above.
                     .anyRequest().denyAll()
             }

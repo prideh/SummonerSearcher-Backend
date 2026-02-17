@@ -32,8 +32,7 @@ class UserController(
     private val twoFactorAuthService: TwoFactorAuthService,
     private val encryptionService: EncryptionService,
     private val userService: UserService,
-    private val refreshTokenRepository: com.pride.summoner_searcher_api.repository.RefreshTokenRepository,
-    @Value("\${dummy.user.email}") private val dummyUserEmail: String
+    private val refreshTokenRepository: com.pride.summoner_searcher_api.repository.RefreshTokenRepository
 ) {
 
     @Value("\${jwt.cookie.secure:false}")
@@ -45,13 +44,6 @@ class UserController(
     @Value("\${jwt.cookie.domain:}")
     private var cookieDomain: String = ""
 
-    /**
-     * A private helper to check if the authenticated user is the protected dummy user.
-     */
-    private fun isDummyUser(user: User): Boolean {
-        return user.email.equals(dummyUserEmail, ignoreCase = true)
-    }
-
     // ... (rest of the file)
 
     /**
@@ -60,10 +52,6 @@ class UserController(
     @PostMapping("/change-password")
     @Transactional
     fun changePassword(@CurrentUser user: User, @RequestBody request: ChangePasswordRequest): ResponseEntity<String> {
-        if (isDummyUser(user)) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("The dummy account password cannot be changed.")
-        }
-
         if (!passwordEncoder.matches(request.oldPassword, user.hashedPassword)) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Incorrect old password.")
         }
@@ -80,10 +68,6 @@ class UserController(
     @PostMapping("/delete-account")
     @Transactional
     fun deleteAccount(@CurrentUser user: User, @RequestBody request: DeleteAccountRequest): ResponseEntity<String> {
-        if (isDummyUser(user)) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("The dummy account cannot be deleted.")
-        }
-
         if (user.twoFactorEnabled) {
             return ResponseEntity.status(HttpStatus.FORBIDDEN).body("Please disable Two-Factor Authentication before deleting your account.")
         }
@@ -119,10 +103,6 @@ class UserController(
      */
     @GetMapping("/2fa/enable")
     fun enableTwoFactorAuth(@CurrentUser user: User): ResponseEntity<Any> {
-        if (isDummyUser(user)) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("2FA cannot be enabled for the dummy account.")
-        }
-
         val secret = twoFactorAuthService.generateNewSecret()
         val qrCodeDataUri = twoFactorAuthService.createQrCodeDataUri(secret, user.email, "SummonerSearcher")
 
@@ -135,9 +115,7 @@ class UserController(
     @PostMapping("/2fa/verify-enable")
     @Transactional
     fun verifyAndEnableTwoFactorAuth(@CurrentUser user: User, @RequestBody request: TwoFactorEnableRequest): ResponseEntity<String> {
-        if (isDummyUser(user)) {
-            return ResponseEntity.status(HttpStatus.FORBIDDEN).body("2FA cannot be enabled for the dummy account.")
-        }
+
 
         if (!twoFactorAuthService.isCodeValid(request.secret, request.code)) {
             return ResponseEntity.status(HttpStatus.BAD_REQUEST).body("Invalid 2FA code.")

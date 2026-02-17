@@ -22,8 +22,9 @@ class AiController(private val aiAnalysisService: AiAnalysisService) {
     private val logger = LoggerFactory.getLogger(AiController::class.java)
 
     @PostMapping("/chat")
-    fun chat(@CurrentUser user: User, @RequestBody request: AiChatRequest): String {
-        logger.info("AI chat request received from user: ${user.email}")
+    fun chat(@CurrentUser user: User?, @RequestBody request: AiChatRequest): String {
+        val userEmail = user?.email ?: "Anonymous"
+        logger.info("AI chat request received from user: $userEmail")
         logger.debug("Request context keys: ${request.context.keys}")
         logger.debug("User message: ${request.userMessage}")
         
@@ -32,7 +33,7 @@ class AiController(private val aiAnalysisService: AiAnalysisService) {
         val result = aiAnalysisService.analyze(request.context, request.messages, request.userMessage).block()
             ?: "Error: No response from AI service"
         
-        logger.info("AI chat response generated successfully for user: ${user.email}")
+        logger.info("AI chat response generated successfully for user: $userEmail")
         return result
     }
 }

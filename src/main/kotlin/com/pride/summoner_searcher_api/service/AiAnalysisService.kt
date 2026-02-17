@@ -11,7 +11,7 @@ class AiAnalysisService(
 ) {
 
     private val webClient = WebClient.builder()
-        .baseUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent")
+        .baseUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent")
         .build()
 
     fun analyze(context: Map<String, Any>, messages: List<Map<String, String>>, userMessage: String): Mono<String> {

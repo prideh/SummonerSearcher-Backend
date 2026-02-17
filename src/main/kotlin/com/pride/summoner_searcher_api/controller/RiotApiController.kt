@@ -70,12 +70,12 @@ class RiotApiController(
         @PathVariable region: String,
         @PathVariable summonerName: String,
         @PathVariable tagLine: String,
-        @CurrentUser user: User
+        @CurrentUser user: User?
     ): ResponseEntity<SummonerProfileDto?> = runBlocking {
         val summonerProfile = summonerProfileService.getSummonerProfile(region, summonerName, tagLine)
 
-        // If the summoner was found, add the search to the user's recent search history.
-        if (summonerProfile != null) {
+        // If the summoner was found and we have a logged-in user, add the search to the user's recent search history.
+        if (summonerProfile != null && user != null) {
             val searchQuery = "$summonerName#$tagLine"
             userService.addRecentSearch(user, searchQuery, region)
         }
