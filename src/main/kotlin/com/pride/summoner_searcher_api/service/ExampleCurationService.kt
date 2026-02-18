@@ -116,6 +116,41 @@ class ExampleCurationService(
         curationRunRepository.save(curationRun)
         
         logger.info("Example curation complete - Added: $addedCount, Replaced: $replacedCount, Duration: ${durationMs}ms")
+        
+        // 🔄 PROMPT EVOLUTION: detect underperforming categories
+        detectUnderperformingCategories()
+    }
+    
+    /**
+     * Detect question categories with high negative feedback rates.
+     * Categories with >60% negative rate and ≥20 interactions trigger a prompt evolution flag.
+     * Currently logs the finding; future: auto-generate new PromptVersion for that category.
+     */
+    private fun detectUnderperformingCategories() {
+        val since = Instant.now().minus(30, ChronoUnit.DAYS)
+        
+        try {
+            val categoryStats = feedbackRepository.findNegativeRateByCategory(since, minInteractions = 20)
+            
+            categoryStats.forEach { row ->
+                val category = row[0] as? String ?: return@forEach
+                val negativeCount = (row[1] as? Number)?.toDouble() ?: 0.0
+                val totalCount = (row[2] as? Number)?.toDouble() ?: 1.0
+                val negativeRate = negativeCount / totalCount
+                
+                if (negativeRate > 0.60) {
+                    logger.warn(
+                        "PROMPT EVOLUTION TRIGGER: Category '$category' has ${(negativeRate * 100).toInt()}% " +
+                        "negative rate over last 30 days ($totalCount interactions). " +
+                        "Consider rewriting the $category section of the prompt."
+                    )
+                    // TODO Phase 2: auto-generate new PromptVersion for this category
+                    // and A/B test it against the current champion
+                }
+            }
+        } catch (e: Exception) {
+            logger.warn("Could not run underperforming category detection: ${e.message}")
+        }
     }
     
     /**

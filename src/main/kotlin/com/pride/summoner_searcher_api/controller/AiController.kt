@@ -8,6 +8,8 @@ import com.pride.summoner_searcher_api.repository.AiFeedbackRepository
 import com.pride.summoner_searcher_api.repository.AiInteractionRepository
 import com.pride.summoner_searcher_api.repository.AiLearnedExampleRepository
 import com.pride.summoner_searcher_api.repository.CurationRunRepository
+import com.pride.summoner_searcher_api.repository.DiscoveredPatternRepository
+import com.pride.summoner_searcher_api.service.AiAnalysisResult
 import com.pride.summoner_searcher_api.service.AiAnalysisService
 import com.pride.summoner_searcher_api.service.FeedbackProtectionService
 import org.slf4j.LoggerFactory
@@ -28,7 +30,8 @@ import java.util.UUID
 data class AiChatRequest(
     val context: Map<String, Any>,
     val messages: List<Map<String, String>>,
-    val userMessage: String
+    val userMessage: String,
+    val sessionId: String? = null
 )
 
 @RestController
@@ -39,7 +42,8 @@ class AiController(
     private val feedbackRepository: AiFeedbackRepository,
     private val exampleRepository: AiLearnedExampleRepository,
     private val curationRunRepository: CurationRunRepository,
-    private val feedbackProtectionService: FeedbackProtectionService
+    private val feedbackProtectionService: FeedbackProtectionService,
+    private val patternRepository: DiscoveredPatternRepository
 ) {
 
     private val logger = LoggerFactory.getLogger(AiController::class.java)
@@ -54,8 +58,8 @@ class AiController(
         val startTime = System.currentTimeMillis()
         
         // Block on the reactive Mono to make this a synchronous endpoint
-        val result = aiAnalysisService.analyze(request.context, request.messages, request.userMessage).block()
-            ?: "Error: No response from AI service"
+        val result = aiAnalysisService.analyze(request.context, request.messages, request.userMessage, request.sessionId).block()
+            ?: AiAnalysisResult("Error: No response from AI service", 0.7)
         
         val responseTime = System.currentTimeMillis() - startTime
         
@@ -66,17 +70,18 @@ class AiController(
             summonerRank = request.context["rank"]?.toString(),
             summonerRole = request.context["primaryRole"]?.toString(),
             userQuestion = request.userMessage,
-            aiResponse = result,
-            contextFingerprint = generateContextFingerprint(request.context),
+            aiResponse = result.response,
+            contextFingerprint = request.sessionId ?: generateContextFingerprint(request.context),
             promptVersion = "v1.0", // Will be dynamic later
-            responseTimeMs = responseTime
+            responseTimeMs = responseTime,
+            temperature = result.temperature
         )
         val savedInteraction = interactionRepository.save(interaction)
         
-        logger.info("AI chat response generated successfully for user: $userEmail (${responseTime}ms)")
+        logger.info("AI chat response generated (temp=${result.temperature}) for user: $userEmail (${responseTime}ms)")
         
         return AiChatResponse(
-            response = result,
+            response = result.response,
             interactionId = savedInteraction.id.toString()
         )
     }
@@ -205,6 +210,63 @@ class AiController(
             )
         }
     }
+    
+    /**
+     * Admin endpoint: Get temperature performance stats per category
+     */
+    @GetMapping("/temperature-stats")
+    fun getTemperatureStats(@CurrentUser user: User?): List<TemperatureStatResponse> {
+        if (user == null) throw ResponseStatusException(HttpStatus.UNAUTHORIZED, "Authentication required")
+        if (user.role != "ADMIN") throw ResponseStatusException(HttpStatus.FORBIDDEN, "Admin access required")
+        
+        // Get all interactions with temperature set, joined with positive feedback
+        val stats = interactionRepository.findAvgQualityByTemperatureAndCategory("")
+        
+        // Group by temperature: count interactions and positive feedback per temp
+        val tempGroups = interactionRepository.findAll()
+            .filter { it.temperature != null }
+            .groupBy { it.temperature!! }
+        
+        return tempGroups.map { (temp, interactions) ->
+            val positiveFeedbackCount = interactions.count { interaction ->
+                feedbackRepository.findByInteractionId(interaction.id!!)
+                    .map { it.feedbackType == "positive" && it.isValidated }.orElse(false)
+            }
+            val totalWithFeedback = interactions.count { interaction ->
+                feedbackRepository.findByInteractionId(interaction.id!!).isPresent
+            }
+            TemperatureStatResponse(
+                temperature = temp,
+                totalUses = interactions.size,
+                positiveCount = positiveFeedbackCount,
+                satisfactionRate = if (totalWithFeedback > 0) 
+                    (positiveFeedbackCount.toDouble() / totalWithFeedback * 100).toBigDecimal().setScale(1, RoundingMode.HALF_UP).toDouble()
+                    else null
+            )
+        }.sortedBy { it.temperature }
+    }
+    
+    /**
+     * Admin endpoint: Get discovered behavioral patterns
+     */
+    @GetMapping("/discovered-patterns")
+    fun getDiscoveredPatterns(@CurrentUser user: User?): List<DiscoveredPatternResponse> {
+        if (user == null) throw ResponseStatusException(HttpStatus.UNAUTHORIZED, "Authentication required")
+        if (user.role != "ADMIN") throw ResponseStatusException(HttpStatus.FORBIDDEN, "Admin access required")
+        
+        return patternRepository.findAll()
+            .sortedByDescending { it.confidenceScore }
+            .map { pattern ->
+                DiscoveredPatternResponse(
+                    triggerCategory = pattern.triggerCategory,
+                    followUpCategory = pattern.followUpCategory,
+                    occurrenceCount = pattern.occurrenceCount,
+                    confidenceScore = (pattern.confidenceScore * 100).toBigDecimal().setScale(1, RoundingMode.HALF_UP).toDouble(),
+                    isActive = pattern.isActive,
+                    lastUpdated = pattern.lastUpdated.toString()
+                )
+            }
+    }
 }
 
 data class AiChatResponse(
@@ -239,4 +301,20 @@ data class CurationRunResponse(
     val examplesReplaced: Int,
     val avgQualityScore: Double?,
     val durationMs: Long?
+)
+
+data class TemperatureStatResponse(
+    val temperature: Double,
+    val totalUses: Int,
+    val positiveCount: Int,
+    val satisfactionRate: Double?
+)
+
+data class DiscoveredPatternResponse(
+    val triggerCategory: String,
+    val followUpCategory: String,
+    val occurrenceCount: Int,
+    val confidenceScore: Double,
+    val isActive: Boolean,
+    val lastUpdated: String
 )

@@ -50,6 +50,9 @@ class AiInteraction(
     /** Response time in milliseconds */
     val responseTimeMs: Long? = null,
     
+    /** Temperature used for this generation (for A/B learning) */
+    val temperature: Double? = null,
+    
     @Column(nullable = false)
     val createdAt: Instant = Instant.now()
 )

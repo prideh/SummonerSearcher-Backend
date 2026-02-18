@@ -1,23 +1,73 @@
 package com.pride.summoner_searcher_api.service
 
+import com.pride.summoner_searcher_api.repository.AiInteractionRepository
 import com.pride.summoner_searcher_api.repository.AiLearnedExampleRepository
+import com.pride.summoner_searcher_api.repository.DiscoveredPatternRepository
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.data.domain.PageRequest
 import org.springframework.stereotype.Service
 import org.springframework.web.reactive.function.client.WebClient
 import reactor.core.publisher.Mono
 
+data class AiAnalysisResult(val response: String, val temperature: Double)
+
 @Service
 class AiAnalysisService(
     @Value("\${GEMINI_API_KEY:}") private val apiKey: String,
-    private val exampleRepository: AiLearnedExampleRepository
+    private val exampleRepository: AiLearnedExampleRepository,
+    private val interactionRepository: AiInteractionRepository,
+    private val patternRepository: DiscoveredPatternRepository
 ) {
 
     private val webClient = WebClient.builder()
         .baseUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-lite:generateContent")
         .build()
+    
+    // Available temperatures and their initial weights
+    // Weights are updated dynamically based on feedback per category
+    private val baseTemperatureWeights = mapOf(
+        0.3 to 1.0,  // Structured, drill-focused
+        0.7 to 1.0,  // Balanced (current default)
+        1.0 to 1.0,  // Creative, uses analogies
+        1.3 to 0.5   // Unconventional framing (starts at half weight - risky)
+    )
+    
+    /**
+     * Select temperature using weighted random based on historical performance per category.
+     * Early on: roughly equal distribution. Over time: winners get more traffic.
+     * Never drops to 0% - always some exploration.
+     */
+    fun selectTemperature(category: String): Double {
+        val weights = baseTemperatureWeights.toMutableMap()
+        
+        // Adjust weights based on historical performance for this category
+        try {
+            val stats = interactionRepository.findAvgQualityByTemperatureAndCategory(category)
+            stats.forEach { row ->
+                val temp = (row[0] as? Number)?.toDouble() ?: return@forEach
+                val avgScore = (row[1] as? Number)?.toDouble() ?: return@forEach
+                val currentWeight = weights[temp] ?: 1.0
+                // Scale weight by relative performance (normalized around 75 baseline)
+                val performanceMultiplier = (avgScore / 75.0).coerceIn(0.2, 3.0)
+                weights[temp] = (currentWeight * performanceMultiplier).coerceAtLeast(0.1)
+            }
+        } catch (e: Exception) {
+            // Fall back to base weights if query fails
+        }
+        
+        // Weighted random selection
+        val totalWeight = weights.values.sum()
+        var random = Math.random() * totalWeight
+        for ((temp, weight) in weights) {
+            random -= weight
+            if (random <= 0) return temp
+        }
+        return 0.7 // fallback
+    }
 
-    fun analyze(context: Map<String, Any>, messages: List<Map<String, String>>, userMessage: String): Mono<String> {
+    fun analyze(context: Map<String, Any>, messages: List<Map<String, String>>, userMessage: String, sessionId: String? = null): Mono<AiAnalysisResult> {
+        val category = categorizeQuestion(userMessage)
+        val temperature = selectTemperature(category)
         val prompt = constructPrompt(context, messages, userMessage)
         
         val requestBody = mapOf(
@@ -27,6 +77,10 @@ class AiAnalysisService(
                         mapOf("text" to prompt)
                     )
                 )
+            ),
+            "generationConfig" to mapOf(
+                "temperature" to temperature,
+                "maxOutputTokens" to 1024
             )
         )
 
@@ -35,7 +89,7 @@ class AiAnalysisService(
             .bodyValue(requestBody)
             .retrieve()
             .bodyToMono(String::class.java)
-            .map { response -> extractContent(response) }
+            .map { response -> AiAnalysisResult(extractContent(response), temperature) }
     }
 
     private fun constructPrompt(context: Map<String, Any>, messages: List<Map<String, String>>, userMessage: String): String {
@@ -63,6 +117,23 @@ class AiAnalysisService(
             }}
             """.trimIndent()
         } else ""
+        
+        // 🧠 BEHAVIORAL PATTERN INJECTION
+        // Discovered from real user sessions: what do users ask AFTER this category?
+        val patternHints = try {
+            val patterns = patternRepository.findByTriggerCategoryAndIsActiveTrue(questionCategory)
+            if (patterns.isNotEmpty()) {
+                val hints = patterns
+                    .sortedByDescending { it.confidenceScore }
+                    .take(2)
+                    .joinToString(", ") { "${it.followUpCategory} (${(it.confidenceScore * 100).toInt()}% of users ask this next)" }
+                """
+                **COACHING INSIGHT (from real user data):**
+                After answering $questionCategory questions, users commonly follow up about: $hints
+                Briefly touch on these topics if relevant, to pre-emptively answer their next question.
+                """.trimIndent()
+            } else ""
+        } catch (e: Exception) { "" }
         
         // 🎯 DYNAMIC OPTIMIZATIONS
         val rankOptimization = getRankSpecificGuidance(context["rank"]?.toString() ?: "")
@@ -100,6 +171,8 @@ class AiAnalysisService(
             - Professional, analytical tone - NO excessive compliments
             
             $fewShotSection
+            
+            $patternHints
             
             **ADVANCED LOL CONCEPTS TO CONSIDER (based on question topic):**
             

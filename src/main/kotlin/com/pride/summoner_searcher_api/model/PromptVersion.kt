@@ -38,6 +38,14 @@ class PromptVersion(
     @Column(nullable = false)
     var negativeFeedbackCount: Int = 0,
     
+    /** Which question category this version targets (null = global/all categories) */
+    @Column(length = 100)
+    val categoryScope: String? = null,
+    
+    /** Whether this is an active A/B test challenger (vs the current champion) */
+    @Column(nullable = false)
+    var isChallenger: Boolean = false,
+    
     @Column(nullable = false)
     val createdAt: Instant = Instant.now()
 )

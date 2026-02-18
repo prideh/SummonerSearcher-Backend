@@ -48,6 +48,9 @@ class AiLearnedExample(
     @Column(nullable = false)
     var timesUsed: Int = 0,
     
+    /** Temperature that produced this example (for learning which temp works best) */
+    val temperature: Double? = null,
+    
     @Column(nullable = false)
     val createdAt: Instant = Instant.now()
 )
