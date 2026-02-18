@@ -389,11 +389,24 @@ class RiotApiService(
     suspend fun fetchNewMatches(puuid: String, region: String, startTime: Long): List<MatchDto>? = coroutineScope {
         val matchIds = getMatchIdsByPuuid(puuid, region, 420, startTime, null, 100, 0) ?: return@coroutineScope emptyList()
         
-        matchIds.map { matchId ->
+        val allMatches = matchIds.map { matchId ->
             async {
                 getMatchById(matchId, region)
             }
         }.awaitAll().filterNotNull()
+        
+        // CLIENT-SIDE DATE FILTER: Riot's startTime parameter is broken.
+        // Filter manually to only return matches newer than startTime.
+        val startTimeMs = startTime * 1000
+        val filtered = allMatches.filter { match ->
+            (match.info?.gameCreation ?: 0) >= startTimeMs
+        }
+        
+        if (filtered.size < allMatches.size) {
+            logger.warn("fetchNewMatches: Filtered out ${allMatches.size - filtered.size} old matches (Riot API bug)")
+        }
+        
+        filtered
     }
 
     suspend fun getMatchById(matchId: String, region: String): MatchDto? {
