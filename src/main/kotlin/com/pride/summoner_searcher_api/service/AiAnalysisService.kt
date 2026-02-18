@@ -8,7 +8,10 @@ import org.springframework.beans.factory.annotation.Value
 import org.springframework.data.domain.PageRequest
 import org.springframework.stereotype.Service
 import org.springframework.web.reactive.function.client.WebClient
+import org.springframework.web.reactive.function.client.WebClientResponseException
 import reactor.core.publisher.Mono
+import reactor.util.retry.Retry
+import java.time.Duration
 
 data class AiAnalysisResult(val response: String, val temperature: Double)
 
@@ -95,6 +98,14 @@ class AiAnalysisService(
                     .bodyValue(requestBody)
                     .retrieve()
                     .bodyToMono(String::class.java)
+                    .retryWhen(
+                        Retry.backoff(3, Duration.ofMillis(500))
+                            .filter { error -> 
+                                error is WebClientResponseException && 
+                                (error.statusCode.value() == 429 || error.statusCode.is5xxServerError)
+                            }
+                            .onRetryExhaustedThrow { _, signal -> signal.failure() }
+                    )
                     .map { response -> AiAnalysisResult(extractContent(response), temperature) }
             }
     }

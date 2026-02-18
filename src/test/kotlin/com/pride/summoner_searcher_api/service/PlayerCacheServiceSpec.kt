@@ -2,7 +2,6 @@ package com.pride.summoner_searcher_api.service
 
 import com.pride.summoner_searcher_api.dto.*
 import io.mockk.*
-import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.runBlocking
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.BeforeEach
@@ -13,6 +12,7 @@ class PlayerCacheServiceSpec {
 
     private lateinit var redisCacheService: RedisCacheService
     private lateinit var riotApiService: RiotApiService
+    private lateinit var statsCalculator: StatsCalculator
     private lateinit var playerCacheService: PlayerCacheService
 
     private val puuid = "test-puuid"
@@ -24,13 +24,14 @@ class PlayerCacheServiceSpec {
     fun setup() {
         redisCacheService = mockk(relaxed = true)
         riotApiService = mockk(relaxed = true)
-        playerCacheService = PlayerCacheService(redisCacheService, riotApiService)
+        statsCalculator = mockk(relaxed = true)
+        playerCacheService = PlayerCacheService(redisCacheService, riotApiService, statsCalculator)
     }
 
     @Test
-    fun `getPlayerProfile - Cache Miss - Streams matches and saves profile`() = runBlocking {
+    fun `getPlayerProfile - Cache Miss - Fetches full profile and saves`() = runBlocking {
         // Mock Cache Miss
-        every { redisCacheService.get(any(), SummonerProfileDto::class.java) } returns null
+        every { redisCacheService.get(any<String>(), eq(SummonerProfileDto::class.java)) } returns null
         
         // Mock Riot API Profile
         val mockProfile = SummonerProfileDto(
@@ -39,71 +40,103 @@ class PlayerCacheServiceSpec {
         )
         coEvery { riotApiService.fetchSummonerProfile(puuid, region) } returns mockProfile
         
-        // Mock Stream Matches (50 matches)
-        val mockMatches = (1..50).map { i ->
-            val p = mockk<ParticipantDto>(relaxed = true) {
-                every { puuid } returns this@PlayerCacheServiceSpec.puuid
-                every { win } returns true
-                every { kills } returns 1
-                every { deaths } returns 0
-                every { assists } returns 5
-                every { championName } returns "Ahri"
-                every { teamId } returns 100
-                every { teamPosition } returns "MIDDLE"
-                every { totalMinionsKilled } returns 100
-                every { neutralMinionsKilled } returns 0
-                every { visionScore } returns 10
-                every { challenges } returns mockk(relaxed=true) {
-                     every { soloKills } returns 0
-                     every { turretPlatesTaken } returns 0
-                }
-            }
-            
-            val info = mockk<MatchInfo>(relaxed = true) {
-                every { gameCreation } returns (System.currentTimeMillis() - (i * 100000))
-                every { gameDuration } returns 1800
-                every { gameId } returns i.toLong()
-                every { participants } returns listOf(p)
-            }
-            
-            mockk<MatchDto>(relaxed = true) {
-                every { this@mockk.info } returns info
-            }
-        }
+        // Mock Matches
+        val mockMatches = listOf(
+            mockk<MatchDto>(relaxed = true)
+        )
+        coEvery { riotApiService.fetchAllMatchesSince(puuid, region, any<Long>()) } returns mockMatches
         
-        coEvery { riotApiService.streamMatches(eq(puuid), eq(region), any()) } returns flowOf(*mockMatches.toTypedArray())
+        // Mock Stats
+        every { statsCalculator.calculateStats(any<List<MatchDto>>(), any<String>()) } returns Pair(emptyList(), mockk(relaxed = true))
 
         // Execute
         val result = playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine)
 
         // Verify
         assertNotNull(result)
-        assertEquals(20, result?.recentMatches?.size) // Top 20 kept
-        assertEquals(50, result?.totalMatches) 
-        assertEquals(50, result?.overallStats?.wins)
-
-        // Verify Redis interactions
-        verify { 
-            redisCacheService.pushToList(
-                eq("player:matches:$region:$puuid"), 
-                match<List<MatchDto>> { it.size == 50 }
-            ) 
-        }
-        // Check if profile was saved
-        verify { redisCacheService.set(eq("player:profile:$region:$puuid"), any(), any()) }
+        assertEquals(1, result?.totalMatches)
+        
+        // Verify Redis save
+        verify { redisCacheService.set(eq("player:profile:$region:$puuid"), any<SummonerProfileDto>(), any<Duration>()) }
     }
 
     @Test
-    fun `getMatches - Returns paginated list from Redis`() {
-        val start = 0
-        val end = 19
-        val mockList = listOf(mockk<MatchDto>(relaxed = true))
-        
-        every { redisCacheService.getFromList(any(), start.toLong(), end.toLong(), MatchDto::class.java) } returns mockList
+    fun `getPlayerProfile - Cache Hit - Updates with new matches`() = runBlocking {
+        // Create a dummy LeagueEntryDto for rank
+        val rankDto = LeagueEntryDto(
+            puuid = puuid, leaguePoints = 50, rank = "IV", wins = 10, losses = 10, 
+            veteran = false, inactive = false, freshBlood = false, hotStreak = false, 
+            leagueId = "123", queueType = "RANKED_SOLO_5x5", tier = "GOLD", summonerName = "Test"
+        )
 
-        val result = playerCacheService.getMatches(puuid, region, start, end)
+        // Mock Cache Hit with existing profile
+        val cachedMatches = listOf(mockk<MatchDto>(relaxed = true) {
+            every { info } returns mockk { every { gameId } returns 100L; every { gameCreation } returns 1000000L }
+        })
+        val cachedProfile = SummonerProfileDto(
+            puuid = puuid, gameName = summonerName, tagLine = tagLine,
+            summonerLevel = 100, profileIconId = 1, soloQueueRank = rankDto, 
+            recentMatches = cachedMatches, totalMatches = 1, championStats = emptyList(), overallStats = mockk(relaxed=true)
+        )
+        every { redisCacheService.get(any<String>(), eq(SummonerProfileDto::class.java)) } returns cachedProfile
         
-        assertEquals(mockList, result)
-        verify { redisCacheService.getFromList(eq("player:matches:$region:$puuid"), start.toLong(), end.toLong(), MatchDto::class.java) }
+        // Mock New Matches found
+        val newMatch = mockk<MatchDto>(relaxed = true) {
+            every { info } returns mockk { every { gameId } returns 200L; every { gameCreation } returns 2000000L }
+        }
+        coEvery { riotApiService.fetchNewMatches(puuid, region, any<Long>()) } returns listOf(newMatch)
+        
+        // Mock Rank Check (unchanged)
+        coEvery { riotApiService.fetchLeagueRank(puuid, region) } returns rankDto
+        
+        // Mock Stats Recalculation
+        every { statsCalculator.calculateStats(any<List<MatchDto>>(), any<String>()) } returns Pair(emptyList(), mockk(relaxed = true))
+
+        // Execute
+        val result = playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine)
+
+        // Verify
+        assertNotNull(result)
+        assertEquals(2, result?.recentMatches?.size) // 1 cached + 1 new
+        
+        // Verify Redis updated
+        verify { redisCacheService.set(eq("player:profile:$region:$puuid"), any<SummonerProfileDto>(), any<Duration>()) }
+    }
+
+    @Test
+    fun `getPlayerProfile - Cache Hit - No new matches - Returns cached`() = runBlocking {
+         // Create a dummy LeagueEntryDto for rank
+        val rankDto = LeagueEntryDto(
+            puuid = puuid, leaguePoints = 50, rank = "IV", wins = 10, losses = 10, 
+            veteran = false, inactive = false, freshBlood = false, hotStreak = false, 
+            leagueId = "123", queueType = "RANKED_SOLO_5x5", tier = "GOLD", summonerName = "Test"
+        )
+
+        // Mock Cache Hit
+         val cachedMatches = listOf(mockk<MatchDto>(relaxed = true) {
+            every { info } returns mockk { every { gameId } returns 100L; every { gameCreation } returns 1000000L }
+        })
+        val cachedProfile = SummonerProfileDto(
+            puuid = puuid, gameName = summonerName, tagLine = tagLine,
+            summonerLevel = 100, profileIconId = 1, soloQueueRank = rankDto,
+            recentMatches = cachedMatches, totalMatches = 1, 
+            championStats = listOf(mockk(relaxed=true)), // NON-EMPTY to avoid migration update
+            overallStats = mockk(relaxed=true)
+        )
+        every { redisCacheService.get(any<String>(), eq(SummonerProfileDto::class.java)) } returns cachedProfile
+        
+        // Mock No New Matches
+        coEvery { riotApiService.fetchNewMatches(puuid, region, any<Long>()) } returns emptyList()
+        coEvery { riotApiService.fetchLeagueRank(puuid, region) } returns rankDto // Rank unchanged
+
+        // Execute
+        val result = playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine)
+
+        // Verify
+        assertNotNull(result)
+        assertEquals(1, result?.recentMatches?.size)
+        
+        // Verify Redis NOT written (aside from maybe logging or if name changed, here name is same)
+        verify(exactly = 0) { redisCacheService.set(eq("player:profile:$region:$puuid"), any<SummonerProfileDto>(), any<Duration>()) }
     }
 }
