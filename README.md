@@ -109,4 +109,4 @@ To prevent API rate-limiting during peak usage, leaderboards are not fetched in 
 
 * **Riot Games API:** Accessed via a singleton `RestClient` with automatic `X-Riot-Token` header injection and rate-limit handling.
 * **Redis:** Caching layer for Leaderboards and Summoner Profiles.
-* **SendGrid:** Email delivery service for verification and password resets.
+* **Resend:** Email delivery service for verification and password resets.
