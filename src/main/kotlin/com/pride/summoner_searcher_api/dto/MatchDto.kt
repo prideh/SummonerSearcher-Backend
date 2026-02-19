@@ -14,7 +14,14 @@ import com.fasterxml.jackson.annotation.JsonProperty
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class MatchDto(
+    val metadata: MatchMetadata?,
     val info: MatchInfo?
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class MatchMetadata(
+    val matchId: String?,
+    val participants: List<String>?
 )
 
 /**

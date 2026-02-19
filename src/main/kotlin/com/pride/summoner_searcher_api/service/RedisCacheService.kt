@@ -50,6 +50,54 @@ class RedisCacheService(
     }
 
     /**
+     * Retrieves and deserializes multiple objects from the Redis cache in a single round-trip.
+     * Use this for batch fetching to reduce network latency.
+     * @param keys The list of keys to retrieve.
+     * @param type The class type of the objects.
+     * @return A map of Key -> Object? for found items. Keys with no value in Redis will have null.
+     */
+    fun <T> multiGet(keys: List<String>, type: Class<T>): Map<String, T?> {
+        if (keys.isEmpty()) return emptyMap()
+
+        val rawValues = redisTemplate.opsForValue().multiGet(keys) ?: return keys.associateWith { null }
+
+        // rawValues matches the order of keys
+        val result = mutableMapOf<String, T?>()
+        
+        for (i in keys.indices) {
+            val key = keys[i]
+            val rawValue = rawValues.getOrNull(i)
+            
+            if (rawValue == null) {
+                result[key] = null
+                continue
+            }
+
+            val json = if (rawValue.startsWith(COMPRESSION_PREFIX)) {
+                try {
+                    decompress(rawValue.removePrefix(COMPRESSION_PREFIX))
+                } catch (e: Exception) {
+                    null
+                }
+            } else {
+                rawValue
+            }
+
+            val obj = if (json != null) {
+                try {
+                    objectMapper.readValue(json, type)
+                } catch (e: Exception) {
+                    null
+                }
+            } else null
+            
+            result[key] = obj
+        }
+        
+        return result
+    }
+
+    /**
      * Serializes, compresses, and stores an object in the Redis cache.
      */
     fun <T> set(key: String, value: T, expiration: Duration) {
@@ -61,6 +109,23 @@ class RedisCacheService(
         } else {
             redisTemplate.opsForValue().set(key, compressed, expiration)
         }
+    }
+
+    /**
+     * Tries to set a key if it does not already exist. Useful for locking.
+     * @return true if the key was set, false if it already existed.
+     */
+    fun setIfAbsent(key: String, value: String, expiration: Duration): Boolean {
+        // We calculate value separately only if needed, but for locks usually value doesn't matter much.
+        // For simplicity, we just store the raw string provided (e.g., "LOCKED").
+        return redisTemplate.opsForValue().setIfAbsent(key, value, expiration) == true
+    }
+
+    /**
+     * Deletes a key from Redis.
+     */
+    fun delete(key: String) {
+        redisTemplate.delete(key)
     }
 
     private fun compress(data: String): String {

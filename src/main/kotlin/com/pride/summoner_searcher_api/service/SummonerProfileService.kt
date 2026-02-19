@@ -38,26 +38,19 @@ class SummonerProfileService(
     }
 
     suspend fun getMatches(region: String, puuid: String, page: Int, pageSize: Int = 20): List<com.pride.summoner_searcher_api.dto.MatchDto> {
-        // We need to retrieve the full profile to get the matches.
-        // Since we don't have name/tag here, we might need a method in PlayerCacheService to get by PUUID only?
-        // Or we can just rely on the cache key being PUUID based.
-        // But PlayerCacheService.getPlayerProfile requires name/tag to update them.
-        // Let's add a getProfileByPuuid method to PlayerCacheService or just pass empty strings if we know it's cached?
-        // Better: Add getCachedProfile(puuid, region) to PlayerCacheService.
-        
-        // For now, let's assume we can't easily get it without name/tag unless we change PlayerCacheService.
-        // But wait, the controller usually has access to name/tag from the request if it's a search.
-        // But for "Load More", we might only send PUUID.
-        
-        // Let's add getCachedProfile to PlayerCacheService.
         val fullProfile = playerCacheService.getCachedProfile(puuid, region) ?: return emptyList()
         
+        val allMatchIds = fullProfile.allMatchIds
+        if (allMatchIds.isEmpty()) return emptyList()
+
         val start = (page - 1) * pageSize
         val end = start + pageSize
         
-        val allMatches = fullProfile.recentMatches ?: emptyList()
-        if (start >= allMatches.size) return emptyList()
+        if (start >= allMatchIds.size) return emptyList()
         
-        return allMatches.subList(start, minOf(end, allMatches.size))
+        val pageMatchIds = allMatchIds.subList(start, minOf(end, allMatchIds.size))
+        
+        // Use the bulk fetch method in PlayerCacheService
+        return playerCacheService.getMatchesByIds(pageMatchIds, region)
     }
 }
