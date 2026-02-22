@@ -169,7 +169,7 @@ class PlayerCacheService(
                 lastRefreshed = java.time.Instant.now()
             )
             
-            redisCacheService.set(cacheKey, updatedProfile, Duration.ofDays(30)) // Store for 30 days
+            redisCacheService.set(cacheKey, updatedProfile, Duration.ofDays(14)) // Store for 14 days
             logger.info("Refreshed profile for $summonerName. Analyzed ${validMatchIds.size} valid matches (out of ${allMatchIds.size} fetched IDs).")
             
             return@coroutineScope updatedProfile
