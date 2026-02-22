@@ -10,6 +10,25 @@
     <img src="https://img.shields.io/badge/🔗_View_Frontend_Repo-React-20232A?style=for-the-badge&logo=react&logoColor=61DAFB" alt="View Frontend Repo" />
   </a>
 
+---
+
+## 🚀 Quick Start (Local Development)
+
+To get the backend running with a local database and cache:
+
+1. **Install Prerequisites:** Ensure [Docker Desktop](https://www.docker.com/products/docker-desktop/) is installed and running.
+2. **Setup Environment:** Copy the example environment file:
+   ```powershell
+   cp .env.example .env
+   ```
+   *Fill in your `RIOT_API_KEY` in the newly created `.env` file.*
+3. **Launch Databases:** Run the following command to start PostgreSQL 18 and Redis:
+   ```powershell
+   docker compose up -d postgres redis
+   ```
+4. **Run the App:** You can now run the application via your IDE or using `./gradlew bootRun`.
+
+---
 
 The backend is a **Kotlin + Spring Boot 3.5** service structured around classic **MVC architecture**, supported by enterprise patterns including Singleton Beans, Filter Chains, and Repository Patterns.
 
