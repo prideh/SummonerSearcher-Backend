@@ -165,8 +165,10 @@ class UserController(
      * Retrieves the user's recent search history.
      */
     @GetMapping("/recent-searches")
+    @Transactional(readOnly = true)
     fun getRecentSearches(@CurrentUser user: User): ResponseEntity<List<com.pride.summoner_searcher_api.model.RecentSearch>> {
-        return ResponseEntity.ok(user.recentSearches)
+        val attachedUser = userRepository.findById(user.id).orElseThrow()
+        return ResponseEntity.ok(attachedUser.recentSearches.toList())
     }
 
     /**
@@ -175,8 +177,9 @@ class UserController(
     @PostMapping("/recent-searches/clear")
     @Transactional
     fun clearRecentSearches(@CurrentUser user: User): ResponseEntity<String> {
-        user.recentSearches.clear()
-        userRepository.save(user)
+        val attachedUser = userRepository.findById(user.id).orElseThrow()
+        attachedUser.recentSearches.clear()
+        userRepository.save(attachedUser)
         return ResponseEntity.ok("Recent searches cleared.")
     }
 }

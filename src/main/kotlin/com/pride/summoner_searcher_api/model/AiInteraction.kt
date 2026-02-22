@@ -8,7 +8,7 @@ import java.util.UUID
  * Stores every AI interaction for learning and analysis
  */
 @Entity
-@Table(name = "ai_interactions")
+@Table(name = "ai_interactions", indexes = [Index(columnList = "summonerName")])
 class AiInteraction(
     @Id
     @GeneratedValue(strategy = GenerationType.UUID)

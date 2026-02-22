@@ -69,6 +69,7 @@ class AuthController(
      * If 2FA is enabled, it returns a temporary token. Otherwise, it returns the final authentication response.
      */
     @PostMapping("/login")
+    @Transactional(readOnly = true)
     fun createAuthenticationToken(@RequestBody authRequest: AuthRequest): ResponseEntity<Any> {
         try {
             authenticationManager.authenticate(
@@ -121,6 +122,7 @@ class AuthController(
      * @return The final [AuthResponse] upon successful verification.
      */
     @PostMapping("/2fa-login")
+    @Transactional(readOnly = true)
     fun twoFactorLogin(@RequestBody request: TwoFactorLoginRequest): ResponseEntity<Any> {
         val email = jwtUtil.getEmailFromToken(request.tempToken)
         val user = userRepository.findByEmail(email)

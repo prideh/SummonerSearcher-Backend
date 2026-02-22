@@ -72,7 +72,7 @@ class User(
     val createdAt: Instant = Instant.now(),
 
     /** A list of the user's recent search queries. Stored in a separate `user_recent_searches` table. */
-    @ElementCollection(fetch = FetchType.EAGER)
+    @ElementCollection(fetch = FetchType.LAZY)
     @CollectionTable(name = "user_recent_searches", joinColumns = [JoinColumn(name = "user_id")])
     var recentSearches: MutableList<RecentSearch> = mutableListOf()
 

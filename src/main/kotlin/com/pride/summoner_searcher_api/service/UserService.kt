@@ -29,7 +29,8 @@ class UserService(private val userRepository: UserRepository) {
      */
     @Transactional
     fun addRecentSearch(user: User, searchQuery: String, server: String) {
-        val searches = user.recentSearches
+        val attachedUser = userRepository.findById(user.id).orElseThrow()
+        val searches = attachedUser.recentSearches
         val newSearch = com.pride.summoner_searcher_api.model.RecentSearch(searchQuery, server)
         
         // Remove the query if it already exists (same query AND same server) to avoid duplicates and to move it to the top.
@@ -44,8 +45,8 @@ class UserService(private val userRepository: UserRepository) {
             .flatMap { (_, serverSearches) -> serverSearches.take(5) }
             .toMutableList()
 
-        user.recentSearches = limitedSearches
-        userRepository.save(user)
+        attachedUser.recentSearches = limitedSearches
+        userRepository.save(attachedUser)
     }
 
     /**
@@ -54,7 +55,8 @@ class UserService(private val userRepository: UserRepository) {
      */
     @Transactional
     fun clearRecentSearches(user: User) {
-        user.recentSearches.clear()
-        userRepository.save(user)
+        val attachedUser = userRepository.findById(user.id).orElseThrow()
+        attachedUser.recentSearches.clear()
+        userRepository.save(attachedUser)
     }
 }
