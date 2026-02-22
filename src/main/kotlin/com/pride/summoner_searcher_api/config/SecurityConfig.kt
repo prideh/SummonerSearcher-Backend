@@ -58,6 +58,8 @@ class SecurityConfig(
                     .requestMatchers("/api/auth/refresh-token", "/api/auth/logout").permitAll()
                     // Allow public access to Riot API endpoints (Leaderboard, Search, Matches, Status)
                     .requestMatchers("/api/riot/**").permitAll()
+                    // Allow public access to feedback endpoints
+                    .requestMatchers("/api/feedback/**").permitAll()
                     // Protected endpoints: Require authentication for all other API paths.
                     .requestMatchers("/api/user/**").authenticated()
                     .requestMatchers("/api/ai/**").permitAll()
