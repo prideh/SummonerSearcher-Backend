@@ -74,6 +74,7 @@ data class TimelineEventDto(
     val skillSlot: Int?,
     val levelUpType: String?,
     val wardType: String?,
+    val creatorId: Int?, // For wards
     val level: Int?,
     val buildingType: String?,
     val laneType: String?,

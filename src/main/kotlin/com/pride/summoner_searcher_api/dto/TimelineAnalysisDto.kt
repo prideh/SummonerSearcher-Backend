@@ -12,6 +12,8 @@ data class TimelineAnalysisDto(
     val wardPositions: List<HeatmapPoint>,
     /** Positions where the player got kills */
     val killPositions: List<HeatmapPoint>,
+    /** Positions where the player got assists */
+    val assistPositions: List<HeatmapPoint>,
     /** Per-match power spike data (player gold vs opponent gold over time) */
     val powerSpikeTimelines: List<MatchPowerSpikeDto>,
     /** Per-match build order */
@@ -27,7 +29,8 @@ data class TimelineAnalysisDto(
 data class HeatmapPoint(
     val x: Int,
     val y: Int,
-    val matchId: String
+    val matchId: String,
+    val minute: Int
 )
 
 /** Minute-by-minute gold/level comparison between player and lane opponent */
@@ -36,8 +39,13 @@ data class PowerSpikePoint(
     val playerGold: Int,
     val opponentGold: Int,
     val playerGoldLead: Int,
+    val playerXp: Int,
+    val opponentXp: Int,
+    val playerCs: Int,
+    val opponentCs: Int,
     val playerItems: List<Int>,     // item IDs purchased by the minute mark
-    val opponentItems: List<Int>
+    val opponentItems: List<Int>,
+    val events: List<MatchEventEntry> // significant events happening this minute
 )
 
 data class MatchPowerSpikeDto(
@@ -105,5 +113,6 @@ data class TimelineAggregateSummary(
     val wardsPlacedTotal: Int,
     val deathsTotal: Int,
     val killsTotal: Int,
+    val assistsTotal: Int,
     val gamesAnalyzed: Int
 )

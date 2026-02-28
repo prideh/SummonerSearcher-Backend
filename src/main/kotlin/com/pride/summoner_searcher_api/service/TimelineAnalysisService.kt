@@ -36,6 +36,7 @@ class TimelineAnalysisService {
         val deaths = mutableListOf<HeatmapPoint>()
         val wards = mutableListOf<HeatmapPoint>()
         val kills = mutableListOf<HeatmapPoint>()
+        val assists = mutableListOf<HeatmapPoint>()
         val powerSpikes = mutableListOf<MatchPowerSpikeDto>()
         val buildOrders = mutableListOf<BuildOrderDto>()
         val skillOrders = mutableListOf<SkillOrderDto>()
@@ -49,6 +50,7 @@ class TimelineAnalysisService {
         var totalWards = 0
         var totalDeaths = 0
         var totalKills = 0
+        var totalAssists = 0
 
         for ((matchId, timeline, matchDto) in timelines) {
             val info = timeline.info ?: continue
@@ -72,6 +74,9 @@ class TimelineAnalysisService {
             }
             val opponentChampion = opponentMatchParticipant?.championName ?: "Unknown"
             val opponentParticipantId = info.participants?.find { it.puuid == opponentMatchParticipant?.puuid }?.participantId
+            
+            // Map of participantId -> Champion name for all 10 players
+            val participantToChampion = matchInfo.participants.associate { it.participantId to (it.championName ?: "Unknown") }
 
             val frames = info.frames ?: continue
 
@@ -80,13 +85,9 @@ class TimelineAnalysisService {
                 val playerFrame = frame.participantFrames?.get(playerParticipantId.toString()) ?: continue
                 val pos = playerFrame.position ?: continue
                 if (pos.x != null && pos.y != null) {
-                    heatmap.add(HeatmapPoint(pos.x, pos.y, matchId))
+                    heatmap.add(HeatmapPoint(pos.x, pos.y, matchId, ((frame.timestamp ?: 0) / 60000).toInt()))
                 }
             }
-
-            // ── Power spike timeline: minute-by-minute gold comparison ──
-            val powerSpikePoints = buildPowerSpikePoints(frames, playerParticipantId, opponentParticipantId, matchId)
-            powerSpikes.add(MatchPowerSpikeDto(matchId, playerChampion, opponentChampion, playerWin, powerSpikePoints))
 
             // Track gold lead at 10/15
             val minuteFrame10 = frames.getOrNull(10)
@@ -108,6 +109,7 @@ class TimelineAnalysisService {
             val buyItems = mutableListOf<BuildItem>()
             val skillLevelUps = mutableListOf<SkillUp>()
             val matchEvents = mutableListOf<MatchEventEntry>()
+            var playerCurrentLevel = 1
 
             for (event in allEvents) {
                 val minute = ((event.timestamp ?: 0) / 60000).toInt()
@@ -119,9 +121,14 @@ class TimelineAnalysisService {
                             buyItems.add(BuildItem(event.itemId, event.timestamp ?: 0, minute))
                         }
                     }
+                    "LEVEL_UP" -> {
+                        if (event.participantId == playerParticipantId && event.level != null) {
+                            playerCurrentLevel = event.level
+                        }
+                    }
                     "SKILL_LEVEL_UP" -> {
-                        if (event.participantId == playerParticipantId && event.skillSlot != null && event.level != null) {
-                            skillLevelUps.add(SkillUp(event.skillSlot, event.level, minute))
+                        if (event.participantId == playerParticipantId && event.skillSlot != null) {
+                            skillLevelUps.add(SkillUp(event.skillSlot, playerCurrentLevel, minute))
                         }
                     }
                     "CHAMPION_KILL" -> {
@@ -147,14 +154,8 @@ class TimelineAnalysisService {
                                 type = eventType,
                                 minuteMark = minute,
                                 secondMark = second,
-                                actor = if (isPlayerKiller || isOpponentKiller) {
-                                    if (isPlayerKiller) playerChampion else opponentChampion
-                                } else null,
-                                target = when {
-                                    isPlayerVictim -> playerChampion
-                                    isOpponentVictim -> opponentChampion
-                                    else -> null
-                                },
+                                actor = participantToChampion[event.killerId],
+                                target = participantToChampion[event.victimId],
                                 isPlayer = isPlayerKiller || isPlayerVictim || isPlayerAssist,
                                 isOpponent = isOpponentKiller || isOpponentVictim,
                                 laneType = null,
@@ -163,15 +164,19 @@ class TimelineAnalysisService {
                             ))
 
                             if (isPlayerKiller) {
-                                kills.add(HeatmapPoint(event.position?.x ?: 0, event.position?.y ?: 0, matchId))
+                                kills.add(HeatmapPoint(event.position?.x ?: 0, event.position?.y ?: 0, matchId, minute))
                                 totalKills++
                             }
                             if (isPlayerVictim) {
-                                deaths.add(HeatmapPoint(event.position?.x ?: 0, event.position?.y ?: 0, matchId))
+                                deaths.add(HeatmapPoint(event.position?.x ?: 0, event.position?.y ?: 0, matchId, minute))
                                 totalDeaths++
                                 if (gamesWithDeath == 0 || minute < Int.MAX_VALUE) {
                                     // We'll compute first death below
                                 }
+                            }
+                            if (isPlayerAssist) {
+                                assists.add(HeatmapPoint(event.position?.x ?: 0, event.position?.y ?: 0, matchId, minute))
+                                totalAssists++
                             }
                         }
                     }
@@ -233,10 +238,12 @@ class TimelineAnalysisService {
                         }
                     }
                     "WARD_PLACED" -> {
-                        if (event.participantId == playerParticipantId) {
-                            val pos = event.position
-                            if (pos?.x != null && pos.y != null) {
-                                wards.add(HeatmapPoint(pos.x, pos.y, matchId))
+                        if (event.creatorId == playerParticipantId) {
+                            val timestamp = event.timestamp ?: 0L
+                            val closestMinute = if (timestamp % 60000 >= 30000) minute + 1 else minute
+                            val pos = event.position ?: frames.getOrNull(closestMinute)?.participantFrames?.get(event.creatorId?.toString())?.position
+                            if (pos?.x != null && pos?.y != null) {
+                                wards.add(HeatmapPoint(pos.x, pos.y, matchId, minute))
                                 totalWards++
                             }
                         }
@@ -262,6 +269,10 @@ class TimelineAnalysisService {
             }
             skillOrders.add(SkillOrderDto(matchId, playerChampion, playerWin, maxOrder, skillLevelUps))
 
+            // ── Power spike timeline: minute-by-minute stats comparison ──
+            val powerSpikePoints = buildPowerSpikePoints(frames, playerParticipantId, opponentParticipantId, matchId, matchEvents)
+            powerSpikes.add(MatchPowerSpikeDto(matchId, playerChampion, opponentChampion, playerWin, powerSpikePoints))
+
             eventTimelines.add(MatchEventTimelineDto(matchId, playerChampion, opponentChampion, playerWin, matchEvents.sortedBy { it.minuteMark * 60 + it.secondMark }))
         }
 
@@ -276,6 +287,7 @@ class TimelineAnalysisService {
             deathPositions = deaths,
             wardPositions = wards,
             killPositions = kills,
+            assistPositions = assists,
             powerSpikeTimelines = powerSpikes,
             buildOrders = buildOrders,
             skillOrders = skillOrders,
@@ -288,6 +300,7 @@ class TimelineAnalysisService {
                 wardsPlacedTotal = totalWards,
                 deathsTotal = totalDeaths,
                 killsTotal = totalKills,
+                assistsTotal = totalAssists,
                 gamesAnalyzed = timelines.size
             )
         )
@@ -297,7 +310,8 @@ class TimelineAnalysisService {
         frames: List<TimelineFrameDto>,
         playerParticipantId: Int,
         opponentParticipantId: Int?,
-        matchId: String
+        matchId: String,
+        matchEvents: List<MatchEventEntry>
     ): List<PowerSpikePoint> {
         val playerItems = mutableListOf<Int>()
         val opponentItems = mutableListOf<Int>()
@@ -324,13 +338,22 @@ class TimelineAnalysisService {
             val minute = ((frame.timestamp ?: 0) / 60000).toInt()
             val playerFrame = frame.participantFrames?.get(playerParticipantId.toString()) ?: continue
             val pg = playerFrame.totalGold ?: 0
+            val pxp = playerFrame.xp ?: 0
+            val pcs = (playerFrame.minionsKilled ?: 0) + (playerFrame.jungleMinionsKilled ?: 0)
+
             val og = if (opponentParticipantId != null)
                 frame.participantFrames?.get(opponentParticipantId.toString())?.totalGold ?: 0
             else 0
+            val oFrame = if (opponentParticipantId != null) frame.participantFrames?.get(opponentParticipantId.toString()) else null
+            val oxp = oFrame?.xp ?: 0
+            val ocs = (oFrame?.minionsKilled ?: 0) + (oFrame?.jungleMinionsKilled ?: 0)
 
             // Accumulate items up to this minute
             playerItemsByMinute[minute]?.let { playerItems.addAll(it) }
             opponentItemsByMinute[minute]?.let { opponentItems.addAll(it) }
+
+            // Events occurring in this minute
+            val eventsThisMinute = matchEvents.filter { it.minuteMark == minute && (it.type == "KILL" || it.type == "DEATH" || it.type == "PLATE") }
 
             // Only emit one point per minute (skip duplicate timestamps)
             if (points.none { it.minute == minute }) {
@@ -339,8 +362,13 @@ class TimelineAnalysisService {
                     playerGold = pg,
                     opponentGold = og,
                     playerGoldLead = pg - og,
+                    playerXp = pxp,
+                    opponentXp = oxp,
+                    playerCs = pcs,
+                    opponentCs = ocs,
                     playerItems = playerItems.toList(),
-                    opponentItems = opponentItems.toList()
+                    opponentItems = opponentItems.toList(),
+                    events = eventsThisMinute
                 ))
             }
         }
