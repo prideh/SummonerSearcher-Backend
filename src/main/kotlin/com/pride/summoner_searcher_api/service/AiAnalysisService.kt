@@ -337,6 +337,8 @@ class AiAnalysisService(
             Only $gameCount games are available. Keep your strategic advice focused on what happened in these specific games, and avoid claiming long-term trends or habits yet.
         """.trimIndent() else ""
 
+        val timelineSection = buildTimelineInsightsSection(context)
+
         return """
             You are an elite, Challenger-tier professional League of Legends coach analyzing ranked performance data. Use a constructive, encouraging, and highly analytical coaching methodology.
             
@@ -365,6 +367,7 @@ class AiAnalysisService(
             
             **🔒 GROUND TRUTH STATS:**
             $groundTruth
+            $timelineSection
             
             **DATA-DRIVEN COACHING RULES:**
             - Base your coaching entirely on the provided STATS and recentMatchSummary.
@@ -739,8 +742,28 @@ class AiAnalysisService(
         }
     }
 
+    /**
+     * Renders timeline analysis insights into the ground truth block, if provided.
+     * Called separately and appended to the main prompt.
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun buildTimelineInsightsSection(context: Map<String, Any>): String {
+        val timeline = context["timelineInsights"] as? Map<String, Any> ?: return ""
+        val lines = mutableListOf<String>()
 
-    
+        lines.add("\n**📊 TIMELINE ANALYSIS (last ${timeline["gamesAnalyzed"] ?: "?"} ranked games):**")
+        timeline["avgGoldLeadAt10"]?.let { lines.add("  - Avg gold lead vs opponent @10min: $it") }
+        timeline["avgGoldLeadAt15"]?.let { lines.add("  - Avg gold lead vs opponent @15min: $it") }
+        timeline["avgFirstDeathMinute"]?.let { lines.add("  - Avg minute of first death: $it") }
+        timeline["mostDangerousZone"]?.let { lines.add("  - Most frequent death zone: $it") }
+        timeline["wardsPlacedTotal"]?.let { lines.add("  - Total wards placed (across all games): $it") }
+        timeline["killsTotal"]?.let { lines.add("  - Total kills across timeline games: $it") }
+        timeline["deathsTotal"]?.let { lines.add("  - Total deaths across timeline games: $it") }
+
+        return if (lines.size > 1) lines.joinToString("\n") else ""
+    }
+
+
     /**
      * Sample size warnings for data quality
      */

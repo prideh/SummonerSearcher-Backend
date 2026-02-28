@@ -358,6 +358,24 @@ class RiotApiService(
         }
     }
 
+    suspend fun getMatchTimeline(matchId: String, region: String): com.pride.summoner_searcher_api.dto.MatchTimelineDto? {
+        val regionalRouting = mapToRegionRouting(region)
+        val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
+        val uri = "$matchBaseUrl/lol/match/v5/matches/{matchId}/timeline"
+
+        return executeRateLimitedCall(region) {
+            try {
+                riotRestClient.get()
+                    .uri(uri, matchId)
+                    .retrieve()
+                    .toEntity(com.pride.summoner_searcher_api.dto.MatchTimelineDto::class.java)
+            } catch (e: HttpClientErrorException.NotFound) {
+                logger.warn("getMatchTimeline returned 404 for matchId: {}", matchId)
+                null
+            }
+        }
+    }
+
     private fun getPreferredContent(translations: List<RiotContent>): String? {
         return translations.find { it.locale.equals("en_US", ignoreCase = true) }?.content
             ?: translations.firstOrNull()?.content
