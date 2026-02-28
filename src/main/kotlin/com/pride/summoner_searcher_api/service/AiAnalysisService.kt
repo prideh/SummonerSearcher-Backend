@@ -72,46 +72,55 @@ class AiAnalysisService(
     }
 
     fun analyze(context: Map<String, Any>, messages: List<Map<String, String>>, userMessage: String, sessionId: String? = null): Mono<AiAnalysisResult> {
-        // 🧠 Step 1: Classify intent via Gemini pre-call (replaces hardcoded keyword matching)
-        return classifyIntentWithGemini(userMessage, messages)
-            .flatMap { intent ->
-                val category = intent.category
-                val temperature = selectTemperature(category)
-                val prompt = constructPrompt(context, messages, userMessage, intent)
+        // 🚀 CONCURRENT EXECUTION OPTIMIZATION
+        // 1. Immediately run the fast local keyword matcher to build the prompt without waiting
+        val fastFallbackIntent = detectIntent(userMessage, messages)
+        val temperature = selectTemperature(fastFallbackIntent.category)
+        val prompt = constructPrompt(context, messages, userMessage, fastFallbackIntent)
 
-                val requestBody = mapOf(
-                    "contents" to listOf(
-                        mapOf(
-                            "parts" to listOf(
-                                mapOf("text" to prompt)
-                            )
-                        )
-                    ),
-                    "generationConfig" to mapOf(
-                        "temperature" to temperature,
-                        "maxOutputTokens" to 8192
+        val requestBody = mapOf(
+            "contents" to listOf(
+                mapOf(
+                    "parts" to listOf(
+                        mapOf("text" to prompt)
                     )
                 )
+            ),
+            "generationConfig" to mapOf(
+                "temperature" to temperature,
+                "maxOutputTokens" to 4096
+            )
+        )
 
-                webClient.post()
-                    .uri("models/gemini-3-flash-preview:generateContent?key={key}", apiKey)
-                    .bodyValue(requestBody)
-                    .retrieve()
-                    .bodyToMono(String::class.java)
-                    .doOnError { e ->
-                        if (e is org.springframework.web.reactive.function.client.WebClientResponseException) {
-                            logger.error("Analyze API failed with status ${e.statusCode}. Body: ${e.responseBodyAsString}")
-                        }
+        val mainGenerationMono = webClient.post()
+            .uri("models/gemini-3-flash-preview:generateContent?key={key}", apiKey)
+            .bodyValue(requestBody)
+            .retrieve()
+            .bodyToMono(String::class.java)
+            .doOnError { e ->
+                if (e is org.springframework.web.reactive.function.client.WebClientResponseException) {
+                    logger.error("Analyze API failed with status ${e.statusCode}. Body: ${e.responseBodyAsString}")
+                }
+            }
+            .retryWhen(
+                Retry.backoff(3, Duration.ofMillis(500))
+                    .filter { error -> 
+                        error is WebClientResponseException && 
+                        (error.statusCode.value() == 429 || error.statusCode.is5xxServerError)
                     }
-                    .retryWhen(
-                        Retry.backoff(3, Duration.ofMillis(500))
-                            .filter { error -> 
-                                error is WebClientResponseException && 
-                                (error.statusCode.value() == 429 || error.statusCode.is5xxServerError)
-                            }
-                            .onRetryExhaustedThrow { _, signal -> signal.failure() }
-                    )
-                    .map { response -> AiAnalysisResult(extractContent(response), temperature) }
+                    .onRetryExhaustedThrow { _, signal -> signal.failure() }
+            )
+            .map { response -> extractContent(response) }
+
+        // 2. Fire the true intent classifier asynchronously in the background
+        val intentClassifierMono = classifyIntentWithGemini(userMessage, messages)
+
+        // 3. Wait for both to finish and zip them together
+        return Mono.zip(mainGenerationMono, intentClassifierMono)
+            .map { tuple -> 
+                val generatedText = tuple.t1
+                // We use the concurrently calculated intent for future analytics
+                AiAnalysisResult(generatedText, temperature) 
             }
     }
 
@@ -185,7 +194,7 @@ class AiAnalysisService(
             ),
             "generationConfig" to mapOf(
                 "temperature" to 0.1, // Very low — we want deterministic classification
-                "maxOutputTokens" to 512
+                "maxOutputTokens" to 1024
             )
         )
 
@@ -317,6 +326,7 @@ class AiAnalysisService(
         val rankOptimization = "- Treat the player as a Challenger tier player. Provide the highest level of advanced tips. Discuss damage foresight, itemization nuances, precise wave manipulation, matchup-specific micro strategies, and high-level macro concepts."
         val sampleSizeWarning = getSampleSizeWarning((context["totalGamesAnalyzed"] as? Number)?.toInt() ?: 0)
         val streakToneAdjustment = getStreakToneAdjustment(context)
+        val playerName = context["summonerName"]?.toString() ?: "the player"
         
         val contextString = context.entries.joinToString("\n") { "${it.key}: ${it.value}" }
         val historyString = messages.joinToString("\n") { "${it["role"]}: ${it["content"]}" }
@@ -338,11 +348,13 @@ class AiAnalysisService(
             $rankOptimization
             
             **COACHING STYLE & TONE:**
+            - Address the player by their summoner name: $playerName. Do NOT address them by their rank (e.g., do not say "Master I, your stats...").
             - Converse naturally. Avoid sounding like a rigid, automated report. Use natural paragraphs or short bullet points only when explaining complex concepts like wave management or ability combos.
             - **Socratic Method:** Occasionally, point out a flaw in their stats and ask them a guiding question to help them realize the mistake themselves, rather than just spoon-feeding the answer directly.
             - **Proactive Coaching:** Even if the user asks a simple question (e.g., "What items to build?"), briefly point out a glaring issue in their data if one exists (e.g., "I'll tell you the build, but I noticed your vision score is bottom 5%—we need to fix that too.").
             - Be professional and honest about weaknesses. Do not use overly fluffy praise unless a stat is truly exceptional.
-            - Keep it concise but highly impactful (aim for 100-150 words). IMPORTANT: You must finish your thoughts completely and always output the SUGGESTIONS block at the very end.
+            - **CRITICAL RULE: ELEVATOR PITCH.** Your response MUST be under 150 words. Do not write filler. Deliver your insight as a brutally efficient elevator pitch.
+            - **IMPORTANT: You MUST ALWAYS output the suggestions block at the very end of your response, absolutely nothing else should follow it. FORMAT:** `---SUGGESTIONS--- ["Option 1", "Option 2", "Option 3"]`
             - **Formatting Highlight:** Use **bold text** strategically to emphasize key points, concepts, or statistics, making your answer easy to scan and read.
             
             $fewShotSection
@@ -771,11 +783,15 @@ class AiAnalysisService(
                 val content = candidate.path("content")
                 val parts = content.path("parts")
                 if (parts.isArray && parts.size() > 0) {
-                    val textOut = parts.get(0).path("text").asText()
-                    if (finishReason != "STOP") {
-                        logger.warn("Gemini did not STOP naturally. Reason: $finishReason. Text length: ${textOut.length}")
+                    val textOut = StringBuilder()
+                    parts.forEach { part ->
+                        textOut.append(part.path("text").asText())
                     }
-                    return textOut
+                    val fullText = textOut.toString()
+                    if (finishReason != "STOP") {
+                        logger.warn("Gemini did not STOP naturally. Reason: $finishReason. Text length: ${fullText.length}")
+                    }
+                    return fullText
                 }
             }
             "No content generated."
