@@ -6,6 +6,7 @@ import com.pride.summoner_searcher_api.dto.MatchInfo
 import com.pride.summoner_searcher_api.dto.MatchMetadata
 import com.pride.summoner_searcher_api.dto.SummonerDto
 import com.pride.summoner_searcher_api.dto.SummonerProfileDto
+import com.pride.summoner_searcher_api.repository.IndexedPlayerRepository
 import io.kotest.core.spec.style.BehaviorSpec
 import io.kotest.matchers.shouldBe
 import io.mockk.*
@@ -14,10 +15,11 @@ import java.time.Duration
 class PlayerCacheServiceTest : BehaviorSpec({
     val redisCacheService = mockk<RedisCacheService>(relaxed = true)
     val riotApiService = mockk<RiotApiService>(relaxed = true)
-    val playerCacheService = PlayerCacheService(redisCacheService, riotApiService)
+    val indexedPlayerRepository = mockk<IndexedPlayerRepository>(relaxed = true)
+    val playerCacheService = PlayerCacheService(redisCacheService, riotApiService, indexedPlayerRepository)
 
     beforeTest {
-        io.mockk.clearMocks(redisCacheService, riotApiService, answers = false)
+        io.mockk.clearMocks(redisCacheService, riotApiService, indexedPlayerRepository, answers = false)
     }
 
     Given("A player cache service") {
