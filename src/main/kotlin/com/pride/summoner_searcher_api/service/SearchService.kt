@@ -15,20 +15,17 @@ class SearchService(
     private val logger = LoggerFactory.getLogger(javaClass)
 
     /**
-     * Searches for players whose game name starts with the specified query.
+     * Searches for players whose game name starts with the specified query, across all regions.
      * Caches the result in Redis for fast retrieval in subsequent identical searches.
      */
-    fun autocompleteSearch(region: String, query: String): List<AutocompletePlayerDto> {
+    fun autocompleteSearch(query: String): List<AutocompletePlayerDto> {
         if (query.isBlank()) return emptyList()
 
         val normalizedQuery = query.trim()
-        val normalizedRegion = region.trim().uppercase()
-        val cacheKey = "autocomplete:$normalizedRegion:${normalizedQuery.lowercase()}"
+        val cacheKey = "autocomplete:${normalizedQuery.lowercase()}"
 
         try {
-            // Generic TypeReference workaround for caching a List of objects
             val cachedResult = redisCacheService.get(cacheKey, Array<AutocompletePlayerDto>::class.java)
-
             if (cachedResult != null) {
                 return cachedResult.toList()
             }
@@ -36,9 +33,8 @@ class SearchService(
             logger.warn("Redis read error for autocomplete cache", e)
         }
 
-        // Cache Miss: Query the database
-        val dbResults = indexedPlayerRepository.findTop5ByRegionAndGameNameStartingWithIgnoreCaseOrderByLastSeenAtDesc(
-            region = normalizedRegion,
+        // Cache Miss: Query the database globally (no region filter)
+        val dbResults = indexedPlayerRepository.findTop8ByGameNameStartingWithIgnoreCaseOrderByLastSeenAtDesc(
             gameNamePrefix = normalizedQuery
         )
 

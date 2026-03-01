@@ -8,11 +8,11 @@ import org.springframework.stereotype.Repository
 interface IndexedPlayerRepository : JpaRepository<IndexedPlayer, String> {
     
     /**
-     * Finds players by region whose game name starts with the given prefix (case-insensitive),
-     * ordered by the most recently seen players first.
+     * Finds players globally (across all regions) whose game name starts with the given prefix
+     * (case-insensitive), ordered by the most recently seen players first.
+     * Capped at 8 to keep the autocomplete dropdown concise with cross-region results.
      */
-    fun findTop5ByRegionAndGameNameStartingWithIgnoreCaseOrderByLastSeenAtDesc(
-        region: String,
+    fun findTop8ByGameNameStartingWithIgnoreCaseOrderByLastSeenAtDesc(
         gameNamePrefix: String
     ): List<IndexedPlayer>
 }
