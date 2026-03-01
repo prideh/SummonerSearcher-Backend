@@ -90,8 +90,9 @@ class JwtAuthenticationFilter(
             }
         } catch (e: Exception) {
             // If any exception occurs during token parsing or validation (e.g., expired token, invalid signature),
-            // we log the error and ensure the security context is cleared to prevent any partial authentication state.
-            log.error("Cannot set user authentication: {}", e.message)
+            // we log the error as debug to prevent spamming the console on public endpoints,
+            // and ensure the security context is cleared to prevent any partial authentication state.
+            log.debug("Cannot set user authentication: {}", e.message)
             SecurityContextHolder.clearContext()
         }
 

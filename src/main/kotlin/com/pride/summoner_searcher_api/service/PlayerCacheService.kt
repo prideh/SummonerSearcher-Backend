@@ -6,6 +6,9 @@ import org.springframework.stereotype.Service
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import java.time.Duration
 
 /**
@@ -16,7 +19,8 @@ import java.time.Duration
 @Service
 class PlayerCacheService(
     private val redisCacheService: RedisCacheService,
-    private val riotApiService: RiotApiService
+    private val riotApiService: RiotApiService,
+    private val indexedPlayerRepository: com.pride.summoner_searcher_api.repository.IndexedPlayerRepository
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
@@ -108,14 +112,17 @@ class PlayerCacheService(
                     }
                 }.awaitAll().filterNotNull()
                 
+
                 // Cache newly fetched matches - ONLY if they are valid (this year)
                 // This prevents polluting Redis with old matches that Riot returns due to the bug.
-                fetchedMatches.forEach { match ->
-                     val matchId = match.metadata?.matchId
-                     val creation = match.info?.gameCreation ?: 0
-                     if (matchId != null && creation >= startOfYearMs) {
-                         redisCacheService.set(getMatchCacheKey(matchId, region), match, Duration.ofDays(60))
-                     }
+                val validFetchedMatches = fetchedMatches.filter { match ->
+                    val creation = match.info?.gameCreation ?: 0
+                    match.metadata?.matchId != null && creation >= startOfYearMs
+                }
+
+                validFetchedMatches.forEach { match ->
+                     val matchId = match.metadata!!.matchId!!
+                     redisCacheService.set(getMatchCacheKey(matchId, region), match, Duration.ofDays(60))
                 }
                 
                 // Combine cached and fetched matches for this chunk
@@ -128,6 +135,13 @@ class PlayerCacheService(
                 // Since match IDs are chronological (newest first), if we find an old match, we stop processing.
                 val validChunkMatches = chunkMatches.filter { (it.info?.gameCreation ?: 0) >= startOfYearMs }
                 
+                // Only index players from the top 10 most recent matches overall
+                // to prevent bloating the database when someone has 300+ matches this season.
+                if (validChunkMatches.isNotEmpty() && processedCount < 10) {
+                    val remainingToIndex = (10 - processedCount).coerceAtMost(validChunkMatches.size)
+                    indexPlayersFromMatches(validChunkMatches.take(remainingToIndex), region)
+                }
+
                 validChunkMatches.forEach { match -> 
                     match.metadata?.matchId?.let { validMatchIds.add(it) }
                 }
@@ -206,8 +220,53 @@ class PlayerCacheService(
              }
         }
         
+        // Index players found in these new matches for autocomplete search
+        if (fetchedMatches.isNotEmpty()) {
+            indexPlayersFromMatches(fetchedMatches, region)
+        }
+        
         matchIds.mapNotNull { id ->
             cachedMatchesMap[getMatchCacheKey(id, region)] ?: fetchedMatches.find { it.metadata?.matchId == id }
+        }
+    }
+
+    private fun indexPlayersFromMatches(matches: List<com.pride.summoner_searcher_api.dto.MatchDto>, region: String) {
+        val playersToIndex = matches.flatMap { it.info?.participants ?: emptyList() }
+            // Filter out players with missing essential Riot ID info
+            .filter { !it.puuid.isNullOrBlank() && !it.riotIdGameName.isNullOrBlank() && !it.riotIdTagline.isNullOrBlank() }
+            .map { p ->
+                com.pride.summoner_searcher_api.model.IndexedPlayer(
+                    puuid = p.puuid!!,
+                    gameName = p.riotIdGameName!!,
+                    tagLine = p.riotIdTagline!!,
+                    region = region,
+                    profileIconId = p.profileIcon ?: 0,
+                    summonerLevel = p.summonerLevel?.toLong() ?: 0L,
+                    lastSeenAt = java.time.Instant.now()
+                )
+            }
+            // If the same player appears in multiple matches in this batch, keep only the latest object.
+            .distinctBy { it.puuid }
+            // Limit to a maximum of 200 players per batch to prevent massive database write loads
+            // when fullly refreshing a user's seasonal match history (>200 matches * 10 players)
+            .take(200)
+
+        if (playersToIndex.isNotEmpty()) {
+            try {
+                // To avoid blocking the main thread significantly if there are many matches, we launch a coroutine on the IO dispatcher.
+                CoroutineScope(Dispatchers.IO).launch {
+                    try {
+                        // Chunk inserts to prevent exceeding parameter limits or causing long write locks
+                        playersToIndex.chunked(100).forEach { batch ->
+                            indexedPlayerRepository.saveAll(batch)
+                        }
+                    } catch (e: Exception) {
+                        logger.error("Error saving indexed players: ${e.message}")
+                    }
+                }
+            } catch (e: Exception) {
+                logger.error("Error dispatching players to index: ${e.message}")
+            }
         }
     }
 }
