@@ -3,6 +3,7 @@ package com.pride.summoner_searcher_api.scheduler
 import com.pride.summoner_searcher_api.dto.CohortBenchmarkCellDto
 import com.pride.summoner_searcher_api.dto.CohortCollectorCheckpointDto
 import com.pride.summoner_searcher_api.dto.CohortCollectorStatusDto
+import com.pride.summoner_searcher_api.dto.CohortRateLimitProbeResultDto
 import com.pride.summoner_searcher_api.dto.RateLimitVerificationSnapshotDto
 import com.pride.summoner_searcher_api.service.CohortBenchmarkService
 import com.pride.summoner_searcher_api.service.SystemTimeProvider
@@ -45,6 +46,7 @@ class OvernightCohortCollectorRunner(
     private val logger = LoggerFactory.getLogger(javaClass)
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val running = AtomicBoolean(false)
+    private val probeRunning = AtomicBoolean(false)
     private val stopRequested = AtomicBoolean(false)
 
     @Volatile
@@ -336,6 +338,73 @@ class OvernightCohortCollectorRunner(
             rateLimitVerification = verification,
             checkpoint = checkpoint
         )
+    }
+
+    /**
+     * Guarded, bounded diagnostic probe entrypoint in the same backend JVM process.
+     * - Observes real Riot `X-App-Rate-Limit`, `X-App-Rate-Limit-Count`, `X-Method-Rate-Limit`, and
+     *   `X-Method-Rate-Limit-Count` headers BEFORE enabling bulk network collection.
+     * - Bounded to at most 1 LOW-priority call per missing required endpoint (`<= 3` calls total;
+     *   `0` calls when already verified), respecting foreground user requests and `429 Retry-After` / `service` backoffs.
+     */
+    fun runDiagnosticProbeGuarded(
+        region: String = "euw1",
+        targetPatch: String? = null,
+        seedPuuid: String? = null,
+        seedMatchId: String? = null
+    ): CohortRateLimitProbeResultDto {
+        val normalizedRegion = region.lowercase().trim()
+        val cleanPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
+        val nowInstant = Instant.ofEpochMilli(timeProvider.now())
+
+        if (!cohortBenchmarkService.isValidRegion(normalizedRegion) || !cohortBenchmarkService.isValidPatchOrNull(cleanPatch)) {
+            return CohortRateLimitProbeResultDto(
+                region = normalizedRegion,
+                probeStatus = "INVALID_PARAMETERS",
+                probedAt = nowInstant,
+                rateLimitVerification = buildInvalidParamStatus(normalizedRegion, cleanPatch, "Invalid region or patch.").rateLimitVerification,
+                notes = listOf("Invalid region or patch parameter; zero Redis or Riot calls executed.")
+            )
+        }
+
+        if (!probeRunning.compareAndSet(false, true)) {
+            return CohortRateLimitProbeResultDto(
+                region = normalizedRegion,
+                probeStatus = "PROBE_ALREADY_RUNNING_IN_PROCESS",
+                probedAt = nowInstant,
+                rateLimitVerification = cohortBenchmarkService.getLiveRateLimitVerification(normalizedRegion),
+                checkpoint = cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch),
+                notes = listOf("Diagnostic probe is already running in this JVM process; 0 duplicate calls made.")
+            )
+        }
+
+        try {
+            val acquiredProbeLock = cohortBenchmarkService.acquireCollectorProbeLock(normalizedRegion)
+            if (!acquiredProbeLock) {
+                return CohortRateLimitProbeResultDto(
+                    region = normalizedRegion,
+                    probeStatus = "PROBE_COOLDOWN_LOCK_ACTIVE",
+                    probedAt = nowInstant,
+                    rateLimitVerification = cohortBenchmarkService.getLiveRateLimitVerification(normalizedRegion),
+                    checkpoint = cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch),
+                    notes = listOf("Diagnostic probe lock is active in Redis for '$normalizedRegion'; 0 duplicate calls made.")
+                )
+            }
+            return try {
+                runBlocking {
+                    cohortBenchmarkService.runBoundedDiagnosticRateLimitProbe(
+                        region = normalizedRegion,
+                        targetPatch = cleanPatch,
+                        explicitSeedPuuid = seedPuuid,
+                        explicitSeedMatchId = seedMatchId
+                    )
+                }
+            } finally {
+                cohortBenchmarkService.releaseCollectorProbeLock(normalizedRegion)
+            }
+        } finally {
+            probeRunning.set(false)
+        }
     }
 
     suspend fun executeResumableRun(

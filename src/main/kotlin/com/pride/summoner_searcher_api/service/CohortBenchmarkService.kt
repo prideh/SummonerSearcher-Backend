@@ -1254,6 +1254,348 @@ class CohortBenchmarkService(
         redisCacheService.delete("lock:cohort:collector:active:$normalizedRegion")
     }
 
+    fun acquireCollectorProbeLock(region: String, ttl: Duration = Duration.ofSeconds(30)): Boolean {
+        val normalizedRegion = region.lowercase().trim()
+        return redisCacheService.setIfAbsent("lock:cohort:collector:probe:$normalizedRegion", "PROBING", ttl)
+    }
+
+    fun releaseCollectorProbeLock(region: String) {
+        val normalizedRegion = region.lowercase().trim()
+        redisCacheService.delete("lock:cohort:collector:probe:$normalizedRegion")
+    }
+
+    /**
+     * Guarded, bounded diagnostic probe from a cached regional seed (`euw1` by default).
+     * - Purpose: Observe real Riot `X-App-Rate-Limit`, `X-App-Rate-Limit-Count`, `X-Method-Rate-Limit`, and
+     *   `X-Method-Rate-Limit-Count` headers in the SAME backend JVM process BEFORE enabling bulk network collection
+     *   (`cohort.network-collection.enabled` can remain `false`).
+     * - Strictly bounded to AT MOST 1 LOW-priority call per missing required endpoint
+     *   (`league-v4-entries-by-puuid`, `match-v5-ids-by-puuid`, `match-v5-match-by-id` -> max 3 calls total;
+     *   0 calls for any endpoint already verified in [RiotApiRateLimiter]).
+     * - Immediately aborts before any call if foreground user traffic is active (`foregroundYieldActive` / `activeUserRequests > 0`),
+     *   if a `429 Retry-After` / `service` backoff is active, or if verified buckets lack LOW-priority headroom.
+     * - Also initializes the cache-only collector checkpoint in Redis if none exists yet.
+     */
+    suspend fun runBoundedDiagnosticRateLimitProbe(
+        region: String = "euw1",
+        targetPatch: String? = null,
+        explicitSeedPuuid: String? = null,
+        explicitSeedMatchId: String? = null
+    ): CohortRateLimitProbeResultDto {
+        val normalizedRegion = region.lowercase().trim()
+        val cleanPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
+        val nowInstant = Instant.ofEpochMilli(timeProvider.now())
+
+        if (!isValidRegion(normalizedRegion) || !isValidPatchOrNull(cleanPatch)) {
+            return CohortRateLimitProbeResultDto(
+                region = normalizedRegion,
+                probeStatus = "INVALID_PARAMETERS",
+                probedAt = nowInstant,
+                rateLimitVerification = getLiveRateLimitVerification(normalizedRegion),
+                notes = listOf("Invalid region or patch format; zero Redis or Riot calls executed.")
+            )
+        }
+
+        // 1. Ensure cache-only baseline checkpoint is initialized so status is populated even while network=false
+        var checkpoint = getCollectorCheckpoint(normalizedRegion, cleanPatch)
+            ?: if (cleanPatch != null) getCollectorCheckpoint(normalizedRegion, null) else null
+        if (checkpoint == null) {
+            val report = extractCachedCohortsAndReport(
+                region = normalizedRegion,
+                targetPatch = cleanPatch,
+                maxGamesPerPlayer = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
+            )
+            val effectivePatch = cleanPatch ?: report.inventory.selectedTargetPatch
+            val candidates = discoverCandidatePuuidsFromCache(normalizedRegion, effectivePatch).take(1_000)
+            val cellProgress = buildAllTargetCellProgress(report.cells)
+            checkpoint = CohortCollectorCheckpointDto(
+                region = normalizedRegion,
+                targetPatch = effectivePatch,
+                patchSelectionSource = report.inventory.patchSelectionSource,
+                queueId = SOLO_QUEUE_ID,
+                roles = listOf("TOP", "MIDDLE", "BOTTOM"),
+                maxGamesPerPlayerCap = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER,
+                targetPlayersPerCell = CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE,
+                targetGamesPerCell = CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE,
+                processedPuuids = emptySet(),
+                pendingCandidatePuuids = candidates,
+                processedMatchIds = emptySet(),
+                playerCellGameCounts = emptyMap(),
+                cellProgress = cellProgress,
+                cellsPassingQualityGate = cellProgress.values.count { it.passesQualityGate },
+                targetCellsCount = TIER_ORDER.size * ELIGIBLE_ROLES.size,
+                totalNetworkCallsMade = 0,
+                lastStopReason = "CACHE_BASELINE_INITIALIZED",
+                startedAt = nowInstant,
+                updatedAt = nowInstant
+            )
+            saveCollectorCheckpoint(checkpoint)
+        }
+
+        // 2. If all required App + Method headers are already verified in this JVM, make 0 calls
+        val preSnap = getLiveRateLimitVerification(normalizedRegion)
+        if (preSnap.appLimitsVerifiedFromHeaders && preSnap.missingRequiredMethodEndpoints.isEmpty()) {
+            return CohortRateLimitProbeResultDto(
+                region = normalizedRegion,
+                probeStatus = "ALREADY_VERIFIED_ZERO_CALLS",
+                seedSource = "NONE_NEEDED",
+                seedPuuidUsed = false,
+                seedMatchIdUsed = false,
+                maxCallsPerEndpoint = 1,
+                totalProbeCallsMade = 0,
+                endpointOutcomes = REQUIRED_COLLECTOR_ENDPOINTS.associateWith { "SKIPPED_ALREADY_VERIFIED" },
+                probedAt = Instant.ofEpochMilli(timeProvider.now()),
+                rateLimitVerification = preSnap,
+                checkpoint = checkpoint,
+                notes = listOf(
+                    "All required App and Method rate-limit headers are already verified in-process; 0 Riot API calls made."
+                )
+            )
+        }
+
+        // 3. Resolve a single seed PUUID (and optional cached match ID) from EUW Redis cache
+        val (seedPuuid, seedSource) = resolveDiagnosticSeedPuuid(normalizedRegion, explicitSeedPuuid, checkpoint)
+        val cachedMatchId = explicitSeedMatchId?.trim()?.takeIf { it.isNotBlank() }
+            ?: resolveCachedMatchId(normalizedRegion)
+
+        if (seedPuuid == null) {
+            return CohortRateLimitProbeResultDto(
+                region = normalizedRegion,
+                probeStatus = "NO_CACHED_SEED_PUUID_AVAILABLE",
+                seedSource = "NONE",
+                seedPuuidUsed = false,
+                seedMatchIdUsed = false,
+                maxCallsPerEndpoint = 1,
+                totalProbeCallsMade = 0,
+                endpointOutcomes = REQUIRED_COLLECTOR_ENDPOINTS.associateWith { "SKIPPED_NO_SEED_PUUID" },
+                probedAt = Instant.ofEpochMilli(timeProvider.now()),
+                rateLimitVerification = preSnap,
+                checkpoint = checkpoint,
+                notes = listOf(
+                    "No cached PUUID found in Challenger leaderboard, profiles, rank snapshots, or matches for '$normalizedRegion'; 0 Riot API calls made."
+                )
+            )
+        }
+
+        fun evaluateProbePauseReason(): String? {
+            val snap = getLiveRateLimitVerification(normalizedRegion)
+            if (snap.foregroundYieldActive || snap.activeUserRequests > 0) {
+                return "PAUSED_FOREGROUND_USER_REQUEST"
+            }
+            if (snap.serviceRateLimitActive || snap.retryAfterUntil != null) {
+                return "PAUSED_RETRY_AFTER_BACKOFF"
+            }
+            if (snap.appLimitsVerifiedFromHeaders && !snap.appHasHeadroomForLowPriority) {
+                return "PAUSED_RATE_LIMIT_HEADROOM"
+            }
+            if (snap.methodLimitsByEndpoint.values.any { !it.hasHeadroomForLowPriority }) {
+                return "PAUSED_RATE_LIMIT_HEADROOM"
+            }
+            return null
+        }
+
+        val outcomes = LinkedHashMap<String, String>()
+        var callsMade = 0
+        var usedMatchId = false
+        var probedMatchId: String? = null
+        var abortedReason: String? = null
+
+        // Step A: Probe league-v4-entries-by-puuid (max 1 call)
+        val snapBeforeLeague = getLiveRateLimitVerification(normalizedRegion)
+        if (snapBeforeLeague.appLimitsVerifiedFromHeaders &&
+            "league-v4-entries-by-puuid" !in snapBeforeLeague.missingRequiredMethodEndpoints
+        ) {
+            outcomes["league-v4-entries-by-puuid"] = "SKIPPED_ALREADY_VERIFIED"
+        } else {
+            val pause = evaluateProbePauseReason()
+            if (pause != null) {
+                outcomes["league-v4-entries-by-puuid"] = pause
+                abortedReason = pause
+            } else {
+                val entry = riotApiService.fetchLeagueRankLowPriority(seedPuuid, normalizedRegion)
+                callsMade++
+                val fetchedTier = entry?.tier?.uppercase()?.trim()?.takeIf { it in TIER_ORDER }
+                if (fetchedTier != null && entry.queueType == "RANKED_SOLO_5x5") {
+                    cacheRankSnapshot(
+                        region = normalizedRegion,
+                        puuid = seedPuuid,
+                        tier = fetchedTier,
+                        rank = entry.rank,
+                        leaguePoints = entry.leaguePoints,
+                        snapshotAt = Instant.ofEpochMilli(timeProvider.now())
+                    )
+                }
+                val snapAfterLeague = getLiveRateLimitVerification(normalizedRegion)
+                outcomes["league-v4-entries-by-puuid"] =
+                    if ("league-v4-entries-by-puuid" in snapAfterLeague.verifiedMethodEndpoints) {
+                        "PROBED_1_CALL_VERIFIED"
+                    } else {
+                        "PROBED_1_CALL_HEADERS_MISSING"
+                    }
+            }
+        }
+
+        // Step B: Probe match-v5-ids-by-puuid (max 1 call, count=1)
+        if (abortedReason == null) {
+            val snapBeforeIds = getLiveRateLimitVerification(normalizedRegion)
+            if (snapBeforeIds.appLimitsVerifiedFromHeaders &&
+                "match-v5-ids-by-puuid" !in snapBeforeIds.missingRequiredMethodEndpoints &&
+                cachedMatchId != null
+            ) {
+                outcomes["match-v5-ids-by-puuid"] = "SKIPPED_ALREADY_VERIFIED"
+            } else if (snapBeforeIds.appLimitsVerifiedFromHeaders &&
+                "match-v5-ids-by-puuid" !in snapBeforeIds.missingRequiredMethodEndpoints &&
+                "match-v5-match-by-id" !in snapBeforeIds.missingRequiredMethodEndpoints
+            ) {
+                outcomes["match-v5-ids-by-puuid"] = "SKIPPED_ALREADY_VERIFIED"
+            } else {
+                val pause = evaluateProbePauseReason()
+                if (pause != null) {
+                    outcomes["match-v5-ids-by-puuid"] = pause
+                    abortedReason = pause
+                } else {
+                    val ids = riotApiService.getMatchIdsByPuuidLowPriority(
+                        puuid = seedPuuid,
+                        region = normalizedRegion,
+                        queueId = SOLO_QUEUE_ID,
+                        count = 1,
+                        start = 0
+                    ).orEmpty()
+                    callsMade++
+                    probedMatchId = ids.firstOrNull()?.trim()?.takeIf { it.isNotBlank() }
+                    val snapAfterIds = getLiveRateLimitVerification(normalizedRegion)
+                    outcomes["match-v5-ids-by-puuid"] =
+                        if ("match-v5-ids-by-puuid" in snapAfterIds.verifiedMethodEndpoints) {
+                            "PROBED_1_CALL_VERIFIED"
+                        } else {
+                            "PROBED_1_CALL_HEADERS_MISSING"
+                        }
+                }
+            }
+        } else {
+            outcomes["match-v5-ids-by-puuid"] = "SKIPPED_DUE_TO_$abortedReason"
+        }
+
+        // Step C: Probe match-v5-match-by-id (max 1 call)
+        if (abortedReason == null) {
+            val snapBeforeMatch = getLiveRateLimitVerification(normalizedRegion)
+            if (snapBeforeMatch.appLimitsVerifiedFromHeaders &&
+                "match-v5-match-by-id" !in snapBeforeMatch.missingRequiredMethodEndpoints
+            ) {
+                outcomes["match-v5-match-by-id"] = "SKIPPED_ALREADY_VERIFIED"
+            } else {
+                val matchIdToProbe = probedMatchId ?: cachedMatchId
+                if (matchIdToProbe == null) {
+                    outcomes["match-v5-match-by-id"] = "SKIPPED_NO_SEED_MATCH_ID"
+                } else {
+                    val pause = evaluateProbePauseReason()
+                    if (pause != null) {
+                        outcomes["match-v5-match-by-id"] = pause
+                        abortedReason = pause
+                    } else {
+                        val match = riotApiService.getMatchByIdLowPriority(matchIdToProbe, normalizedRegion)
+                        callsMade++
+                        usedMatchId = true
+                        if (match != null) {
+                            redisCacheService.set("match:$normalizedRegion:$matchIdToProbe", match, MATCH_CACHE_TTL)
+                        }
+                        val snapAfterMatch = getLiveRateLimitVerification(normalizedRegion)
+                        outcomes["match-v5-match-by-id"] =
+                            if ("match-v5-match-by-id" in snapAfterMatch.verifiedMethodEndpoints) {
+                                "PROBED_1_CALL_VERIFIED"
+                            } else {
+                                "PROBED_1_CALL_HEADERS_MISSING"
+                            }
+                    }
+                }
+            }
+        } else {
+            outcomes["match-v5-match-by-id"] = "SKIPPED_DUE_TO_$abortedReason"
+        }
+
+        val finalSnap = getLiveRateLimitVerification(normalizedRegion)
+        val finalStatus = when {
+            abortedReason != null -> abortedReason
+            finalSnap.appLimitsVerifiedFromHeaders && finalSnap.missingRequiredMethodEndpoints.isEmpty() ->
+                "ALL_REQUIRED_HEADERS_VERIFIED"
+            else -> "PARTIAL_HEADERS_OBSERVED"
+        }
+
+        val updatedCheckpoint = checkpoint.copy(
+            totalNetworkCallsMade = checkpoint.totalNetworkCallsMade + callsMade,
+            updatedAt = Instant.ofEpochMilli(timeProvider.now())
+        )
+        saveCollectorCheckpoint(updatedCheckpoint)
+
+        return CohortRateLimitProbeResultDto(
+            region = normalizedRegion,
+            probeStatus = finalStatus,
+            seedSource = seedSource,
+            seedPuuidUsed = true,
+            seedMatchIdUsed = usedMatchId,
+            maxCallsPerEndpoint = 1,
+            totalProbeCallsMade = callsMade,
+            endpointOutcomes = outcomes,
+            probedAt = Instant.ofEpochMilli(timeProvider.now()),
+            rateLimitVerification = finalSnap,
+            checkpoint = updatedCheckpoint,
+            notes = listOf(
+                "Bounded diagnostic probe executed in-process (max 1 LOW-priority call per required endpoint, totalCalls=$callsMade).",
+                "Bulk network collection remains ${if (networkCollectionEnabled) "ENABLED" else "DISABLED (cohort.network-collection.enabled=false)"}."
+            )
+        )
+    }
+
+    private fun resolveDiagnosticSeedPuuid(
+        region: String,
+        explicitSeedPuuid: String?,
+        checkpoint: CohortCollectorCheckpointDto?
+    ): Pair<String?, String> {
+        val explicit = explicitSeedPuuid?.trim()?.takeIf { it.isNotBlank() }
+        if (explicit != null) return explicit to "EXPLICIT_OPERATOR_SEED"
+
+        val lbKeys = listOf(
+            "leaderboard:$region::RANKED_SOLO_5x5",
+            "leaderboard:$region:RANKED_SOLO_5x5"
+        )
+        for (lbKey in lbKeys) {
+            val lb = redisCacheService.get(lbKey, CachedLeaderboardDto::class.java)
+            val puuid = lb?.leaderboard?.entries?.firstOrNull { !it.puuid.isNullOrBlank() }?.puuid?.trim()
+            if (!puuid.isNullOrBlank()) return puuid to "CACHED_CHALLENGER_LEADERBOARD"
+        }
+
+        val fromCheckpoint = checkpoint?.pendingCandidatePuuids?.firstOrNull { it.isNotBlank() }
+            ?: checkpoint?.processedPuuids?.firstOrNull { it.isNotBlank() }
+        if (!fromCheckpoint.isNullOrBlank()) return fromCheckpoint.trim() to "CACHED_COLLECTOR_CHECKPOINT"
+
+        val profileKey = redisCacheService.scanKeys("player:profile:$region:*", maxKeys = 20).firstOrNull()
+        if (profileKey != null) {
+            val puuid = profileKey.substringAfterLast(":").trim()
+            if (puuid.isNotBlank()) return puuid to "CACHED_SUMMONER_PROFILE"
+        }
+
+        val snapKey = redisCacheService.scanKeys("cohort:rank:snapshot:$region:*", maxKeys = 20).firstOrNull()
+        if (snapKey != null) {
+            val puuid = snapKey.substringAfterLast(":").trim()
+            if (puuid.isNotBlank()) return puuid to "CACHED_RANK_SNAPSHOT"
+        }
+
+        val matchKeys = redisCacheService.scanKeys("match:$region:*", maxKeys = 10)
+        if (matchKeys.isNotEmpty()) {
+            val matches = redisCacheService.multiGet(matchKeys, MatchDto::class.java).values.filterNotNull()
+            for (m in matches) {
+                val p = m.info?.participants?.firstOrNull { !it.puuid.isNullOrBlank() }?.puuid?.trim()
+                if (!p.isNullOrBlank()) return p to "CACHED_MATCH_PARTICIPANT"
+            }
+        }
+        return null to "NONE"
+    }
+
+    private fun resolveCachedMatchId(region: String): String? {
+        val matchKey = redisCacheService.scanKeys("match:$region:*", maxKeys = 10).firstOrNull() ?: return null
+        return matchKey.substringAfterLast(":").trim().takeIf { it.isNotBlank() }
+    }
+
     fun getCollectorCheckpoint(region: String, targetPatch: String? = null): CohortCollectorCheckpointDto? {
         val normalizedRegion = region.lowercase().trim()
         val key = collectorCheckpointKey(normalizedRegion, targetPatch?.trim()?.takeIf { it.isNotBlank() })
@@ -1312,20 +1654,40 @@ class CohortBenchmarkService(
             val t = soloRank?.tier?.uppercase()?.trim()
             if (t != null && t in TIER_ORDER) return t
         }
+        val lbKeys = listOf("leaderboard:$region::RANKED_SOLO_5x5", "leaderboard:$region:RANKED_SOLO_5x5")
+        for (lbKey in lbKeys) {
+            val cachedLb = redisCacheService.get(lbKey, CachedLeaderboardDto::class.java) ?: continue
+            val lbRefreshed = cachedLb.lastRefreshed ?: continue
+            if (!lbRefreshed.isBefore(minSnapshotInstant)) {
+                val hasPlayer = cachedLb.leaderboard?.entries?.any { it.puuid == puuid } == true
+                if (hasPlayer) {
+                    val lbTier = cachedLb.leaderboard?.tier?.uppercase()?.trim()?.takeIf { it in TIER_ORDER } ?: "CHALLENGER"
+                    return lbTier
+                }
+            }
+        }
         return null
     }
 
     private fun discoverCandidatePuuidsFromCache(region: String, targetPatch: String?): List<String> {
         val discovered = LinkedHashSet<String>()
+        val lbKeys = listOf("leaderboard:$region::RANKED_SOLO_5x5", "leaderboard:$region:RANKED_SOLO_5x5")
+        for (lbKey in lbKeys) {
+            val cachedLb = redisCacheService.get(lbKey, CachedLeaderboardDto::class.java) ?: continue
+            for (entry in cachedLb.leaderboard?.entries.orEmpty()) {
+                val pid = entry.puuid?.trim()?.takeIf { it.isNotBlank() } ?: continue
+                if (discovered.size < 1_000) discovered.add(pid)
+            }
+        }
         val profileKeys = redisCacheService.scanKeys("player:profile:$region:*", maxKeys = 500)
         for (key in profileKeys) {
             val puuid = key.substringAfterLast(":").trim()
-            if (puuid.isNotBlank()) discovered.add(puuid)
+            if (puuid.isNotBlank() && discovered.size < 1_000) discovered.add(puuid)
         }
         val snapKeys = redisCacheService.scanKeys("cohort:rank:snapshot:$region:*", maxKeys = 500)
         for (key in snapKeys) {
             val puuid = key.substringAfterLast(":").trim()
-            if (puuid.isNotBlank()) discovered.add(puuid)
+            if (puuid.isNotBlank() && discovered.size < 1_000) discovered.add(puuid)
         }
         val matchKeys = redisCacheService.scanKeys("match:$region:*", maxKeys = 500)
         if (matchKeys.isNotEmpty()) {

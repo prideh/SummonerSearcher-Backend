@@ -285,6 +285,23 @@ data class CohortCollectorStatusDto(
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
+data class CohortRateLimitProbeResultDto(
+    val region: String,
+    val probeStatus: String,
+    val executionMode: String = "SAME_PROCESS_BOUNDED_PROBE",
+    val seedSource: String = "NONE",
+    val seedPuuidUsed: Boolean = false,
+    val seedMatchIdUsed: Boolean = false,
+    val maxCallsPerEndpoint: Int = 1,
+    val totalProbeCallsMade: Int = 0,
+    val endpointOutcomes: Map<String, String> = emptyMap(),
+    val probedAt: Instant,
+    val rateLimitVerification: RateLimitVerificationSnapshotDto,
+    val checkpoint: CohortCollectorCheckpointDto? = null,
+    val notes: List<String> = emptyList()
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class CohortExtractionReportDto(
     val reportSource: String = "FRESH_BOUNDED_EXTRACTION",
     val inventory: CohortCacheInventoryDto,
@@ -292,3 +309,4 @@ data class CohortExtractionReportDto(
     val cells: List<CohortBenchmarkCellDto>,
     val methodologyNotes: List<String>
 )
+

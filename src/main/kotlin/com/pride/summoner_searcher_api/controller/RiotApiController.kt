@@ -181,11 +181,45 @@ class RiotApiController(
     }
 
     /**
+     * Guarded same-process bounded diagnostic probe for the LOW-priority cohort collector.
+     * Uses a cached seed (`euw1` by default) to perform at most 1 LOW-priority call per missing required endpoint
+     * (`league-v4-entries-by-puuid`, `match-v5-ids-by-puuid`, `match-v5-match-by-id`) so actual Riot
+     * `X-App-Rate-Limit` and `X-Method-Rate-Limit` headers can be observed BEFORE enabling bulk network collection.
+     */
+    @org.springframework.web.bind.annotation.RequestMapping(
+        value = ["/cohorts/{region}/collector/probe"],
+        method = [org.springframework.web.bind.annotation.RequestMethod.POST, org.springframework.web.bind.annotation.RequestMethod.GET]
+    )
+    fun probeCohortCollectorRateLimits(
+        @PathVariable region: String,
+        @org.springframework.web.bind.annotation.RequestParam(required = false) patch: String? = null,
+        @org.springframework.web.bind.annotation.RequestParam(required = false) seedPuuid: String? = null,
+        @org.springframework.web.bind.annotation.RequestParam(required = false) seedMatchId: String? = null,
+        @org.springframework.web.bind.annotation.RequestHeader(name = "X-Cohort-Operator-Token", required = false) operatorToken: String? = null,
+        httpRequest: jakarta.servlet.http.HttpServletRequest
+    ): ResponseEntity<com.pride.summoner_searcher_api.dto.CohortRateLimitProbeResultDto?> {
+        val runner = overnightCohortCollectorRunner ?: return ResponseEntity.notFound().build()
+        if (!isAuthorizedCollectorOperator(runner, httpRequest, operatorToken)) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.FORBIDDEN).build()
+        }
+        val probeResult = runner.runDiagnosticProbeGuarded(
+            region = region,
+            targetPatch = patch,
+            seedPuuid = seedPuuid,
+            seedMatchId = seedMatchId
+        )
+        return ResponseEntity.ok(probeResult)
+    }
+
+    /**
      * Guarded same-process start/resume endpoint for the LOW-priority cohort collector.
      * Executes inside the live backend JVM sharing [com.pride.summoner_searcher_api.service.RiotApiRateLimiter]
      * so foreground user requests and verified rate-limit headers are shared in-process.
      */
-    @org.springframework.web.bind.annotation.PostMapping("/cohorts/{region}/collector/start")
+    @org.springframework.web.bind.annotation.RequestMapping(
+        value = ["/cohorts/{region}/collector/start"],
+        method = [org.springframework.web.bind.annotation.RequestMethod.POST, org.springframework.web.bind.annotation.RequestMethod.GET]
+    )
     fun startOrResumeCohortCollector(
         @PathVariable region: String,
         @org.springframework.web.bind.annotation.RequestParam(required = false) patch: String? = null,
@@ -214,7 +248,10 @@ class RiotApiController(
     /**
      * Guarded same-process stop endpoint for the LOW-priority cohort collector.
      */
-    @org.springframework.web.bind.annotation.PostMapping("/cohorts/{region}/collector/stop")
+    @org.springframework.web.bind.annotation.RequestMapping(
+        value = ["/cohorts/{region}/collector/stop"],
+        method = [org.springframework.web.bind.annotation.RequestMethod.POST, org.springframework.web.bind.annotation.RequestMethod.GET]
+    )
     fun stopCohortCollector(
         @PathVariable region: String,
         @org.springframework.web.bind.annotation.RequestParam(required = false) patch: String? = null,
@@ -242,4 +279,5 @@ class RiotApiController(
         )
     }
 }
+
 

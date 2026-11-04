@@ -936,6 +936,231 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 invalidPatchResp.action shouldBe "INVALID_PARAMETERS"
             }
         }
+
+        When("running the guarded bounded diagnostic probe from cached EUW seed before enabling bulk network collection") {
+            val clockMs = java.util.concurrent.atomic.AtomicLong(nowInstant.toEpochMilli())
+            val testClock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            val probeRateLimiter = RiotApiRateLimiter(testClock)
+            val probeRedis = mockk<RedisCacheService>(relaxed = true)
+            val probeRiotApi = mockk<RiotApiService>(relaxed = true)
+            val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
+            val savedRankSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
+            val savedMatches = mutableMapOf<String, MatchDto>()
+            var cachedLb: CachedLeaderboardDto? = null
+            var probeLockHeld = false
+
+            every { probeRedis.scanKeys(any(), any(), any()) } returns emptyList()
+            every { probeRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
+                savedCheckpoints[firstArg()]
+            }
+            every { probeRedis.get(match { it.startsWith("leaderboard:euw1:") }, CachedLeaderboardDto::class.java) } answers {
+                cachedLb
+            }
+            every { probeRedis.setIfAbsent(match { it.startsWith("lock:cohort:collector:probe:") }, any(), any()) } answers {
+                if (probeLockHeld) false else {
+                    probeLockHeld = true
+                    true
+                }
+            }
+            every { probeRedis.delete(match { it.startsWith("lock:cohort:collector:probe:") }) } answers {
+                probeLockHeld = false
+            }
+            every { probeRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                when (val value = secondArg<Any>()) {
+                    is CohortCollectorCheckpointDto -> savedCheckpoints[key] = value
+                    is CohortRankSnapshotDto -> savedRankSnapshots[key] = value
+                    is MatchDto -> savedMatches[key] = value
+                }
+            }
+
+            // Network collection remains OFF (false) while observing real headers via bounded probe
+            val probeService = CohortBenchmarkService(
+                redisCacheService = probeRedis,
+                cohortBenchmarkCellRepository = cohortRepo,
+                riotApiRateLimiter = probeRateLimiter,
+                riotApiService = probeRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = testClock
+            )
+            val probeRunner = com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner(
+                cohortBenchmarkService = probeService,
+                configuredOperatorToken = "",
+                timeProvider = testClock
+            )
+            val probeController = com.pride.summoner_searcher_api.controller.RiotApiController(
+                riotApiService = probeRiotApi,
+                challengerLeagueService = mockk(relaxed = true),
+                userService = mockk(relaxed = true),
+                summonerProfileService = mockk(relaxed = true),
+                redisCacheService = probeRedis,
+                cohortBenchmarkService = probeService,
+                overnightCohortCollectorRunner = probeRunner
+            )
+
+            val externalReq = org.springframework.mock.web.MockHttpServletRequest().apply {
+                remoteAddr = "198.51.100.77"
+            }
+            val loopbackReq = org.springframework.mock.web.MockHttpServletRequest().apply {
+                remoteAddr = "127.0.0.1"
+            }
+
+            // 1. External caller is rejected with 403 Forbidden
+            val forbiddenProbe = probeController.probeCohortCollectorRateLimits(
+                region = "euw1",
+                httpRequest = externalReq
+            )
+
+            // 2. No cached seed in Redis -> 0 Riot calls, initializes baseline checkpoint
+            val noSeedProbe = probeController.probeCohortCollectorRateLimits(
+                region = "euw1",
+                httpRequest = loopbackReq
+            ).body!!
+
+            // 3. Populate cached EUW Challenger leaderboard seed ("leaderboard:euw1::RANKED_SOLO_5x5")
+            cachedLb = CachedLeaderboardDto(
+                lastRefreshed = nowInstant,
+                leaderboard = LeagueListDTO(
+                    tier = "CHALLENGER",
+                    leagueId = "euw-challenger",
+                    queue = "RANKED_SOLO_5x5",
+                    name = "Challenger",
+                    entries = listOf(
+                        LeagueEntryDto(
+                            puuid = "euw-seed-puuid-1",
+                            leaguePoints = 1200,
+                            rank = "I",
+                            wins = 150,
+                            losses = 100,
+                            veteran = true,
+                            inactive = false,
+                            freshBlood = false,
+                            hotStreak = true,
+                            leagueId = "euw-challenger",
+                            queueType = "RANKED_SOLO_5x5",
+                            tier = "CHALLENGER",
+                            summonerName = "Seed1"
+                        )
+                    )
+                )
+            )
+
+            // 4. Foreground user request active -> aborts before making any call
+            probeRateLimiter.beginUserRequest("euw1")
+            val fgPausedProbe = probeController.probeCohortCollectorRateLimits(
+                region = "euw1",
+                httpRequest = loopbackReq
+            ).body!!
+            probeRateLimiter.endUserRequest("euw1")
+            clockMs.addAndGet(3_000L)
+
+            // 5. Service 429 Retry-After active -> aborts before making any call
+            probeRateLimiter.recordRetryAfter("euw1", 0L, "service")
+            val retryPausedProbe = probeController.probeCohortCollectorRateLimits(
+                region = "euw1",
+                httpRequest = loopbackReq
+            ).body!!
+            clockMs.addAndGet(11_000L)
+
+            // 6. Clear to probe: mock the 3 low-priority Riot calls to update real headers in probeRateLimiter
+            var leagueCalls = 0
+            var matchIdCalls = 0
+            var matchDetailCalls = 0
+
+            coEvery { probeRiotApi.fetchLeagueRankLowPriority("euw-seed-puuid-1", "euw1") } coAnswers {
+                leagueCalls++
+                probeRateLimiter.updateLimits(
+                    region = "euw1",
+                    limitHeader = "20:1,100:120",
+                    countHeader = "1:1,1:120",
+                    endpointKey = "league-v4-entries-by-puuid",
+                    methodLimitHeader = "500:10",
+                    methodCountHeader = "1:10"
+                )
+                LeagueEntryDto(
+                    leagueId = "l-euw", queueType = "RANKED_SOLO_5x5", tier = "CHALLENGER", rank = "I",
+                    summonerName = "Seed1", puuid = "euw-seed-puuid-1", leaguePoints = 1200, wins = 150, losses = 100,
+                    veteran = true, inactive = false, freshBlood = false, hotStreak = true
+                )
+            }
+            coEvery { probeRiotApi.getMatchIdsByPuuidLowPriority("euw-seed-puuid-1", "euw1", 420, 1, 0) } coAnswers {
+                matchIdCalls++
+                probeRateLimiter.updateLimits(
+                    region = "euw1",
+                    limitHeader = "20:1,100:120",
+                    countHeader = "2:1,2:120",
+                    endpointKey = "match-v5-ids-by-puuid",
+                    methodLimitHeader = "2000:10",
+                    methodCountHeader = "1:10"
+                )
+                listOf("EUW1_PROBE_M1")
+            }
+            coEvery { probeRiotApi.getMatchByIdLowPriority("EUW1_PROBE_M1", "euw1") } coAnswers {
+                matchDetailCalls++
+                probeRateLimiter.updateLimits(
+                    region = "euw1",
+                    limitHeader = "20:1,100:120",
+                    countHeader = "3:1,3:120",
+                    endpointKey = "match-v5-match-by-id",
+                    methodLimitHeader = "2000:10",
+                    methodCountHeader = "1:10"
+                )
+                null
+            }
+
+            val verifiedProbe = probeController.probeCohortCollectorRateLimits(
+                region = "euw1",
+                httpRequest = loopbackReq
+            ).body!!
+
+            // 7. Second probe call when already verified makes 0 Riot API calls
+            val repeatProbe = probeController.probeCohortCollectorRateLimits(
+                region = "euw1",
+                httpRequest = loopbackReq
+            ).body!!
+
+            Then("it should enforce max 1 call per required endpoint, respect foreground and Retry-After pauses, verify all 3 method headers with network still OFF, and make 0 calls once verified") {
+                forbiddenProbe.statusCode shouldBe org.springframework.http.HttpStatus.FORBIDDEN
+
+                noSeedProbe.probeStatus shouldBe "NO_CACHED_SEED_PUUID_AVAILABLE"
+                noSeedProbe.totalProbeCallsMade shouldBe 0
+                noSeedProbe.checkpoint shouldNotBe null
+                noSeedProbe.checkpoint?.lastStopReason shouldBe "CACHE_BASELINE_INITIALIZED"
+
+                fgPausedProbe.probeStatus shouldBe "PAUSED_FOREGROUND_USER_REQUEST"
+                fgPausedProbe.totalProbeCallsMade shouldBe 0
+
+                retryPausedProbe.probeStatus shouldBe "PAUSED_RETRY_AFTER_BACKOFF"
+                retryPausedProbe.totalProbeCallsMade shouldBe 0
+
+                verifiedProbe.probeStatus shouldBe "ALL_REQUIRED_HEADERS_VERIFIED"
+                verifiedProbe.seedSource shouldBe "CACHED_CHALLENGER_LEADERBOARD"
+                verifiedProbe.totalProbeCallsMade shouldBe 3
+                leagueCalls shouldBe 1
+                matchIdCalls shouldBe 1
+                matchDetailCalls shouldBe 1
+                verifiedProbe.rateLimitVerification.appLimitsVerifiedFromHeaders shouldBe true
+                verifiedProbe.rateLimitVerification.appRateLimitHeader shouldBe "20:1,100:120"
+                verifiedProbe.rateLimitVerification.verifiedMethodEndpoints shouldBe setOf(
+                    "league-v4-entries-by-puuid",
+                    "match-v5-ids-by-puuid",
+                    "match-v5-match-by-id"
+                )
+                verifiedProbe.rateLimitVerification.missingRequiredMethodEndpoints shouldBe emptySet()
+                // Bulk network collection remains OFF until operator explicitly enables it
+                verifiedProbe.rateLimitVerification.networkCollectionEnabled shouldBe false
+                verifiedProbe.rateLimitVerification.readyForLowPriorityNetworkCollection shouldBe false
+
+                repeatProbe.probeStatus shouldBe "ALREADY_VERIFIED_ZERO_CALLS"
+                repeatProbe.totalProbeCallsMade shouldBe 0
+                leagueCalls shouldBe 1
+                matchIdCalls shouldBe 1
+                matchDetailCalls shouldBe 1
+            }
+        }
     }
 })
 
