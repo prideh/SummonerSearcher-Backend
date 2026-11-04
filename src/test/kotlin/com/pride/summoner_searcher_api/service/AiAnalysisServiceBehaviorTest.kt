@@ -742,7 +742,7 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 heuristicTokens shouldBe 3809
                 (promptBytes <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
                 // User question is preserved verbatim (never silently truncated)
-                prompt shouldContain "**USER QUESTION:**\n$userQuestion"
+                prompt shouldContain "User: $userQuestion"
 
                 // 2. Bounded match count + omitted rollup
                 val expandedGameLines = Regex("""^\s{4}Game \d+""", RegexOption.MULTILINE).findAll(prompt).count()
@@ -799,7 +799,7 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 val stressedHeuristicTokens = AiAnalysisService.heuristicTokenEstimate(stressedPrompt)
                 println("MEASURED_STRESSED_PROMPT_BYTES: stressedBytes=$stressedBytes, stressedHeuristicTokens=$stressedHeuristicTokens, maxAllowed=${AiAnalysisService.MAX_PROMPT_BYTES}")
                 (stressedBytes <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
-                stressedPrompt shouldContain "**USER QUESTION:**\n$nearLimitQuestion"
+                stressedPrompt shouldContain "User: $nearLimitQuestion"
             }
         }
 
