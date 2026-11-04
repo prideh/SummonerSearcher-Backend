@@ -65,6 +65,7 @@ class SecurityConfig(
                     // Protected endpoints: Require authentication for all other API paths.
                     .requestMatchers("/api/user/**").authenticated()
                     .requestMatchers("/api/ai/**").permitAll()
+                    .requestMatchers("/api/sitemap.xml").permitAll()
                     // Default security rule: Deny any request that doesn't match the rules above.
                     .anyRequest().denyAll()
             }

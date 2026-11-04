@@ -15,4 +15,9 @@ interface IndexedPlayerRepository : JpaRepository<IndexedPlayer, String> {
     fun findTop8ByGameNameStartingWithIgnoreCaseOrderByLastSeenAtDesc(
         gameNamePrefix: String
     ): List<IndexedPlayer>
+
+    /**
+     * Retrieves the top 5,000 most recently seen indexed players for dynamic XML sitemap generation.
+     */
+    fun findTop5000ByOrderByLastSeenAtDesc(): List<IndexedPlayer>
 }
