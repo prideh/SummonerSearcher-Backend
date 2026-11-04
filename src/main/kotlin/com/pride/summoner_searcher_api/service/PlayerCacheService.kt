@@ -86,22 +86,20 @@ class PlayerCacheService(
             // 2. Fetch ALL match IDs since start of year (pagination handled in service)
             val allMatchIds = riotApiService.fetchMatchIdsSince(puuid, region, startOfYear)
 
-            // Fast-path: if we already have a cached profile and no new matches have been played,
+            // Fast-path: if we already have a cached profile, no new matches have been played,
+            // and all served recentMatches already have info.gameVersion populated,
             // skip re-streaming and re-accumulating all matches from Redis while updating rank, level, and icon.
-            if (cachedProfile != null && (
+            val recentMatchesHaveGameVersion = cachedProfile?.recentMatches?.all { it.info?.gameVersion != null } ?: true
+            if (cachedProfile != null && recentMatchesHaveGameVersion && (
                 (allMatchIds.isEmpty() && cachedProfile.allMatchIds.isEmpty()) ||
                 (cachedProfile.allMatchIds.isNotEmpty() && allMatchIds.firstOrNull() == cachedProfile.allMatchIds.first() && cachedProfile.overallStats != null)
             )) {
-                val backfilledRecentMatches = cachedProfile.recentMatches?.let {
-                    backfillMissingGameVersions(it, region, checkRedisFirst = true)
-                }
                 val fastUpdatedProfile = cachedProfile.copy(
                     gameName = summonerName,
                     tagLine = tagLine,
                     summonerLevel = refreshedLevel,
                     profileIconId = refreshedIconId,
                     soloQueueRank = freshRank,
-                    recentMatches = backfilledRecentMatches,
                     lastRefreshed = java.time.Instant.now()
                 )
                 redisCacheService.set(cacheKey, fastUpdatedProfile, Duration.ofDays(14))
@@ -113,7 +111,6 @@ class PlayerCacheService(
             val accumulator = MatchStatsAccumulator(puuid)
             val recentMatches = mutableListOf<com.pride.summoner_searcher_api.dto.MatchDto>()
             val validMatchIds = mutableListOf<String>()
-            val freshlyFetchedIds = mutableSetOf<String>()
             val startOfYearMs = startOfYear * 1000
             
             // We need to re-process ALL matches to ensure stats are accurate.
@@ -128,11 +125,14 @@ class PlayerCacheService(
                 val redisKeys = chunk.map { getMatchCacheKey(it, region) }
                 val cachedMatchesMap = redisCacheService.multiGet(redisKeys, com.pride.summoner_searcher_api.dto.MatchDto::class.java)
                 
-                // Identify missing matches
-                val missingIds = chunk.filter { cachedMatchesMap[getMatchCacheKey(it, region)] == null }
+                // Identify missing matches (or legacy cached matches with gameVersion == null)
+                val missingIds = chunk.filter { id ->
+                    val cached = cachedMatchesMap[getMatchCacheKey(id, region)]
+                    cached == null || cached.info?.gameVersion == null
+                }
                 
                 if (missingIds.isNotEmpty()) {
-                    logger.info("Chunk ${processedCount / chunkSize + 1}/${chunks.size}: Fetching ${missingIds.size} missing matches from API")
+                    logger.info("Chunk ${processedCount / chunkSize + 1}/${chunks.size}: Fetching ${missingIds.size} missing/legacy matches from API")
                 }
                 
                 // Fetch missing from API concurrently
@@ -145,8 +145,6 @@ class PlayerCacheService(
                         }
                     }
                 }.awaitAll().filterNotNull()
-                
-                fetchedMatches.mapNotNull { it.metadata?.matchId }.forEach { freshlyFetchedIds.add(it) }
 
                 // Cache newly fetched matches - ONLY if they are valid (this year)
                 // This prevents polluting Redis with old matches that Riot returns due to the bug.
@@ -160,9 +158,10 @@ class PlayerCacheService(
                      redisCacheService.set(getMatchCacheKey(matchId, region), match, Duration.ofDays(60))
                 }
                 
-                // Combine cached and fetched matches for this chunk
+                // Combine cached and fetched matches for this chunk (preferring freshly refetched matches)
+                val fetchedById = fetchedMatches.associateBy { it.metadata?.matchId }
                 val chunkMatches = chunk.mapNotNull { id ->
-                    cachedMatchesMap[getMatchCacheKey(id, region)] ?: fetchedMatches.find { it.metadata?.matchId == id }
+                    fetchedById[id] ?: cachedMatchesMap[getMatchCacheKey(id, region)]
                 }
                 
                 // FILTER: Client-side work around for Riot API bug ignoring startTime
@@ -202,12 +201,6 @@ class PlayerCacheService(
             }
             
             val (championStats, overallStats) = accumulator.getResult()
-            val backfilledRecentMatches = backfillMissingGameVersions(
-                matches = recentMatches,
-                region = region,
-                alreadyFetchedIds = freshlyFetchedIds,
-                checkRedisFirst = false
-            )
             
             val updatedProfile = SummonerProfileDto(
                 puuid = puuid,
@@ -216,7 +209,7 @@ class PlayerCacheService(
                 summonerLevel = refreshedLevel,
                 profileIconId = refreshedIconId,
                 soloQueueRank = freshRank,
-                recentMatches = backfilledRecentMatches, // Only 20 matches, with gameVersion backfilled if needed
+                recentMatches = recentMatches, // Only 20 matches
                 allMatchIds = validMatchIds,   // Only valid matches from this year
                 championStats = championStats,
                 overallStats = overallStats,
@@ -235,62 +228,6 @@ class PlayerCacheService(
     }
 
     /**
-     * Lazily backfills [com.pride.summoner_searcher_api.dto.MatchInfo.gameVersion] on cached [com.pride.summoner_searcher_api.dto.MatchDto]
-     * entries that predate the gameVersion field so served profiles expose it without waiting for the 14d/60d TTLs to expire.
-     */
-    private suspend fun backfillMissingGameVersions(
-        matches: List<com.pride.summoner_searcher_api.dto.MatchDto>,
-        region: String,
-        alreadyFetchedIds: Set<String> = emptySet(),
-        checkRedisFirst: Boolean = true
-    ): List<com.pride.summoner_searcher_api.dto.MatchDto> = kotlinx.coroutines.coroutineScope {
-        val staleIds = matches.mapNotNull { match ->
-            val id = match.metadata?.matchId
-            if (id != null && id !in alreadyFetchedIds && match.info?.gameVersion.isNullOrBlank()) id else null
-        }
-        if (staleIds.isEmpty()) return@coroutineScope matches
-
-        logger.info("Lazy backfilling gameVersion for ${staleIds.size} cached matches in $region")
-        val cachedMatchesMap = if (checkRedisFirst) {
-            val redisKeys = staleIds.map { getMatchCacheKey(it, region) }
-            redisCacheService.multiGet(redisKeys, com.pride.summoner_searcher_api.dto.MatchDto::class.java)
-        } else {
-            emptyMap()
-        }
-
-        val idsToFetchFromApi = staleIds.filter { id ->
-            cachedMatchesMap[getMatchCacheKey(id, region)]?.info?.gameVersion.isNullOrBlank() != false
-        }
-
-        val fetchedById = idsToFetchFromApi.map { matchId ->
-            async {
-                try {
-                    riotApiService.getMatchById(matchId, region)
-                } catch (e: Exception) {
-                    null
-                }
-            }
-        }.awaitAll().filterNotNull().associateBy { it.metadata?.matchId }
-
-        fetchedById.forEach { (mid, match) ->
-            if (mid != null) {
-                redisCacheService.set(getMatchCacheKey(mid, region), match, Duration.ofDays(60))
-            }
-        }
-
-        matches.map { original ->
-            val id = original.metadata?.matchId
-            if (id != null && original.info?.gameVersion.isNullOrBlank()) {
-                fetchedById[id]
-                    ?: cachedMatchesMap[getMatchCacheKey(id, region)]?.takeIf { !it.info?.gameVersion.isNullOrBlank() }
-                    ?: original
-            } else {
-                original
-            }
-        }
-    }
-
-    /**
      * Retrieves a cached profile directly. Used for pagination.
      */
     fun getCachedProfile(puuid: String, region: String): SummonerProfileDto? {
@@ -304,12 +241,12 @@ class PlayerCacheService(
         val redisKeys = matchIds.map { getMatchCacheKey(it, region) }
         val cachedMatchesMap = redisCacheService.multiGet(redisKeys, com.pride.summoner_searcher_api.dto.MatchDto::class.java)
         
-        val missingOrStaleIds = matchIds.filter { id ->
+        val missingIds = matchIds.filter { id ->
             val cached = cachedMatchesMap[getMatchCacheKey(id, region)]
-            cached == null || cached.info?.gameVersion.isNullOrBlank()
+            cached == null || cached.info?.gameVersion == null
         }
         
-        val fetchedMatches = missingOrStaleIds.map { matchId ->
+        val fetchedMatches = missingIds.map { matchId ->
             async {
                 try {
                     riotApiService.getMatchById(matchId, region)

@@ -239,9 +239,12 @@ class PlayerCacheServiceTest : BehaviorSpec({
             coEvery { riotApiService.getSummonerByPuuid(puuid, region) } returns SummonerDto("id", puuid, 125L, 456)
             coEvery { riotApiService.fetchMatchIdsSince(puuid, region, any()) } returns existingMatchIds
 
-            // Redis match cache also has legacy entry with gameVersion == null
-            every { redisCacheService.multiGet(listOf("match:euw1:EUW1_2"), MatchDto::class.java) } returns mapOf(
-                "match:euw1:EUW1_2" to legacyMatch2
+            // Slow-path chunk multiGet returns legacyMatch2 (gameVersion == null) and currentMatch1 (gameVersion != null)
+            every {
+                redisCacheService.multiGet(listOf("match:euw1:EUW1_2", "match:euw1:EUW1_1"), MatchDto::class.java)
+            } returns mapOf(
+                "match:euw1:EUW1_2" to legacyMatch2,
+                "match:euw1:EUW1_1" to currentMatch1
             )
 
             val backfilledMatch2 = legacyMatch2.copy(
@@ -265,13 +268,14 @@ class PlayerCacheServiceTest : BehaviorSpec({
 
             val result = playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine)
 
-            Then("it should lazily backfill only the stale match and persist both match and profile caches") {
+            Then("it should fall through fast-path to slow-path, refetch only the match with gameVersion==null, and update Redis in place") {
                 result?.recentMatches?.size shouldBe 2
                 result?.recentMatches?.get(0)?.info?.gameVersion shouldBe "16.20.826.3891"
                 result?.recentMatches?.get(1)?.info?.gameVersion shouldBe "16.19.820.1111"
                 fetchedMatchIds shouldBe listOf("EUW1_2")
                 cachedMatchKeys shouldBe listOf("match:euw1:EUW1_2")
                 savedProfile?.recentMatches?.get(0)?.info?.gameVersion shouldBe "16.20.826.3891"
+                savedProfile?.recentMatches?.get(1)?.info?.gameVersion shouldBe "16.19.820.1111"
             }
         }
 
