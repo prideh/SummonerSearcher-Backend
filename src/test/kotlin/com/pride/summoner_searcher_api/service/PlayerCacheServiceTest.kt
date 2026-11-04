@@ -10,6 +10,8 @@ import com.pride.summoner_searcher_api.repository.IndexedPlayerRepository
 import io.kotest.core.spec.style.BehaviorSpec
 import io.kotest.matchers.shouldBe
 import io.mockk.*
+import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import java.time.Duration
 
 class PlayerCacheServiceTest : BehaviorSpec({
@@ -377,6 +379,284 @@ class PlayerCacheServiceTest : BehaviorSpec({
             Then("it should return null without caching a ghost profile") {
                 result shouldBe null
                 coVerify(exactly = 0) { riotApiService.fetchMatchIdsSince(puuid, "kr", any()) }
+            }
+        }
+
+        When("fetching a 60-match seasonal history where all 60 cached matches lack teams (recent20-only enrichment + full-season correctness)") {
+            val matchIds = (1..60).map { "EUW1_$it" }
+            val nowMs = System.currentTimeMillis()
+            val mapper = com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules()
+
+            fun buildParticipant(): com.pride.summoner_searcher_api.dto.ParticipantDto =
+                mapper.readValue(
+                    """
+                    {
+                      "puuid": "$puuid",
+                      "championName": "Orianna",
+                      "teamId": 100,
+                      "teamPosition": "MIDDLE",
+                      "win": true,
+                      "kills": 8,
+                      "deaths": 2,
+                      "assists": 10,
+                      "totalMinionsKilled": 220,
+                      "neutralMinionsKilled": 10,
+                      "visionScore": 25
+                    }
+                    """.trimIndent(),
+                    com.pride.summoner_searcher_api.dto.ParticipantDto::class.java
+                )
+
+            every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            every { redisCacheService.get(any(), SummonerProfileDto::class.java) } returns null
+            coEvery { riotApiService.getSummonerByPuuid(puuid, region) } returns SummonerDto("id", puuid, 200L, 55)
+            coEvery { riotApiService.fetchLeagueRank(puuid, region) } returns null
+            coEvery { riotApiService.fetchMatchIdsSince(puuid, region, any()) } returns matchIds
+
+            // All 60 matches exist in Redis with participant stats, but teams == null (legacy cache)
+            every { redisCacheService.multiGet(any(), MatchDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                keys.associateWith { key ->
+                    val id = key.substringAfterLast(":")
+                    val idx = id.substringAfter("_").toInt()
+                    MatchDto(
+                        metadata = MatchMetadata(id, listOf(puuid)),
+                        info = MatchInfo(
+                            gameCreation = nowMs - idx * 60_000L,
+                            gameDuration = 1800L,
+                            gameId = idx.toLong(),
+                            queueId = 420,
+                            gameMode = "CLASSIC",
+                            gameVersion = "16.7.1",
+                            participants = listOf(buildParticipant()),
+                            teams = null
+                        )
+                    )
+                }
+            }
+
+            val fetchedMatchIds = java.util.Collections.synchronizedList(mutableListOf<String>())
+            coEvery { riotApiService.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                fetchedMatchIds.add(id)
+                val idx = id.substringAfter("_").toInt()
+                MatchDto(
+                    metadata = MatchMetadata(id, listOf(puuid)),
+                    info = MatchInfo(
+                        gameCreation = nowMs - idx * 60_000L,
+                        gameDuration = 1800L,
+                        gameId = idx.toLong(),
+                        queueId = 420,
+                        gameMode = "CLASSIC",
+                        gameVersion = "16.7.1",
+                        participants = listOf(buildParticipant()),
+                        teams = emptyList()
+                    )
+                )
+            }
+
+            val result = playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine)
+
+            Then("it should enrich only the recent 20 matches from Riot API while accumulating full-season stats across all 60 matches") {
+                fetchedMatchIds.size shouldBe 20
+                fetchedMatchIds.toSet() shouldBe (1..20).map { "EUW1_$it" }.toSet()
+                result?.recentMatches?.size shouldBe 20
+                result?.recentMatches?.all { it.info?.teams != null } shouldBe true
+                result?.allMatchIds?.size shouldBe 60
+                result?.totalMatches shouldBe 60
+                result?.overallStats?.wins shouldBe 60
+                result?.championStats?.firstOrNull()?.games shouldBe 60
+            }
+        }
+
+        When("fetching a 60-match seasonal history where recent 20 are enriched, 21..55 are legacy cached, and 56..60 are missing from Redis") {
+            val matchIds = (1..60).map { "EUW1_$it" }
+            val nowMs = System.currentTimeMillis()
+            val mapper = com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules()
+
+            fun buildParticipant(): com.pride.summoner_searcher_api.dto.ParticipantDto =
+                mapper.readValue(
+                    """
+                    {
+                      "puuid": "$puuid",
+                      "championName": "Syndra",
+                      "teamId": 100,
+                      "teamPosition": "MIDDLE",
+                      "win": true,
+                      "kills": 6,
+                      "deaths": 1,
+                      "assists": 8,
+                      "totalMinionsKilled": 200,
+                      "neutralMinionsKilled": 0,
+                      "visionScore": 20
+                    }
+                    """.trimIndent(),
+                    com.pride.summoner_searcher_api.dto.ParticipantDto::class.java
+                )
+
+            every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            every { redisCacheService.get(any(), SummonerProfileDto::class.java) } returns null
+            coEvery { riotApiService.getSummonerByPuuid(puuid, region) } returns SummonerDto("id", puuid, 200L, 55)
+            coEvery { riotApiService.fetchLeagueRank(puuid, region) } returns null
+            coEvery { riotApiService.fetchMatchIdsSince(puuid, region, any()) } returns matchIds
+
+            every { redisCacheService.multiGet(any(), MatchDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                keys.associateWith { key ->
+                    val id = key.substringAfterLast(":")
+                    val idx = id.substringAfter("_").toInt()
+                    when {
+                        idx > 55 -> null // Missing from Redis in chunk 2
+                        idx <= 20 -> MatchDto(
+                            metadata = MatchMetadata(id, listOf(puuid)),
+                            info = MatchInfo(
+                                gameCreation = nowMs - idx * 60_000L,
+                                gameDuration = 1800L,
+                                gameId = idx.toLong(),
+                                queueId = 420,
+                                gameMode = "CLASSIC",
+                                gameVersion = "16.7.1",
+                                participants = listOf(buildParticipant()),
+                                teams = emptyList()
+                            )
+                        )
+                        else -> MatchDto(
+                            metadata = MatchMetadata(id, listOf(puuid)),
+                            info = MatchInfo(
+                                gameCreation = nowMs - idx * 60_000L,
+                                gameDuration = 1800L,
+                                gameId = idx.toLong(),
+                                queueId = 420,
+                                gameMode = "CLASSIC",
+                                gameVersion = "16.7.1",
+                                participants = listOf(buildParticipant()),
+                                teams = null
+                            )
+                        )
+                    }
+                }
+            }
+
+            val fetchedMatchIds = java.util.Collections.synchronizedList(mutableListOf<String>())
+            coEvery { riotApiService.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                fetchedMatchIds.add(id)
+                val idx = id.substringAfter("_").toInt()
+                MatchDto(
+                    metadata = MatchMetadata(id, listOf(puuid)),
+                    info = MatchInfo(
+                        gameCreation = nowMs - idx * 60_000L,
+                        gameDuration = 1800L,
+                        gameId = idx.toLong(),
+                        queueId = 420,
+                        gameMode = "CLASSIC",
+                        gameVersion = "16.7.1",
+                        participants = listOf(buildParticipant()),
+                        teams = emptyList()
+                    )
+                )
+            }
+
+            val result = playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine)
+
+            Then("it should fetch only the 5 missing older matches (56..60) from Riot API and include all 60 in season totals") {
+                fetchedMatchIds.toSet() shouldBe (56..60).map { "EUW1_$it" }.toSet()
+                result?.totalMatches shouldBe 60
+                result?.overallStats?.wins shouldBe 60
+                result?.championStats?.firstOrNull()?.games shouldBe 60
+            }
+        }
+
+        When("fetching a warm cached profile that is already complete and enriched (cached-immediate/background refresh)") {
+            val nowMs = System.currentTimeMillis()
+            val enrichedRecentMatch = MatchDto(
+                metadata = MatchMetadata("EUW1_1", listOf(puuid)),
+                info = MatchInfo(
+                    gameCreation = nowMs - 120_000L,
+                    gameDuration = 1800L,
+                    gameId = 1L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.7.1",
+                    participants = emptyList(),
+                    teams = emptyList()
+                )
+            )
+            val (_, existingOverallStats) = MatchStatsAccumulator(puuid).getResult()
+            val warmCachedProfile = SummonerProfileDto(
+                puuid = puuid,
+                gameName = summonerName,
+                tagLine = tagLine,
+                summonerLevel = 150L,
+                profileIconId = 77,
+                soloQueueRank = null,
+                recentMatches = listOf(enrichedRecentMatch),
+                allMatchIds = listOf("EUW1_1"),
+                championStats = emptyList(),
+                overallStats = existingOverallStats,
+                improvementStats = com.pride.summoner_searcher_api.dto.ImprovementStatsDto(),
+                totalMatches = 1,
+                lastRefreshed = java.time.Instant.now().minusSeconds(600)
+            )
+
+            val backgroundSaved = kotlinx.coroutines.CompletableDeferred<SummonerProfileDto>()
+            every { redisCacheService.get("player:profile:euw1:$puuid", SummonerProfileDto::class.java) } returns warmCachedProfile
+            every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            coEvery { riotApiService.getSummonerByPuuid(puuid, region) } coAnswers {
+                kotlinx.coroutines.delay(80)
+                SummonerDto("id", puuid, 151L, 88)
+            }
+            coEvery { riotApiService.fetchLeagueRank(puuid, region) } returns null
+            coEvery { riotApiService.fetchMatchIdsSince(puuid, region, any()) } returns listOf("EUW1_1")
+            every {
+                redisCacheService.set<SummonerProfileDto>("player:profile:euw1:$puuid", any(), any())
+            } answers {
+                backgroundSaved.complete(secondArg())
+            }
+
+            val immediateResult = playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine)
+            val refreshedInBackground = kotlinx.coroutines.withTimeout(2_000L) { backgroundSaved.await() }
+
+            Then("it should return the cached profile immediately and complete the refresh in the background") {
+                immediateResult?.summonerLevel shouldBe 150L
+                refreshedInBackground.summonerLevel shouldBe 151L
+                refreshedInBackground.profileIconId shouldBe 88
+            }
+        }
+
+        When("two concurrent requests arrive for the same cold uncached profile (duplicate-lock single-flight fix)") {
+            val coldPuuid = "cold-concurrent-puuid"
+            val summonerCalls = java.util.concurrent.atomic.AtomicInteger(0)
+            val matchIdsCalls = java.util.concurrent.atomic.AtomicInteger(0)
+            every { redisCacheService.get("player:profile:euw1:$coldPuuid", SummonerProfileDto::class.java) } returns null
+            every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            coEvery { riotApiService.getSummonerByPuuid(coldPuuid, region) } coAnswers {
+                summonerCalls.incrementAndGet()
+                kotlinx.coroutines.delay(100)
+                SummonerDto("id", coldPuuid, 300L, 99)
+            }
+            coEvery { riotApiService.fetchLeagueRank(coldPuuid, region) } returns null
+            coEvery { riotApiService.fetchMatchIdsSince(coldPuuid, region, any()) } coAnswers {
+                matchIdsCalls.incrementAndGet()
+                emptyList()
+            }
+
+            val (res1, res2) = kotlinx.coroutines.runBlocking {
+                val d1 = async(kotlinx.coroutines.Dispatchers.Default) {
+                    playerCacheService.getPlayerProfile(coldPuuid, region, summonerName, tagLine)
+                }
+                val d2 = async(kotlinx.coroutines.Dispatchers.Default) {
+                    kotlinx.coroutines.delay(15)
+                    playerCacheService.getPlayerProfile(coldPuuid, region, summonerName, tagLine)
+                }
+                d1.await() to d2.await()
+            }
+
+            Then("both callers should receive the non-null profile and Riot API should only be queried once") {
+                res1?.summonerLevel shouldBe 300L
+                res2?.summonerLevel shouldBe 300L
+                summonerCalls.get() shouldBe 1
+                matchIdsCalls.get() shouldBe 1
             }
         }
     }

@@ -28,7 +28,8 @@ class RiotApiController(
     private val challengerLeagueService: ChallengerLeagueService,
     private val userService: UserService,
     private val summonerProfileService: SummonerProfileService,
-    private val redisCacheService: com.pride.summoner_searcher_api.service.RedisCacheService
+    private val redisCacheService: com.pride.summoner_searcher_api.service.RedisCacheService,
+    private val cohortBenchmarkService: com.pride.summoner_searcher_api.service.CohortBenchmarkService? = null
 ) {
 
     /**
@@ -124,5 +125,34 @@ class RiotApiController(
         }
 
         ResponseEntity.ok(liveGame)
+    }
+
+    /**
+     * Runs a cache-only cohort extraction + rate-limit verification report for [region] (zero Riot API calls).
+     */
+    @GetMapping("/cohorts/{region}/report")
+    fun getCohortExtractionReport(
+        @PathVariable region: String,
+        @org.springframework.web.bind.annotation.RequestParam(required = false) patch: String? = null,
+        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "10") maxGamesPerPlayer: Int = 10
+    ): ResponseEntity<com.pride.summoner_searcher_api.dto.CohortExtractionReportDto?> {
+        val report = cohortBenchmarkService?.extractCachedCohortsAndReport(
+            region = region,
+            targetPatch = patch,
+            maxGamesPerPlayer = maxGamesPerPlayer
+        )
+        return ResponseEntity.ok(report)
+    }
+
+    /**
+     * Returns persisted de-identified cohort benchmark cells for [region] and optional [patch].
+     */
+    @GetMapping("/cohorts/{region}")
+    fun getCohortBenchmarks(
+        @PathVariable region: String,
+        @org.springframework.web.bind.annotation.RequestParam(required = false) patch: String? = null
+    ): ResponseEntity<List<com.pride.summoner_searcher_api.dto.CohortBenchmarkCellDto>> {
+        val cells = cohortBenchmarkService?.getPersistedCohortCells(region, patch) ?: emptyList()
+        return ResponseEntity.ok(cells)
     }
 }

@@ -128,6 +128,36 @@ class RedisCacheService(
         redisTemplate.delete(key)
     }
 
+    /**
+     * Non-blocking cursor-based key scan matching [pattern] (e.g., `match:euw1:*` or `player:profile:euw1:*`).
+     * Falls back to `redisTemplate.keys(pattern)` only when `scan` is unstubbed in unit tests.
+     */
+    fun scanKeys(pattern: String, countHint: Long = 200): List<String> {
+        return try {
+            val options = org.springframework.data.redis.core.ScanOptions.scanOptions()
+                .match(pattern)
+                .count(countHint)
+                .build()
+            val found = mutableSetOf<String>()
+            redisTemplate.scan(options).use { cursor ->
+                while (cursor.hasNext()) {
+                    found.add(cursor.next())
+                }
+            }
+            if (found.isNotEmpty()) {
+                found.sorted()
+            } else {
+                redisTemplate.keys(pattern)?.sorted() ?: emptyList()
+            }
+        } catch (e: Exception) {
+            try {
+                redisTemplate.keys(pattern)?.sorted() ?: emptyList()
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }
+    }
+
     private fun compress(data: String): String {
         val bos = java.io.ByteArrayOutputStream()
         java.util.zip.GZIPOutputStream(bos).bufferedWriter(java.nio.charset.StandardCharsets.UTF_8).use { it.write(data) }

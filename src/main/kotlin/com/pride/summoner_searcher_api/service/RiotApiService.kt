@@ -32,64 +32,102 @@ class RiotApiService(
     /**
      * Wrapper function that enforces rate limiting for all Riot API calls.
      * 
-     * Now supports Dynamic Rate Limiting by parsing response headers.
+     * Now supports Dynamic Rate Limiting by parsing both App and Method response headers.
      */
     private suspend fun <T> executeRateLimitedCall(
         region: String, 
         priority: ApiPriority = ApiPriority.HIGH, 
+        endpointKey: String? = null,
         apiCall: () -> ResponseEntity<T>?
     ): T? {
         var attempts = 0
         val maxRetries = 3
-        
-        while (true) {
-            rateLimiter.acquirePermit(region, priority)
-            try {
-                val response = withContext(Dispatchers.IO) {
-                    apiCall()
+        if (priority == ApiPriority.HIGH) {
+            rateLimiter.beginUserRequest(region)
+        }
+        try {
+            while (true) {
+                val waitStartMs = System.currentTimeMillis()
+                if (priority == ApiPriority.LOW) {
+                    rateLimiter.awaitLowPriorityClearance(region)
                 }
-                
-                if (response != null) {
-                    val headers = response.headers
-                    rateLimiter.updateLimits(
-                        region,
-                        headers.getFirst("X-App-Rate-Limit"),
-                        headers.getFirst("X-App-Rate-Limit-Count")
+                rateLimiter.acquirePermit(region, priority, endpointKey)
+                val limiterWaitMs = System.currentTimeMillis() - waitStartMs
+                if (limiterWaitMs > 25L) {
+                    logger.info(
+                        "Riot rate limiter wait: region={}, endpoint={}, priority={}, limiterWaitMs={}",
+                        region, endpointKey ?: "unspecified", priority, limiterWaitMs
                     )
-                    return response.body
-                } else {
-                    return null
                 }
-            } catch (e: HttpClientErrorException.TooManyRequests) {
-                attempts++
-                
-                // Update limits from the 429 response as well
-                rateLimiter.updateLimits(
-                    region,
-                    e.responseHeaders?.getFirst("X-App-Rate-Limit"),
-                    e.responseHeaders?.getFirst("X-App-Rate-Limit-Count")
-                )
+                try {
+                    val httpStartMs = System.currentTimeMillis()
+                    val response = withContext(Dispatchers.IO) {
+                        apiCall()
+                    }
+                    val httpMs = System.currentTimeMillis() - httpStartMs
+                    
+                    if (response != null) {
+                        val headers = response.headers
+                        val appLimit = headers.getFirst("X-App-Rate-Limit")
+                        val appCount = headers.getFirst("X-App-Rate-Limit-Count")
+                        val methodLimit = headers.getFirst("X-Method-Rate-Limit")
+                        val methodCount = headers.getFirst("X-Method-Rate-Limit-Count")
+                        rateLimiter.updateLimits(
+                            region = region,
+                            limitHeader = appLimit,
+                            countHeader = appCount,
+                            endpointKey = endpointKey,
+                            methodLimitHeader = methodLimit,
+                            methodCountHeader = methodCount
+                        )
+                        logger.debug(
+                            "Riot API call complete: region={}, endpoint={}, priority={}, limiterWaitMs={}, httpMs={}, appLimit={} ({}), methodLimit={} ({})",
+                            region, endpointKey ?: "unspecified", priority, limiterWaitMs, httpMs,
+                            appLimit ?: "n/a", appCount ?: "n/a", methodLimit ?: "n/a", methodCount ?: "n/a"
+                        )
+                        return response.body
+                    } else {
+                        return null
+                    }
+                } catch (e: HttpClientErrorException.TooManyRequests) {
+                    attempts++
+                    
+                    // Update limits from the 429 response as well
+                    rateLimiter.updateLimits(
+                        region = region,
+                        limitHeader = e.responseHeaders?.getFirst("X-App-Rate-Limit"),
+                        countHeader = e.responseHeaders?.getFirst("X-App-Rate-Limit-Count"),
+                        endpointKey = endpointKey,
+                        methodLimitHeader = e.responseHeaders?.getFirst("X-Method-Rate-Limit"),
+                        methodCountHeader = e.responseHeaders?.getFirst("X-Method-Rate-Limit-Count")
+                    )
 
-                if (attempts > maxRetries) {
-                    logger.error("Exceeded max retries ($maxRetries) for rate limit. Giving up.")
-                    throw e
+                    // Parse Retry-After header (in seconds) and record regional Retry-After window
+                    val retryAfterSeconds = e.responseHeaders?.getFirst("Retry-After")?.toLongOrNull() ?: 1L
+                    val waitMs = (retryAfterSeconds * 1000) + 100 // Add 100ms buffer
+                    rateLimiter.recordRetryAfter(region, waitMs)
+
+                    if (attempts > maxRetries) {
+                        logger.error("Exceeded max retries ($maxRetries) for rate limit. Giving up.")
+                        throw e
+                    }
+                    
+                    logger.warn("Hit 429 Rate Limit! Waiting {}ms before retry {}/{}.", waitMs, attempts, maxRetries)
+                    kotlinx.coroutines.delay(waitMs)
+                } catch (e: org.springframework.web.client.ResourceAccessException) {
+                    attempts++
+                    if (attempts > maxRetries) {
+                        logger.error("Exceeded max retries ($maxRetries) for network timeout. Giving up.")
+                        throw e
+                    }
+                    val waitMs = 1000L * attempts // Exponential backoff: 1s, 2s, 3s
+                    logger.warn("Network timeout (ReadTimeout). Waiting {}ms before retry {}/{}.", waitMs, attempts, maxRetries)
+                    kotlinx.coroutines.delay(waitMs)
                 }
-                
-                // Parse Retry-After header (in seconds)
-                val retryAfterSeconds = e.responseHeaders?.getFirst("Retry-After")?.toLongOrNull() ?: 1L
-                val waitMs = (retryAfterSeconds * 1000) + 100 // Add 100ms buffer
-                
-                logger.warn("Hit 429 Rate Limit! Waiting {}ms before retry {}/{}.", waitMs, attempts, maxRetries)
-                kotlinx.coroutines.delay(waitMs)
-            } catch (e: org.springframework.web.client.ResourceAccessException) {
-                attempts++
-                if (attempts > maxRetries) {
-                    logger.error("Exceeded max retries ($maxRetries) for network timeout. Giving up.")
-                    throw e
-                }
-                val waitMs = 1000L * attempts // Exponential backoff: 1s, 2s, 3s
-                logger.warn("Network timeout (ReadTimeout). Waiting {}ms before retry {}/{}.", waitMs, attempts, maxRetries)
-                kotlinx.coroutines.delay(waitMs)
+            }
+        } finally {
+            if (priority == ApiPriority.HIGH) {
+                rateLimiter.endUserRequest(region)
             }
         }
     }
@@ -98,7 +136,7 @@ class RiotApiService(
         val regionalRouting = mapToRegionRouting(region)
         val accountBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val uri = "$accountBaseUrl/riot/account/v1/accounts/by-puuid/{puuid}"
-        return executeRateLimitedCall(region, priority) {
+        return executeRateLimitedCall(region, priority, "account-v1-by-puuid") {
             try {
                 riotRestClient.get()
                     .uri(uri, puuid)
@@ -115,7 +153,7 @@ class RiotApiService(
         val regionalRouting = mapToRegionRouting(region)
         val accountBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val accountUri = "$accountBaseUrl/riot/account/v1/accounts/by-riot-id/{summonerName}/{tagLine}"
-        return executeRateLimitedCall(region, ApiPriority.HIGH) {
+        return executeRateLimitedCall(region, ApiPriority.HIGH, "account-v1-by-riot-id") {
             try {
                 riotRestClient.get()
                     .uri(accountUri, summonerName, tagLine)
@@ -131,7 +169,7 @@ class RiotApiService(
     suspend fun getSummonerByPuuid(puuid: String, region: String): SummonerDto? {
         val platformBaseUrl = "https://${region}.api.riotgames.com"
         val summonerUri = "$platformBaseUrl/lol/summoner/v4/summoners/by-puuid/{puuid}"
-        return executeRateLimitedCall(region, ApiPriority.HIGH) {
+        return executeRateLimitedCall(region, ApiPriority.HIGH, "summoner-v4-by-puuid") {
             try {
                 riotRestClient.get()
                     .uri(summonerUri, puuid)
@@ -163,7 +201,7 @@ class RiotApiService(
         val platformBaseUrl = "https://${region}.api.riotgames.com"
         val leagueUri = "$platformBaseUrl/lol/league/v4/entries/by-puuid/{puuid}"
         val leagueEntriesType = object : ParameterizedTypeReference<List<LeagueEntryDto>>() {}
-        val allLeagueEntries = executeRateLimitedCall(region, ApiPriority.HIGH) {
+        val allLeagueEntries = executeRateLimitedCall(region, ApiPriority.HIGH, "league-v4-entries-by-puuid") {
             try {
                 riotRestClient.get()
                     .uri(leagueUri, puuid)
@@ -184,7 +222,7 @@ class RiotApiService(
         
         // Fetching the list itself is a background task but infrequent, can be HIGH or LOW. 
         // Let's keep it LOW since it's part of the warmer.
-        val leagueList = executeRateLimitedCall(region, ApiPriority.LOW) {
+        val leagueList = executeRateLimitedCall(region, ApiPriority.LOW, "league-v4-challenger") {
             try {
                 riotRestClient.get()
                     .uri(uri, queue)
@@ -247,7 +285,7 @@ class RiotApiService(
         }
 
         val responseType = object : ParameterizedTypeReference<List<String>>() {}
-        return executeRateLimitedCall(region) {
+        return executeRateLimitedCall(region, ApiPriority.HIGH, "match-v5-ids-by-puuid") {
             try {
                 riotRestClient.get()
                     .uri(uriBuilder.toString(), uriVariables)
@@ -259,6 +297,35 @@ class RiotApiService(
             }
         }
 
+    }
+
+    suspend fun getMatchIdsByPuuidLowPriority(
+        puuid: String,
+        region: String,
+        queueId: Int = 420,
+        count: Int = 20,
+        start: Int = 0
+    ): List<String>? {
+        val regionalRouting = mapToRegionRouting(region)
+        val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
+        val uri = "$matchBaseUrl/lol/match/v5/matches/by-puuid/{puuid}/ids?queue={queueId}&count={count}&start={start}"
+        val uriVariables = mapOf(
+            "puuid" to puuid,
+            "queueId" to queueId,
+            "count" to count,
+            "start" to start
+        )
+        val responseType = object : ParameterizedTypeReference<List<String>>() {}
+        return executeRateLimitedCall(region, ApiPriority.LOW, "match-v5-ids-by-puuid") {
+            try {
+                riotRestClient.get()
+                    .uri(uri, uriVariables)
+                    .retrieve()
+                    .toEntity(responseType)
+            } catch (e: HttpClientErrorException.NotFound) {
+                null
+            }
+        }
     }
     
     /**
@@ -345,7 +412,7 @@ class RiotApiService(
         val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val uri = "$matchBaseUrl/lol/match/v5/matches/{matchId}"
         
-        return executeRateLimitedCall(region) {
+        return executeRateLimitedCall(region, ApiPriority.HIGH, "match-v5-match-by-id") {
             try {
                 riotRestClient.get()
                     .uri(uri, matchId)
@@ -358,12 +425,29 @@ class RiotApiService(
         }
     }
 
+    suspend fun getMatchByIdLowPriority(matchId: String, region: String): MatchDto? {
+        val regionalRouting = mapToRegionRouting(region)
+        val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
+        val uri = "$matchBaseUrl/lol/match/v5/matches/{matchId}"
+
+        return executeRateLimitedCall(region, ApiPriority.LOW, "match-v5-match-by-id") {
+            try {
+                riotRestClient.get()
+                    .uri(uri, matchId)
+                    .retrieve()
+                    .toEntity(MatchDto::class.java)
+            } catch (e: HttpClientErrorException.NotFound) {
+                null
+            }
+        }
+    }
+
     suspend fun getMatchTimeline(matchId: String, region: String): com.pride.summoner_searcher_api.dto.MatchTimelineDto? {
         val regionalRouting = mapToRegionRouting(region)
         val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val uri = "$matchBaseUrl/lol/match/v5/matches/{matchId}/timeline"
 
-        return executeRateLimitedCall(region) {
+        return executeRateLimitedCall(region, ApiPriority.HIGH, "match-v5-timeline-by-id") {
             try {
                 riotRestClient.get()
                     .uri(uri, matchId)
@@ -384,7 +468,7 @@ class RiotApiService(
     suspend fun getPlatformData(region: String): PlatformStatusDto? {
         val baseUrl = "https://${region}.api.riotgames.com"
         val uri = "$baseUrl/lol/status/v4/platform-data"
-        return executeRateLimitedCall(region) {
+        return executeRateLimitedCall(region, ApiPriority.HIGH, "status-v4-platform-data") {
             try {
                 riotRestClient.get()
                     .uri(uri)
@@ -423,7 +507,7 @@ class RiotApiService(
         val platformBaseUrl = "https://${region}.api.riotgames.com"
         val uri = "$platformBaseUrl/lol/spectator/v5/active-games/by-summoner/{puuid}"
         
-        val gameInfo = executeRateLimitedCall(region) {
+        val gameInfo = executeRateLimitedCall(region, ApiPriority.HIGH, "spectator-v5-active-game") {
             try {
                 riotRestClient.get()
                     .uri(uri, puuid)

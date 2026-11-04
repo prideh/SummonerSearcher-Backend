@@ -1,15 +1,24 @@
 package com.pride.summoner_searcher_api.service
 
+import com.pride.summoner_searcher_api.dto.MatchDto
 import com.pride.summoner_searcher_api.dto.SummonerProfileDto
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import java.time.Duration
+import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * A service for managing the caching of player profiles.
@@ -24,6 +33,20 @@ class PlayerCacheService(
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
+    private val timelineAnalysisService = TimelineAnalysisService()
+    private val inFlightMutex = Mutex()
+    private val inFlightRefreshes = ConcurrentHashMap<String, CompletableDeferred<SummonerProfileDto?>>()
+    private val backgroundRefreshScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    companion object {
+        private const val RECENT_MATCHES_LIMIT = 20
+        private const val CHUNK_SIZE = 50
+        private val PROFILE_CACHE_TTL = Duration.ofDays(14)
+        private val MATCH_CACHE_TTL = Duration.ofDays(60)
+        private val PROFILE_LOCK_TTL = Duration.ofSeconds(60)
+        private const val LOCK_POLL_INTERVAL_MS = 250L
+        private const val LOCK_MAX_POLL_ATTEMPTS = 120 // Up to 30s wait for cross-instance cold loads
+    }
 
     /**
      * Generates a unique key for storing a player's profile in Redis.
@@ -32,52 +55,173 @@ class PlayerCacheService(
     
     private fun getMatchCacheKey(matchId: String, region: String) = "match:${region.lowercase()}:$matchId"
 
-    private val timelineAnalysisService = TimelineAnalysisService()
+    private fun getLockKey(puuid: String, region: String) = "lock:profile:${region.lowercase()}:$puuid"
 
-    private fun needsMatchBackfill(cached: com.pride.summoner_searcher_api.dto.MatchDto?): Boolean {
+    private fun getFlightKey(puuid: String, region: String) = "${region.lowercase()}:$puuid"
+
+    /**
+     * True when a match is completely absent from Redis and must be fetched for full-season stats accuracy.
+     */
+    private fun isMissingForSeasonStats(cached: MatchDto?): Boolean {
+        return cached?.info == null
+    }
+
+    /**
+     * True when a match is missing or lacks enriched fields (`gameVersion`, `teams`) needed for
+     * recent-20 match display, patch badges, and `improvementStats` objective control.
+     */
+    private fun needsMatchBackfill(cached: MatchDto?): Boolean {
         val info = cached?.info ?: return true
         return info.gameVersion == null || info.teams == null
     }
 
     /**
-     * Retrieves a player's profile, utilizing a cache-aside strategy with an "always check" update mechanism.
-     * To prevent OOM, it processes matches in chunks and only stores the latest 20 in the profile.
+     * A cached profile is ready for immediate cache-hit response (with asynchronous background refresh)
+     * when its full-season `overallStats`, `improvementStats`, and enriched `recentMatches` are present.
      */
-    suspend fun getPlayerProfile(puuid: String, region: String, summonerName: String, tagLine: String): SummonerProfileDto? = kotlinx.coroutines.coroutineScope {
+    internal fun isProfileReadyForImmediateServe(cached: SummonerProfileDto?): Boolean {
+        if (cached == null) return false
+        if (cached.overallStats == null || cached.improvementStats == null) return false
+        val recent = cached.recentMatches
+        if (cached.allMatchIds.isNotEmpty() && recent.isNullOrEmpty()) return false
+        return recent?.none { needsMatchBackfill(it) } ?: true
+    }
+
+    /**
+     * Retrieves a player's profile:
+     * - If a complete profile with enriched `recentMatches` is already in Redis, returns it immediately
+     *   and triggers a non-blocking background refresh (`cached-immediate/background refresh`).
+     * - Otherwise (cache miss or legacy un-enriched cache entry), coordinates a single-flight refresh.
+     */
+    suspend fun getPlayerProfile(puuid: String, region: String, summonerName: String, tagLine: String): SummonerProfileDto? {
         val cacheKey = getProfileCacheKey(puuid, region)
-        val lockKey = "lock:profile:${region.lowercase()}:$puuid"
+        val cachedProfile = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
 
-        // Try to acquire lock
-        val acquired = redisCacheService.setIfAbsent(lockKey, "LOCKED", Duration.ofSeconds(15))
+        if (isProfileReadyForImmediateServe(cachedProfile)) {
+            logger.info("Immediate cache hit for $summonerName#$tagLine ($region); serving cached profile and triggering background refresh.")
+            triggerBackgroundRefresh(puuid, region, summonerName, tagLine)
+            return cachedProfile
+        }
 
-        if (!acquired) {
-            logger.info("Profile refresh already in progress for $summonerName. Waiting/Returning cached.")
-            // Wait briefly for the other request to finish (handling the double-request-on-first-load case)
-            repeat(5) {
-                val cached = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
-                if (cached != null && (cached.lastRefreshed?.isAfter(java.time.Instant.now().minusSeconds(10)) == true)) {
-                    logger.info("Cache hit (during lock wait) for $summonerName")
-                    return@coroutineScope cached
-                }
-                kotlinx.coroutines.delay(500)
+        return refreshPlayerProfile(puuid, region, summonerName, tagLine)
+    }
+
+    /**
+     * Triggers an asynchronous background refresh if one is not already in flight for `(region, puuid)`.
+     */
+    fun triggerBackgroundRefresh(puuid: String, region: String, summonerName: String, tagLine: String) {
+        val flightKey = getFlightKey(puuid, region)
+        val existing = inFlightRefreshes[flightKey]
+        if (existing != null && existing.isActive) {
+            return
+        }
+        backgroundRefreshScope.launch {
+            try {
+                refreshPlayerProfile(puuid, region, summonerName, tagLine)
+            } catch (e: Exception) {
+                logger.warn("Background profile refresh failed for $summonerName#$tagLine ($region): ${e.message}")
             }
-            // If still nothing or stale, return whatever is in cache (graceful degradation)
-            return@coroutineScope redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
+        }
+    }
+
+    /**
+     * Single-flight profile refresh with duplicate-lock coordination.
+     * Concurrent callers in the same JVM share the in-flight [Deferred] instead of timing out after 2.5s
+     * and returning `null`.
+     */
+    suspend fun refreshPlayerProfile(
+        puuid: String,
+        region: String,
+        summonerName: String,
+        tagLine: String
+    ): SummonerProfileDto? {
+        val flightKey = getFlightKey(puuid, region)
+        val (deferred, isLeader) = inFlightMutex.withLock {
+            val active = inFlightRefreshes[flightKey]
+            if (active != null && active.isActive) {
+                active to false
+            } else {
+                val created = CompletableDeferred<SummonerProfileDto?>()
+                inFlightRefreshes[flightKey] = created
+                created to true
+            }
+        }
+
+        if (!isLeader) {
+            logger.info("Joining in-flight profile refresh for $summonerName#$tagLine ($region)")
+            return deferred.await()
         }
 
         try {
+            val result = executeLockedRefresh(puuid, region, summonerName, tagLine)
+            deferred.complete(result)
+            return result
+        } catch (t: Throwable) {
+            deferred.completeExceptionally(t)
+            throw t
+        } finally {
+            inFlightMutex.withLock {
+                if (inFlightRefreshes[flightKey] === deferred) {
+                    inFlightRefreshes.remove(flightKey)
+                }
+            }
+        }
+    }
+
+    private suspend fun executeLockedRefresh(
+        puuid: String,
+        region: String,
+        summonerName: String,
+        tagLine: String
+    ): SummonerProfileDto? = coroutineScope {
+        val cacheKey = getProfileCacheKey(puuid, region)
+        val lockKey = getLockKey(puuid, region)
+        val waitStart = Instant.now()
+
+        val acquired = redisCacheService.setIfAbsent(lockKey, "LOCKED", PROFILE_LOCK_TTL)
+
+        if (!acquired) {
+            logger.info("Profile refresh lock held externally for $summonerName#$tagLine ($region). Waiting for completion.")
+            val immediateCached = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
+            if (isProfileReadyForImmediateServe(immediateCached)) {
+                return@coroutineScope immediateCached
+            }
+
+            repeat(LOCK_MAX_POLL_ATTEMPTS) {
+                val cached = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
+                if (cached != null && (
+                        cached.lastRefreshed?.isAfter(waitStart.minusSeconds(10)) == true ||
+                            isProfileReadyForImmediateServe(cached)
+                        )
+                ) {
+                    logger.info("Cache populated during lock wait for $summonerName#$tagLine ($region)")
+                    return@coroutineScope cached
+                }
+                delay(LOCK_POLL_INTERVAL_MS)
+            }
+
+            val afterWaitCached = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
+            if (afterWaitCached != null) {
+                return@coroutineScope afterWaitCached
+            }
+            logger.warn("Lock wait expired with empty cache for $summonerName#$tagLine ($region); proceeding with fallback refresh.")
+        }
+
+        try {
+            val refreshStartMs = System.currentTimeMillis()
             val cachedProfile = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
 
             if (cachedProfile != null) {
-                logger.info("Cache hit for $summonerName")
+                logger.info("Refreshing cached profile for $summonerName#$tagLine ($region)")
             } else {
-                logger.info("Cache miss for $summonerName - Fetching from API")
+                logger.info("Cache miss for $summonerName#$tagLine ($region) - Fetching from API")
             }
 
             // Calculate Start of Year (Jan 1st) in Epoch Seconds
             val startOfYear = java.time.Year.now().atDay(1).atStartOfDay(java.time.ZoneOffset.UTC).toEpochSecond()
 
             // 1. Verify summoner exists on this regional shard and fetch fresh level & icon
+            val metaStartMs = System.currentTimeMillis()
             val freshSummoner = riotApiService.getSummonerByPuuid(puuid, region)
             if (freshSummoner == null) {
                 logger.info("No summoner found on shard $region for $summonerName#$tagLine (puuid=$puuid). Returning null.")
@@ -88,10 +232,13 @@ class PlayerCacheService(
             }
             val refreshedLevel = freshSummoner.summonerLevel ?: cachedProfile?.summonerLevel
             val refreshedIconId = freshSummoner.profileIconId ?: cachedProfile?.profileIconId
-            val freshRank = riotApiService.fetchLeagueRank(puuid, region)
-            
-            // 2. Fetch ALL match IDs since start of year (pagination handled in service)
-            val allMatchIds = riotApiService.fetchMatchIdsSince(puuid, region, startOfYear)
+
+            // Fetch rank and season match ID list concurrently
+            val rankDeferred = async { riotApiService.fetchLeagueRank(puuid, region) }
+            val matchIdsDeferred = async { riotApiService.fetchMatchIdsSince(puuid, region, startOfYear) }
+            val freshRank = rankDeferred.await()
+            val allMatchIds = matchIdsDeferred.await()
+            val metadataAndIdsMs = System.currentTimeMillis() - metaStartMs
 
             // Fast-path: if we already have a cached profile, no new matches have been played,
             // and all served recentMatches already have info.gameVersion and info.teams populated,
@@ -110,42 +257,77 @@ class PlayerCacheService(
                     profileIconId = refreshedIconId,
                     soloQueueRank = freshRank,
                     improvementStats = fastImprovementStats,
-                    lastRefreshed = java.time.Instant.now()
+                    lastRefreshed = Instant.now()
                 )
-                redisCacheService.set(cacheKey, fastUpdatedProfile, Duration.ofDays(14))
-                logger.info("Fast-path refresh for $summonerName (no new matches since ${cachedProfile.allMatchIds.firstOrNull()}).")
+                redisCacheService.set(cacheKey, fastUpdatedProfile, PROFILE_CACHE_TTL)
+                val totalFastMs = System.currentTimeMillis() - refreshStartMs
+                logger.info(
+                    "Fast-path refresh for {}#{} ({}): totalMs={}, metadataAndIdsMs={}, totalMatches={} (no new matches since {}).",
+                    summonerName, tagLine, region, totalFastMs, metadataAndIdsMs,
+                    cachedProfile.totalMatches, cachedProfile.allMatchIds.firstOrNull()
+                )
                 return@coroutineScope fastUpdatedProfile
             }
             
-            // 3. Process matches in chunks to calculate stats without holding everything in memory
+            // 3. Process matches in chunks to calculate full-season stats without holding everything in memory.
+            // Recent-20-only enrichment:
+            // - Matches in the recent 20 (first 20 valid seasonal matches) are fetched if missing OR if they lack gameVersion/teams.
+            // - Matches beyond the recent 20 (index >= 20) are fetched ONLY if genuinely missing from Redis (cached?.info == null),
+            //   avoiding re-fetching hundreds of older cached matches just for gameVersion/teams while preserving full-season stats accuracy.
+            val matchProcessingStartMs = System.currentTimeMillis()
             val accumulator = MatchStatsAccumulator(puuid)
-            val recentMatches = mutableListOf<com.pride.summoner_searcher_api.dto.MatchDto>()
+            val recentMatches = mutableListOf<MatchDto>()
             val validMatchIds = mutableListOf<String>()
             val startOfYearMs = startOfYear * 1000
             
-            // We need to re-process ALL matches to ensure stats are accurate.
-            // Thanks to Redis, this is fast for existing matches.
-            val chunkSize = 50
-            val chunks = allMatchIds.chunked(chunkSize)
-            
+            val chunks = allMatchIds.chunked(CHUNK_SIZE)
             var processedCount = 0
+            var projectedRecentCount = 0
+            var cacheHitsCount = 0
+            var missingSeasonFetchCount = 0
+            var recent20BackfillCount = 0
+            var skippedOlderBackfillCount = 0
+            val alreadyFetchedIds = mutableSetOf<String>()
             
             for (chunk in chunks) {
-                // Bulk fetch from Redis
                 val redisKeys = chunk.map { getMatchCacheKey(it, region) }
-                val cachedMatchesMap = redisCacheService.multiGet(redisKeys, com.pride.summoner_searcher_api.dto.MatchDto::class.java)
+                val cachedMatchesMap = redisCacheService.multiGet(redisKeys, MatchDto::class.java)
                 
-                // Identify missing matches (or legacy cached matches with gameVersion == null or teams == null)
-                val missingIds = chunk.filter { id ->
+                val missingIds = mutableListOf<String>()
+                for (id in chunk) {
                     val cached = cachedMatchesMap[getMatchCacheKey(id, region)]
-                    needsMatchBackfill(cached)
+                    if (isMissingForSeasonStats(cached)) {
+                        missingIds.add(id)
+                        missingSeasonFetchCount++
+                        if (projectedRecentCount < RECENT_MATCHES_LIMIT) {
+                            projectedRecentCount++
+                        }
+                    } else {
+                        cacheHitsCount++
+                        val creation = cached?.info?.gameCreation ?: 0L
+                        if (creation >= startOfYearMs) {
+                            if (projectedRecentCount < RECENT_MATCHES_LIMIT) {
+                                projectedRecentCount++
+                                if (needsMatchBackfill(cached)) {
+                                    missingIds.add(id)
+                                    recent20BackfillCount++
+                                }
+                            } else if (needsMatchBackfill(cached)) {
+                                skippedOlderBackfillCount++
+                            }
+                        }
+                    }
                 }
                 
                 if (missingIds.isNotEmpty()) {
-                    logger.info("Chunk ${processedCount / chunkSize + 1}/${chunks.size}: Fetching ${missingIds.size} missing/legacy matches from API")
+                    alreadyFetchedIds.addAll(missingIds)
+                    logger.info(
+                        "Chunk {}/{}: Fetching {} matches from API (missing={}, recent20Backfill={}, skippedOlderBackfill={})",
+                        processedCount / CHUNK_SIZE + 1, chunks.size, missingIds.size,
+                        missingSeasonFetchCount, recent20BackfillCount, skippedOlderBackfillCount
+                    )
                 }
                 
-                // Fetch missing from API concurrently
                 val fetchedMatches = missingIds.map { matchId ->
                     async { 
                         try {
@@ -156,31 +338,23 @@ class PlayerCacheService(
                     }
                 }.awaitAll().filterNotNull()
 
-                // Cache newly fetched matches - ONLY if they are valid (this year)
-                // This prevents polluting Redis with old matches that Riot returns due to the bug.
                 val validFetchedMatches = fetchedMatches.filter { match ->
                     val creation = match.info?.gameCreation ?: 0
                     match.metadata?.matchId != null && creation >= startOfYearMs
                 }
 
                 validFetchedMatches.forEach { match ->
-                     val matchId = match.metadata!!.matchId!!
-                     redisCacheService.set(getMatchCacheKey(matchId, region), match, Duration.ofDays(60))
+                    val matchId = match.metadata!!.matchId!!
+                    redisCacheService.set(getMatchCacheKey(matchId, region), match, MATCH_CACHE_TTL)
                 }
                 
-                // Combine cached and fetched matches for this chunk (preferring freshly refetched matches)
                 val fetchedById = fetchedMatches.associateBy { it.metadata?.matchId }
                 val chunkMatches = chunk.mapNotNull { id ->
                     fetchedById[id] ?: cachedMatchesMap[getMatchCacheKey(id, region)]
                 }
                 
-                // FILTER: Client-side work around for Riot API bug ignoring startTime
-                // We only process matches that are actually from this year.
-                // Since match IDs are chronological (newest first), if we find an old match, we stop processing.
                 val validChunkMatches = chunkMatches.filter { (it.info?.gameCreation ?: 0) >= startOfYearMs }
                 
-                // Only index players from the top 10 most recent matches overall
-                // to prevent bloating the database when someone has 300+ matches this season.
                 if (validChunkMatches.isNotEmpty() && processedCount < 10) {
                     val remainingToIndex = (10 - processedCount).coerceAtMost(validChunkMatches.size)
                     indexPlayersFromMatches(validChunkMatches.take(remainingToIndex), region)
@@ -190,23 +364,51 @@ class PlayerCacheService(
                     match.metadata?.matchId?.let { validMatchIds.add(it) }
                 }
 
-                // Feed to accumulator
                 validChunkMatches.forEach { accumulator.add(it) }
                 
-                // Keep the first 20 matches for the initial profile view
-                if (recentMatches.size < 20) {
-                    // We take as many as we need to fill up to 20
-                    val needed = 20 - recentMatches.size
+                if (recentMatches.size < RECENT_MATCHES_LIMIT) {
+                    val needed = RECENT_MATCHES_LIMIT - recentMatches.size
                     recentMatches.addAll(validChunkMatches.take(needed))
                 }
                 
                 processedCount += chunk.size
                 
-                // OPTIMIZATION: If we filtered out any matches in this chunk, or if the chunk was empty to begin with (but valid IDs existed),
-                // it means we hit the time boundary. Stop processing further chunks.
                 if (validChunkMatches.size < chunkMatches.size) {
                     logger.info("Hit match time boundary (start of year). Stopping fetch early.")
                     break
+                }
+            }
+
+            // Safety top-up: if any match in the final recent 20 still needs backfill AND was not already fetched
+            // (e.g., an earlier match 404'd and shifted cached match #21 into slot #20), enrich only those entries.
+            val unenrichedRecentIds = recentMatches
+                .filter { needsMatchBackfill(it) }
+                .mapNotNull { it.metadata?.matchId }
+                .filter { it !in alreadyFetchedIds }
+            if (unenrichedRecentIds.isNotEmpty()) {
+                val topUpFetched = unenrichedRecentIds.map { matchId ->
+                    async {
+                        try {
+                            riotApiService.getMatchById(matchId, region)
+                        } catch (e: Exception) {
+                            null
+                        }
+                    }
+                }.awaitAll().filterNotNull()
+                val topUpById = topUpFetched.associateBy { it.metadata?.matchId }
+                topUpFetched.forEach { match ->
+                    val matchId = match.metadata?.matchId
+                    if (matchId != null) {
+                        redisCacheService.set(getMatchCacheKey(matchId, region), match, MATCH_CACHE_TTL)
+                    }
+                }
+                for (i in recentMatches.indices) {
+                    val mid = recentMatches[i].metadata?.matchId
+                    val replacement = if (mid != null) topUpById[mid] else null
+                    if (replacement != null) {
+                        recentMatches[i] = replacement
+                        recent20BackfillCount++
+                    }
                 }
             }
             
@@ -224,22 +426,31 @@ class PlayerCacheService(
                 summonerLevel = refreshedLevel,
                 profileIconId = refreshedIconId,
                 soloQueueRank = freshRank,
-                recentMatches = recentMatches, // Only 20 matches
-                allMatchIds = validMatchIds,   // Only valid matches from this year
+                recentMatches = recentMatches,
+                allMatchIds = validMatchIds,
                 championStats = championStats,
                 overallStats = overallStats,
                 improvementStats = matchOnlyImprovementStats,
                 totalMatches = validMatchIds.size,
-                lastRefreshed = java.time.Instant.now()
+                lastRefreshed = Instant.now()
             )
             
-            redisCacheService.set(cacheKey, updatedProfile, Duration.ofDays(14)) // Store for 14 days
-            logger.info("Refreshed profile for $summonerName. Analyzed ${validMatchIds.size} valid matches (out of ${allMatchIds.size} fetched IDs).")
+            redisCacheService.set(cacheKey, updatedProfile, PROFILE_CACHE_TTL)
+            val matchProcessingMs = System.currentTimeMillis() - matchProcessingStartMs
+            val totalRefreshMs = System.currentTimeMillis() - refreshStartMs
+            logger.info(
+                "Refreshed profile for {}#{} ({}): totalMs={}, metadataAndIdsMs={}, matchProcessingMs={}, validMatches={}/{}, cacheHits={}, missingFetches={}, recent20Backfills={}, skippedOlderBackfills={}",
+                summonerName, tagLine, region, totalRefreshMs, metadataAndIdsMs, matchProcessingMs,
+                validMatchIds.size, allMatchIds.size, cacheHitsCount, missingSeasonFetchCount,
+                recent20BackfillCount, skippedOlderBackfillCount
+            )
             
             return@coroutineScope updatedProfile
 
         } finally {
-            redisCacheService.delete(lockKey)
+            if (acquired) {
+                redisCacheService.delete(lockKey)
+            }
         }
     }
 
