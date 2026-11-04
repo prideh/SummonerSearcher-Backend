@@ -81,4 +81,21 @@ interface AiInteractionRepository : JpaRepository<AiInteraction, UUID> {
         HAVING COUNT(ai) >= 2
     """)
     fun findMultiTurnSessionIds(@Param("since") since: Instant): List<String>
+
+    /**
+     * Aggregate temperature performance stats across all interactions in a single query.
+     * Returns list of [temperature, totalUses, positiveValidatedCount, totalWithFeedback].
+     */
+    @Query("""
+        SELECT ai.temperature,
+               COUNT(DISTINCT ai.id),
+               SUM(CASE WHEN f.feedbackType = 'positive' AND f.isValidated = true THEN 1 ELSE 0 END),
+               COUNT(f.id)
+        FROM AiInteraction ai
+        LEFT JOIN AiFeedback f ON f.interaction.id = ai.id
+        WHERE ai.temperature IS NOT NULL
+        GROUP BY ai.temperature
+        ORDER BY ai.temperature ASC
+    """)
+    fun findTemperatureStats(): List<Array<Any>>
 }

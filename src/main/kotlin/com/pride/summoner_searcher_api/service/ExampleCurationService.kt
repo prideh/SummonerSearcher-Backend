@@ -53,7 +53,8 @@ class ExampleCurationService(
             
             // Only add high-quality examples (score > 80)
             if (qualityScore > BigDecimal("80.0")) {
-                val category = categorizeQuestion(interaction.userQuestion)
+                val category = interaction.summonerRole?.takeIf { it in AiAnalysisService.VALID_CATEGORIES }
+                    ?: categorizeQuestion(interaction.userQuestion)
                 
                 // Check if we already have enough examples for this category
                 val existingCount = exampleRepository.countByQuestionCategoryAndIsActive(category, true)
@@ -205,13 +206,6 @@ class ExampleCurationService(
      * Same logic as AI service for consistency
      */
     private fun categorizeQuestion(question: String): String {
-        val lowerQ = question.lowercase()
-        return when {
-            lowerQ.contains("cs") || lowerQ.contains("farm") || lowerQ.contains("minion") -> "cs_improvement"
-            lowerQ.contains("ward") || lowerQ.contains("vision") -> "vision_improvement"
-            lowerQ.contains("champion") || lowerQ.contains("pool") -> "champion_pool"
-            lowerQ.contains("analyze") || lowerQ.contains("profile") -> "full_analysis"
-            else -> "general"
-        }
+        return AiAnalysisService.categorizeQuestion(question)
     }
 }

@@ -68,7 +68,7 @@ class AiController(
             user = user,
             summonerName = request.context["summonerName"]?.toString() ?: "Unknown",
             summonerRank = request.context["rank"]?.toString(),
-            summonerRole = request.context["primaryRole"]?.toString(),
+            summonerRole = result.category.take(20),
             userQuestion = request.userMessage,
             aiResponse = result.response,
             contextFingerprint = request.sessionId ?: generateContextFingerprint(request.context),
@@ -219,31 +219,20 @@ class AiController(
         if (user == null) throw ResponseStatusException(HttpStatus.UNAUTHORIZED, "Authentication required")
         if (user.role != "ADMIN") throw ResponseStatusException(HttpStatus.FORBIDDEN, "Admin access required")
         
-        // Get all interactions with temperature set, joined with positive feedback
-        val stats = interactionRepository.findAvgQualityByTemperatureAndCategory("")
-        
-        // Group by temperature: count interactions and positive feedback per temp
-        val tempGroups = interactionRepository.findAll()
-            .filter { it.temperature != null }
-            .groupBy { it.temperature!! }
-        
-        return tempGroups.map { (temp, interactions) ->
-            val positiveFeedbackCount = interactions.count { interaction ->
-                feedbackRepository.findByInteractionId(interaction.id!!)
-                    .map { it.feedbackType == "positive" && it.isValidated }.orElse(false)
-            }
-            val totalWithFeedback = interactions.count { interaction ->
-                feedbackRepository.findByInteractionId(interaction.id!!).isPresent
-            }
+        return interactionRepository.findTemperatureStats().mapNotNull { row ->
+            val temp = (row[0] as? Number)?.toDouble() ?: return@mapNotNull null
+            val totalUses = (row[1] as? Number)?.toInt() ?: 0
+            val positiveCount = (row[2] as? Number)?.toInt() ?: 0
+            val totalWithFeedback = (row[3] as? Number)?.toInt() ?: 0
             TemperatureStatResponse(
                 temperature = temp,
-                totalUses = interactions.size,
-                positiveCount = positiveFeedbackCount,
+                totalUses = totalUses,
+                positiveCount = positiveCount,
                 satisfactionRate = if (totalWithFeedback > 0) 
-                    (positiveFeedbackCount.toDouble() / totalWithFeedback * 100).toBigDecimal().setScale(1, RoundingMode.HALF_UP).toDouble()
+                    (positiveCount.toDouble() / totalWithFeedback * 100).toBigDecimal().setScale(1, RoundingMode.HALF_UP).toDouble()
                     else null
             )
-        }.sortedBy { it.temperature }
+        }
     }
     
     /**

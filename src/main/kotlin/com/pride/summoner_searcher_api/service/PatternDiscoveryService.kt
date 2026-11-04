@@ -48,8 +48,10 @@ class PatternDiscoveryService(
                 val current = interactions[i]
                 val next = interactions[i + 1]
                 
-                val triggerCategory = categorizeQuestion(current.userQuestion)
-                val followUpCategory = categorizeQuestion(next.userQuestion)
+                val triggerCategory = current.summonerRole?.takeIf { it in AiAnalysisService.VALID_CATEGORIES }
+                    ?: categorizeQuestion(current.userQuestion)
+                val followUpCategory = next.summonerRole?.takeIf { it in AiAnalysisService.VALID_CATEGORIES }
+                    ?: categorizeQuestion(next.userQuestion)
                 
                 // Only record if they're different categories (not repeating same question)
                 if (triggerCategory != followUpCategory) {
@@ -99,23 +101,8 @@ class PatternDiscoveryService(
     
     /**
      * Categorize question - mirrors AiAnalysisService logic for consistency.
-     * Kept simple here since we only need broad categories for pattern matching.
      */
     private fun categorizeQuestion(question: String): String {
-        val lowerQ = question.lowercase()
-        return when {
-            lowerQ.contains("cs") || lowerQ.contains("farm") || lowerQ.contains("minion") || lowerQ.contains("last hit") -> "cs_farming"
-            lowerQ.contains("ward") || lowerQ.contains("vision") || lowerQ.contains("pink ward") || lowerQ.contains("control ward") -> "vision_warding"
-            lowerQ.contains("wave") || lowerQ.contains("freeze") || lowerQ.contains("push") || lowerQ.contains("slow push") -> "wave_management"
-            lowerQ.contains("trade") || lowerQ.contains("all-in") || lowerQ.contains("poke") || lowerQ.contains("harass") -> "trading_laning"
-            lowerQ.contains("item") || lowerQ.contains("build") || lowerQ.contains("buy") -> "itemization_builds"
-            lowerQ.contains("roam") || lowerQ.contains("rotate") || lowerQ.contains("macro") -> "roaming"
-            lowerQ.contains("jungle") || lowerQ.contains("gank") || lowerQ.contains("camp") -> "jungle_pathing"
-            lowerQ.contains("teamfight") || lowerQ.contains("team fight") || lowerQ.contains("engage") -> "teamfighting"
-            lowerQ.contains("objective") || lowerQ.contains("dragon") || lowerQ.contains("baron") -> "objective_control"
-            lowerQ.contains("champion") || lowerQ.contains("pool") || lowerQ.contains("pick") -> "champion_pool"
-            lowerQ.contains("analyze") || lowerQ.contains("profile") || lowerQ.contains("overall") -> "full_analysis"
-            else -> "general"
-        }
+        return AiAnalysisService.categorizeQuestion(question)
     }
 }

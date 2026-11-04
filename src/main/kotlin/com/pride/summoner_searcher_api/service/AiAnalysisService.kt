@@ -13,7 +13,11 @@ import reactor.core.publisher.Mono
 import reactor.util.retry.Retry
 import java.time.Duration
 
-data class AiAnalysisResult(val response: String, val temperature: Double)
+data class AiAnalysisResult(
+    val response: String,
+    val temperature: Double,
+    val category: String = "general"
+)
 
 @Service
 class AiAnalysisService(
@@ -120,7 +124,7 @@ class AiAnalysisService(
             .map { tuple -> 
                 val generatedText = tuple.t1
                 // We use the concurrently calculated intent for future analytics
-                AiAnalysisResult(generatedText, temperature) 
+                AiAnalysisResult(generatedText, temperature, fastFallbackIntent.category) 
             }
     }
 
@@ -234,15 +238,7 @@ class AiAnalysisService(
             val isFrustrated = node.path("isFrustrated").asBoolean(false)
 
             // Validate category is one we know
-            val validCategories = setOf(
-                "cs_farming", "vision_warding", "wave_management", "trading_laning",
-                "itemization_builds", "macro_rotations", "teamfighting", "objective_control",
-                "jungle_pathing", "roaming", "back_timing", "win_conditions", "champion_pool",
-                "matchups", "champion_mechanics", "power_spikes", "positional_spacing",
-                "resource_management", "mental_state_tilt", "review_methodology",
-                "full_analysis", "opponent_specific", "frustration", "general"
-            )
-            val safeCategory = if (category in validCategories) category else "general"
+            val safeCategory = if (category in VALID_CATEGORIES) category else "general"
 
             // Map "frustration" category to isFrustrated flag
             val effectivelyFrustrated = isFrustrated || safeCategory == "frustration"
@@ -422,226 +418,189 @@ class AiAnalysisService(
      * Low confidence → prompt AI to ask a clarifying question.
      * Frustration detected → prompt AI to acknowledge and ask what they meant.
      */
-    private fun detectIntent(question: String, history: List<Map<String, String>>): IntentResult {
-        val lowerQ = question.lowercase().trim()
+    fun detectIntent(question: String, history: List<Map<String, String>> = emptyList()): IntentResult =
+        Companion.detectIntent(question, history)
 
-        // ── Frustration detection ──────────────────────────────────────────────
-        val frustrationSignals = listOf(
-            "that doesn't answer", "that doesnt answer", "you didn't understand",
-            "you didnt understand", "not what i asked", "not what i meant",
-            "wrong answer", "that's wrong", "thats wrong", "you're wrong", "youre wrong",
-            "not helpful", "useless", "that's not", "thats not", "try again",
-            "answer my question", "my question was", "i asked about",
-            "you misunderstood", "missed the point", "not relevant"
+    /**
+     * Categorize question for targeted few-shot learning and pattern discovery.
+     * Uses the canonical 24-category taxonomy shared with detectIntent().
+     */
+    fun categorizeQuestion(question: String): String =
+        Companion.categorizeQuestion(question)
+
+    companion object {
+        val VALID_CATEGORIES: Set<String> = setOf(
+            "cs_farming", "vision_warding", "wave_management", "trading_laning",
+            "itemization_builds", "macro_rotations", "teamfighting", "objective_control",
+            "jungle_pathing", "roaming", "back_timing", "win_conditions", "champion_pool",
+            "matchups", "champion_mechanics", "power_spikes", "positional_spacing",
+            "resource_management", "mental_state_tilt", "review_methodology",
+            "full_analysis", "opponent_specific", "frustration", "general"
         )
-        val isFrustrated = frustrationSignals.any { lowerQ.contains(it) }
 
-        // ── Category scoring — each category gets a score based on keyword hits ─
-        data class CategoryScore(val category: String, val score: Int, val meaning: String)
+        fun categorizeQuestion(question: String): String =
+            detectIntent(question, emptyList()).category
 
-        val scores = mutableListOf<CategoryScore>()
+        fun detectIntent(question: String, history: List<Map<String, String>> = emptyList()): IntentResult {
+            val lowerQ = question.lowercase().trim()
 
-        fun score(category: String, meaning: String, vararg keywords: String): Int {
-            val hits = keywords.count { lowerQ.contains(it) }
-            if (hits > 0) scores.add(CategoryScore(category, hits, meaning))
-            return hits
-        }
-
-        // Opponent / matchup — must be checked before generic "against"
-        // NOTE: opponent_specific always forces clarification because the data context
-        // only has aggregate stats — we cannot answer "which specific player" without more info.
-        val opponentScore = score("opponent_specific", "a specific opponent from your match history OR which champion types you tend to beat",
-            "which player", "which opponent", "who do i beat", "who can i beat",
-            "best chances", "easiest to beat", "hardest to beat", "who should i avoid",
-            "who gives me trouble", "which enemy", "which summoner",
-            "specific player", "specific opponent", "specific summoner",
-            "perform better against", "do better against", "win more against",
-            "have better odds", "better odds against", "more likely to win against",
-            "tend to beat", "usually beat", "consistently beat")
-
-        score("matchups", "champion matchup advice (which champions you win/lose against)",
-            "matchup", "counter", "countered by", "counters me", "vs ", "versus")
-
-        // Core Fundamentals
-        score("cs_farming", "CS / farming advice", "cs", "farm", "minion", "last hit")
-        score("vision_warding", "vision / warding advice", "ward", "vision", "pink ward", "control ward")
-        score("wave_management", "wave management", "wave", "freeze", "slow push", "crash")
-        score("trading_laning", "trading / laning", "trade", "trading", "poke", "harass")
-        score("itemization_builds", "item builds", "item", "build", "buy", "purchase")
-
-        // Macro
-        score("macro_rotations", "macro / rotations", "macro", "rotation", "split push")
-        score("teamfighting", "teamfighting", "teamfight", "5v5", "group")
-        score("objective_control", "objective control", "objective", "drake", "baron", "dragon")
-        score("jungle_pathing", "jungle pathing", "jungle path", "jungle clear", "jungle route")
-        score("roaming", "roaming / ganking", "roam", "gank", "when to leave lane")
-        score("back_timing", "recall timing", "recall", "back timing", "when to back")
-        score("win_conditions", "win conditions", "win condition", "win con", "game plan")
-
-        // Champion
-        score("champion_pool", "champion pool selection", "champion pool", "what champion", "one trick")
-        score("champion_mechanics", "champion mechanics", "combo", "ability", "skill order", "mechanic")
-        score("power_spikes", "power spikes", "power spike", "level 2", "level 6", "item spike")
-
-        // Advanced
-        score("positional_spacing", "positioning", "position", "where to stand", "spacing")
-        score("resource_management", "resource management", "mana", "energy", "resource")
-        score("mental_state_tilt", "mental / tilt", "tilt", "mental", "frustrat", "anger")
-        score("review_methodology", "VOD review", "review", "vod", "replay")
-        score("full_analysis", "general performance analysis", "analyze", "how am i", "performance", "overall")
-
-        // Sort by score descending
-        scores.sortByDescending { it.score }
-
-        return when {
-            isFrustrated -> IntentResult(
-                category = scores.firstOrNull()?.category ?: "general",
-                confidence = 1.0,
-                isFrustrated = true,
-                possibleMeanings = emptyList()
+            // ── Frustration detection ──────────────────────────────────────────────
+            val frustrationSignals = listOf(
+                "that doesn't answer", "that doesnt answer", "you didn't understand",
+                "you didnt understand", "not what i asked", "not what i meant",
+                "wrong answer", "that's wrong", "thats wrong", "you're wrong", "youre wrong",
+                "not helpful", "useless", "that's not", "thats not", "try again",
+                "answer my question", "my question was", "i asked about",
+                "you misunderstood", "missed the point", "not relevant"
             )
+            val isFrustrated = frustrationSignals.any { lowerQ.contains(it) }
 
-            // opponent_specific always forces clarification — we don't have per-player data
-            scores.firstOrNull()?.category == "opponent_specific" -> IntentResult(
-                category = "opponent_specific",
-                confidence = 0.0, // force clarification gate
-                isFrustrated = false,
-                possibleMeanings = listOf(
-                    "a specific summoner (by name) you've faced recently",
-                    "which champion types or roles you tend to beat more often"
+            // ── Category scoring — each category gets a score based on keyword hits ─
+            data class CategoryScore(val category: String, val score: Int, val meaning: String)
+
+            val scores = mutableListOf<CategoryScore>()
+
+            fun score(category: String, meaning: String, vararg keywords: String): Int {
+                val hits = keywords.count { lowerQ.contains(it) }
+                if (hits > 0) scores.add(CategoryScore(category, hits, meaning))
+                return hits
+            }
+
+            // Opponent / matchup — must be checked before generic "against"
+            // NOTE: opponent_specific always forces clarification because the data context
+            // only has aggregate stats — we cannot answer "which specific player" without more info.
+            score("opponent_specific", "a specific opponent from your match history OR which champion types you tend to beat",
+                "which player", "which opponent", "who do i beat", "who can i beat",
+                "best chances", "easiest to beat", "hardest to beat", "who should i avoid",
+                "who gives me trouble", "which enemy", "which summoner",
+                "specific player", "specific opponent", "specific summoner",
+                "perform better against", "do better against", "win more against",
+                "have better odds", "better odds against", "more likely to win against",
+                "tend to beat", "usually beat", "consistently beat")
+
+            score("matchups", "champion matchup advice (which champions you win/lose against)",
+                "matchup", "counter", "countered by", "counters me", "vs ", "versus")
+
+            // Core Fundamentals
+            score("cs_farming", "CS / farming advice", "cs", "farm", "minion", "last hit")
+            score("vision_warding", "vision / warding advice", "ward", "vision", "pink ward", "control ward")
+            score("wave_management", "wave management", "wave", "freeze", "slow push", "crash")
+            score("trading_laning", "trading / laning", "trade", "trading", "poke", "harass")
+            score("itemization_builds", "item builds", "item", "build", "buy", "purchase")
+
+            // Macro
+            score("macro_rotations", "macro / rotations", "macro", "rotation", "split push")
+            score("teamfighting", "teamfighting", "teamfight", "5v5", "group")
+            score("objective_control", "objective control", "objective", "drake", "baron", "dragon")
+            score("jungle_pathing", "jungle pathing", "jungle path", "jungle clear", "jungle route")
+            score("roaming", "roaming / ganking", "roam", "gank", "when to leave lane")
+            score("back_timing", "recall timing", "recall", "back timing", "when to back")
+            score("win_conditions", "win conditions", "win condition", "win con", "game plan")
+
+            // Champion
+            score("champion_pool", "champion pool selection", "champion pool", "what champion", "one trick")
+            score("champion_mechanics", "champion mechanics", "combo", "ability", "skill order", "mechanic")
+            score("power_spikes", "power spikes", "power spike", "level 2", "level 6", "item spike")
+
+            // Advanced
+            score("positional_spacing", "positioning", "position", "where to stand", "spacing")
+            score("resource_management", "resource management", "mana", "energy", "resource")
+            score("mental_state_tilt", "mental / tilt", "tilt", "mental", "frustrat", "anger")
+            score("review_methodology", "VOD review", "review", "vod", "replay")
+            score("full_analysis", "general performance analysis", "analyze", "how am i", "performance", "overall")
+
+            // Sort by score descending
+            scores.sortByDescending { it.score }
+
+            return when {
+                isFrustrated -> IntentResult(
+                    category = scores.firstOrNull()?.category ?: "general",
+                    confidence = 1.0,
+                    isFrustrated = true,
+                    possibleMeanings = emptyList()
                 )
-            )
 
-            scores.isEmpty() -> {
-                // History-aware fallback: if the current message is vague but the conversation
-                // history shows a recent clarification about a specific topic, inherit that intent.
-                val inheritedCategory = inferIntentFromHistory(history)
-                if (inheritedCategory != null) {
-                    IntentResult(
-                        category = inheritedCategory,
-                        confidence = 0.8,
-                        isFrustrated = false,
-                        possibleMeanings = listOf(inheritedCategory)
+                // opponent_specific always forces clarification — we don't have per-player data
+                scores.firstOrNull()?.category == "opponent_specific" -> IntentResult(
+                    category = "opponent_specific",
+                    confidence = 0.0, // force clarification gate
+                    isFrustrated = false,
+                    possibleMeanings = listOf(
+                        "a specific summoner (by name) you've faced recently",
+                        "which champion types or roles you tend to beat more often"
                     )
-                } else {
+                )
+
+                scores.isEmpty() -> {
+                    // History-aware fallback: if the current message is vague but the conversation
+                    // history shows a recent clarification about a specific topic, inherit that intent.
+                    val inheritedCategory = inferIntentFromHistory(history)
+                    if (inheritedCategory != null) {
+                        IntentResult(
+                            category = inheritedCategory,
+                            confidence = 0.8,
+                            isFrustrated = false,
+                            possibleMeanings = listOf(inheritedCategory)
+                        )
+                    } else {
+                        IntentResult(
+                            category = "general",
+                            confidence = 0.3,
+                            isFrustrated = false,
+                            possibleMeanings = listOf("a general coaching question", "something specific I couldn't identify")
+                        )
+                    }
+                }
+
+                scores.size == 1 -> IntentResult(
+                    category = scores[0].category,
+                    confidence = 0.9,
+                    isFrustrated = false,
+                    possibleMeanings = listOf(scores[0].meaning)
+                )
+
+                else -> {
+                    val top = scores[0]
+                    val second = scores[1]
+                    val confidence = if (top.score > second.score) 0.85 else 0.45
+                    // History-aware boost: if history suggests a topic and top matches it, boost confidence
+                    val inheritedCategory = inferIntentFromHistory(history)
+                    val boostedConfidence = if (inheritedCategory == top.category) 0.9 else confidence
                     IntentResult(
-                        category = "general",
-                        confidence = 0.3,
+                        category = top.category,
+                        confidence = boostedConfidence,
                         isFrustrated = false,
-                        possibleMeanings = listOf("a general coaching question", "something specific I couldn't identify")
+                        possibleMeanings = listOf(top.meaning, second.meaning)
                     )
                 }
             }
+        }
 
-            scores.size == 1 -> IntentResult(
-                category = scores[0].category,
-                confidence = 0.9,
-                isFrustrated = false,
-                possibleMeanings = listOf(scores[0].meaning)
-            )
+        /**
+         * Scan the last few messages in history to infer the topic being discussed.
+         * Used as a fallback when the current message is too short/vague to classify.
+         */
+        private fun inferIntentFromHistory(history: List<Map<String, String>>): String? {
+            // Look at the last 4 messages (2 exchanges)
+            val recent = history.takeLast(4)
+            val combinedText = recent.joinToString(" ") { it["content"] ?: "" }.lowercase()
 
-            else -> {
-                val top = scores[0]
-                val second = scores[1]
-                val confidence = if (top.score > second.score) 0.85 else 0.45
-                // History-aware boost: if history suggests a topic and top matches it, boost confidence
-                val inheritedCategory = inferIntentFromHistory(history)
-                val boostedConfidence = if (inheritedCategory == top.category) 0.9 else confidence
-                IntentResult(
-                    category = top.category,
-                    confidence = boostedConfidence,
-                    isFrustrated = false,
-                    possibleMeanings = listOf(top.meaning, second.meaning)
-                )
+            return when {
+                combinedText.contains("champion") || combinedText.contains("matchup") ||
+                combinedText.contains("beat") || combinedText.contains("counter") ||
+                combinedText.contains("which champion") -> "matchups"
+
+                combinedText.contains("cs") || combinedText.contains("farm") -> "cs_farming"
+                combinedText.contains("ward") || combinedText.contains("vision") -> "vision_warding"
+                combinedText.contains("wave") || combinedText.contains("freeze") -> "wave_management"
+                combinedText.contains("teamfight") || combinedText.contains("5v5") -> "teamfighting"
+                combinedText.contains("objective") || combinedText.contains("baron") || combinedText.contains("drake") -> "objective_control"
+                combinedText.contains("roam") || combinedText.contains("gank") -> "roaming"
+                combinedText.contains("item") || combinedText.contains("build") -> "itemization_builds"
+                combinedText.contains("position") || combinedText.contains("spacing") -> "positional_spacing"
+                combinedText.contains("mental") || combinedText.contains("tilt") -> "mental_state_tilt"
+                else -> null
             }
-        }
-    }
-
-    /**
-     * Scan the last few messages in history to infer the topic being discussed.
-     * Used as a fallback when the current message is too short/vague to classify.
-     */
-    private fun inferIntentFromHistory(history: List<Map<String, String>>): String? {
-        // Look at the last 4 messages (2 exchanges)
-        val recent = history.takeLast(4)
-        val combinedText = recent.joinToString(" ") { it["content"] ?: "" }.lowercase()
-
-        return when {
-            combinedText.contains("champion") || combinedText.contains("matchup") ||
-            combinedText.contains("beat") || combinedText.contains("counter") ||
-            combinedText.contains("which champion") -> "matchups"
-
-            combinedText.contains("cs") || combinedText.contains("farm") -> "cs_farming"
-            combinedText.contains("ward") || combinedText.contains("vision") -> "vision_warding"
-            combinedText.contains("wave") || combinedText.contains("freeze") -> "wave_management"
-            combinedText.contains("teamfight") || combinedText.contains("5v5") -> "teamfighting"
-            combinedText.contains("objective") || combinedText.contains("baron") || combinedText.contains("drake") -> "objective_control"
-            combinedText.contains("roam") || combinedText.contains("gank") -> "roaming"
-            combinedText.contains("item") || combinedText.contains("build") -> "itemization_builds"
-            combinedText.contains("position") || combinedText.contains("spacing") -> "positional_spacing"
-            combinedText.contains("mental") || combinedText.contains("tilt") -> "mental_state_tilt"
-            else -> null
-        }
-    }
-
-    /**
-     * Categorize question for targeted few-shot learning
-     * Expanded to 35+ categories for maximum nuance and specificity
-     */
-    private fun categorizeQuestion(question: String): String {
-        val lowerQ = question.lowercase()
-        
-        return when {
-            // Core Fundamentals
-            lowerQ.contains("cs") || lowerQ.contains("farm") || lowerQ.contains("minion") || lowerQ.contains("last hit") -> "cs_farming"
-            lowerQ.contains("ward") || lowerQ.contains("vision") || lowerQ.contains("pink ward") || lowerQ.contains("control ward") -> "vision_warding"
-            lowerQ.contains("wave") || lowerQ.contains("freeze") || lowerQ.contains("slow push") || lowerQ.contains("crash") -> "wave_management"
-            lowerQ.contains("trade") || lowerQ.contains("trading") || lowerQ.contains("poke") || lowerQ.contains("harass") -> "trading_laning"
-            lowerQ.contains("item") || lowerQ.contains("build") || lowerQ.contains("buy") || lowerQ.contains("purchase") -> "itemization_builds"
-            
-            // Macro & Strategy
-            lowerQ.contains("macro") || lowerQ.contains("rotation") || lowerQ.contains("split push") -> "macro_rotations"
-            lowerQ.contains("teamfight") || lowerQ.contains("5v5") || lowerQ.contains("group") -> "teamfighting"
-            lowerQ.contains("objective") || lowerQ.contains("drake") || lowerQ.contains("baron") || lowerQ.contains("dragon") -> "objective_control"
-            lowerQ.contains("jungle") && (lowerQ.contains("path") || lowerQ.contains("clear") || lowerQ.contains("route")) -> "jungle_pathing"
-            lowerQ.contains("roam") || lowerQ.contains("gank") || lowerQ.contains("when to leave lane") -> "roaming"
-            lowerQ.contains("back") || lowerQ.contains("recall") || lowerQ.contains("reset") -> "back_timing"
-            lowerQ.contains("win condition") || lowerQ.contains("win con") || lowerQ.contains("game plan") -> "win_conditions"
-            lowerQ.contains("tempo") || lowerQ.contains("sync") || lowerQ.contains("timing window") -> "tempo_alignment"
-            
-            // Champion Specific
-            lowerQ.contains("champion pool") || lowerQ.contains("what champion") || lowerQ.contains("one trick") -> "champion_pool"
-            lowerQ.contains("matchup") || lowerQ.contains("vs") || lowerQ.contains("against") || lowerQ.contains("counter") -> "matchups"
-            lowerQ.contains("combo") || lowerQ.contains("ability") || lowerQ.contains("skill order") || lowerQ.contains("mechanic") -> "champion_mechanics"
-            lowerQ.contains("power spike") || lowerQ.contains("level 2") || lowerQ.contains("level 6") || lowerQ.contains("item spike") -> "power_spikes"
-            
-            // Advanced Tactics
-            lowerQ.contains("dive") || lowerQ.contains("tower dive") || lowerQ.contains("aggro") -> "dive_execution"
-            lowerQ.contains("flank") || lowerQ.contains("tp") || lowerQ.contains("teleport") -> "flank_setups"
-            lowerQ.contains("fog of war") || lowerQ.contains("fow") || lowerQ.contains("hide") || lowerQ.contains("bush") -> "fow_manipulation"
-            lowerQ.contains("tether") || lowerQ.contains("spacing") || lowerQ.contains("range") || lowerQ.contains("kiting") -> "tethering_micro"
-            lowerQ.contains("cooldown") || lowerQ.contains("cd") || lowerQ.contains("ultimate timer") || lowerQ.contains("summ timer") -> "cooldown_tracking"
-            lowerQ.contains("position") || lowerQ.contains("spacing") || lowerQ.contains("where to stand") -> "positional_spacing"
-            lowerQ.contains("mana") || lowerQ.contains("energy") || lowerQ.contains("health") || lowerQ.contains("resource") -> "resource_management"
-            lowerQ.contains("funnel") || lowerQ.contains("gold priority") || lowerQ.contains("who gets farm") -> "resource_priority"
-            lowerQ.contains("threat") || lowerQ.contains("danger") || lowerQ.contains("burst") || lowerQ.contains("damage calc") -> "threat_assessment"
-            lowerQ.contains("cursor") || lowerQ.contains("click") || lowerQ.contains("mouse") || lowerQ.contains("precision") -> "cursor_precision"
-            
-            // Meta & Preparation  
-            lowerQ.contains("draft") || lowerQ.contains("ban") || lowerQ.contains("pick") || lowerQ.contains("champ select") -> "drafting_banning"
-            lowerQ.contains("load") || lowerQ.contains("loading screen") || lowerQ.contains("rune") || lowerQ.contains("summoner spell") -> "load_screen_analysis"
-            lowerQ.contains("ping") || lowerQ.contains("communicate") || lowerQ.contains("chat") || lowerQ.contains("shotcall") -> "communication_pinging"
-            lowerQ.contains("synergy") || lowerQ.contains("comp") || lowerQ.contains("team comp") -> "role_synergy"
-            lowerQ.contains("setting") || lowerQ.contains("hotkey") || lowerQ.contains("keybind") || lowerQ.contains("config") -> "settings_hotkeys"
-            
-            // Mental & Meta-Learning
-            lowerQ.contains("tilt") || lowerQ.contains("mental") || lowerQ.contains("frustrat") || lowerQ.contains("anger") -> "mental_state_tilt"
-            lowerQ.contains("review") || lowerQ.contains("vod") || lowerQ.contains("replay") || lowerQ.contains("analyze replay") -> "review_methodology"
-            
-            // General Requests
-            lowerQ.contains("analyze") || lowerQ.contains("how am i") || lowerQ.contains("performance") -> "full_analysis"
-            
-            else -> "general"
         }
     }
     
