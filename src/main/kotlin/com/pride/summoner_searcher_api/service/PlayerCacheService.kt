@@ -305,7 +305,7 @@ class PlayerCacheService(
             val startOfYear = java.time.Year.now().atDay(1).atStartOfDay(java.time.ZoneOffset.UTC).toEpochSecond()
 
             // 1. Verify summoner exists on this regional shard and fetch fresh level & icon
-            val metaStartMs = System.currentTimeMillis()
+            val metaStartMs = timeProvider.now()
             val freshSummoner = riotApiService.getSummonerByPuuid(puuid, region)
             if (freshSummoner == null) {
                 logger.info("No summoner found on shard $region for $summonerName#$tagLine (puuid=$puuid). Returning null.")
@@ -322,7 +322,7 @@ class PlayerCacheService(
             val matchIdsDeferred = async { riotApiService.fetchMatchIdsSince(puuid, region, startOfYear) }
             val freshRank = rankDeferred.await()
             val allMatchIds = matchIdsDeferred.await()
-            val metadataAndIdsMs = System.currentTimeMillis() - metaStartMs
+            val metadataAndIdsMs = timeProvider.now() - metaStartMs
 
             // Fast-path: if we already have a cached profile, no new matches have been played,
             // and all served recentMatches already have info.gameVersion and info.teams populated,
@@ -341,10 +341,10 @@ class PlayerCacheService(
                     profileIconId = refreshedIconId,
                     soloQueueRank = freshRank,
                     improvementStats = fastImprovementStats,
-                    lastRefreshed = Instant.now()
+                    lastRefreshed = Instant.ofEpochMilli(timeProvider.now())
                 )
                 redisCacheService.set(cacheKey, fastUpdatedProfile, PROFILE_CACHE_TTL)
-                val totalFastMs = System.currentTimeMillis() - refreshStartMs
+                val totalFastMs = timeProvider.now() - refreshStartMs
                 logger.info(
                     "Fast-path refresh for {}#{} ({}): totalMs={}, metadataAndIdsMs={}, totalMatches={} (no new matches since {}).",
                     summonerName, tagLine, region, totalFastMs, metadataAndIdsMs,
@@ -358,7 +358,7 @@ class PlayerCacheService(
             // - Matches in the recent 20 (first 20 valid seasonal matches) are fetched if missing OR if they lack gameVersion/teams.
             // - Matches beyond the recent 20 (index >= 20) are fetched ONLY if genuinely missing from Redis (cached?.info == null),
             //   avoiding re-fetching hundreds of older cached matches just for gameVersion/teams while preserving full-season stats accuracy.
-            val matchProcessingStartMs = System.currentTimeMillis()
+            val matchProcessingStartMs = timeProvider.now()
             val accumulator = MatchStatsAccumulator(puuid)
             val recentMatches = mutableListOf<MatchDto>()
             val validMatchIds = mutableListOf<String>()

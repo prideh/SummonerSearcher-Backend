@@ -91,6 +91,7 @@ class RiotApiService(
                     }
                 } catch (e: HttpClientErrorException.TooManyRequests) {
                     attempts++
+                    val rateLimitType = e.responseHeaders?.getFirst("X-Rate-Limit-Type")
                     
                     // Update limits from the 429 response as well
                     rateLimiter.updateLimits(
@@ -102,18 +103,22 @@ class RiotApiService(
                         methodCountHeader = e.responseHeaders?.getFirst("X-Method-Rate-Limit-Count")
                     )
 
-                    // Parse Retry-After header (in seconds) and record regional Retry-After window
-                    val retryAfterSeconds = e.responseHeaders?.getFirst("Retry-After")?.toLongOrNull() ?: 1L
-                    val waitMs = (retryAfterSeconds * 1000) + 100 // Add 100ms buffer
-                    rateLimiter.recordRetryAfter(region, waitMs)
+                    // Parse Retry-After header (in seconds) and record regional Retry-After window (including service 429s)
+                    val retryAfterSeconds = e.responseHeaders?.getFirst("Retry-After")?.toLongOrNull()
+                    val baseWaitMs = when {
+                        retryAfterSeconds != null -> (retryAfterSeconds * 1000) + 100
+                        rateLimitType.equals("service", ignoreCase = true) -> RiotApiRateLimiter.SERVICE_429_MIN_BACKOFF_MS
+                        else -> 1_100L
+                    }
+                    rateLimiter.recordRetryAfter(region, baseWaitMs, rateLimitType)
 
                     if (attempts > maxRetries) {
-                        logger.error("Exceeded max retries ($maxRetries) for rate limit. Giving up.")
+                        logger.error("Exceeded max retries ($maxRetries) for rate limit (type=${rateLimitType ?: "n/a"}). Giving up.")
                         throw e
                     }
                     
-                    logger.warn("Hit 429 Rate Limit! Waiting {}ms before retry {}/{}.", waitMs, attempts, maxRetries)
-                    kotlinx.coroutines.delay(waitMs)
+                    logger.warn("Hit 429 Rate Limit (type={})! Waiting {}ms before retry {}/{}.", rateLimitType ?: "n/a", baseWaitMs, attempts, maxRetries)
+                    kotlinx.coroutines.delay(baseWaitMs)
                 } catch (e: org.springframework.web.client.ResourceAccessException) {
                     attempts++
                     if (attempts > maxRetries) {
@@ -213,6 +218,51 @@ class RiotApiService(
             }
         }
         return allLeagueEntries?.find { it.queueType == "RANKED_SOLO_5x5" }
+    }
+
+    suspend fun fetchLeagueRankLowPriority(puuid: String, region: String): LeagueEntryDto? {
+        val platformBaseUrl = "https://${region}.api.riotgames.com"
+        val leagueUri = "$platformBaseUrl/lol/league/v4/entries/by-puuid/{puuid}"
+        val leagueEntriesType = object : ParameterizedTypeReference<List<LeagueEntryDto>>() {}
+        val allLeagueEntries = executeRateLimitedCall(region, ApiPriority.LOW, "league-v4-entries-by-puuid") {
+            try {
+                riotRestClient.get()
+                    .uri(leagueUri, puuid)
+                    .retrieve()
+                    .toEntity(leagueEntriesType)
+            } catch (e: HttpClientErrorException.NotFound) {
+                null
+            }
+        }
+        return allLeagueEntries?.find { it.queueType == "RANKED_SOLO_5x5" }
+    }
+
+    suspend fun fetchLeagueEntriesByTierDivisionLowPriority(
+        region: String,
+        queue: String = "RANKED_SOLO_5x5",
+        tier: String,
+        division: String = "I",
+        page: Int = 1
+    ): List<LeagueEntryDto>? {
+        val platformBaseUrl = "https://${region}.api.riotgames.com"
+        val uri = "$platformBaseUrl/lol/league/v4/entries/{queue}/{tier}/{division}?page={page}"
+        val uriVariables = mapOf(
+            "queue" to queue,
+            "tier" to tier.uppercase().trim(),
+            "division" to division.uppercase().trim(),
+            "page" to page.coerceAtLeast(1)
+        )
+        val responseType = object : ParameterizedTypeReference<List<LeagueEntryDto>>() {}
+        return executeRateLimitedCall(region, ApiPriority.LOW, "league-v4-entries-by-tier") {
+            try {
+                riotRestClient.get()
+                    .uri(uri, uriVariables)
+                    .retrieve()
+                    .toEntity(responseType)
+            } catch (e: HttpClientErrorException.NotFound) {
+                null
+            }
+        }
     }
 
 

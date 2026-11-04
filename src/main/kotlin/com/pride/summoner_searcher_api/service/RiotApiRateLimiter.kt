@@ -49,6 +49,7 @@ class RiotApiRateLimiter(
     companion object {
         const val LOW_PRIORITY_CAP_RATIO = 0.8
         const val USER_REQUEST_YIELD_WINDOW_MS = 2_000L
+        const val SERVICE_429_MIN_BACKOFF_MS = 10_000L
     }
 
     /**
@@ -82,12 +83,13 @@ class RiotApiRateLimiter(
     }
 
     /**
-     * Records a regional `429 Retry-After` window (in milliseconds) so subsequent permits wait.
+     * Records a regional `429 Retry-After` window (in milliseconds) and optional `X-Rate-Limit-Type`
+     * (`application`, `method`, or `service`) so subsequent permits wait and background workers pause.
      */
-    fun recordRetryAfter(region: String, waitMs: Long) {
+    fun recordRetryAfter(region: String, waitMs: Long, rateLimitType: String? = null) {
         val normalizedRegion = region.lowercase()
         limiters.computeIfAbsent(normalizedRegion) { RegionRateLimiter(it) }
-            .recordRetryAfter(waitMs)
+            .recordRetryAfter(waitMs, rateLimitType)
     }
 
     /**
@@ -110,7 +112,7 @@ class RiotApiRateLimiter(
 
     /**
      * Suspends a `LOW` priority background worker while any `HIGH` priority user request is active,
-     * within [USER_REQUEST_YIELD_WINDOW_MS] of the last user request, or inside a `429 Retry-After` window.
+     * within [USER_REQUEST_YIELD_WINDOW_MS] of the last user request, or inside a `429 Retry-After` / `service` window.
      */
     suspend fun awaitLowPriorityClearance(region: String) {
         val normalizedRegion = region.lowercase()
@@ -119,15 +121,16 @@ class RiotApiRateLimiter(
     }
 
     /**
-     * Returns a read-only verification snapshot of observed App and Method rate limits and headroom.
+     * Returns a read-only verification snapshot of observed App, Method, and Service rate limits and headroom.
      */
     fun getVerificationSnapshot(
         region: String,
-        networkCollectionEnabled: Boolean = false
+        networkCollectionEnabled: Boolean = false,
+        requiredEndpoints: Set<String> = emptySet()
     ): RateLimitVerificationSnapshotDto {
         val normalizedRegion = region.lowercase()
         val regionLimiter = limiters.computeIfAbsent(normalizedRegion) { RegionRateLimiter(it) }
-        return regionLimiter.toVerificationSnapshot(networkCollectionEnabled)
+        return regionLimiter.toVerificationSnapshot(networkCollectionEnabled, requiredEndpoints)
     }
 
     inner class MethodEndpointState(val endpointKey: String) {
@@ -155,6 +158,10 @@ class RiotApiRateLimiter(
         @Volatile
         private var retryAfterUntilMs: Long = 0L
         @Volatile
+        private var serviceRateLimitUntilMs: Long = 0L
+        @Volatile
+        private var lastRateLimitType: String? = null
+        @Volatile
         private var lastHighPriorityAtMs: Long? = null
         private val activeUserRequests = AtomicInteger(0)
         private val methodEndpoints = ConcurrentHashMap<String, MethodEndpointState>()
@@ -176,18 +183,36 @@ class RiotApiRateLimiter(
             lastHighPriorityAtMs = timeProvider.now()
         }
 
-        fun recordRetryAfter(waitMs: Long) {
-            if (waitMs <= 0L) return
-            val target = timeProvider.now() + waitMs
+        fun recordRetryAfter(waitMs: Long, rateLimitType: String? = null) {
+            val now = timeProvider.now()
+            val normalizedType = rateLimitType?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+            if (normalizedType != null) {
+                lastRateLimitType = normalizedType
+            }
+            val effectiveWaitMs = when {
+                normalizedType == "service" -> maxOf(waitMs, SERVICE_429_MIN_BACKOFF_MS)
+                else -> waitMs
+            }
+            if (effectiveWaitMs <= 0L) return
+            val target = now + effectiveWaitMs
             if (target > retryAfterUntilMs) {
                 retryAfterUntilMs = target
             }
+            if (normalizedType == "service" && target > serviceRateLimitUntilMs) {
+                serviceRateLimitUntilMs = target
+            }
+        }
+
+        private fun isForegroundYieldActive(now: Long): Boolean {
+            if (activeUserRequests.get() > 0) return true
+            val lastHigh = lastHighPriorityAtMs ?: return false
+            return (now - lastHigh) in 0 until USER_REQUEST_YIELD_WINDOW_MS
         }
 
         suspend fun awaitLowPriorityClearance() {
             while (true) {
                 val now = timeProvider.now()
-                val retryWait = retryAfterUntilMs - now
+                val retryWait = maxOf(retryAfterUntilMs, serviceRateLimitUntilMs) - now
                 if (retryWait > 0) {
                     delay(retryWait + 10)
                     continue
@@ -197,7 +222,7 @@ class RiotApiRateLimiter(
                     continue
                 }
                 val lastHigh = lastHighPriorityAtMs
-                if (lastHigh != null && (now - lastHigh) in 1 until USER_REQUEST_YIELD_WINDOW_MS) {
+                if (lastHigh != null && (now - lastHigh) in 0 until USER_REQUEST_YIELD_WINDOW_MS) {
                     delay((USER_REQUEST_YIELD_WINDOW_MS - (now - lastHigh)).coerceAtLeast(50))
                     continue
                 }
@@ -210,7 +235,7 @@ class RiotApiRateLimiter(
             if (priority == ApiPriority.HIGH) {
                 lastHighPriorityAtMs = now
             }
-            val retryWait = retryAfterUntilMs - now
+            val retryWait = maxOf(retryAfterUntilMs, serviceRateLimitUntilMs) - now
             if (retryWait > 0) {
                 delay(retryWait + 10)
             }
@@ -310,7 +335,10 @@ class RiotApiRateLimiter(
             }
         }
 
-        fun toVerificationSnapshot(networkCollectionEnabled: Boolean): RateLimitVerificationSnapshotDto {
+        fun toVerificationSnapshot(
+            networkCollectionEnabled: Boolean,
+            requiredEndpoints: Set<String> = emptySet()
+        ): RateLimitVerificationSnapshotDto {
             val now = timeProvider.now()
             val currentAppBuckets = buckets
             val appHasHeadroom = currentAppBuckets.all { it.hasHeadroomForLowPriority(now) }
@@ -327,14 +355,30 @@ class RiotApiRateLimiter(
                         lastUpdatedAt = state.lastUpdatedAtMs?.let { Instant.ofEpochMilli(it) }
                     )
                 }
-            val retryUntil = retryAfterUntilMs.takeIf { it > now }?.let { Instant.ofEpochMilli(it) }
-            val methodsVerified = methodMap.isNotEmpty() && methodMap.values.all { it.hasHeadroomForLowPriority }
+            val verifiedMethodKeys = methodMap.entries
+                .filter { (_, v) -> !v.methodRateLimitHeader.isNullOrBlank() && !v.methodRateLimitCountHeader.isNullOrBlank() }
+                .map { it.key }
+                .toSet()
+            val missingRequired = requiredEndpoints - verifiedMethodKeys
+            val effectiveRetryUntilMs = maxOf(retryAfterUntilMs, serviceRateLimitUntilMs)
+            val retryUntil = effectiveRetryUntilMs.takeIf { it > now }?.let { Instant.ofEpochMilli(it) }
+            val serviceActive = serviceRateLimitUntilMs > now ||
+                (retryUntil != null && lastRateLimitType == "service")
+            val fgYieldActive = isForegroundYieldActive(now)
+            val methodsVerified = verifiedMethodKeys.isNotEmpty() &&
+                missingRequired.isEmpty() &&
+                methodMap.values.all {
+                    !it.methodRateLimitHeader.isNullOrBlank() &&
+                        !it.methodRateLimitCountHeader.isNullOrBlank() &&
+                        it.hasHeadroomForLowPriority
+                }
             val ready = networkCollectionEnabled &&
                 appLimitsVerifiedFromHeaders &&
                 appHasHeadroom &&
                 methodsVerified &&
-                activeUserRequests.get() == 0 &&
-                retryUntil == null
+                !fgYieldActive &&
+                retryUntil == null &&
+                !serviceActive
 
             return RateLimitVerificationSnapshotDto(
                 region = regionName,
@@ -344,6 +388,11 @@ class RiotApiRateLimiter(
                 activeAppBuckets = currentAppBuckets.map { "${it.currentUsage(now)}/${it.capacity} per ${it.windowSeconds}s" },
                 appHasHeadroomForLowPriority = appHasHeadroom,
                 methodLimitsByEndpoint = methodMap,
+                verifiedMethodEndpoints = verifiedMethodKeys,
+                missingRequiredMethodEndpoints = missingRequired,
+                lastRateLimitType = lastRateLimitType,
+                serviceRateLimitActive = serviceActive,
+                foregroundYieldActive = fgYieldActive,
                 lowPriorityCapRatio = LOW_PRIORITY_CAP_RATIO,
                 userRequestYieldWindowMs = USER_REQUEST_YIELD_WINDOW_MS,
                 activeUserRequests = activeUserRequests.get(),

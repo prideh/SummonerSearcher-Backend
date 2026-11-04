@@ -552,11 +552,236 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 verifiedSnapshot.readyForLowPriorityNetworkCollection shouldBe true
 
                 pausedDuringUserReq.activeUserRequests shouldBe 1
+                pausedDuringUserReq.foregroundYieldActive shouldBe true
                 pausedDuringUserReq.readyForLowPriorityNetworkCollection shouldBe false
 
                 pausedDuringRetryAfter.retryAfterUntil shouldNotBe null
                 pausedDuringRetryAfter.readyForLowPriorityNetworkCollection shouldBe false
             }
         }
+
+        When("running the resumable checkpointed LOW-priority collector across disabled, unverified, foreground-yield, service-429, and verified resume states") {
+            val clockMs = java.util.concurrent.atomic.AtomicLong(nowInstant.toEpochMilli())
+            val testClock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            val rateLimiter = RiotApiRateLimiter(testClock)
+            val localRedis = mockk<RedisCacheService>(relaxed = true)
+
+            val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
+            val savedRankSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
+            val savedMatches = mutableMapOf<String, MatchDto>()
+
+            every { localRedis.scanKeys(any(), any(), any()) } answers {
+                val pattern = firstArg<String>()
+                when {
+                    pattern.startsWith("cohort:rank:snapshot:euw1:") -> savedRankSnapshots.keys.toList()
+                    pattern.startsWith("match:euw1:") -> savedMatches.keys.toList()
+                    else -> emptyList()
+                }
+            }
+            every { localRedis.multiGet(any(), CohortRankSnapshotDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                keys.associateWith { savedRankSnapshots[it] }
+            }
+            every { localRedis.multiGet(any(), MatchDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                keys.associateWith { savedMatches[it] }
+            }
+            every { localRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
+                savedCheckpoints[firstArg()]
+            }
+            every { localRedis.get(any(), CohortRankSnapshotDto::class.java) } answers {
+                savedRankSnapshots[firstArg()]
+            }
+            every { localRedis.get(any(), MatchDto::class.java) } answers {
+                savedMatches[firstArg()]
+            }
+            every { localRedis.get(any(), SummonerProfileDto::class.java) } returns null
+            every { localRedis.get(any(), CachedLeaderboardDto::class.java) } returns null
+            every { localRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                when (val value = secondArg<Any>()) {
+                    is CohortCollectorCheckpointDto -> savedCheckpoints[key] = value
+                    is CohortRankSnapshotDto -> savedRankSnapshots[key] = value
+                    is MatchDto -> savedMatches[key] = value
+                }
+            }
+
+            val disabledCollector = CohortBenchmarkService(
+                redisCacheService = localRedis,
+                cohortBenchmarkCellRepository = cohortRepo,
+                riotApiRateLimiter = rateLimiter,
+                riotApiService = riotApiService,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = testClock
+            )
+            val enabledCollector = CohortBenchmarkService(
+                redisCacheService = localRedis,
+                cohortBenchmarkCellRepository = cohortRepo,
+                riotApiRateLimiter = rateLimiter,
+                riotApiService = riotApiService,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = testClock
+            )
+
+            // 1. Disabled config -> 0 network calls
+            val cpDisabled = disabledCollector.runResumableLowPriorityCollectorBatch(
+                region = "euw1",
+                targetPatch = "16.7",
+                seedPuuids = listOf("seed-p1", "seed-p2")
+            )
+
+            // 2. Enabled config but unverified rate-limit headers -> 0 network calls
+            val cpUnverified = enabledCollector.runResumableLowPriorityCollectorBatch(
+                region = "euw1",
+                targetPatch = "16.7",
+                seedPuuids = listOf("seed-p1", "seed-p2")
+            )
+
+            // 3. Verify App + Method headers for collector endpoints
+            rateLimiter.updateLimits(
+                region = "euw1",
+                limitHeader = "20:1,100:120",
+                countHeader = "2:1,10:120",
+                endpointKey = "league-v4-entries-by-puuid",
+                methodLimitHeader = "500:10",
+                methodCountHeader = "5:10"
+            )
+            rateLimiter.updateLimits(
+                region = "euw1",
+                limitHeader = "20:1,100:120",
+                countHeader = "2:1,10:120",
+                endpointKey = "match-v5-ids-by-puuid",
+                methodLimitHeader = "2000:10",
+                methodCountHeader = "5:10"
+            )
+            rateLimiter.updateLimits(
+                region = "euw1",
+                limitHeader = "20:1,100:120",
+                countHeader = "2:1,10:120",
+                endpointKey = "match-v5-match-by-id",
+                methodLimitHeader = "2000:10",
+                methodCountHeader = "5:10"
+            )
+
+            // 4. Foreground user request active -> yields immediately with 0 network calls
+            rateLimiter.beginUserRequest("euw1")
+            val cpForegroundYield = enabledCollector.runResumableLowPriorityCollectorBatch(
+                region = "euw1",
+                targetPatch = "16.7",
+                seedPuuids = listOf("seed-p1", "seed-p2")
+            )
+            rateLimiter.endUserRequest("euw1")
+            // Advance past the 2,000ms foreground yield window
+            clockMs.addAndGet(3_000L)
+
+            // 5. Service-level 429 backoff (X-Rate-Limit-Type: service with 0s Retry-After enforces 10s minimum backoff)
+            rateLimiter.recordRetryAfter("euw1", 0L, "service")
+            val cpService429 = enabledCollector.runResumableLowPriorityCollectorBatch(
+                region = "euw1",
+                targetPatch = "16.7",
+                seedPuuids = listOf("seed-p1", "seed-p2")
+            )
+            // Advance past the 10s service backoff window
+            clockMs.addAndGet(11_000L)
+
+            // 6. Verified & clear: batch 1 processes maxPlayersPerBatch=1 ("seed-p1"), caps at 10 games/player,
+            // stops when encountering an older patch (16.6), and discovers "discovered-p3"
+            coEvery { riotApiService.fetchLeagueRankLowPriority("seed-p1", "euw1") } returns LeagueEntryDto(
+                leagueId = "l1", queueType = "RANKED_SOLO_5x5", tier = "EMERALD", rank = "II",
+                summonerName = "P1", puuid = "seed-p1", leaguePoints = 50, wins = 20, losses = 18,
+                veteran = false, inactive = false, freshBlood = false, hotStreak = false
+            )
+            coEvery { riotApiService.fetchLeagueRankLowPriority("seed-p2", "euw1") } returns LeagueEntryDto(
+                leagueId = "l2", queueType = "RANKED_SOLO_5x5", tier = "EMERALD", rank = "I",
+                summonerName = "P2", puuid = "seed-p2", leaguePoints = 75, wins = 30, losses = 20,
+                veteran = false, inactive = false, freshBlood = false, hotStreak = false
+            )
+            // Return 10 match IDs for seed-p1: first 2 are on 16.7, 3rd is on older patch 16.6 (should stop at 3rd!)
+            coEvery {
+                riotApiService.getMatchIdsByPuuidLowPriority("seed-p1", "euw1", 420, 10, 0)
+            } returns (1..10).map { "EUW1_C$it" }
+            coEvery {
+                riotApiService.getMatchIdsByPuuidLowPriority("seed-p2", "euw1", 420, 10, 0)
+            } returns listOf("EUW1_C1") // Already cached from batch 1!
+
+            val fetchedMatchCalls = mutableListOf<String>()
+            coEvery { riotApiService.getMatchByIdLowPriority(any(), "euw1") } answers {
+                val mId = firstArg<String>()
+                fetchedMatchCalls.add(mId)
+                val idx = mId.removePrefix("EUW1_C").toInt()
+                val version = if (idx <= 2) "16.7.600.1234" else "16.6.590.1111"
+                MatchDto(
+                    metadata = MatchMetadata(mId, listOf("seed-p1", "seed-p2", "discovered-p3")),
+                    info = MatchInfo(
+                        gameCreation = clockMs.get() - idx * 60_000L,
+                        gameDuration = 1800L,
+                        gameId = idx.toLong(),
+                        queueId = 420,
+                        gameMode = "CLASSIC",
+                        gameVersion = version,
+                        participants = listOf(
+                            buildParticipant(puuid = "seed-p1", role = "TOP", laneCs10 = 84, totalMinions = 210, neutralMinions = 8),
+                            buildParticipant(puuid = "seed-p2", role = "MIDDLE", laneCs10 = 92, totalMinions = 230, neutralMinions = 12),
+                            buildParticipant(puuid = "discovered-p3", role = "BOTTOM", laneCs10 = 88, totalMinions = 225, neutralMinions = 4)
+                        )
+                    )
+                )
+            }
+
+            val cpBatch1 = enabledCollector.runResumableLowPriorityCollectorBatch(
+                region = "euw1",
+                targetPatch = "16.7",
+                seedPuuids = listOf("seed-p1", "seed-p2"),
+                maxPlayersPerBatch = 1,
+                maxGamesPerPlayer = 10
+            )
+
+            // 7. Batch 2 resumes from Redis checkpoint without re-processing "seed-p1" and processes "seed-p2"
+            val cpBatch2 = enabledCollector.runResumableLowPriorityCollectorBatch(
+                region = "euw1",
+                targetPatch = "16.7",
+                maxPlayersPerBatch = 1,
+                maxGamesPerPlayer = 10
+            )
+
+            Then("it should enforce all pre-flight/live rate-limit guardrails, stop on older patches, persist checkpoints, and resume without repeating processed PUUIDs") {
+                cpDisabled.lastStopReason shouldBe "NETWORK_COLLECTION_DISABLED_BY_CONFIG"
+                cpDisabled.totalNetworkCallsMade shouldBe 0
+
+                cpUnverified.lastStopReason shouldBe "RATE_LIMIT_VERIFICATION_OR_HEADROOM_NOT_READY"
+                cpUnverified.totalNetworkCallsMade shouldBe 0
+
+                cpForegroundYield.lastStopReason shouldBe "PAUSED_FOREGROUND_USER_REQUEST"
+                cpForegroundYield.yieldedToForegroundCount shouldBe 1
+                cpForegroundYield.totalNetworkCallsMade shouldBe 0
+
+                cpService429.lastStopReason shouldBe "PAUSED_RETRY_AFTER_BACKOFF"
+                cpService429.pausedForRetryAfterCount shouldBe 1
+                cpService429.totalNetworkCallsMade shouldBe 0
+
+                // Batch 1 processed seed-p1 only, stopped match loop at EUW1_C3 (patch 16.6), and discovered discovered-p3
+                cpBatch1.processedPuuids shouldBe setOf("seed-p1")
+                cpBatch1.pendingCandidatePuuids.contains("seed-p2") shouldBe true
+                cpBatch1.pendingCandidatePuuids.contains("discovered-p3") shouldBe true
+                fetchedMatchCalls shouldBe listOf("EUW1_C1", "EUW1_C2", "EUW1_C3")
+                cpBatch1.playerCellGameCounts["EMERALD:TOP:seed-p1"] shouldBe 2
+                cpBatch1.targetCellsCount shouldBe 30
+
+                // Batch 2 resumed from checkpoint, skipped seed-p1, processed seed-p2 using already-cached EUW1_C1
+                cpBatch2.processedPuuids shouldBe setOf("seed-p1", "seed-p2")
+                cpBatch2.fetchedRankSnapshots shouldBe 2
+                cpBatch2.fetchedMatchIdLists shouldBe 2
+                // No additional match detail calls needed for EUW1_C1 because it was cached in Batch 1
+                fetchedMatchCalls.size shouldBe 3
+                cpBatch2.cellProgress["EMERALD:TOP"]?.eligibleGames shouldBe 2
+                cpBatch2.cellProgress["EMERALD:MIDDLE"]?.eligibleGames shouldBe 2
+                cpBatch2.cellProgress["EMERALD:TOP"]?.passesQualityGate shouldBe false
+            }
+        }
     }
 })
+

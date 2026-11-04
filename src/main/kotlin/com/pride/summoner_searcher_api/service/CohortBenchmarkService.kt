@@ -246,6 +246,36 @@ class CohortBenchmarkService(
             }
         }
 
+        // Also scan compact cohort rank snapshot keys (bounded, same freshness rules)
+        val snapshotKeys = redisCacheService.scanKeys(
+            pattern = "cohort:rank:snapshot:$normalizedRegion:*",
+            maxKeys = MAX_SCAN_KEYS_PER_NAMESPACE
+        )
+        if (snapshotKeys.isNotEmpty()) {
+            val snapshotsMap = snapshotKeys.chunked(200).flatMap { chunk ->
+                redisCacheService.multiGet(chunk, CohortRankSnapshotDto::class.java).entries
+            }
+            for ((_, snap) in snapshotsMap) {
+                if (snap == null) continue
+                val puuid = snap.puuid.takeIf { it.isNotBlank() } ?: continue
+                if (snap.queueType != "RANKED_SOLO_5x5") continue
+                val tier = snap.tier.uppercase().trim().takeIf { it.isNotBlank() } ?: continue
+                val snapshotAt = snap.snapshotAt
+                if (snapshotAt.isBefore(minSnapshotInstant) || snapshotAt.isAfter(maxFutureSkewInstant)) {
+                    excludedStaleRankSnapshots++
+                    continue
+                }
+                val existing = rankSnapshotsByPuuid[puuid]
+                if (existing == null || snapshotAt.isAfter(existing.snapshotAt)) {
+                    rankSnapshotsByPuuid[puuid] = RankSnapshot(
+                        puuid = puuid,
+                        tier = tier,
+                        snapshotAt = snapshotAt
+                    )
+                }
+            }
+        }
+
         // Also scan Challenger leaderboard cache keys for the region (bounded)
         val leaderboardKeys = (
             redisCacheService.scanKeys(
@@ -782,14 +812,15 @@ class CohortBenchmarkService(
      * Refuses to execute unless:
      * 1. `cohort.network-collection.enabled=true` is explicitly configured, AND
      * 2. Actual Riot `X-App-Rate-Limit` and `X-Method-Rate-Limit` headers have been verified on [region]
-     *    with sufficient headroom, no active `429 Retry-After` window, and no active `HIGH`-priority user requests.
+     *    with sufficient headroom, no active `429 Retry-After` / `service` window, and no active `HIGH`-priority user requests.
      */
     suspend fun runGuardedLowPriorityCollectionStep(
         region: String = "euw1",
         candidatePuuids: List<String>,
-        maxNewMatchesPerPlayer: Int = 3
+        maxNewMatchesPerPlayer: Int = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
     ): Map<String, Any> {
         val normalizedRegion = region.lowercase().trim()
+        val effectiveCap = maxNewMatchesPerPlayer.coerceIn(1, CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER)
         val verification = riotApiRateLimiter.getVerificationSnapshot(
             region = normalizedRegion,
             networkCollectionEnabled = networkCollectionEnabled
@@ -811,6 +842,9 @@ class CohortBenchmarkService(
                 "region" to normalizedRegion,
                 "appLimitsVerifiedFromHeaders" to verification.appLimitsVerifiedFromHeaders,
                 "appHasHeadroomForLowPriority" to verification.appHasHeadroomForLowPriority,
+                "verifiedMethodEndpoints" to verification.verifiedMethodEndpoints,
+                "serviceRateLimitActive" to verification.serviceRateLimitActive,
+                "foregroundYieldActive" to verification.foregroundYieldActive,
                 "activeUserRequests" to verification.activeUserRequests,
                 "retryAfterUntil" to (verification.retryAfterUntil?.toString() ?: "NONE"),
                 "fetchedMatches" to 0
@@ -821,8 +855,8 @@ class CohortBenchmarkService(
         for (puuid in candidatePuuids.distinct()) {
             riotApiRateLimiter.awaitLowPriorityClearance(normalizedRegion)
             val nowVerify = riotApiRateLimiter.getVerificationSnapshot(normalizedRegion, networkCollectionEnabled)
-            if (!nowVerify.appHasHeadroomForLowPriority) {
-                logger.info("Low-priority cohort worker pausing on {}: headroom below threshold", normalizedRegion)
+            if (!nowVerify.readyForLowPriorityNetworkCollection) {
+                logger.info("Low-priority cohort worker pausing on {}: verification/headroom not ready", normalizedRegion)
                 break
             }
 
@@ -830,16 +864,21 @@ class CohortBenchmarkService(
                 puuid = puuid,
                 region = normalizedRegion,
                 queueId = SOLO_QUEUE_ID,
-                count = maxNewMatchesPerPlayer.coerceIn(1, 20),
+                count = effectiveCap,
                 start = 0
             ).orEmpty()
 
-            for (matchId in matchIds.take(maxNewMatchesPerPlayer.coerceAtLeast(1))) {
+            for (matchId in matchIds.take(effectiveCap)) {
                 val matchKey = "match:$normalizedRegion:$matchId"
                 if (redisCacheService.get(matchKey, MatchDto::class.java) != null) {
                     continue
                 }
                 riotApiRateLimiter.awaitLowPriorityClearance(normalizedRegion)
+                val matchVerify = riotApiRateLimiter.getVerificationSnapshot(normalizedRegion, networkCollectionEnabled)
+                if (!matchVerify.readyForLowPriorityNetworkCollection) {
+                    logger.info("Low-priority cohort worker pausing before match fetch on {}", normalizedRegion)
+                    break
+                }
                 val match = riotApiService.getMatchByIdLowPriority(matchId, normalizedRegion) ?: continue
                 redisCacheService.set(matchKey, match, MATCH_CACHE_TTL)
                 fetchedMatches++
@@ -853,6 +892,449 @@ class CohortBenchmarkService(
             "fetchedMatches" to fetchedMatches
         )
     }
+
+    /**
+     * Resumable, checkpointed LOW-priority collector batch for EUW (or specified [region]),
+     * targeting current-patch Ranked Solo (`420`), roles `TOP`/`MIDDLE`/`BOTTOM`, all 10 rank tiers,
+     * capped at `10` games/player per `(tier, role)` cell, with quality gate `50` players + `200` games per cell.
+     *
+     * Strictly enforces:
+     * - Cache-only inventory & checkpoint initialization first.
+     * - Network calls start ONLY when `cohort.network-collection.enabled=true` AND actual App + Method
+     *   rate-limit headers and headroom are verified, with no active `429 Retry-After` / `service` backoff
+     *   and no active/recent foreground user request (`foregroundYieldActive == false`).
+     * - Persists resumable checkpoint state in Redis (`cohort:collector:checkpoint:{region}:{patch}`) after each player
+     *   and immediately on any yield/backoff/headroom pause.
+     */
+    suspend fun runResumableLowPriorityCollectorBatch(
+        region: String = "euw1",
+        targetPatch: String? = null,
+        seedPuuids: List<String> = emptyList(),
+        maxPlayersPerBatch: Int = 25,
+        maxGamesPerPlayer: Int = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
+    ): CohortCollectorCheckpointDto {
+        val normalizedRegion = region.lowercase().trim()
+        val effectiveCap = maxGamesPerPlayer.coerceIn(1, CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER)
+        val effectiveBatchLimit = maxPlayersPerBatch.coerceIn(1, 200)
+        val nowInstant = Instant.ofEpochMilli(timeProvider.now())
+
+        // 1. Always run bounded cache-only extraction first to establish baseline cell coverage and current patch
+        val initialReport = extractCachedCohortsAndReport(
+            region = normalizedRegion,
+            targetPatch = targetPatch,
+            maxGamesPerPlayer = effectiveCap
+        )
+        var effectivePatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
+            ?: initialReport.inventory.selectedTargetPatch
+        val patchSource = initialReport.inventory.patchSelectionSource
+
+        val existingCheckpoint = getCollectorCheckpoint(normalizedRegion, effectivePatch)
+            ?: if (effectivePatch != null) getCollectorCheckpoint(normalizedRegion, null) else null
+
+        val processedPuuids = existingCheckpoint?.processedPuuids?.toMutableSet() ?: mutableSetOf()
+        val processedMatchIds = existingCheckpoint?.processedMatchIds?.toMutableSet() ?: mutableSetOf()
+        val playerCellGameCounts = existingCheckpoint?.playerCellGameCounts?.toMutableMap() ?: mutableMapOf()
+        val pendingQueue = LinkedHashSet<String>()
+        seedPuuids.map { it.trim() }.filter { it.isNotBlank() && it !in processedPuuids }.forEach { pendingQueue.add(it) }
+        existingCheckpoint?.pendingCandidatePuuids?.filter { it !in processedPuuids }?.forEach { pendingQueue.add(it) }
+
+        // Seed additional candidates from cached profiles, rank snapshots, and cached match participants
+        val discoveredFromCache = discoverCandidatePuuidsFromCache(normalizedRegion, effectivePatch)
+        for (candidate in discoveredFromCache) {
+            if (candidate !in processedPuuids && pendingQueue.size < 1_000) {
+                pendingQueue.add(candidate)
+            }
+        }
+
+        var cellProgress = buildAllTargetCellProgress(initialReport.cells)
+        var cellsPassing = cellProgress.values.count { it.passesQualityGate }
+        val startedAt = existingCheckpoint?.startedAt ?: nowInstant
+        var totalNetworkCalls = existingCheckpoint?.totalNetworkCallsMade ?: 0
+        var fetchedRankSnapshots = existingCheckpoint?.fetchedRankSnapshots ?: 0
+        var fetchedMatchIdLists = existingCheckpoint?.fetchedMatchIdLists ?: 0
+        var fetchedMatches = existingCheckpoint?.fetchedMatches ?: 0
+        var yieldedToForeground = existingCheckpoint?.yieldedToForegroundCount ?: 0
+        var pausedForRetryAfter = existingCheckpoint?.pausedForRetryAfterCount ?: 0
+        var pausedForHeadroom = existingCheckpoint?.pausedForHeadroomCount ?: 0
+
+        fun buildCurrentCheckpoint(stopReason: String): CohortCollectorCheckpointDto {
+            return CohortCollectorCheckpointDto(
+                region = normalizedRegion,
+                targetPatch = effectivePatch,
+                patchSelectionSource = patchSource,
+                queueId = SOLO_QUEUE_ID,
+                roles = listOf("TOP", "MIDDLE", "BOTTOM"),
+                maxGamesPerPlayerCap = effectiveCap,
+                targetPlayersPerCell = CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE,
+                targetGamesPerCell = CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE,
+                processedPuuids = processedPuuids.toSet(),
+                pendingCandidatePuuids = pendingQueue.filter { it !in processedPuuids }.take(1_000),
+                processedMatchIds = processedMatchIds.toSet(),
+                playerCellGameCounts = playerCellGameCounts.toMap(),
+                cellProgress = cellProgress,
+                cellsPassingQualityGate = cellsPassing,
+                targetCellsCount = TIER_ORDER.size * ELIGIBLE_ROLES.size,
+                totalNetworkCallsMade = totalNetworkCalls,
+                fetchedRankSnapshots = fetchedRankSnapshots,
+                fetchedMatchIdLists = fetchedMatchIdLists,
+                fetchedMatches = fetchedMatches,
+                yieldedToForegroundCount = yieldedToForeground,
+                pausedForRetryAfterCount = pausedForRetryAfter,
+                pausedForHeadroomCount = pausedForHeadroom,
+                lastStopReason = stopReason,
+                startedAt = startedAt,
+                updatedAt = Instant.ofEpochMilli(timeProvider.now())
+            )
+        }
+
+        // 2. If all 30 target (tier, role) cells already pass 50 players + 200 games, stop with 0 network calls
+        if (cellsPassing >= TIER_ORDER.size * ELIGIBLE_ROLES.size) {
+            val doneCheckpoint = buildCurrentCheckpoint("ALL_TARGET_CELLS_SATISFIED")
+            saveCollectorCheckpoint(doneCheckpoint)
+            return doneCheckpoint
+        }
+
+        // 3. Enforce network-collection config gate
+        if (!networkCollectionEnabled) {
+            val disabledCheckpoint = buildCurrentCheckpoint("NETWORK_COLLECTION_DISABLED_BY_CONFIG")
+            saveCollectorCheckpoint(disabledCheckpoint)
+            return disabledCheckpoint
+        }
+
+        // 4. Enforce actual App + Method + Service rate-limit header & headroom verification before starting network calls
+        fun evaluateLivePauseReason(requiredEndpoint: String? = null): String? {
+            val reqSet = if (requiredEndpoint != null) setOf(requiredEndpoint) else emptySet()
+            val snap = riotApiRateLimiter.getVerificationSnapshot(
+                region = normalizedRegion,
+                networkCollectionEnabled = networkCollectionEnabled,
+                requiredEndpoints = reqSet
+            )
+            if (snap.foregroundYieldActive || snap.activeUserRequests > 0) {
+                yieldedToForeground++
+                return "PAUSED_FOREGROUND_USER_REQUEST"
+            }
+            if (snap.serviceRateLimitActive || snap.retryAfterUntil != null) {
+                pausedForRetryAfter++
+                return "PAUSED_RETRY_AFTER_BACKOFF"
+            }
+            if (!snap.appLimitsVerifiedFromHeaders || snap.verifiedMethodEndpoints.isEmpty()) {
+                return "RATE_LIMIT_VERIFICATION_OR_HEADROOM_NOT_READY"
+            }
+            if (!snap.appHasHeadroomForLowPriority || snap.methodLimitsByEndpoint.values.any { !it.hasHeadroomForLowPriority }) {
+                pausedForHeadroom++
+                return "PAUSED_RATE_LIMIT_HEADROOM"
+            }
+            if (requiredEndpoint != null && requiredEndpoint in snap.missingRequiredMethodEndpoints) {
+                return "RATE_LIMIT_VERIFICATION_OR_HEADROOM_NOT_READY"
+            }
+            return null
+        }
+
+        val initialPauseReason = evaluateLivePauseReason()
+        if (initialPauseReason != null) {
+            val pausedCheckpoint = buildCurrentCheckpoint(initialPauseReason)
+            saveCollectorCheckpoint(pausedCheckpoint)
+            return pausedCheckpoint
+        }
+
+        if (pendingQueue.isEmpty()) {
+            val emptyCheckpoint = buildCurrentCheckpoint("NO_CANDIDATES_REMAINING")
+            saveCollectorCheckpoint(emptyCheckpoint)
+            return emptyCheckpoint
+        }
+
+        // 5. Process up to maxPlayersPerBatch candidates at LOW priority, checkpointing after each player
+        var playersProcessedThisBatch = 0
+        var stopReason = "BATCH_BUDGET_REACHED_RESUMABLE"
+        val minSnapshotInstant = Instant.ofEpochMilli(timeProvider.now()).minus(MAX_RANK_SNAPSHOT_AGE)
+
+        val candidatesThisBatch = pendingQueue.filter { it !in processedPuuids }.take(effectiveBatchLimit)
+        outerLoop@ for (puuid in candidatesThisBatch) {
+            val prePlayerPause = evaluateLivePauseReason()
+            if (prePlayerPause != null) {
+                stopReason = prePlayerPause
+                break@outerLoop
+            }
+
+            // Step A: Resolve or fetch fresh Solo Queue rank snapshot
+            var playerTier = getFreshCachedTierForPuuid(normalizedRegion, puuid, minSnapshotInstant)
+            if (playerTier == null) {
+                val rankPause = evaluateLivePauseReason()
+                if (rankPause != null) {
+                    stopReason = rankPause
+                    break@outerLoop
+                }
+                val leagueEntry = riotApiService.fetchLeagueRankLowPriority(puuid, normalizedRegion)
+                totalNetworkCalls++
+                fetchedRankSnapshots++
+                val fetchedTier = leagueEntry?.tier?.uppercase()?.trim()?.takeIf { it in TIER_ORDER }
+                if (fetchedTier != null && leagueEntry.queueType == "RANKED_SOLO_5x5") {
+                    cacheRankSnapshot(
+                        region = normalizedRegion,
+                        puuid = puuid,
+                        tier = fetchedTier,
+                        rank = leagueEntry.rank,
+                        leaguePoints = leagueEntry.leaguePoints,
+                        snapshotAt = Instant.ofEpochMilli(timeProvider.now())
+                    )
+                    playerTier = fetchedTier
+                } else {
+                    // Unranked in Solo Queue; mark processed and checkpoint
+                    processedPuuids.add(puuid)
+                    pendingQueue.remove(puuid)
+                    playersProcessedThisBatch++
+                    saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
+                    continue@outerLoop
+                }
+            }
+
+            // Step B: Skip player if all 3 roles in their tier already pass quality gate (50 players + 200 games)
+            // or if the player already reached the 10-game cap in every under-filled role of their tier
+            val underfilledRolesForTier = ELIGIBLE_ROLES.filter { role ->
+                val cell = cellProgress["$playerTier:$role"]
+                val passes = cell?.passesQualityGate == true
+                val playerGames = playerCellGameCounts["$playerTier:$role:$puuid"] ?: 0
+                !passes && playerGames < effectiveCap
+            }
+            if (underfilledRolesForTier.isEmpty()) {
+                processedPuuids.add(puuid)
+                pendingQueue.remove(puuid)
+                playersProcessedThisBatch++
+                saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
+                continue@outerLoop
+            }
+
+            // Step C: Fetch up to effectiveCap (10) recent Solo Queue match IDs at LOW priority
+            val matchListPause = evaluateLivePauseReason("match-v5-ids-by-puuid")
+            if (matchListPause != null) {
+                stopReason = matchListPause
+                break@outerLoop
+            }
+            val matchIds = riotApiService.getMatchIdsByPuuidLowPriority(
+                puuid = puuid,
+                region = normalizedRegion,
+                queueId = SOLO_QUEUE_ID,
+                count = effectiveCap,
+                start = 0
+            ).orEmpty()
+            totalNetworkCalls++
+            fetchedMatchIdLists++
+
+            // Step D: Inspect/fetch matches on current patch, enforcing 10-game per-player cap
+            matchLoop@ for (matchId in matchIds.take(effectiveCap)) {
+                val allRolesCappedForPlayer = ELIGIBLE_ROLES.all { role ->
+                    (playerCellGameCounts["$playerTier:$role:$puuid"] ?: 0) >= effectiveCap
+                }
+                if (allRolesCappedForPlayer) {
+                    break@matchLoop
+                }
+
+                val matchKey = "match:$normalizedRegion:$matchId"
+                var match = redisCacheService.get(matchKey, MatchDto::class.java)
+                if (match == null) {
+                    val matchFetchPause = evaluateLivePauseReason("match-v5-match-by-id")
+                    if (matchFetchPause != null) {
+                        stopReason = matchFetchPause
+                        break@outerLoop
+                    }
+                    match = riotApiService.getMatchByIdLowPriority(matchId, normalizedRegion)
+                    totalNetworkCalls++
+                    if (match != null) {
+                        redisCacheService.set(matchKey, match, MATCH_CACHE_TTL)
+                        fetchedMatches++
+                    }
+                }
+                processedMatchIds.add(matchId)
+                val info = match?.info ?: continue@matchLoop
+                val matchPatch = extractMajorMinorPatch(info.gameVersion)
+                if (effectivePatch == null && matchPatch != null) {
+                    effectivePatch = matchPatch
+                }
+                // Match IDs are ordered newest-first; stop inspecting older matches once we cross into an older patch
+                if (effectivePatch != null && matchPatch != null && patchComparator.compare(matchPatch, effectivePatch!!) < 0) {
+                    break@matchLoop
+                }
+                if (info.queueId != SOLO_QUEUE_ID || (info.gameDuration ?: 0L) < MIN_GAME_DURATION_SECONDS) {
+                    continue@matchLoop
+                }
+                if (effectivePatch != null && matchPatch != effectivePatch) {
+                    continue@matchLoop
+                }
+
+                for (participant in info.participants) {
+                    val role = resolveNormalizedRole(participant)
+                    if (role !in ELIGIBLE_ROLES) continue
+                    val pPuuid = participant.puuid?.takeIf { it.isNotBlank() } ?: continue
+                    if (pPuuid !in processedPuuids && pendingQueue.size < 1_000) {
+                        pendingQueue.add(pPuuid)
+                    }
+                    if (pPuuid == puuid) {
+                        val countKey = "$playerTier:$role:$puuid"
+                        val currentCount = playerCellGameCounts[countKey] ?: 0
+                        if (currentCount < effectiveCap) {
+                            playerCellGameCounts[countKey] = currentCount + 1
+                        }
+                    }
+                }
+            }
+
+            processedPuuids.add(puuid)
+            pendingQueue.remove(puuid)
+            playersProcessedThisBatch++
+            saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
+        }
+
+        // 6. Re-extract from cache to update persisted de-identified cells and cellProgress
+        val updatedReport = extractCachedCohortsAndReport(
+            region = normalizedRegion,
+            targetPatch = effectivePatch,
+            maxGamesPerPlayer = effectiveCap
+        )
+        if (effectivePatch == null) {
+            effectivePatch = updatedReport.inventory.selectedTargetPatch
+        }
+        cellProgress = buildAllTargetCellProgress(updatedReport.cells)
+        cellsPassing = cellProgress.values.count { it.passesQualityGate }
+
+        if (cellsPassing >= TIER_ORDER.size * ELIGIBLE_ROLES.size) {
+            stopReason = "ALL_TARGET_CELLS_SATISFIED"
+        } else if (stopReason == "BATCH_BUDGET_REACHED_RESUMABLE" && pendingQueue.none { it !in processedPuuids }) {
+            stopReason = "NO_CANDIDATES_REMAINING"
+        }
+
+        val finalCheckpoint = buildCurrentCheckpoint(stopReason)
+        saveCollectorCheckpoint(finalCheckpoint)
+        return finalCheckpoint
+    }
+
+    fun getCollectorCheckpoint(region: String, targetPatch: String? = null): CohortCollectorCheckpointDto? {
+        val normalizedRegion = region.lowercase().trim()
+        val key = collectorCheckpointKey(normalizedRegion, targetPatch?.trim()?.takeIf { it.isNotBlank() })
+        return redisCacheService.get(key, CohortCollectorCheckpointDto::class.java)
+    }
+
+    fun saveCollectorCheckpoint(checkpoint: CohortCollectorCheckpointDto) {
+        val normalizedRegion = checkpoint.region.lowercase().trim()
+        val primaryKey = collectorCheckpointKey(normalizedRegion, checkpoint.targetPatch)
+        redisCacheService.set(primaryKey, checkpoint, MAX_RANK_SNAPSHOT_AGE)
+        if (checkpoint.targetPatch != null) {
+            redisCacheService.set(collectorCheckpointKey(normalizedRegion, null), checkpoint, MAX_RANK_SNAPSHOT_AGE)
+        }
+    }
+
+    fun cacheRankSnapshot(
+        region: String,
+        puuid: String,
+        tier: String,
+        rank: String? = null,
+        leaguePoints: Int? = null,
+        snapshotAt: Instant = Instant.ofEpochMilli(timeProvider.now())
+    ) {
+        val normalizedRegion = region.lowercase().trim()
+        val cleanPuuid = puuid.trim()
+        val cleanTier = tier.uppercase().trim()
+        if (cleanPuuid.isBlank() || cleanTier !in TIER_ORDER) return
+        val dto = CohortRankSnapshotDto(
+            puuid = cleanPuuid,
+            region = normalizedRegion,
+            tier = cleanTier,
+            rank = rank,
+            leaguePoints = leaguePoints,
+            queueType = "RANKED_SOLO_5x5",
+            snapshotAt = snapshotAt
+        )
+        redisCacheService.set("cohort:rank:snapshot:$normalizedRegion:$cleanPuuid", dto, MAX_RANK_SNAPSHOT_AGE)
+    }
+
+    private fun getFreshCachedTierForPuuid(
+        region: String,
+        puuid: String,
+        minSnapshotInstant: Instant
+    ): String? {
+        val snap = redisCacheService.get("cohort:rank:snapshot:$region:$puuid", CohortRankSnapshotDto::class.java)
+        if (snap != null && snap.queueType == "RANKED_SOLO_5x5" && !snap.snapshotAt.isBefore(minSnapshotInstant)) {
+            val t = snap.tier.uppercase().trim()
+            if (t in TIER_ORDER) return t
+        }
+        val profile = redisCacheService.get("player:profile:$region:$puuid", SummonerProfileDto::class.java)
+        val refreshed = profile?.lastRefreshed
+        val soloRank = profile?.soloQueueRank
+        if (refreshed != null && !refreshed.isBefore(minSnapshotInstant) &&
+            (soloRank?.queueType == null || soloRank.queueType == "RANKED_SOLO_5x5")
+        ) {
+            val t = soloRank?.tier?.uppercase()?.trim()
+            if (t != null && t in TIER_ORDER) return t
+        }
+        return null
+    }
+
+    private fun discoverCandidatePuuidsFromCache(region: String, targetPatch: String?): List<String> {
+        val discovered = LinkedHashSet<String>()
+        val profileKeys = redisCacheService.scanKeys("player:profile:$region:*", maxKeys = 500)
+        for (key in profileKeys) {
+            val puuid = key.substringAfterLast(":").trim()
+            if (puuid.isNotBlank()) discovered.add(puuid)
+        }
+        val snapKeys = redisCacheService.scanKeys("cohort:rank:snapshot:$region:*", maxKeys = 500)
+        for (key in snapKeys) {
+            val puuid = key.substringAfterLast(":").trim()
+            if (puuid.isNotBlank()) discovered.add(puuid)
+        }
+        val matchKeys = redisCacheService.scanKeys("match:$region:*", maxKeys = 500)
+        if (matchKeys.isNotEmpty()) {
+            val matches = matchKeys.chunked(100).flatMap { chunk ->
+                redisCacheService.multiGet(chunk, MatchDto::class.java).values.filterNotNull()
+            }
+            for (m in matches) {
+                val info = m.info ?: continue
+                if (info.queueId != SOLO_QUEUE_ID) continue
+                val p = extractMajorMinorPatch(info.gameVersion)
+                if (targetPatch != null && p != targetPatch) continue
+                for (part in info.participants) {
+                    val role = resolveNormalizedRole(part)
+                    val pid = part.puuid?.takeIf { it.isNotBlank() }
+                    if (role in ELIGIBLE_ROLES && pid != null && discovered.size < 1_000) {
+                        discovered.add(pid)
+                    }
+                }
+            }
+        }
+        return discovered.toList()
+    }
+
+    private fun buildAllTargetCellProgress(
+        computedCells: List<CohortBenchmarkCellDto>
+    ): Map<String, CohortCellProgressDto> {
+        val byKey = computedCells.associateBy { "${it.tier.uppercase()}:${it.role.uppercase()}" }
+        val result = LinkedHashMap<String, CohortCellProgressDto>()
+        for (tier in TIER_ORDER) {
+            for (role in listOf("TOP", "MIDDLE", "BOTTOM")) {
+                val key = "$tier:$role"
+                val cell = byKey[key]
+                val players = cell?.distinctPlayers ?: 0
+                val games = cell?.eligibleGames ?: 0
+                val passes = cell?.passesQualityGate == true ||
+                    (players >= CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE &&
+                        games >= CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE)
+                result[key] = CohortCellProgressDto(
+                    tier = tier,
+                    role = role,
+                    distinctPlayers = players,
+                    eligibleGames = games,
+                    targetPlayers = CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE,
+                    targetGames = CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE,
+                    passesQualityGate = passes,
+                    deficitPlayers = (CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE - players).coerceAtLeast(0),
+                    deficitGames = (CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE - games).coerceAtLeast(0)
+                )
+            }
+        }
+        return result
+    }
+
+    private fun collectorCheckpointKey(region: String, patch: String?): String =
+        "cohort:collector:checkpoint:${region.lowercase()}:${patch ?: "latest"}"
+
 
     private fun persistDeidentifiedCells(
         region: String,

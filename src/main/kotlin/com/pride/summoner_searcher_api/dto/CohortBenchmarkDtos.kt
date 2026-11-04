@@ -188,6 +188,11 @@ data class RateLimitVerificationSnapshotDto(
     val activeAppBuckets: List<String>,
     val appHasHeadroomForLowPriority: Boolean,
     val methodLimitsByEndpoint: Map<String, MethodRateLimitSnapshotDto>,
+    val verifiedMethodEndpoints: Set<String> = emptySet(),
+    val missingRequiredMethodEndpoints: Set<String> = emptySet(),
+    val lastRateLimitType: String? = null,
+    val serviceRateLimitActive: Boolean = false,
+    val foregroundYieldActive: Boolean = false,
     val lowPriorityCapRatio: Double,
     val userRequestYieldWindowMs: Long,
     val activeUserRequests: Int,
@@ -195,6 +200,69 @@ data class RateLimitVerificationSnapshotDto(
     val retryAfterUntil: Instant?,
     val networkCollectionEnabled: Boolean,
     val readyForLowPriorityNetworkCollection: Boolean
+)
+
+/**
+ * Compact timestamped Solo Queue current-rank snapshot cached at `cohort:rank:snapshot:{region}:{puuid}`.
+ * Never fabricates historical rank; carries explicit [snapshotAt] enforced against freshness & match-proximity bounds.
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class CohortRankSnapshotDto(
+    val puuid: String,
+    val region: String,
+    val tier: String,
+    val rank: String? = null,
+    val leaguePoints: Int? = null,
+    val queueType: String = "RANKED_SOLO_5x5",
+    val snapshotAt: Instant
+)
+
+/**
+ * Per-(tier, role) cell progress toward the quality gate (`50` distinct players + `200` eligible games).
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class CohortCellProgressDto(
+    val tier: String,
+    val role: String,
+    val distinctPlayers: Int,
+    val eligibleGames: Int,
+    val targetPlayers: Int = CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE,
+    val targetGames: Int = CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE,
+    val passesQualityGate: Boolean,
+    val deficitPlayers: Int,
+    val deficitGames: Int
+)
+
+/**
+ * Resumable, checkpointed state for the LOW-priority cohort collector (`cohort:collector:checkpoint:{region}:{patch}`).
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class CohortCollectorCheckpointDto(
+    val region: String,
+    val targetPatch: String?,
+    val patchSelectionSource: String,
+    val queueId: Int = 420,
+    val roles: List<String> = listOf("TOP", "MIDDLE", "BOTTOM"),
+    val maxGamesPerPlayerCap: Int = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER,
+    val targetPlayersPerCell: Int = CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE,
+    val targetGamesPerCell: Int = CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE,
+    val processedPuuids: Set<String> = emptySet(),
+    val pendingCandidatePuuids: List<String> = emptyList(),
+    val processedMatchIds: Set<String> = emptySet(),
+    val playerCellGameCounts: Map<String, Int> = emptyMap(),
+    val cellProgress: Map<String, CohortCellProgressDto> = emptyMap(),
+    val cellsPassingQualityGate: Int = 0,
+    val targetCellsCount: Int = 30,
+    val totalNetworkCallsMade: Int = 0,
+    val fetchedRankSnapshots: Int = 0,
+    val fetchedMatchIdLists: Int = 0,
+    val fetchedMatches: Int = 0,
+    val yieldedToForegroundCount: Int = 0,
+    val pausedForRetryAfterCount: Int = 0,
+    val pausedForHeadroomCount: Int = 0,
+    val lastStopReason: String = "INITIALIZED",
+    val startedAt: Instant,
+    val updatedAt: Instant
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -205,3 +273,4 @@ data class CohortExtractionReportDto(
     val cells: List<CohortBenchmarkCellDto>,
     val methodologyNotes: List<String>
 )
+
