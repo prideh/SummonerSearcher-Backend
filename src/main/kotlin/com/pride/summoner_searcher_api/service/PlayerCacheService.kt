@@ -70,11 +70,18 @@ class PlayerCacheService(
             // Calculate Start of Year (Jan 1st) in Epoch Seconds
             val startOfYear = java.time.Year.now().atDay(1).atStartOfDay(java.time.ZoneOffset.UTC).toEpochSecond()
 
-            // 1. Fetch current rank and fresh summoner metadata (level & icon)
-            val freshRank = riotApiService.fetchLeagueRank(puuid, region)
+            // 1. Verify summoner exists on this regional shard and fetch fresh level & icon
             val freshSummoner = riotApiService.getSummonerByPuuid(puuid, region)
-            val refreshedLevel = freshSummoner?.summonerLevel ?: cachedProfile?.summonerLevel
-            val refreshedIconId = freshSummoner?.profileIconId ?: cachedProfile?.profileIconId
+            if (freshSummoner == null) {
+                logger.info("No summoner found on shard $region for $summonerName#$tagLine (puuid=$puuid). Returning null.")
+                if (cachedProfile != null) {
+                    redisCacheService.delete(cacheKey)
+                }
+                return@coroutineScope null
+            }
+            val refreshedLevel = freshSummoner.summonerLevel ?: cachedProfile?.summonerLevel
+            val refreshedIconId = freshSummoner.profileIconId ?: cachedProfile?.profileIconId
+            val freshRank = riotApiService.fetchLeagueRank(puuid, region)
             
             // 2. Fetch ALL match IDs since start of year (pagination handled in service)
             val allMatchIds = riotApiService.fetchMatchIdsSince(puuid, region, startOfYear)

@@ -197,5 +197,18 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 verify(exactly = 0) { redisCacheService.multiGet(any(), MatchDto::class.java) }
             }
         }
+
+        When("fetching a profile for a Riot ID that has no summoner on the selected region") {
+            every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            every { redisCacheService.get(any(), SummonerProfileDto::class.java) } returns null
+            coEvery { riotApiService.getSummonerByPuuid(puuid, "kr") } returns null
+
+            val result = playerCacheService.getPlayerProfile(puuid, "kr", summonerName, tagLine)
+
+            Then("it should return null without caching a ghost profile") {
+                result shouldBe null
+                coVerify(exactly = 0) { riotApiService.fetchMatchIdsSince(puuid, "kr", any()) }
+            }
+        }
     }
 })
