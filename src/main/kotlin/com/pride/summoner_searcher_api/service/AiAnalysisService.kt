@@ -36,10 +36,10 @@ class AiAnalysisService(
     // Available temperatures and their initial weights
     // Weights are updated dynamically based on feedback per category
     private val baseTemperatureWeights = mapOf(
-        0.3 to 1.0,  // Structured, drill-focused
-        0.7 to 1.0,  // Balanced (current default)
-        1.0 to 1.0,  // Creative, uses analogies
-        1.3 to 0.5   // Unconventional framing (starts at half weight - risky)
+        0.3 to 1.2,  // Structured, drill-focused
+        0.7 to 1.5,  // Balanced (primary default)
+        1.0 to 0.4,  // Creative, uses analogies
+        1.3 to 0.1   // Unconventional framing (minimal weight to avoid off-topic drift)
     )
     
     /**
@@ -159,7 +159,7 @@ class AiAnalysisService(
                 """
                 **COACHING INSIGHT (from real user data):**
                 After answering $questionCategory questions, users commonly follow up about: $hints
-                Briefly touch on these topics if relevant, to pre-emptively answer their next question.
+                Use these topics when generating your 3 `---SUGGESTIONS---` follow-up options at the end (do not derail your main answer away from the user's question).
                 """.trimIndent()
             } else ""
         } catch (e: Exception) { "" }
@@ -170,7 +170,6 @@ class AiAnalysisService(
         val streakToneAdjustment = getStreakToneAdjustment(context)
         val playerName = context["summonerName"]?.toString() ?: "the player"
         
-        val contextString = context.entries.joinToString("\n") { "${it.key}: ${it.value}" }
         val historyString = messages.joinToString("\n") { "${it["role"]}: ${it["content"]}" }
         val groundTruth = buildGroundTruthSection(context)
         val gameCount = (context["totalGamesAnalyzed"] as? Number)?.toInt() ?: 0
@@ -185,8 +184,8 @@ class AiAnalysisService(
             You are an elite, Challenger-tier professional League of Legends coach analyzing ranked performance data. Use a constructive, encouraging, and highly analytical coaching methodology.
             
             **ANALYSIS FRAMEWORK (INTERNAL CHECKLIST):**
-            1. **Identify Context**: Rank, Role, Game Count.
-            2. **Find Gaps**: Compare player stats to opponent averages to find the biggest strengths and weaknesses.
+            1. **Identify Context**: Rank, Role, Game Count, and the user's exact question.
+            2. **Answer the Question First**: Directly address what the user asked before anything else.
             3. **Formulate Response**: Offer deep, actionable insight with high-elo terminology.
             
             $rankOptimization
@@ -194,8 +193,8 @@ class AiAnalysisService(
             **COACHING STYLE & TONE:**
             - NEVER start a response with the player's name. NEVER address the player by their rank (e.g., do not say "Master I..."). Do not use the player's name ($playerName) more than once per response, and only when it's genuinely natural to do so mid-sentence. Most responses should use no name at all.
             - Converse naturally. Avoid sounding like a rigid, automated report. Use natural paragraphs or short bullet points only when explaining complex concepts like wave management or ability combos.
-            - **Socratic Method:** Occasionally, point out a flaw in their stats and ask them a guiding question to help them realize the mistake themselves, rather than just spoon-feeding the answer directly.
-            - **Proactive Coaching:** Even if the user asks a simple question (e.g., "What items to build?"), briefly point out a glaring issue in their data if one exists (e.g., "I'll tell you the build, but I noticed your vision score is bottom 5%—we need to fix that too.").
+            - **Direct Answer Priority (#1 Rule):** ALWAYS directly and thoroughly answer the user's specific question first. Do NOT pivot to unrelated stat weaknesses (such as vision score or CS) when the user asks a focused question about a different topic (such as an item description, build path, champion mechanic, or matchup). Only bring up broader stat weaknesses when the user asks for an overall/general performance review or when it directly relates to their question.
+            - **Socratic Method:** When reviewing player mistakes, you may ask a brief guiding question to help them recognize the pattern, after answering their direct question.
             - Be professional and honest about weaknesses. Do not use overly fluffy praise unless a stat is truly exceptional.
             - **CRITICAL RULE: ELEVATOR PITCH.** Your response MUST be under 150 words. Do not write filler. Deliver your insight as a brutally efficient elevator pitch.
             - **IMPORTANT: You MUST ALWAYS output the suggestions block at the very end of your response, absolutely nothing else should follow it. FORMAT:** `---SUGGESTIONS--- ["Option 1", "Option 2", "Option 3"]`
@@ -212,9 +211,9 @@ class AiAnalysisService(
             $timelineSection
             
             **DATA-DRIVEN COACHING RULES:**
-            - Base your coaching entirely on the provided STATS and recentMatchSummary.
-            - Do not invent game events, stats, or champion matchups that are not explicitly listed in the data.
-            - If data is missing or inconclusive, simply state that the data doesn't provide a clear answer.
+            - For player-specific claims (win rates, KDA, CS/min, match history, or matchups played), rely strictly on the provided GROUND TRUTH STATS and recentMatchSummary. Do not invent game events, player stats, or match results that are not listed in the data.
+            - For general League of Legends domain questions (such as item descriptions, item stats/passives, build paths, rune interactions, ability mechanics, or macro concepts), answer directly and accurately using your League of Legends knowledge, and connect the explanation to the player's champions or stats when relevant.
+            - If the user asks for specific player data that is missing from the stats block, state clearly what data is unavailable.
             
             **MATCHUP GURU EXPERTISE:**
             When discussing champion matchups, utilize the provided data. Go beyond basic win rates: explain *why* a matchup is favored or difficult by discussing specific ability interactions, cooldown windows, tethering, or power spikes.
@@ -234,9 +233,6 @@ class AiAnalysisService(
             Format these questions exactly as a JSON array of strings, prefixed with "---SUGGESTIONS---".
             Example:
             ---SUGGESTIONS--- ["How do I improve my CS?", "Best warding spots?", "Review my champion pool"]
-            
-            Stats:
-            $contextString
             
             Previous:
             $historyString
@@ -329,31 +325,37 @@ class AiAnalysisService(
 
             // Core Fundamentals
             score("cs_farming", "CS / farming advice", "cs", "farm", "minion", "last hit")
-            score("vision_warding", "vision / warding advice", "ward", "vision", "pink ward", "control ward")
-            score("wave_management", "wave management", "wave", "freeze", "slow push", "crash")
-            score("trading_laning", "trading / laning", "trade", "trading", "poke", "harass")
-            score("itemization_builds", "item builds", "item", "build", "buy", "purchase")
+            score("vision_warding", "vision / warding advice", "ward", "vision", "pink ward", "control ward", "sweeper", "farsight")
+            score("wave_management", "wave management", "wave", "freeze", "slow push", "crash", "fast push", "bounce")
+            score("trading_laning", "trading / laning", "trade", "trading", "poke", "harass", "all-in", "all in", "lane phase", "laning")
+            score("itemization_builds", "item builds",
+                "item", "build", "buy", "purchase", "boots", "zhonya", "rabadon", "infinity edge",
+                "black cleaver", "trinity", "eclipse", "liandry", "luden", "void staff", "cryptbloom",
+                "mortal reminder", "lord dominik", "bloodthirster", "kraken", "ruined king", "bork",
+                "sterak", "jak'sho", "thornmail", "kaenic", "randuin", "spirit visage", "guardian angel",
+                "statikk", "nashor", "collector", "shojin", "sundered sky", "stridebreaker", "heartsteel",
+                "lethality", "magic pen", "armor pen", "anti-heal", "grievous", "gold cost", "recipe")
 
             // Macro
-            score("macro_rotations", "macro / rotations", "macro", "rotation", "split push")
-            score("teamfighting", "teamfighting", "teamfight", "5v5", "group")
-            score("objective_control", "objective control", "objective", "drake", "baron", "dragon")
-            score("jungle_pathing", "jungle pathing", "jungle path", "jungle clear", "jungle route")
-            score("roaming", "roaming / ganking", "roam", "gank", "when to leave lane")
-            score("back_timing", "recall timing", "recall", "back timing", "when to back")
-            score("win_conditions", "win conditions", "win condition", "win con", "game plan")
+            score("macro_rotations", "macro / rotations", "macro", "rotation", "split push", "side lane", "sidelane", "tempo")
+            score("teamfighting", "teamfighting", "teamfight", "5v5", "group", "front to back", "flank", "peel")
+            score("objective_control", "objective control", "objective", "drake", "baron", "dragon", "herald", "grubs", "voidgrub")
+            score("jungle_pathing", "jungle pathing", "jungle path", "jungle clear", "jungle route", "pathing", "full clear", "invade")
+            score("roaming", "roaming / ganking", "roam", "gank", "when to leave lane", "dive")
+            score("back_timing", "recall timing", "recall", "back timing", "when to back", "reset")
+            score("win_conditions", "win conditions", "win condition", "win con", "game plan", "close out")
 
             // Champion
-            score("champion_pool", "champion pool selection", "champion pool", "what champion", "one trick")
-            score("champion_mechanics", "champion mechanics", "combo", "ability", "skill order", "mechanic")
-            score("power_spikes", "power spikes", "power spike", "level 2", "level 6", "item spike")
+            score("champion_pool", "champion pool selection", "champion pool", "what champion", "one trick", "main", "who should i play")
+            score("champion_mechanics", "champion mechanics", "combo", "ability", "abilities", "skill order", "mechanic", "passive", "ultimate", "rune", "keystone")
+            score("power_spikes", "power spikes", "power spike", "level 2", "level 6", "item spike", "scaling")
 
             // Advanced
-            score("positional_spacing", "positioning", "position", "where to stand", "spacing")
-            score("resource_management", "resource management", "mana", "energy", "resource")
-            score("mental_state_tilt", "mental / tilt", "tilt", "mental", "frustrat", "anger")
+            score("positional_spacing", "positioning", "position", "where to stand", "spacing", "tether", "tethering", "kiting")
+            score("resource_management", "resource management", "mana", "energy", "resource", "cooldown")
+            score("mental_state_tilt", "mental / tilt", "tilt", "mental", "frustrat", "anger", "lose streak", "losing streak")
             score("review_methodology", "VOD review", "review", "vod", "replay")
-            score("full_analysis", "general performance analysis", "analyze", "how am i", "performance", "overall")
+            score("full_analysis", "general performance analysis", "analyze", "how am i", "performance", "overall", "strengths", "weaknesses")
 
             // Sort by score descending
             scores.sortByDescending { it.score }
@@ -378,9 +380,9 @@ class AiAnalysisService(
                 )
 
                 scores.isEmpty() -> {
-                    // History-aware fallback: if the current message is vague but the conversation
-                    // history shows a recent clarification about a specific topic, inherit that intent.
-                    val inheritedCategory = inferIntentFromHistory(history)
+                    // History-aware fallback: ONLY inherit intent from history when the current message
+                    // is a short/vague follow-up, NOT when the user asks a full new question on another topic.
+                    val inheritedCategory = if (isLikelyFollowUp(lowerQ)) inferIntentFromHistory(history) else null
                     if (inheritedCategory != null) {
                         IntentResult(
                             category = inheritedCategory,
@@ -391,9 +393,9 @@ class AiAnalysisService(
                     } else {
                         IntentResult(
                             category = "general",
-                            confidence = 0.3,
+                            confidence = 0.7,
                             isFrustrated = false,
-                            possibleMeanings = listOf("a general coaching question", "something specific I couldn't identify")
+                            possibleMeanings = listOf("a general coaching or League of Legends question")
                         )
                     }
                 }
@@ -422,27 +424,36 @@ class AiAnalysisService(
             }
         }
 
+        private fun isLikelyFollowUp(lowerQ: String): Boolean {
+            val words = lowerQ.split(Regex("\\s+")).filter { it.isNotBlank() }
+            if (words.size <= 4) return true
+            val followUpPrefixes = listOf(
+                "what about", "how about", "and ", "then ", "also ", "why ", "elaborate",
+                "can you explain", "tell me more", "more about", "in that case"
+            )
+            return followUpPrefixes.any { lowerQ.startsWith(it) }
+        }
+
         /**
-         * Scan the last few messages in history to infer the topic being discussed.
-         * Used as a fallback when the current message is too short/vague to classify.
+         * Scan the last few user messages in history to infer the topic being discussed.
+         * Used as a fallback only when the current message is a short/vague follow-up.
          */
         private fun inferIntentFromHistory(history: List<Map<String, String>>): String? {
-            // Look at the last 4 messages (2 exchanges)
-            val recent = history.takeLast(4)
-            val combinedText = recent.joinToString(" ") { it["content"] ?: "" }.lowercase()
+            // Look at the last 4 messages, prioritizing user messages to avoid matching AI boilerplate
+            val recentUserMessages = history.takeLast(4).filter { it["role"] == "user" }
+            val sourceMessages = if (recentUserMessages.isNotEmpty()) recentUserMessages else history.takeLast(2)
+            val combinedText = sourceMessages.joinToString(" ") { it["content"] ?: "" }.lowercase()
 
             return when {
-                combinedText.contains("champion") || combinedText.contains("matchup") ||
-                combinedText.contains("beat") || combinedText.contains("counter") ||
+                combinedText.contains("item") || combinedText.contains("build") -> "itemization_builds"
+                combinedText.contains("matchup") || combinedText.contains("counter") ||
                 combinedText.contains("which champion") -> "matchups"
-
                 combinedText.contains("cs") || combinedText.contains("farm") -> "cs_farming"
                 combinedText.contains("ward") || combinedText.contains("vision") -> "vision_warding"
                 combinedText.contains("wave") || combinedText.contains("freeze") -> "wave_management"
                 combinedText.contains("teamfight") || combinedText.contains("5v5") -> "teamfighting"
                 combinedText.contains("objective") || combinedText.contains("baron") || combinedText.contains("drake") -> "objective_control"
                 combinedText.contains("roam") || combinedText.contains("gank") -> "roaming"
-                combinedText.contains("item") || combinedText.contains("build") -> "itemization_builds"
                 combinedText.contains("position") || combinedText.contains("spacing") -> "positional_spacing"
                 combinedText.contains("mental") || combinedText.contains("tilt") -> "mental_state_tilt"
                 else -> null
@@ -526,6 +537,7 @@ class AiAnalysisService(
                 m["earlyLaningPhaseGoldExpAdvantage"]?.let { advStats.add("earlyLaningAdvantage=$it") }
                 m["maxCsAdvantageOnLaneOpponent"]?.let { advStats.add("csAdvantage=$it") }
                 m["visionScoreAdvantageLaneOpponent"]?.let { advStats.add("visionAdvantage=$it") }
+                (m["items"] ?: m["itemBuild"])?.let { advStats.add("items=$it") }
                 
                 val advStr = if (advStats.isNotEmpty()) ", " + advStats.joinToString(", ") else ""
                 
