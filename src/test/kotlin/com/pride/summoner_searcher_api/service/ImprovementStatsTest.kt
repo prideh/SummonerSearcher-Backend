@@ -629,6 +629,14 @@ class ImprovementStatsTest : DescribeSpec({
             jgSlice.phaseFarming.min10To20.avgJungleCsPerMin shouldBe 7.0
             jgSlice.phaseFarming.min20ToEnd.eligibleGames shouldBe 0
             jgSlice.phaseFarming.min20ToEnd.avgJungleCsPerMin.shouldBeNull()
+
+            // ── 7. Real Serialized DTO Contract Fixture Verification (for Frontend #15 integration) ──
+            val prettyJson = mapper.writerWithDefaultPrettyPrinter().writeValueAsString(stats)
+            val fixtureFile = java.io.File("src/test/resources/fixtures/improvement-stats-contract.json")
+            fixtureFile.exists() shouldBe true
+            val expectedJson = fixtureFile.readText()
+            mapper.readTree(prettyJson) shouldBe mapper.readTree(expectedJson)
+            mapper.readValue(expectedJson, ImprovementStatsDto::class.java) shouldBe stats
         }
 
         it("should lazily backfill cached timelines in TimelineService when CHAMPION_KILL events predate bounty/shutdownBounty") {
