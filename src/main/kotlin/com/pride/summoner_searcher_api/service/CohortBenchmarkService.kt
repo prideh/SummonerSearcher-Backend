@@ -47,6 +47,12 @@ class CohortBenchmarkService(
         private val REPORT_CACHE_TTL = Duration.ofMinutes(15)
         private val RECOMPUTE_GUARD_TTL = Duration.ofMinutes(5)
         private val MATCH_CACHE_TTL = Duration.ofDays(7)
+        private val COLLECTOR_LOCK_TTL = Duration.ofMinutes(10)
+        val REQUIRED_COLLECTOR_ENDPOINTS = setOf(
+            "league-v4-entries-by-puuid",
+            "match-v5-ids-by-puuid",
+            "match-v5-match-by-id"
+        )
     }
 
     private data class RankSnapshot(
@@ -911,7 +917,8 @@ class CohortBenchmarkService(
         targetPatch: String? = null,
         seedPuuids: List<String> = emptyList(),
         maxPlayersPerBatch: Int = 25,
-        maxGamesPerPlayer: Int = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
+        maxGamesPerPlayer: Int = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER,
+        shouldStop: () -> Boolean = { false }
     ): CohortCollectorCheckpointDto {
         val normalizedRegion = region.lowercase().trim()
         val effectiveCap = maxGamesPerPlayer.coerceIn(1, CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER)
@@ -987,6 +994,12 @@ class CohortBenchmarkService(
             )
         }
 
+        if (shouldStop()) {
+            val stoppedCheckpoint = buildCurrentCheckpoint("STOPPED_BY_OPERATOR")
+            saveCollectorCheckpoint(stoppedCheckpoint)
+            return stoppedCheckpoint
+        }
+
         // 2. If all 30 target (tier, role) cells already pass 50 players + 200 games, stop with 0 network calls
         if (cellsPassing >= TIER_ORDER.size * ELIGIBLE_ROLES.size) {
             val doneCheckpoint = buildCurrentCheckpoint("ALL_TARGET_CELLS_SATISFIED")
@@ -1003,6 +1016,9 @@ class CohortBenchmarkService(
 
         // 4. Enforce actual App + Method + Service rate-limit header & headroom verification before starting network calls
         fun evaluateLivePauseReason(requiredEndpoint: String? = null): String? {
+            if (shouldStop()) {
+                return "STOPPED_BY_OPERATOR"
+            }
             val reqSet = if (requiredEndpoint != null) setOf(requiredEndpoint) else emptySet()
             val snap = riotApiRateLimiter.getVerificationSnapshot(
                 region = normalizedRegion,
@@ -1059,7 +1075,7 @@ class CohortBenchmarkService(
             // Step A: Resolve or fetch fresh Solo Queue rank snapshot
             var playerTier = getFreshCachedTierForPuuid(normalizedRegion, puuid, minSnapshotInstant)
             if (playerTier == null) {
-                val rankPause = evaluateLivePauseReason()
+                val rankPause = evaluateLivePauseReason("league-v4-entries-by-puuid")
                 if (rankPause != null) {
                     stopReason = rankPause
                     break@outerLoop
@@ -1205,6 +1221,37 @@ class CohortBenchmarkService(
         val finalCheckpoint = buildCurrentCheckpoint(stopReason)
         saveCollectorCheckpoint(finalCheckpoint)
         return finalCheckpoint
+    }
+
+    fun isValidRegion(region: String): Boolean = region.lowercase().trim() in ALLOWED_REGIONS
+
+    fun isValidPatchOrNull(patch: String?): Boolean {
+        val clean = patch?.trim()?.takeIf { it.isNotBlank() } ?: return true
+        return PATCH_REGEX.matches(clean)
+    }
+
+    fun getLiveRateLimitVerification(region: String): RateLimitVerificationSnapshotDto {
+        val normalizedRegion = region.lowercase().trim()
+        return riotApiRateLimiter.getVerificationSnapshot(
+            region = normalizedRegion,
+            networkCollectionEnabled = networkCollectionEnabled,
+            requiredEndpoints = REQUIRED_COLLECTOR_ENDPOINTS
+        )
+    }
+
+    fun acquireCollectorProcessLock(region: String): Boolean {
+        val normalizedRegion = region.lowercase().trim()
+        return redisCacheService.setIfAbsent("lock:cohort:collector:active:$normalizedRegion", "ACTIVE", COLLECTOR_LOCK_TTL)
+    }
+
+    fun refreshCollectorProcessLock(region: String) {
+        val normalizedRegion = region.lowercase().trim()
+        redisCacheService.set("lock:cohort:collector:active:$normalizedRegion", "ACTIVE", COLLECTOR_LOCK_TTL)
+    }
+
+    fun releaseCollectorProcessLock(region: String) {
+        val normalizedRegion = region.lowercase().trim()
+        redisCacheService.delete("lock:cohort:collector:active:$normalizedRegion")
     }
 
     fun getCollectorCheckpoint(region: String, targetPatch: String? = null): CohortCollectorCheckpointDto? {

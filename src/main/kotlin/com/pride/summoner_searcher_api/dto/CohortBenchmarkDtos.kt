@@ -266,6 +266,25 @@ data class CohortCollectorCheckpointDto(
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
+data class CohortCollectorStatusDto(
+    val region: String,
+    val targetPatch: String?,
+    val runningInProcess: Boolean,
+    val stopRequested: Boolean = false,
+    val executionMode: String = "SAME_PROCESS_GUARDED",
+    val action: String = "STATUS",
+    val message: String,
+    val activeBatchIndex: Int = 0,
+    val maxBatchesConfigured: Int = 0,
+    val batchSizeConfigured: Int = 25,
+    val pauseDelayMsConfigured: Long = 2_500L,
+    val lastRunStartedAt: Instant? = null,
+    val lastRunCompletedAt: Instant? = null,
+    val rateLimitVerification: RateLimitVerificationSnapshotDto,
+    val checkpoint: CohortCollectorCheckpointDto? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class CohortExtractionReportDto(
     val reportSource: String = "FRESH_BOUNDED_EXTRACTION",
     val inventory: CohortCacheInventoryDto,
@@ -273,4 +292,3 @@ data class CohortExtractionReportDto(
     val cells: List<CohortBenchmarkCellDto>,
     val methodologyNotes: List<String>
 )
-

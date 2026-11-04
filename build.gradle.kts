@@ -82,3 +82,18 @@ tasks.withType<Test> {
 		showStandardStreams = true
 	}
 }
+
+tasks.withType<org.springframework.boot.gradle.tasks.run.BootRun> {
+	// Forward explicit -D system properties (cohort.*, spring.*, server.*) to the forked application JVM
+	System.getProperties().forEach { (k, v) ->
+		val key = k.toString()
+		if (key.startsWith("cohort.") || key.startsWith("spring.") || key.startsWith("server.")) {
+			systemProperty(key, v.toString())
+		}
+	}
+	// Map -Pargs="..." to application arguments
+	project.findProperty("args")?.toString()?.takeIf { it.isNotBlank() }?.let { rawArgs ->
+		args(rawArgs.trim().split(Regex("\\s+")))
+	}
+}
+

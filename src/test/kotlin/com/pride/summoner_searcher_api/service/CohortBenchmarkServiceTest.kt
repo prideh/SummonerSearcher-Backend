@@ -782,6 +782,160 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 cpBatch2.cellProgress["EMERALD:TOP"]?.passesQualityGate shouldBe false
             }
         }
+
+        When("controlling the collector via the same-process guarded runner and controller endpoints") {
+            val clockMs = java.util.concurrent.atomic.AtomicLong(nowInstant.toEpochMilli())
+            val testClock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            // Shared in-process rate limiter (same instance used by foreground traffic and collector)
+            val sharedRateLimiter = RiotApiRateLimiter(testClock)
+            val localRedis = mockk<RedisCacheService>(relaxed = true)
+            val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
+            var lockHeld = false
+
+            every { localRedis.scanKeys(any(), any(), any()) } returns emptyList()
+            every { localRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
+                savedCheckpoints[firstArg()]
+            }
+            every { localRedis.get(any(), CachedLeaderboardDto::class.java) } returns null
+            every { localRedis.setIfAbsent(match { it.startsWith("lock:cohort:collector:active:") }, any(), any()) } answers {
+                if (lockHeld) false else {
+                    lockHeld = true
+                    true
+                }
+            }
+            every { localRedis.delete(match { it.startsWith("lock:cohort:collector:active:") }) } answers {
+                lockHeld = false
+            }
+            every { localRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                val value = secondArg<Any>()
+                if (value is CohortCollectorCheckpointDto) {
+                    savedCheckpoints[key] = value
+                }
+            }
+
+            val sameProcessService = CohortBenchmarkService(
+                redisCacheService = localRedis,
+                cohortBenchmarkCellRepository = cohortRepo,
+                riotApiRateLimiter = sharedRateLimiter,
+                riotApiService = riotApiService,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = testClock
+            )
+            val runnerLoopback = com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner(
+                cohortBenchmarkService = sameProcessService,
+                configuredOperatorToken = "",
+                timeProvider = testClock
+            )
+            val runnerTokenProtected = com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner(
+                cohortBenchmarkService = sameProcessService,
+                configuredOperatorToken = "secret-operator-token",
+                timeProvider = testClock
+            )
+            val controller = com.pride.summoner_searcher_api.controller.RiotApiController(
+                riotApiService = riotApiService,
+                challengerLeagueService = mockk(relaxed = true),
+                userService = mockk(relaxed = true),
+                summonerProfileService = mockk(relaxed = true),
+                redisCacheService = localRedis,
+                cohortBenchmarkService = sameProcessService,
+                overnightCohortCollectorRunner = runnerLoopback
+            )
+
+            // 1. Authorization guard checks: reject external IP and proxied X-Forwarded-For when no token is configured
+            val externalReq = org.springframework.mock.web.MockHttpServletRequest().apply {
+                remoteAddr = "203.0.113.42"
+            }
+            val proxiedLoopbackReq = org.springframework.mock.web.MockHttpServletRequest().apply {
+                remoteAddr = "127.0.0.1"
+                addHeader("X-Forwarded-For", "198.51.100.9")
+            }
+            val directLoopbackReq = org.springframework.mock.web.MockHttpServletRequest().apply {
+                remoteAddr = "127.0.0.1"
+            }
+
+            val forbiddenExternal = controller.startOrResumeCohortCollector(
+                region = "euw1",
+                async = false,
+                httpRequest = externalReq
+            )
+            val forbiddenProxied = controller.getCohortCollectorStatus(
+                region = "euw1",
+                httpRequest = proxiedLoopbackReq
+            )
+
+            // 2. Simulate foreground user traffic in the SAME process populating headers & activeUserRequests
+            sharedRateLimiter.updateLimits(
+                region = "euw1",
+                limitHeader = "20:1,100:120",
+                countHeader = "3:1,12:120",
+                endpointKey = "league-v4-entries-by-puuid",
+                methodLimitHeader = "500:10",
+                methodCountHeader = "4:10"
+            )
+            sharedRateLimiter.beginUserRequest("euw1")
+            val liveStatusDuringUserReq = controller.getCohortCollectorStatus(
+                region = "euw1",
+                httpRequest = directLoopbackReq
+            )
+            sharedRateLimiter.endUserRequest("euw1")
+
+            // 3. Synchronous start/resume in same process (network OFF by default -> cache-only + checkpoint)
+            val startResp = controller.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                maxBatches = 1,
+                batchSize = 5,
+                pauseDelayMs = 0L,
+                async = false,
+                httpRequest = directLoopbackReq
+            )
+
+            // 4. Operator stop marks checkpoint as STOPPED_BY_OPERATOR
+            val stopResp = controller.stopCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                httpRequest = directLoopbackReq
+            )
+
+            // 5. Invalid region / patch validation without touching Redis
+            val invalidRegionResp = runnerLoopback.startOrResumeGuarded(region = "bad_region", async = false)
+            val invalidPatchResp = runnerLoopback.startOrResumeGuarded(region = "euw1", targetPatch = "bad-patch", async = false)
+
+            Then("it should enforce loopback/token authorization, share live in-process rate-limit headers and foreground counts, and checkpoint start/stop state cleanly") {
+                forbiddenExternal.statusCode shouldBe org.springframework.http.HttpStatus.FORBIDDEN
+                forbiddenProxied.statusCode shouldBe org.springframework.http.HttpStatus.FORBIDDEN
+
+                runnerTokenProtected.isAuthorizedOperatorRequest("127.0.0.1", providedToken = null) shouldBe false
+                runnerTokenProtected.isAuthorizedOperatorRequest("127.0.0.1", providedToken = "wrong-token") shouldBe false
+                runnerTokenProtected.isAuthorizedOperatorRequest("203.0.113.42", providedToken = "secret-operator-token") shouldBe true
+
+                // Same-process status sees live headers and foreground request count from sharedRateLimiter
+                val liveBody = liveStatusDuringUserReq.body!!
+                liveBody.executionMode shouldBe "SAME_PROCESS_GUARDED"
+                liveBody.rateLimitVerification.appLimitsVerifiedFromHeaders shouldBe true
+                liveBody.rateLimitVerification.verifiedMethodEndpoints shouldBe setOf("league-v4-entries-by-puuid")
+                liveBody.rateLimitVerification.missingRequiredMethodEndpoints shouldBe setOf("match-v5-ids-by-puuid", "match-v5-match-by-id")
+                liveBody.rateLimitVerification.activeUserRequests shouldBe 1
+                liveBody.rateLimitVerification.foregroundYieldActive shouldBe true
+
+                val startedBody = startResp.body!!
+                startedBody.action shouldBe "COMPLETED_SYNCHRONOUS_RUN"
+                startedBody.runningInProcess shouldBe false
+                startedBody.checkpoint?.lastStopReason shouldBe "NETWORK_COLLECTION_DISABLED_BY_CONFIG"
+                startedBody.checkpoint?.totalNetworkCallsMade shouldBe 0
+
+                val stoppedBody = stopResp.body!!
+                stoppedBody.action shouldBe "STOPPED"
+                stoppedBody.checkpoint?.lastStopReason shouldBe "STOPPED_BY_OPERATOR"
+
+                invalidRegionResp.action shouldBe "INVALID_PARAMETERS"
+                invalidPatchResp.action shouldBe "INVALID_PARAMETERS"
+            }
+        }
     }
 })
 

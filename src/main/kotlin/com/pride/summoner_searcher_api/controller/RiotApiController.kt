@@ -29,7 +29,8 @@ class RiotApiController(
     private val userService: UserService,
     private val summonerProfileService: SummonerProfileService,
     private val redisCacheService: com.pride.summoner_searcher_api.service.RedisCacheService,
-    private val cohortBenchmarkService: com.pride.summoner_searcher_api.service.CohortBenchmarkService? = null
+    private val cohortBenchmarkService: com.pride.summoner_searcher_api.service.CohortBenchmarkService? = null,
+    private val overnightCohortCollectorRunner: com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner? = null
 ) {
 
     /**
@@ -160,4 +161,85 @@ class RiotApiController(
         val cells = cohortBenchmarkService?.getPersistedCohortCells(region, patch) ?: emptyList()
         return ResponseEntity.ok(cells)
     }
+
+    /**
+     * Guarded same-process status endpoint for the LOW-priority cohort collector.
+     * Reads live in-memory [com.pride.summoner_searcher_api.service.RiotApiRateLimiter] verification + single checkpoint key.
+     */
+    @GetMapping("/cohorts/{region}/collector/status")
+    fun getCohortCollectorStatus(
+        @PathVariable region: String,
+        @org.springframework.web.bind.annotation.RequestParam(required = false) patch: String? = null,
+        @org.springframework.web.bind.annotation.RequestHeader(name = "X-Cohort-Operator-Token", required = false) operatorToken: String? = null,
+        httpRequest: jakarta.servlet.http.HttpServletRequest
+    ): ResponseEntity<com.pride.summoner_searcher_api.dto.CohortCollectorStatusDto?> {
+        val runner = overnightCohortCollectorRunner ?: return ResponseEntity.notFound().build()
+        if (!isAuthorizedCollectorOperator(runner, httpRequest, operatorToken)) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.FORBIDDEN).build()
+        }
+        return ResponseEntity.ok(runner.getStatus(region = region, targetPatch = patch))
+    }
+
+    /**
+     * Guarded same-process start/resume endpoint for the LOW-priority cohort collector.
+     * Executes inside the live backend JVM sharing [com.pride.summoner_searcher_api.service.RiotApiRateLimiter]
+     * so foreground user requests and verified rate-limit headers are shared in-process.
+     */
+    @org.springframework.web.bind.annotation.PostMapping("/cohorts/{region}/collector/start")
+    fun startOrResumeCohortCollector(
+        @PathVariable region: String,
+        @org.springframework.web.bind.annotation.RequestParam(required = false) patch: String? = null,
+        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "20") maxBatches: Int = 20,
+        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "25") batchSize: Int = 25,
+        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "2500") pauseDelayMs: Long = 2_500L,
+        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "true") async: Boolean = true,
+        @org.springframework.web.bind.annotation.RequestHeader(name = "X-Cohort-Operator-Token", required = false) operatorToken: String? = null,
+        httpRequest: jakarta.servlet.http.HttpServletRequest
+    ): ResponseEntity<com.pride.summoner_searcher_api.dto.CohortCollectorStatusDto?> {
+        val runner = overnightCohortCollectorRunner ?: return ResponseEntity.notFound().build()
+        if (!isAuthorizedCollectorOperator(runner, httpRequest, operatorToken)) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.FORBIDDEN).build()
+        }
+        val status = runner.startOrResumeGuarded(
+            region = region,
+            targetPatch = patch,
+            maxBatches = maxBatches,
+            batchSize = batchSize,
+            pauseDelayMs = pauseDelayMs,
+            async = async
+        )
+        return ResponseEntity.ok(status)
+    }
+
+    /**
+     * Guarded same-process stop endpoint for the LOW-priority cohort collector.
+     */
+    @org.springframework.web.bind.annotation.PostMapping("/cohorts/{region}/collector/stop")
+    fun stopCohortCollector(
+        @PathVariable region: String,
+        @org.springframework.web.bind.annotation.RequestParam(required = false) patch: String? = null,
+        @org.springframework.web.bind.annotation.RequestHeader(name = "X-Cohort-Operator-Token", required = false) operatorToken: String? = null,
+        httpRequest: jakarta.servlet.http.HttpServletRequest
+    ): ResponseEntity<com.pride.summoner_searcher_api.dto.CohortCollectorStatusDto?> {
+        val runner = overnightCohortCollectorRunner ?: return ResponseEntity.notFound().build()
+        if (!isAuthorizedCollectorOperator(runner, httpRequest, operatorToken)) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.FORBIDDEN).build()
+        }
+        return ResponseEntity.ok(runner.requestStop(region = region, targetPatch = patch))
+    }
+
+    private fun isAuthorizedCollectorOperator(
+        runner: com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner,
+        httpRequest: jakarta.servlet.http.HttpServletRequest,
+        operatorToken: String?
+    ): Boolean {
+        return runner.isAuthorizedOperatorRequest(
+            remoteAddr = httpRequest.remoteAddr,
+            forwardedFor = httpRequest.getHeader("X-Forwarded-For"),
+            forwarded = httpRequest.getHeader("Forwarded"),
+            realIp = httpRequest.getHeader("X-Real-IP"),
+            providedToken = operatorToken
+        )
+    }
 }
+
