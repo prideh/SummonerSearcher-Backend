@@ -255,4 +255,100 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
             }
         }
     }
+
+    Given("Issue #17 AI coach prompt: softened length rule, rank-appropriate persona, and explicit data-boundary declarations") {
+        val service = createService()
+        val constructPromptMethod = AiAnalysisService::class.java.getDeclaredMethod(
+            "constructPrompt",
+            Map::class.java,
+            List::class.java,
+            String::class.java,
+            AiAnalysisService.IntentResult::class.java,
+            PromptVersion::class.java
+        ).apply { isAccessible = true }
+
+        When("building a prompt for a Gold player when timelineStatus is NOT_ANALYZED") {
+            Then("it uses rank-appropriate Gold–Platinum guidance, replaces the hard 150-word rule, and includes all explicit data boundaries and guardrails") {
+                val goldContext = mapOf(
+                    "summonerName" to "MidLearner#EUW",
+                    "rank" to "GOLD II (54 LP)",
+                    "primaryRole" to "MIDDLE",
+                    "totalGamesAnalyzed" to 10,
+                    "timelineStatus" to "NOT_ANALYZED",
+                    "recentMatches" to listOf(
+                        mapOf(
+                            "champion" to "Ahri",
+                            "role" to "MIDDLE",
+                            "win" to true,
+                            "kda" to "4.50",
+                            "csPerMin" to 7.8,
+                            "laneCsAt10" to mapOf("actual" to 81, "spawnedSupply" to 120)
+                        )
+                    )
+                )
+
+                val intent = service.detectIntent("Review my early laning and vision habits")
+                val prompt = constructPromptMethod.invoke(
+                    service,
+                    goldContext,
+                    emptyList<Map<String, String>>(),
+                    "Review my early laning and vision habits",
+                    intent,
+                    null
+                ) as String
+
+                // 1. Softened 150-word rule -> concise-but-natural depth guidance
+                prompt shouldNotContain "MUST be under 150 words"
+                prompt shouldNotContain "brutally efficient elevator pitch"
+                prompt shouldContain "Concise & Natural Depth"
+                prompt shouldContain "allow longer, fuller explanations when the question needs depth"
+
+                // 2. Rank-appropriate persona instead of hardcoded Challenger persona
+                prompt shouldNotContain "Treat the player as a Challenger tier player"
+                prompt shouldContain "Rank-Appropriate Persona (GOLD II (54 LP))"
+                prompt shouldContain "Gold–Platinum progression level"
+
+                // 3. Explicit data-boundary phrasing rules
+                prompt shouldContain "timelineStatus: NOT_ANALYZED"
+                prompt shouldContain "When `timelineStatus` is `NOT_ANALYZED`, state clearly that only end-of-game summary and challenge stats are available"
+                prompt shouldContain "WARD_PLACED"
+                prompt shouldContain "never claim ward placement in specific bushes"
+                prompt shouldContain "assisted deaths are not necessarily jungle ganks"
+                prompt shouldContain "cs10.spawnedSupply"
+                prompt shouldContain "120 on verified patch 26.1+ games only"
+                prompt shouldContain "laneCs@10=81"
+                prompt shouldContain "cs10.spawnedSupply=120"
+
+                // 4. Existing guardrails and ---SUGGESTIONS--- contract preserved
+                prompt shouldContain "---SUGGESTIONS---"
+                prompt shouldContain "NO SOURCE CODE"
+                prompt shouldContain "NO OFF-TOPIC"
+            }
+        }
+
+        When("building a prompt for a Silver player vs a Master player") {
+            Then("it adapts the rank persona to Iron–Silver fundamentals vs Master+ apex play") {
+                val silverPrompt = constructPromptMethod.invoke(
+                    service,
+                    mapOf("rank" to "SILVER IV (20 LP)", "totalGamesAnalyzed" to 8),
+                    emptyList<Map<String, String>>(),
+                    "How do I die less?",
+                    null,
+                    null
+                ) as String
+
+                val masterPrompt = constructPromptMethod.invoke(
+                    service,
+                    mapOf("rank" to "MASTER I (240 LP)", "totalGamesAnalyzed" to 30),
+                    emptyList<Map<String, String>>(),
+                    "How do I punish wave bounce timings?",
+                    null,
+                    null
+                ) as String
+
+                silverPrompt shouldContain "Iron–Silver fundamental level"
+                masterPrompt shouldContain "Master+ apex level"
+            }
+        }
+    }
 })
