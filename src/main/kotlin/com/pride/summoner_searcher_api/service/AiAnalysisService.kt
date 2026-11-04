@@ -341,6 +341,7 @@ class AiAnalysisService(
             - **Vision Boundary:** Discuss ward counts, ward types, and timing buckets only; never claim ward placement in specific bushes, river entrances, or map areas (`WARD_PLACED` events carry no coordinates).
             - **Deaths & Assist Attribution:** Treat "assisted" deaths as multi-enemy involvement only—assisted deaths are not necessarily jungle ganks (lane 2v2s, support roams, and skirmishes/teamfights produce assists too). Describe enemy involvement rather than assigning causal blame.
             - **Early CS Supply (`cs10.spawnedSupply`):** `cs10.spawnedSupply` (120 on verified patch 26.1+ games only) is theoretical spawned minion supply by 10:00, not guaranteed farmable CS. Compare actual CS@10 primarily against the lane opponent, matchup pressure, and role expectations.
+            - **Incomplete Legacy Cache Fields:** When any stat or timeline breakdown (such as `assistedDeaths`, `unassistedDeaths`, `wardsByTimeBucket`, or `cs10.spawnedSupply`) is `null` or marked `incomplete`, treat it as unavailable/incomplete data from an older cache—never treat `null` or `incomplete` fields as `0`.
             
             **MATCHUP GURU EXPERTISE:**
             When discussing champion matchups, utilize the provided data. Go beyond basic win rates: explain *why* a matchup is favored or difficult by discussing specific ability interactions, cooldown windows, tethering, or power spikes.
@@ -615,7 +616,8 @@ class AiAnalysisService(
 
         // Scalar stats — pull known keys explicitly so we format them cleanly
         val scalarKeys = listOf(
-            "rank", "role", "primaryRole", "totalGamesAnalyzed", "timelineStatus", "visionDataPrecision",
+            "rank", "role", "primaryRole", "totalWins", "totalLosses", "totalGamesAnalyzed",
+            "timelineStatus", "visionDataPrecision",
             "winRate", "kda", "avgKda", "avgCsPerMin", "avgVisionScore", "avgDamagePerMin",
             "avgGoldPerMin", "avgKillParticipation", "avgDeathsPerGame",
             "avgAssistsPerGame", "avgKillsPerGame", "avgKills", "avgDeaths", "avgAssists",
@@ -629,6 +631,28 @@ class AiAnalysisService(
             lines.add("  timelineStatus: $inferredStatus")
         }
 
+        // Top champions pool
+        val topChampions = context["topChampions"] as? List<*>
+        if (!topChampions.isNullOrEmpty()) {
+            val formattedChamps = topChampions.mapNotNull { entry ->
+                when (entry) {
+                    is Map<*, *> -> {
+                        val name = entry["name"] ?: entry["champion"] ?: return@mapNotNull null
+                        val games = entry["games"] ?: "?"
+                        val wr = entry["winRate"]?.toString()?.removeSuffix("%") ?: "?"
+                        val kda = entry["kda"] ?: entry["avgKda"] ?: "?"
+                        val cs = entry["csPerMin"] ?: entry["avgCsPerMin"]
+                        val csSuffix = if (cs != null) ", $cs CS/m" else ""
+                        "$name (${games}g, ${wr}% WR, $kda KDA$csSuffix)"
+                    }
+                    else -> entry?.toString()
+                }
+            }
+            if (formattedChamps.isNotEmpty()) {
+                lines.add("  topChampions: ${formattedChamps.joinToString(", ")}")
+            }
+        }
+
         // Opponent stats block
         val opponentStats = context["opponentStats"] as? Map<String, Any>
         if (opponentStats != null) {
@@ -636,21 +660,30 @@ class AiAnalysisService(
             opponentStats.forEach { (k, v) -> lines.add("    $k: $v") }
         }
 
-        // Top strengths / weaknesses (string lists)
+        // Top strengths / weaknesses (string or map lists)
         val strengths = context["topStrengths"] as? List<*>
-        if (!strengths.isNullOrEmpty()) lines.add("  topStrengths: ${strengths.joinToString(", ")}")
+        if (!strengths.isNullOrEmpty()) {
+            val formatted = strengths.joinToString(", ") { item ->
+                if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString()
+            }
+            lines.add("  topStrengths: $formatted")
+        }
 
         val weaknesses = context["topWeaknesses"] as? List<*>
-        if (!weaknesses.isNullOrEmpty()) lines.add("  topWeaknesses: ${weaknesses.joinToString(", ")}")
+        if (!weaknesses.isNullOrEmpty()) {
+            val formatted = weaknesses.joinToString(", ") { item ->
+                if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString()
+            }
+            lines.add("  topWeaknesses: $formatted")
+        }
 
-        // Champion Matchups (new!)
+        // Champion Matchups
         val matchups = context["championMatchups"] as? Map<String, Map<String, Any>>
         if (!matchups.isNullOrEmpty()) {
             val formattedMatchups = matchups.entries
                 .sortedByDescending { (it.value["total"]?.toString()?.toDoubleOrNull()?.toInt()) ?: 0 }
                 .take(5) // Top 5 most frequent matchups
                 .joinToString(", ") { (champ, stats) ->
-                    // Safe casting for numbers that might be Int, Long, or Double from JSON
                     val wins = stats["wins"]?.toString()?.toDoubleOrNull()?.toInt() ?: 0
                     val losses = stats["losses"]?.toString()?.toDoubleOrNull()?.toInt() ?: 0
                     val winRate = stats["winRate"] ?: "0%"
@@ -661,58 +694,119 @@ class AiAnalysisService(
             }
         }
 
-        // Recent match summary (wins/losses only — no inventing per-game details)
-        val recentMatches = context["recentMatches"] as? List<Map<String, Any>>
+        // Recent match summary (wins/losses + approved per-match telemetry)
+        val recentMatches = context["recentMatches"] as? List<Map<String, Any?>>
         if (!recentMatches.isNullOrEmpty()) {
             val wins = recentMatches.count { it["win"] == true }
             val total = recentMatches.size
             lines.add("  recentMatchSummary: $wins wins / ${total - wins} losses in last $total games")
-            // Include per-match details including opponent name and advanced stats, reversed to be chronological
+            // Include per-match details including opponent build/runes, 5v5 draft, damage split, objectives, and timeline context
             val matchSummaries = recentMatches.take(20).reversed().mapIndexed { i, m ->
                 val win = if (m["win"] == true) "W" else "L"
-                val kda = m["kda"] ?: "?"
+                val kda = m["kda"] ?: m["kills"]?.let { "${m["kills"]}/${m["deaths"] ?: 0}/${m["assists"] ?: 0}" } ?: "?"
                 val cs = m["csPerMin"] ?: "?"
                 val champion = m["champion"] ?: m["championName"] ?: "?"
                 
-                val opponentMap = m["opponent"] as? Map<String, Any>
+                val opponentMap = m["opponent"] as? Map<String, Any?>
                 val oppName = opponentMap?.get("name") ?: "?"
                 val oppChamp = opponentMap?.get("champion") ?: "?"
                 
-                // Advanced stats optionally passed
                 val advStats = mutableListOf<String>()
-                m["patch"]?.let { advStats.add("patch=$it") }
+                m["matchId"]?.let { advStats.add("matchId=$it") }
+                (m["patch"] ?: m["gameVersion"])?.let { advStats.add("patch=$it") }
                 (m["role"] ?: m["teamPosition"])?.let { advStats.add("role=$it") }
                 m["side"]?.let { advStats.add("side=$it") }
+                m["gameDuration"]?.let { advStats.add("duration=${it}m") }
+                m["killParticipation"]?.let { advStats.add("kp=${it.toString().removeSuffix("%")}%") }
                 m["keystone"]?.let { advStats.add("keystone=$it") }
+                m["subStyle"]?.let { advStats.add("subStyle=$it") }
                 m["summonerSpells"]?.let { advStats.add("spells=$it") }
-                m["damagePerMinute"]?.let { advStats.add("dmg/min=$it") }
-                m["goldPerMinute"]?.let { advStats.add("gold/min=$it") }
+                (m["items"] ?: m["itemBuild"])?.let { advStats.add("items=$it") }
+
+                // 5v5 Draft (allies & enemies)
+                val draftMap = m["draft"] as? Map<String, Any?>
+                if (draftMap != null) {
+                    val allies = draftMap["allies"]
+                    val enemies = draftMap["enemies"]
+                    advStats.add("draft={allies=$allies, enemies=$enemies}")
+                }
+
+                // Damage split percentages (physical / magic / true)
+                val dmgSplit = m["damageSplitPct"] as? Map<String, Any?>
+                if (dmgSplit != null) {
+                    advStats.add(
+                        "damageSplitPct={physical=${dmgSplit["physical"]}%, magic=${dmgSplit["magic"]}%, true=${dmgSplit["true"]}%}"
+                    )
+                }
+
+                // Opponent details (KDA, CS/min, KP, vision, plates, keystone/runes, items)
+                if (opponentMap != null) {
+                    val oppFields = mutableListOf<String>()
+                    opponentMap["champion"]?.let { oppFields.add("champion=$it") }
+                    opponentMap["kda"]?.let { oppFields.add("kda=$it") }
+                    opponentMap["csPerMin"]?.let { oppFields.add("cs/min=$it") }
+                    opponentMap["killParticipation"]?.let { oppFields.add("kp=${it.toString().removeSuffix("%")}%") }
+                    opponentMap["visionScore"]?.let { oppFields.add("vision=$it") }
+                    opponentMap["turretPlates"]?.let { oppFields.add("plates=$it") }
+                    opponentMap["keystone"]?.let { oppFields.add("keystone=$it") }
+                    opponentMap["subStyle"]?.let { oppFields.add("subStyle=$it") }
+                    opponentMap["items"]?.let { oppFields.add("items=$it") }
+                    if (oppFields.isNotEmpty()) {
+                        advStats.add("opponentDetails={${oppFields.joinToString(", ")}}")
+                    }
+                }
+
+                // Vision & Objective / Turret / Plate telemetry
+                m["visionScore"]?.let { advStats.add("visionScore=$it") }
+                m["controlWardsPlaced"]?.let { advStats.add("controlWards=$it") }
+                m["wardsPlaced"]?.let { advStats.add("wardsPlaced=$it") }
+                m["wardsKilled"]?.let { advStats.add("wardsKilled=$it") }
+                (m["turretPlatesTaken"] ?: m["turretPlates"])?.let { advStats.add("turretPlates=$it") }
+                m["damageDealtToObjectives"]?.let { advStats.add("damageDealtToObjectives=$it") }
+                m["damageDealtToTurrets"]?.let { advStats.add("damageDealtToTurrets=$it") }
+
+                // Advanced & Early CS stats
+                (m["damagePerMinute"] ?: m["damagePerMin"])?.let { advStats.add("dmg/min=$it") }
+                (m["goldPerMinute"] ?: m["goldPerMin"])?.let { advStats.add("gold/min=$it") }
                 m["soloKills"]?.let { advStats.add("soloKills=$it") }
                 m["laneMinionsFirst10Minutes"]?.let { advStats.add("laneCs@10=$it") }
                 val cs10Map = (m["laneCsAt10"] ?: m["cs10"]) as? Map<String, Any?>
                 if (cs10Map != null) {
                     val actual = cs10Map["actual"]
                     val spawnedSupply = cs10Map["spawnedSupply"]
+                    val supplyLabel = cs10Map["supplyLabel"]
                     if (m["laneMinionsFirst10Minutes"] == null && actual != null) {
                         advStats.add("laneCs@10=$actual")
                     }
-                    if (spawnedSupply != null) {
-                        advStats.add("cs10.spawnedSupply=$spawnedSupply")
+                    advStats.add("cs10.spawnedSupply=${spawnedSupply ?: "null"}")
+                    if (supplyLabel != null) {
+                        advStats.add("cs10.supplyLabel=$supplyLabel")
                     }
                 }
                 m["jungleCsBefore10Minutes"]?.let { advStats.add("jungleCs@10=$it") }
                 m["earlyLaningPhaseGoldExpAdvantage"]?.let { advStats.add("earlyLaningAdvantage=$it") }
                 m["maxCsAdvantageOnLaneOpponent"]?.let { advStats.add("csAdvantage=$it") }
                 m["visionScoreAdvantageLaneOpponent"]?.let { advStats.add("visionAdvantage=$it") }
-                m["controlWardsPlaced"]?.let { advStats.add("controlWards=$it") }
-                m["wardsPlaced"]?.let { advStats.add("wardsPlaced=$it") }
-                m["wardsKilled"]?.let { advStats.add("wardsKilled=$it") }
+                m["timeCCingOthers"]?.let { advStats.add("timeCCingOthers=$it") }
+                m["totalDamageShieldedOnTeammates"]?.let { advStats.add("totalDamageShieldedOnTeammates=$it") }
+                m["totalHealsOnTeammates"]?.let { advStats.add("totalHealsOnTeammates=$it") }
                 m["timelineAt10"]?.let { advStats.add("timelineAt10=$it") }
                 m["timelineAt15"]?.let { advStats.add("timelineAt15=$it") }
-                m["deathContext"]?.let { advStats.add("deathContext=$it") }
+                val deathCtx = m["deathContext"] as? Map<String, Any?>
+                if (deathCtx != null) {
+                    fun formatNullableValue(v: Any?): String = when (v) {
+                        null -> "incomplete"
+                        is Map<*, *> -> "{" + v.entries.joinToString(", ") { (ek, ev) -> "$ek=${formatNullableValue(ev)}" } + "}"
+                        is List<*> -> "[" + v.joinToString(", ") { formatNullableValue(it) } + "]"
+                        else -> v.toString()
+                    }
+                    val formattedDeathCtx = deathCtx.entries.joinToString(", ") { (k, v) ->
+                        "$k=${formatNullableValue(v)}"
+                    }
+                    advStats.add("deathContext={$formattedDeathCtx}")
+                }
                 m["itemSpikes"]?.let { advStats.add("itemSpikes=$it") }
                 m["skillMaxOrder"]?.let { advStats.add("skillMaxOrder=$it") }
-                (m["items"] ?: m["itemBuild"])?.let { advStats.add("items=$it") }
                 
                 val advStr = if (advStats.isNotEmpty()) ", " + advStats.joinToString(", ") else ""
                 
@@ -740,7 +834,7 @@ class AiAnalysisService(
      */
     @Suppress("UNCHECKED_CAST")
     private fun buildTimelineInsightsSection(context: Map<String, Any>): String {
-        val timeline = context["timelineInsights"] as? Map<String, Any> ?: return ""
+        val timeline = context["timelineInsights"] as? Map<String, Any?> ?: return ""
         val lines = mutableListOf<String>()
 
         lines.add("\n**📊 TIMELINE ANALYSIS (last ${timeline["gamesAnalyzed"] ?: "?"} ranked games):**")
@@ -749,13 +843,25 @@ class AiAnalysisService(
         timeline["avgFirstDeathMinute"]?.let { lines.add("  - Avg minute of first death: $it") }
         timeline["mostDangerousZone"]?.let { lines.add("  - Most frequent death zone: $it") }
         timeline["wardsPlacedTotal"]?.let { lines.add("  - Total wards placed (across all games): $it") }
-        timeline["wardsByTimeBucket"]?.let { lines.add("  - Wards placed by time bucket (no coordinates): $it") }
+        if (timeline.containsKey("wardsByTimeBucket")) {
+            val buckets = timeline["wardsByTimeBucket"]
+            lines.add("  - Wards placed by time bucket (no coordinates): ${buckets ?: "incomplete (legacy cache)"}")
+        }
         timeline["killsTotal"]?.let { lines.add("  - Total kills across timeline games: $it") }
         timeline["deathsTotal"]?.let { lines.add("  - Total deaths across timeline games: $it") }
-        timeline["deathsBefore10"]?.let { lines.add("  - Deaths before 10min: $it") }
-        timeline["assistedDeaths"]?.let { lines.add("  - Assisted deaths (multi-enemy involvement, not necessarily ganks): $it") }
-        timeline["unassistedDeaths"]?.let { lines.add("  - Unassisted (1v1) deaths: $it") }
-        timeline["deathsNearObjectiveWindows"]?.let { lines.add("  - Deaths near objective windows: $it") }
+        timeline["assistsTotal"]?.let { lines.add("  - Total assists across timeline games: $it") }
+        if (timeline.containsKey("deathsBefore10")) {
+            lines.add("  - Deaths before 10min: ${timeline["deathsBefore10"] ?: "incomplete (legacy cache)"}")
+        }
+        if (timeline.containsKey("assistedDeaths")) {
+            lines.add("  - Assisted deaths (multi-enemy involvement, not necessarily ganks): ${timeline["assistedDeaths"] ?: "incomplete (legacy cache)"}")
+        }
+        if (timeline.containsKey("unassistedDeaths")) {
+            lines.add("  - Unassisted (1v1) deaths: ${timeline["unassistedDeaths"] ?: "incomplete (legacy cache)"}")
+        }
+        if (timeline.containsKey("deathsNearObjectiveWindows")) {
+            lines.add("  - Deaths near objective windows: ${timeline["deathsNearObjectiveWindows"] ?: "incomplete (legacy cache)"}")
+        }
 
         return if (lines.size > 1) lines.joinToString("\n") else ""
     }

@@ -350,5 +350,134 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 masterPrompt shouldContain "Master+ apex level"
             }
         }
+
+        When("building a prompt with full enriched match context and incomplete legacy cache timeline fields (#17 contract repair)") {
+            Then("it serializes draft, opponent items/runes/stats, damage split, objective/turret damage, and marks null legacy cache fields as incomplete rather than zero") {
+                val enrichedContext = mapOf(
+                    "summonerName" to "MidLearner#EUW",
+                    "rank" to "PLATINUM III (40 LP)",
+                    "winRate" to "56.0%",
+                    "totalWins" to 28,
+                    "totalLosses" to 22,
+                    "primaryRole" to "MIDDLE",
+                    "totalGamesAnalyzed" to 10,
+                    "timelineStatus" to "ANALYZED",
+                    "topChampions" to listOf(
+                        mapOf("name" to "Ahri", "games" to 6, "winRate" to 67, "avgKda" to "4.20", "avgCsPerMin" to "7.9")
+                    ),
+                    "recentMatches" to listOf(
+                        mapOf(
+                            "matchId" to "EUW1_7000000001",
+                            "gameVersion" to "16.1.648.1234",
+                            "gameDuration" to "30:00",
+                            "champion" to "Ahri",
+                            "role" to "MIDDLE",
+                            "win" to true,
+                            "kda" to "8/2/11 (9.50)",
+                            "killParticipation" to "68%",
+                            "csPerMin" to 8.1,
+                            "goldPerMin" to 445,
+                            "damagePerMin" to 812,
+                            "damageShare" to "29%",
+                            "damageSplitPct" to mapOf("physical" to 8, "magic" to 79, "true" to 13),
+                            "damageDealtToObjectives" to 14200,
+                            "damageDealtToTurrets" to 6400,
+                            "turretPlates" to 3,
+                            "visionScore" to 38,
+                            "visionScorePerMin" to "1.27",
+                            "controlWardsPlaced" to 5,
+                            "wardsPlaced" to 14,
+                            "wardsKilled" to 6,
+                            "keystone" to 8112,
+                            "subStyle" to 8200,
+                            "items" to listOf(6655, 3020, 3157),
+                            "laneCsAt10" to mapOf(
+                                "actual" to 84,
+                                "spawnedSupply" to 120,
+                                "supplyLabel" to "S16 patch 26.1+ verified spawned wave supply"
+                            ),
+                            "draft" to mapOf(
+                                "allies" to listOf("Gnar (TOP)", "Viego (JUNGLE)", "Ahri (MIDDLE)", "Jinx (BOTTOM)", "Lulu (UTILITY)"),
+                                "enemies" to listOf("Renekton (TOP)", "LeeSin (JUNGLE)", "Syndra (MIDDLE)", "KaiSa (BOTTOM)", "Nautilus (UTILITY)")
+                            ),
+                            "opponent" to mapOf(
+                                "champion" to "Syndra",
+                                "kda" to "2/8/3 (0.63)",
+                                "csPerMin" to 6.8,
+                                "killParticipation" to "38%",
+                                "visionScore" to 21,
+                                "turretPlates" to 1,
+                                "keystone" to 8229,
+                                "subStyle" to 8300,
+                                "items" to listOf(6655, 3020),
+                                "maxCsAdvantageOnLaneOpponent" to 24.0,
+                                "maxLevelLeadLaneOpponent" to 2,
+                                "visionScoreAdvantageLaneOpponent" to "35%"
+                            ),
+                            "deathContext" to mapOf(
+                                "totalDeaths" to 2,
+                                "deathsBefore10" to 1,
+                                "assistedDeaths" to null,
+                                "unassistedDeaths" to null,
+                                "deathsNearObjectiveWindows" to 1,
+                                "events" to listOf(
+                                    mapOf("minute" to 5, "killer" to "Syndra", "assistants" to null, "nearObjectiveWindow" to true)
+                                )
+                            )
+                        )
+                    ),
+                    "timelineInsights" to mapOf(
+                        "matchesAnalyzed" to 1,
+                        "avgGoldDiffAt10" to 300,
+                        "avgGoldDiffAt15" to 650,
+                        "avgCsAt10" to 84.0,
+                        "avgCsAt15" to 132.0,
+                        "avgLevelDiffAt10" to 0.8,
+                        "earlyLeadConversionRate" to 100.0,
+                        "throwRate" to 0.0,
+                        "comebackRate" to 0.0,
+                        "totalDeaths" to 2,
+                        "deathsBefore10" to 1,
+                        "assistedDeaths" to null,
+                        "unassistedDeaths" to null,
+                        "deathsNearObjectiveWindows" to 1,
+                        "avgDeathMinute" to 11.5,
+                        "wardsPlacedTotal" to 0,
+                        "wardsByTimeBucket" to null,
+                        "dominantPlaystyle" to "Early Game Aggressor",
+                        "keyStrength" to "Strong early laning",
+                        "keyWeakness" to "Mid-game positioning"
+                    )
+                )
+
+                val prompt = constructPromptMethod.invoke(
+                    service,
+                    enrichedContext,
+                    emptyList<Map<String, String>>(),
+                    "Review my matchup, build, damage split, and deaths",
+                    null,
+                    null
+                ) as String
+
+                // Draft, opponent items/runes/stats, damage split, and objective/turret damage must be serialized
+                prompt shouldContain "draft={allies=[Gnar (TOP), Viego (JUNGLE), Ahri (MIDDLE), Jinx (BOTTOM), Lulu (UTILITY)]"
+                prompt shouldContain "enemies=[Renekton (TOP), LeeSin (JUNGLE), Syndra (MIDDLE), KaiSa (BOTTOM), Nautilus (UTILITY)]}"
+                prompt shouldContain "damageSplitPct={physical=8%, magic=79%, true=13%}"
+                prompt shouldContain "damageDealtToObjectives=14200"
+                prompt shouldContain "damageDealtToTurrets=6400"
+                prompt shouldContain "turretPlates=3"
+                prompt shouldContain "subStyle=8200"
+                prompt shouldContain "opponentDetails={champion=Syndra, kda=2/8/3 (0.63), cs/min=6.8, kp=38%, vision=21, plates=1, keystone=8229, subStyle=8300, items=[6655, 3020]}"
+                prompt shouldContain "topChampions: Ahri (6g, 67% WR, 4.20 KDA, 7.9 CS/m)"
+
+                // Legacy cache null fields must render as incomplete, never coerced to 0
+                prompt shouldContain "assistedDeaths=incomplete, unassistedDeaths=incomplete"
+                prompt shouldContain "assistants=incomplete"
+                prompt shouldContain "Assisted deaths (multi-enemy involvement, not necessarily ganks): incomplete (legacy cache)"
+                prompt shouldContain "Unassisted (1v1) deaths: incomplete (legacy cache)"
+                prompt shouldContain "Wards placed by time bucket (no coordinates): incomplete (legacy cache)"
+                prompt shouldContain "Incomplete Legacy Cache Fields"
+            }
+        }
     }
 })

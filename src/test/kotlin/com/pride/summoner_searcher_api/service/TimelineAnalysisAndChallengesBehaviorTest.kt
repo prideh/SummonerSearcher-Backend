@@ -2,7 +2,10 @@ package com.pride.summoner_searcher_api.service
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.pride.summoner_searcher_api.dto.MatchDto
+import com.pride.summoner_searcher_api.dto.MatchEventEntry
 import com.pride.summoner_searcher_api.dto.MatchTimelineDto
+import com.pride.summoner_searcher_api.dto.TimelineAggregateSummary
+import com.pride.summoner_searcher_api.dto.WardTimeBucketsDto
 import io.kotest.core.spec.style.BehaviorSpec
 import io.kotest.matchers.shouldBe
 
@@ -15,7 +18,7 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
             {
               "metadata": {
                 "matchId": "EUW1_7000000001",
-                "participants": ["puuid-1", "puuid-2"]
+                "participants": ["puuid-1", "puuid-2", "puuid-3"]
               },
               "info": {
                 "gameCreation": 1730000000000,
@@ -65,6 +68,17 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
                     "kills": 2,
                     "deaths": 8,
                     "assists": 3
+                  },
+                  {
+                    "puuid": "puuid-3",
+                    "participantId": 7,
+                    "championName": "LeeSin",
+                    "teamPosition": "JUNGLE",
+                    "teamId": 200,
+                    "win": false,
+                    "kills": 3,
+                    "deaths": 4,
+                    "assists": 5
                   }
                 ]
               }
@@ -99,20 +113,21 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
             }
         }
 
-        When("TimelineAnalysisService analyzes a timeline containing KILL, ASSIST, PLATE, and OBJECTIVE events") {
-            Then("the gold chart timeline point retains ASSIST and OBJECTIVE events alongside KILL and PLATE") {
+        When("TimelineAnalysisService analyzes a timeline containing KILL, DEATH, ASSIST, PLATE, OBJECTIVE, and WARD events (#17)") {
+            Then("gold chart points keep combat/objective events without ward clutter, while eventTimelines and aggregateSummary record assistants and ward time buckets") {
                 val matchDto = mapper.readValue(rawJson, MatchDto::class.java)
                 val timelineJson = """
                     {
                       "metadata": {
                         "matchId": "EUW1_7000000001",
-                        "participants": ["puuid-1", "puuid-2"]
+                        "participants": ["puuid-1", "puuid-2", "puuid-3"]
                       },
                       "info": {
                         "frameInterval": 60000,
                         "participants": [
                           { "participantId": 1, "puuid": "puuid-1" },
-                          { "participantId": 6, "puuid": "puuid-2" }
+                          { "participantId": 6, "puuid": "puuid-2" },
+                          { "participantId": 7, "puuid": "puuid-3" }
                         ],
                         "frames": [
                           {
@@ -151,10 +166,18 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
                               {
                                 "type": "CHAMPION_KILL",
                                 "timestamp": 315000,
-                                "killerId": 2,
-                                "victimId": 7,
-                                "assistingParticipantIds": [1],
+                                "killerId": 6,
+                                "victimId": 1,
+                                "assistingParticipantIds": [7],
                                 "position": { "x": 7400, "y": 7400 }
+                              },
+                              {
+                                "type": "CHAMPION_KILL",
+                                "timestamp": 320000,
+                                "killerId": 1,
+                                "victimId": 7,
+                                "assistingParticipantIds": [],
+                                "position": { "x": 7450, "y": 7450 }
                               },
                               {
                                 "type": "TURRET_PLATE_DESTROYED",
@@ -166,6 +189,24 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
                                 "timestamp": 340000,
                                 "killerId": 1,
                                 "monsterType": "DRAGON"
+                              },
+                              {
+                                "type": "WARD_PLACED",
+                                "timestamp": 240000,
+                                "creatorId": 1,
+                                "wardType": "YELLOW_TRINKET"
+                              },
+                              {
+                                "type": "WARD_PLACED",
+                                "timestamp": 720000,
+                                "creatorId": 1,
+                                "wardType": "CONTROL_WARD"
+                              },
+                              {
+                                "type": "WARD_KILL",
+                                "timestamp": 750000,
+                                "killerId": 1,
+                                "wardType": "YELLOW_TRINKET"
                               }
                             ]
                           }
@@ -181,7 +222,80 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
                 )
                 val pointEvents = analysis.powerSpikeTimelines.first().points.first().events.map { it.type }
 
-                pointEvents.containsAll(listOf("KILL", "ASSIST", "PLATE", "OBJECTIVE")) shouldBe true
+                pointEvents.containsAll(listOf("KILL", "DEATH", "PLATE", "OBJECTIVE")) shouldBe true
+                pointEvents.contains("WARD_PLACED") shouldBe false
+                pointEvents.contains("WARD_KILLED") shouldBe false
+
+                val matchEvents = analysis.eventTimelines.first().events
+                val soloKill = matchEvents.first { it.type == "KILL" && it.target == "Syndra" }
+                soloKill.killer shouldBe "Ahri"
+                soloKill.assistants shouldBe emptyList()
+
+                val assistedDeath = matchEvents.first { it.type == "DEATH" && it.target == "Ahri" }
+                assistedDeath.killer shouldBe "Syndra"
+                assistedDeath.assistants shouldBe listOf("LeeSin")
+
+                val wardPlacedEvents = matchEvents.filter { it.type == "WARD_PLACED" && it.isPlayer }
+                wardPlacedEvents.size shouldBe 2
+                wardPlacedEvents[0].wardType shouldBe "YELLOW_TRINKET"
+                wardPlacedEvents[0].position shouldBe null
+                wardPlacedEvents[1].wardType shouldBe "CONTROL_WARD"
+
+                val wardKilledEvents = matchEvents.filter { it.type == "WARD_KILLED" && it.isPlayer }
+                wardKilledEvents.size shouldBe 1
+                wardKilledEvents[0].wardType shouldBe "YELLOW_TRINKET"
+
+                val summary = analysis.aggregateSummary
+                summary.wardsPlacedTotal shouldBe 2
+                summary.wardsByTimeBucket shouldBe WardTimeBucketsDto(pre10 = 1, min10To20 = 1, post20 = 0)
+                summary.deathsBefore10 shouldBe 1
+                summary.assistedDeaths shouldBe 1
+                summary.unassistedDeaths shouldBe 0
+                summary.deathsNearObjectiveWindows shouldBe 1
+            }
+        }
+
+        When("Jackson deserializes legacy cached MatchEventEntry and TimelineAggregateSummary payloads missing #17 fields") {
+            Then("new fields deserialize as null (incomplete) rather than 0 or emptyList") {
+                val legacyEventJson = """
+                    {
+                      "type": "DEATH",
+                      "minuteMark": 5,
+                      "secondMark": 15,
+                      "actor": "Syndra",
+                      "target": "Ahri",
+                      "isPlayer": true,
+                      "isOpponent": true,
+                      "laneType": null,
+                      "monsterType": null,
+                      "position": { "x": 7400, "y": 7400 }
+                    }
+                """.trimIndent()
+                val legacySummaryJson = """
+                    {
+                      "avgFirstDeathMinute": 6.5,
+                      "mostDangerousZone": "Mid Lane",
+                      "avgGoldLeadAt10": 150.0,
+                      "avgGoldLeadAt15": 320.0,
+                      "wardsPlacedTotal": 0,
+                      "deathsTotal": 6,
+                      "killsTotal": 12,
+                      "assistsTotal": 18,
+                      "gamesAnalyzed": 3
+                    }
+                """.trimIndent()
+
+                val legacyEvent = mapper.readValue(legacyEventJson, MatchEventEntry::class.java)
+                legacyEvent.killer shouldBe null
+                legacyEvent.assistants shouldBe null
+                legacyEvent.wardType shouldBe null
+
+                val legacySummary = mapper.readValue(legacySummaryJson, TimelineAggregateSummary::class.java)
+                legacySummary.deathsBefore10 shouldBe null
+                legacySummary.assistedDeaths shouldBe null
+                legacySummary.unassistedDeaths shouldBe null
+                legacySummary.deathsNearObjectiveWindows shouldBe null
+                legacySummary.wardsByTimeBucket shouldBe null
             }
         }
     }

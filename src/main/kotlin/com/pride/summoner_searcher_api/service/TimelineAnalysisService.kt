@@ -48,7 +48,14 @@ class TimelineAnalysisService {
         var totalGoldLeadAt15 = 0.0
         var gamesWithGoldData = 0
         var totalWards = 0
+        var wardsPre10 = 0
+        var wardsMin10To20 = 0
+        var wardsPost20 = 0
         var totalDeaths = 0
+        var totalDeathsBefore10 = 0
+        var totalAssistedDeaths = 0
+        var totalUnassistedDeaths = 0
+        var totalDeathsNearObjectives = 0
         var totalKills = 0
         var totalAssists = 0
 
@@ -75,8 +82,22 @@ class TimelineAnalysisService {
             val opponentChampion = opponentMatchParticipant?.championName ?: "Unknown"
             val opponentParticipantId = info.participants?.find { it.puuid == opponentMatchParticipant?.puuid }?.participantId
             
-            // Map of participantId -> Champion name for all 10 players
-            val participantToChampion = matchInfo.participants.associate { it.participantId to (it.championName ?: "Unknown") }
+            // Map of participantId -> Champion name for all 10 players (with index and PUUID fallbacks)
+            val puuidToChampion = matchInfo.participants.mapNotNull { p ->
+                p.puuid?.let { it to (p.championName ?: "Unknown") }
+            }.toMap()
+            val participantToChampion = mutableMapOf<Int, String>()
+            matchInfo.participants.forEachIndexed { idx, p ->
+                val pid = p.participantId ?: (idx + 1)
+                participantToChampion[pid] = p.championName ?: "Unknown"
+            }
+            info.participants?.forEach { tp ->
+                val pid = tp.participantId
+                val champ = tp.puuid?.let { puuidToChampion[it] }
+                if (pid != null && champ != null && !participantToChampion.containsKey(pid)) {
+                    participantToChampion[pid] = champ
+                }
+            }
 
             val frames = info.frames ?: continue
 
@@ -106,6 +127,9 @@ class TimelineAnalysisService {
 
             // ── Events: build all structures in one pass ──
             val allEvents = frames.flatMap { it.events ?: emptyList() }
+            val objectiveMinutesInMatch = allEvents
+                .filter { it.type == "ELITE_MONSTER_KILL" }
+                .map { (it.timestamp ?: 0L) / 60000.0 }
             val buyItems = mutableListOf<BuildItem>()
             val skillLevelUps = mutableListOf<SkillUp>()
             val matchEvents = mutableListOf<MatchEventEntry>()
@@ -149,18 +173,24 @@ class TimelineAnalysisService {
                                 isOpponentVictim -> "DEATH"
                                 else -> "KILL"
                             }
+                            val killerChamp = event.killerId?.let { participantToChampion[it] }
+                            val assistingChamps = event.assistingParticipantIds
+                                ?.map { participantToChampion[it] ?: "Participant $it" }
+                                ?: emptyList()
 
                             matchEvents.add(MatchEventEntry(
                                 type = eventType,
                                 minuteMark = minute,
                                 secondMark = second,
-                                actor = participantToChampion[event.killerId],
-                                target = participantToChampion[event.victimId],
+                                actor = killerChamp,
+                                target = event.victimId?.let { participantToChampion[it] },
                                 isPlayer = isPlayerKiller || isPlayerVictim || isPlayerAssist,
                                 isOpponent = isOpponentKiller || isOpponentVictim,
                                 laneType = null,
                                 monsterType = null,
-                                position = event.position
+                                position = event.position,
+                                killer = killerChamp,
+                                assistants = assistingChamps
                             ))
 
                             if (isPlayerKiller) {
@@ -170,8 +200,17 @@ class TimelineAnalysisService {
                             if (isPlayerVictim) {
                                 deaths.add(HeatmapPoint(event.position?.x ?: 0, event.position?.y ?: 0, matchId, minute))
                                 totalDeaths++
-                                if (gamesWithDeath == 0 || minute < Int.MAX_VALUE) {
-                                    // We'll compute first death below
+                                if (minute < 10) {
+                                    totalDeathsBefore10++
+                                }
+                                if (assistingChamps.isNotEmpty()) {
+                                    totalAssistedDeaths++
+                                } else {
+                                    totalUnassistedDeaths++
+                                }
+                                val exactDeathMin = minute + second / 60.0
+                                if (objectiveMinutesInMatch.any { objMin -> abs(objMin - exactDeathMin) <= 1.0 }) {
+                                    totalDeathsNearObjectives++
                                 }
                             }
                             if (isPlayerAssist) {
@@ -181,11 +220,6 @@ class TimelineAnalysisService {
                         }
                     }
                     "BUILDING_KILL", "TURRET_PLATE_DESTROYED" -> {
-                        // Include turret plate kills that involve player's team or opponent team
-                        val involvedTeamId = event.teamId
-                        val playerTeamTook = involvedTeamId != null && involvedTeamId == playerTeamId
-                        val opponentTeamTook = involvedTeamId != null && involvedTeamId != playerTeamId
-
                         // Only include the plate if player or opponent is the killer or assist
                         val playerInvolved = event.killerId == playerParticipantId ||
                                 event.assistingParticipantIds?.contains(playerParticipantId) == true
@@ -194,6 +228,8 @@ class TimelineAnalysisService {
                                 event.assistingParticipantIds?.contains(opponentParticipantId) == true)
 
                         if (playerInvolved || opponentInvolved) {
+                            val assistingChamps = event.assistingParticipantIds
+                                ?.map { participantToChampion[it] ?: "Participant $it" }
                             matchEvents.add(MatchEventEntry(
                                 type = "PLATE",
                                 minuteMark = minute,
@@ -208,7 +244,8 @@ class TimelineAnalysisService {
                                 isOpponent = opponentInvolved,
                                 laneType = event.laneType,
                                 monsterType = null,
-                                position = event.position
+                                position = event.position,
+                                assistants = assistingChamps
                             ))
                         }
                     }
@@ -220,6 +257,8 @@ class TimelineAnalysisService {
                                 event.assistingParticipantIds?.contains(opponentParticipantId) == true)
 
                         if (playerInvolved || opponentInvolved) {
+                            val assistingChamps = event.assistingParticipantIds
+                                ?.map { participantToChampion[it] ?: "Participant $it" }
                             matchEvents.add(MatchEventEntry(
                                 type = "OBJECTIVE",
                                 minuteMark = minute,
@@ -233,19 +272,68 @@ class TimelineAnalysisService {
                                 isOpponent = opponentInvolved,
                                 laneType = null,
                                 monsterType = event.monsterType,
-                                position = event.position
+                                position = event.position,
+                                killer = event.killerId?.let { participantToChampion[it] },
+                                assistants = assistingChamps
                             ))
                         }
                     }
                     "WARD_PLACED" -> {
-                        if (event.creatorId == playerParticipantId) {
+                        val isPlayerWard = event.creatorId == playerParticipantId || event.participantId == playerParticipantId
+                        val isOpponentWard = opponentParticipantId != null &&
+                                (event.creatorId == opponentParticipantId || event.participantId == opponentParticipantId)
+
+                        if (isPlayerWard || isOpponentWard) {
+                            matchEvents.add(MatchEventEntry(
+                                type = "WARD_PLACED",
+                                minuteMark = minute,
+                                secondMark = second,
+                                actor = if (isPlayerWard) playerChampion else opponentChampion,
+                                target = event.wardType ?: "WARD",
+                                isPlayer = isPlayerWard,
+                                isOpponent = isOpponentWard,
+                                laneType = null,
+                                monsterType = null,
+                                position = null,
+                                wardType = event.wardType
+                            ))
+                        }
+
+                        if (isPlayerWard) {
+                            totalWards++
+                            when {
+                                minute < 10 -> wardsPre10++
+                                minute < 20 -> wardsMin10To20++
+                                else -> wardsPost20++
+                            }
                             val timestamp = event.timestamp ?: 0L
                             val closestMinute = if (timestamp % 60000 >= 30000) minute + 1 else minute
-                            val pos = event.position ?: frames.getOrNull(closestMinute)?.participantFrames?.get(event.creatorId?.toString())?.position
-                            if (pos?.x != null && pos?.y != null) {
+                            val pos = event.position ?: frames.getOrNull(closestMinute)?.participantFrames?.get(playerParticipantId.toString())?.position
+                            if (pos?.x != null && pos.y != null) {
                                 wards.add(HeatmapPoint(pos.x, pos.y, matchId, minute))
-                                totalWards++
                             }
+                        }
+                    }
+                    "WARD_KILL" -> {
+                        val isPlayerKiller = event.killerId == playerParticipantId || event.participantId == playerParticipantId
+                        val isOpponentKiller = opponentParticipantId != null &&
+                                (event.killerId == opponentParticipantId || event.participantId == opponentParticipantId)
+
+                        if (isPlayerKiller || isOpponentKiller) {
+                            matchEvents.add(MatchEventEntry(
+                                type = "WARD_KILLED",
+                                minuteMark = minute,
+                                secondMark = second,
+                                actor = if (isPlayerKiller) playerChampion else opponentChampion,
+                                target = event.wardType ?: "WARD",
+                                isPlayer = isPlayerKiller,
+                                isOpponent = isOpponentKiller,
+                                laneType = null,
+                                monsterType = null,
+                                position = null,
+                                killer = if (isPlayerKiller) playerChampion else opponentChampion,
+                                wardType = event.wardType
+                            ))
                         }
                     }
                 }
@@ -301,7 +389,16 @@ class TimelineAnalysisService {
                 deathsTotal = totalDeaths,
                 killsTotal = totalKills,
                 assistsTotal = totalAssists,
-                gamesAnalyzed = timelines.size
+                gamesAnalyzed = timelines.size,
+                deathsBefore10 = totalDeathsBefore10,
+                assistedDeaths = totalAssistedDeaths,
+                unassistedDeaths = totalUnassistedDeaths,
+                deathsNearObjectiveWindows = totalDeathsNearObjectives,
+                wardsByTimeBucket = WardTimeBucketsDto(
+                    pre10 = wardsPre10,
+                    min10To20 = wardsMin10To20,
+                    post20 = wardsPost20
+                )
             )
         )
     }

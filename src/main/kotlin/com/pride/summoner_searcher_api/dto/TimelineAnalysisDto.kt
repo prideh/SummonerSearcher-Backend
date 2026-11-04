@@ -102,7 +102,16 @@ data class MatchEventEntry(
     val isOpponent: Boolean,   // true if the tracked opponent is the actor
     val laneType: String?,
     val monsterType: String?,
-    val position: TimelinePositionDto?
+    val position: TimelinePositionDto?,
+    val killer: String? = null,
+    val assistants: List<String>? = null,
+    val wardType: String? = null
+)
+
+data class WardTimeBucketsDto(
+    val pre10: Int,
+    val min10To20: Int,
+    val post20: Int
 )
 
 data class TimelineAggregateSummary(
@@ -114,5 +123,10 @@ data class TimelineAggregateSummary(
     val deathsTotal: Int,
     val killsTotal: Int,
     val assistsTotal: Int,
-    val gamesAnalyzed: Int
+    val gamesAnalyzed: Int,
+    val deathsBefore10: Int? = null,
+    val assistedDeaths: Int? = null,
+    val unassistedDeaths: Int? = null,
+    val deathsNearObjectiveWindows: Int? = null,
+    val wardsByTimeBucket: WardTimeBucketsDto? = null
 )
