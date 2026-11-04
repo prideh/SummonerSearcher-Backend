@@ -5,7 +5,6 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import com.pride.summoner_searcher_api.dto.MatchDto
 import com.pride.summoner_searcher_api.dto.MatchTimelineDto
 import io.kotest.core.spec.style.BehaviorSpec
-import io.kotest.matchers.collections.shouldContainAll
 import io.kotest.matchers.shouldBe
 
 class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
@@ -44,16 +43,16 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
                       "laneMinionsFirst10Minutes": 84,
                       "jungleCsBefore10Minutes": 4.0,
                       "killParticipation": 0.68,
-                      "teamDamagePercentage": 0.29,
                       "turretPlatesTaken": 3,
                       "controlWardsPlaced": 5,
                       "visionScoreAdvantageLaneOpponent": 0.35,
                       "maxCsAdvantageOnLaneOpponent": 24.0,
                       "maxLevelLeadLaneOpponent": 2,
                       "soloKills": 3,
-                      "takedownsFirstXMinutes": 4,
+                      "takedownsFirst25Minutes": 4,
                       "effectiveHealAndShielding": 120.5,
-                      "saveAllyFromDeath": 1
+                      "scuttleCrabKills": 2,
+                      "wardTakedowns": 6
                     }
                   },
                   {
@@ -76,20 +75,23 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
             val matchDto = mapper.readValue(rawJson, MatchDto::class.java)
             val challenges = matchDto.info!!.participants.first().challenges!!
 
-            Then("all 13 newly mapped challenge fields are preserved without being stripped") {
+            Then("all newly mapped early-CS and challenge fields are preserved without being stripped") {
                 challenges.laneMinionsFirst10Minutes shouldBe 84
-                challenges.jungleCsBefore10Minutes shouldBe 4.0
-                challenges.killParticipation shouldBe 0.68
-                challenges.teamDamagePercentage shouldBe 0.29
+                challenges.jungleCsBefore10Minutes shouldBe 4.0f
+                challenges.killParticipation shouldBe 0.68f
+                challenges.goldPerMinute shouldBe 445.2f
+                challenges.damagePerMinute shouldBe 812.4f
+                challenges.visionScorePerMinute shouldBe 1.45f
                 challenges.turretPlatesTaken shouldBe 3
                 challenges.controlWardsPlaced shouldBe 5
-                challenges.visionScoreAdvantageLaneOpponent shouldBe 0.35
-                challenges.maxCsAdvantageOnLaneOpponent shouldBe 24.0
+                challenges.visionScoreAdvantageLaneOpponent shouldBe 0.35f
+                challenges.maxCsAdvantageOnLaneOpponent shouldBe 24.0f
                 challenges.maxLevelLeadLaneOpponent shouldBe 2
                 challenges.soloKills shouldBe 3
-                challenges.takedownsFirstXMinutes shouldBe 4
-                challenges.effectiveHealAndShielding shouldBe 120.5
-                challenges.saveAllyFromDeath shouldBe 1
+                challenges.takedownsFirst25Minutes shouldBe 4
+                challenges.effectiveHealAndShielding shouldBe 120.5f
+                challenges.scuttleCrabKills shouldBe 2
+                challenges.wardTakedowns shouldBe 6
             }
         }
 
@@ -172,10 +174,10 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
                 listOf(Triple("EUW1_7000000001", timelineDto, matchDto)),
                 "puuid-1"
             )
-            val pointEvents = analysis.powerSpikes.first().timeline.first().events.map { it.type }
+            val pointEvents = analysis.powerSpikeTimelines.first().points.first().events.map { it.type }
 
             Then("the gold chart timeline point retains ASSIST and OBJECTIVE events alongside KILL and PLATE") {
-                pointEvents shouldContainAll listOf("KILL", "ASSIST", "PLATE", "OBJECTIVE")
+                pointEvents.containsAll(listOf("KILL", "ASSIST", "PLATE", "OBJECTIVE")) shouldBe true
             }
         }
     }
