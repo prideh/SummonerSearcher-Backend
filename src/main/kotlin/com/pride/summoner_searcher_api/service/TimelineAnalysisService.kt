@@ -180,7 +180,7 @@ class TimelineAnalysisService {
                             }
                         }
                     }
-                    "BUILDING_KILL" -> {
+                    "BUILDING_KILL", "TURRET_PLATE_DESTROYED" -> {
                         // Include turret plate kills that involve player's team or opponent team
                         val involvedTeamId = event.teamId
                         val playerTeamTook = involvedTeamId != null && involvedTeamId == playerTeamId

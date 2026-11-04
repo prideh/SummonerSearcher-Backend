@@ -1,5 +1,6 @@
 package com.pride.summoner_searcher_api.service
 
+import com.pride.summoner_searcher_api.model.CurationRun
 import com.pride.summoner_searcher_api.model.PromptVersion
 import com.pride.summoner_searcher_api.repository.AiFeedbackRepository
 import com.pride.summoner_searcher_api.repository.AiInteractionRepository
@@ -64,6 +65,7 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                 )
 
                 every { interactionRepository.findCandidatesForLearning(any()) } returns emptyList()
+                every { curationRunRepository.save(any<CurationRun>()) } answers { firstArg<CurationRun>() }
                 every { promptVersionRepository.findByIsActiveTrueAndIsChallengerTrue() } returns listOf(challenger)
                 every { promptVersionRepository.findByIsActiveTrueAndCategoryScope("itemization_builds") } returns listOf(champion, challenger)
                 every { feedbackRepository.findNegativeRateByCategory(any(), any()) } returns emptyList()
@@ -87,6 +89,7 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                     promptVersionRepository
                 )
                 every { interactionRepository.findCandidatesForLearning(any()) } returns emptyList()
+                every { curationRunRepository.save(any<CurationRun>()) } answers { firstArg<CurationRun>() }
                 every { promptVersionRepository.findByIsActiveTrueAndIsChallengerTrue() } returns emptyList()
                 every { feedbackRepository.findNegativeRateByCategory(any(), any()) } returns listOf(
                     arrayOf<Any>("matchups", 16L, 22L) // 72.7% negative rate
