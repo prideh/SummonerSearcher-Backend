@@ -381,7 +381,7 @@ class OvernightCohortCollectorRunner(
         }
 
         val verification = cohortBenchmarkService.getLiveRateLimitVerification(normalizedRegion)
-        val memoryHeadroom = cohortBenchmarkService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
+        val memoryHeadroom = cohortBenchmarkService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = true)
         val checkpoint = cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch)
             ?: if (cleanPatch == null && activeTargetPatch != null) {
                 cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, activeTargetPatch)

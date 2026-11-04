@@ -1725,9 +1725,9 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 idleMemorySnap.nearCapStopTriggered shouldBe false
                 (idleMemorySnap.effectiveUtilizationRatio in 0.66..0.68) shouldBe true
 
-                // Verify streaming chunk bounds: 45 profiles -> [20, 20, 5]; 60 matches -> [25, 25, 10]; 0 bulk timeline multiGets
-                reportProfileChunkSizes shouldBe listOf(20, 20, 5)
-                reportMatchChunkSizes shouldBe listOf(25, 25, 10)
+                // Verify streaming chunk bounds: 45 profiles -> [10, 10, 10, 10, 5]; 60 matches -> [10, 10, 10, 10, 10, 10]; 0 bulk timeline multiGets
+                reportProfileChunkSizes shouldBe listOf(10, 10, 10, 10, 5)
+                reportMatchChunkSizes shouldBe listOf(10, 10, 10, 10, 10, 10)
                 profileChunkSizes.all { it <= CohortBenchmarkService.PROFILE_SCAN_CHUNK_SIZE } shouldBe true
                 matchChunkSizes.all { it <= CohortBenchmarkService.MATCH_SCAN_CHUNK_SIZE } shouldBe true
                 bulkTimelineMultiGetCalls shouldBe 0
@@ -1754,10 +1754,14 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 // Auto-resume stays blocked while memory is at 80%
                 autoResumeWhileNearCap shouldBe null
 
-                // Once memory recovers to ~67%, auto-resume runs and completes stream-puuid-1
+                // Once memory recovers to ~67%, auto-resume runs and completes stream-puuid-1 with 0 cache re-scans
                 autoResumedAfterMemoryRecovery.productiveBatchesCompleted shouldBe 1
                 autoResumedAfterMemoryRecovery.checkpoint?.processedPuuids shouldBe setOf("stream-puuid-1")
-                autoResumedAfterMemoryRecovery.checkpoint?.lastStopReason shouldBe "BATCH_BUDGET_REACHED_RESUMABLE"
+                autoResumedAfterMemoryRecovery.checkpoint?.lastStopReason shouldBe "NO_CANDIDATES_REMAINING"
+                autoResumedAfterMemoryRecovery.overnightSessionArmed shouldBe false
+                // Confirm the collector batch did NOT trigger a second full profile/match scan at Step 6
+                profileChunkSizes shouldBe listOf(10, 10, 10, 10, 5)
+                matchChunkSizes shouldBe listOf(10, 10, 10, 10, 10, 10)
             }
         }
     }

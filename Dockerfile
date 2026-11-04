@@ -32,5 +32,6 @@ USER spring:spring
 # Copy jar from build stage
 COPY --from=build /app/build/libs/*.jar app.jar
 
+ENV MALLOC_ARENA_MAX=2
 EXPOSE 8080
-ENTRYPOINT ["java", "-XX:+UseSerialGC", "-XX:MaxRAMPercentage=50.0", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=64m", "-Xss512k", "-jar", "app.jar"]
+ENTRYPOINT ["java", "-XX:+UseSerialGC", "-XX:MaxRAMPercentage=25.0", "-XX:MinHeapFreeRatio=5", "-XX:MaxHeapFreeRatio=15", "-XX:-ShrinkHeapInSteps", "-XX:MaxMetaspaceSize=96m", "-XX:CompressedClassSpaceSize=16m", "-XX:ReservedCodeCacheSize=24m", "-XX:TieredStopAtLevel=1", "-XX:CICompilerCount=2", "-XX:MaxDirectMemorySize=24m", "-Dio.netty.allocator.type=unpooled", "-Dio.netty.noPreferDirect=true", "-Dio.netty.maxDirectMemory=0", "-Djdk.nio.maxCachedBufferSize=32768", "-Xss384k", "-jar", "app.jar"]
