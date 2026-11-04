@@ -35,6 +35,7 @@ data class AiStreamContext(
 @Service
 class AiAnalysisService(
     @Value("\${GEMINI_API_KEY:}") private val apiKey: String,
+    @Value("\${gemini.model:gemini-3.5-flash-lite}") private val geminiModel: String = "gemini-3.5-flash-lite",
     private val exampleRepository: AiLearnedExampleRepository,
     private val interactionRepository: AiInteractionRepository,
     private val patternRepository: DiscoveredPatternRepository,
@@ -141,7 +142,7 @@ class AiAnalysisService(
         )
 
         return webClient.post()
-            .uri("models/gemini-3-flash-preview:generateContent?key={key}", apiKey)
+            .uri("models/{model}:generateContent?key={key}", geminiModel, apiKey)
             .bodyValue(requestBody)
             .retrieve()
             .bodyToMono(String::class.java)
@@ -192,7 +193,7 @@ class AiAnalysisService(
 
         val sseType = object : ParameterizedTypeReference<ServerSentEvent<String>>() {}
         val chunks = webClient.post()
-            .uri("models/gemini-3-flash-preview:streamGenerateContent?alt=sse&key={key}", apiKey)
+            .uri("models/{model}:streamGenerateContent?alt=sse&key={key}", geminiModel, apiKey)
             .bodyValue(requestBody)
             .retrieve()
             .bodyToFlux(sseType)
@@ -735,7 +736,9 @@ class AiAnalysisService(
                 if (parts.isArray && parts.size() > 0) {
                     val textOut = StringBuilder()
                     parts.forEach { part ->
-                        textOut.append(part.path("text").asText())
+                        if (!part.path("thought").asBoolean(false)) {
+                            textOut.append(part.path("text").asText())
+                        }
                     }
                     val fullText = textOut.toString()
                     if (finishReason != "STOP") {
@@ -762,7 +765,9 @@ class AiAnalysisService(
                 if (parts.isArray && parts.size() > 0) {
                     val sb = StringBuilder()
                     parts.forEach { part ->
-                        sb.append(part.path("text").asText(""))
+                        if (!part.path("thought").asBoolean(false)) {
+                            sb.append(part.path("text").asText(""))
+                        }
                     }
                     return sb.toString()
                 }
