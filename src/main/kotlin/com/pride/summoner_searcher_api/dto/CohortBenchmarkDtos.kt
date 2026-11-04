@@ -203,6 +203,38 @@ data class RateLimitVerificationSnapshotDto(
 )
 
 /**
+ * Live JVM + Linux cgroup container memory headroom telemetry and safety gate status for the 512MB container.
+ * Stops/yields low-priority work before memory utilization approaches the container cap (no paid plan upgrade required).
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class MemoryHeadroomSnapshotDto(
+    val measuredAt: Instant,
+    val memoryMeasurementSource: String,
+    val configuredContainerLimitBytes: Long = 536_870_912L,
+    val cgroupMemoryCurrentBytes: Long? = null,
+    val cgroupMemoryMaxBytes: Long? = null,
+    val jvmHeapUsedBytes: Long,
+    val jvmHeapCommittedBytes: Long,
+    val jvmHeapMaxBytes: Long,
+    val jvmNonHeapUsedBytes: Long = 0L,
+    val effectiveMemoryUsedBytes: Long,
+    val effectiveMemoryLimitBytes: Long,
+    val jvmHeapUtilizationRatio: Double,
+    val containerUtilizationRatio: Double,
+    val effectiveUtilizationRatio: Double,
+    val maxAllowedUtilizationRatio: Double = 0.78,
+    val minRequiredFreeBytes: Long = 67_108_864L,
+    val estimatedFreeHeadroomBytes: Long,
+    val hasHeadroomForLowPriority: Boolean,
+    val nearCapStopTriggered: Boolean = !hasHeadroomForLowPriority,
+    val scanKeyCapPerNamespace: Int = 500,
+    val profileScanChunkSize: Int = 20,
+    val snapshotScanChunkSize: Int = 50,
+    val matchScanChunkSize: Int = 25,
+    val maxInMemoryParticipantSamples: Int = 6_000
+)
+
+/**
  * Compact timestamped Solo Queue current-rank snapshot cached at `cohort:rank:snapshot:{region}:{puuid}`.
  * Never fabricates historical rank; carries explicit [snapshotAt] enforced against freshness & match-proximity bounds.
  */
@@ -260,6 +292,7 @@ data class CohortCollectorCheckpointDto(
     val yieldedToForegroundCount: Int = 0,
     val pausedForRetryAfterCount: Int = 0,
     val pausedForHeadroomCount: Int = 0,
+    val pausedForMemoryHeadroomCount: Int = 0,
     val lastStopReason: String = "INITIALIZED",
     val startedAt: Instant,
     val updatedAt: Instant
@@ -286,6 +319,7 @@ data class CohortCollectorStatusDto(
     val lastRunStartedAt: Instant? = null,
     val lastRunCompletedAt: Instant? = null,
     val rateLimitVerification: RateLimitVerificationSnapshotDto,
+    val memoryHeadroom: MemoryHeadroomSnapshotDto? = null,
     val checkpoint: CohortCollectorCheckpointDto? = null
 )
 
@@ -307,6 +341,7 @@ data class CohortRateLimitProbeResultDto(
     val endpointOutcomes: Map<String, String> = emptyMap(),
     val probedAt: Instant,
     val rateLimitVerification: RateLimitVerificationSnapshotDto,
+    val memoryHeadroom: MemoryHeadroomSnapshotDto? = null,
     val checkpoint: CohortCollectorCheckpointDto? = null,
     val notes: List<String> = emptyList()
 )
@@ -316,6 +351,7 @@ data class CohortExtractionReportDto(
     val reportSource: String = "FRESH_BOUNDED_EXTRACTION",
     val inventory: CohortCacheInventoryDto,
     val rateLimitVerification: RateLimitVerificationSnapshotDto,
+    val memoryHeadroom: MemoryHeadroomSnapshotDto? = null,
     val cells: List<CohortBenchmarkCellDto>,
     val methodologyNotes: List<String>
 )

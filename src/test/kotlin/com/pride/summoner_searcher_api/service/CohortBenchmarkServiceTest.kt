@@ -1482,6 +1482,284 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 resumedAndFinishedStatus.overnightSessionArmed shouldBe false
             }
         }
+
+        When("enforcing the 512MB container memory headroom safety gate (~67% idle vs >=78% near-cap stop/yield) and streaming non-accumulating cache scans") {
+            val clockMs = java.util.concurrent.atomic.AtomicLong(nowInstant.toEpochMilli())
+            val testClock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            val memLimiter = RiotApiRateLimiter(testClock)
+            val memRedis = mockk<RedisCacheService>(relaxed = true)
+            val memRiotApi = mockk<RiotApiService>(relaxed = true)
+            val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
+            val savedSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
+            var lockHeld = false
+
+            // Track chunk sizes passed to multiGet to verify bounded non-accumulating streaming scans
+            val profileChunkSizes = mutableListOf<Int>()
+            val matchChunkSizes = mutableListOf<Int>()
+            var bulkTimelineMultiGetCalls = 0
+
+            val profileKeys = (1..45).map { "player:profile:euw1:User$it:EUW" }
+            val matchKeys = (1..60).map { "match:euw1:EUW1_STREAM_$it" }
+
+            every { memRedis.scanKeys(any(), any(), any()) } answers {
+                val pattern = firstArg<String>()
+                when {
+                    pattern.startsWith("player:profile:euw1:") -> profileKeys
+                    pattern.startsWith("match:euw1:") -> matchKeys
+                    pattern.startsWith("cohort:rank:snapshot:euw1:") -> savedSnapshots.keys.toList()
+                    else -> emptyList()
+                }
+            }
+            every { memRedis.multiGet(any(), SummonerProfileDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                profileChunkSizes.add(keys.size)
+                keys.associateWith { key ->
+                    val idx = key.substringAfter("User").substringBefore(":").toIntOrNull() ?: 1
+                    SummonerProfileDto(
+                        puuid = "stream-puuid-$idx",
+                        gameName = "User$idx",
+                        tagLine = "EUW",
+                        profileIconId = 1,
+                        summonerLevel = 100L,
+                        soloQueueRank = LeagueEntryDto(
+                            leagueId = "l-$idx",
+                            queueType = "RANKED_SOLO_5x5",
+                            tier = "EMERALD",
+                            rank = "II",
+                            summonerName = "User$idx",
+                            puuid = "stream-puuid-$idx",
+                            leaguePoints = 50,
+                            wins = 20,
+                            losses = 18,
+                            veteran = false,
+                            inactive = false,
+                            freshBlood = false,
+                            hotStreak = false
+                        ),
+                        recentMatches = emptyList(),
+                        lastRefreshed = snapshotTime
+                    )
+                }
+            }
+            every { memRedis.multiGet(any(), CohortRankSnapshotDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                keys.associateWith { savedSnapshots[it] }
+            }
+            every { memRedis.multiGet(any(), MatchDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                matchChunkSizes.add(keys.size)
+                keys.associateWith { key ->
+                    val idx = key.substringAfterLast("_").toIntOrNull() ?: 1
+                    val pId = "stream-puuid-${((idx - 1) % 45) + 1}"
+                    MatchDto(
+                        metadata = MatchMetadata("EUW1_STREAM_$idx", listOf(pId)),
+                        info = MatchInfo(
+                            gameCreation = clockMs.get() - idx * 60_000L,
+                            gameDuration = 1800L,
+                            gameId = idx.toLong(),
+                            queueId = 420,
+                            gameMode = "CLASSIC",
+                            gameVersion = "16.7.600.1234",
+                            participants = listOf(
+                                buildParticipant(
+                                    puuid = pId,
+                                    role = "MIDDLE",
+                                    laneCs10 = 88,
+                                    totalMinions = 220,
+                                    neutralMinions = 8
+                                )
+                            )
+                        )
+                    )
+                }
+            }
+            every { memRedis.multiGet(any(), MatchTimelineDto::class.java) } answers {
+                bulkTimelineMultiGetCalls++
+                emptyMap()
+            }
+            every { memRedis.get(any(), MatchTimelineDto::class.java) } returns null
+            every { memRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
+                savedCheckpoints[firstArg()]
+            }
+            every { memRedis.get(any(), CohortRankSnapshotDto::class.java) } answers {
+                savedSnapshots[firstArg()]
+            }
+            every { memRedis.get(any(), SummonerProfileDto::class.java) } returns null
+            every { memRedis.get(any(), MatchDto::class.java) } returns null
+            every { memRedis.get(any(), CachedLeaderboardDto::class.java) } returns null
+            every { memRedis.setIfAbsent(match { it.startsWith("lock:cohort:collector:") }, any(), any()) } answers {
+                val key = firstArg<String>()
+                if (key.contains(":active:")) {
+                    if (lockHeld) false else {
+                        lockHeld = true
+                        true
+                    }
+                } else {
+                    true
+                }
+            }
+            every { memRedis.delete(match { it.startsWith("lock:cohort:collector:active:") }) } answers {
+                lockHeld = false
+            }
+            every { memRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                when (val value = secondArg<Any>()) {
+                    is CohortCollectorCheckpointDto -> savedCheckpoints[key] = value
+                    is CohortRankSnapshotDto -> savedSnapshots[key] = value
+                }
+            }
+
+            // Controllable 512MB container memory stats provider:
+            // 512MB = 536,870,912 bytes.
+            // Idle (~67%): 360,000,000 bytes cgroup used, 180MB heap used / 268MB maxHeap.
+            val containerMaxBytes = 536_870_912L
+            val currentCgroupBytes = java.util.concurrent.atomic.AtomicLong(360_000_000L) // ~67.06%
+            val currentHeapUsedBytes = java.util.concurrent.atomic.AtomicLong(180_000_000L)
+            val maxHeapBytes = 268_435_456L // 256MB (-XX:MaxRAMPercentage=50.0)
+
+            val mockMemoryProvider = object : MemoryStatsProvider {
+                override fun sample(): RawMemorySample = RawMemorySample(
+                    jvmHeapUsedBytes = currentHeapUsedBytes.get(),
+                    jvmHeapCommittedBytes = 220_000_000L,
+                    jvmHeapMaxBytes = maxHeapBytes,
+                    jvmNonHeapUsedBytes = 95_000_000L,
+                    cgroupMemoryCurrentBytes = currentCgroupBytes.get(),
+                    cgroupMemoryMaxBytes = containerMaxBytes
+                )
+            }
+
+            for (ep in CohortBenchmarkService.REQUIRED_COLLECTOR_ENDPOINTS) {
+                memLimiter.updateLimits(
+                    region = "euw1",
+                    limitHeader = "20:1,100:120",
+                    countHeader = "1:1,1:120",
+                    endpointKey = ep,
+                    methodLimitHeader = "500:10",
+                    methodCountHeader = "1:10"
+                )
+            }
+
+            val memService = CohortBenchmarkService(
+                redisCacheService = memRedis,
+                cohortBenchmarkCellRepository = cohortRepo,
+                riotApiRateLimiter = memLimiter,
+                riotApiService = memRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = testClock,
+                configuredContainerLimitBytes = containerMaxBytes,
+                maxMemoryUtilizationRatio = 0.78,
+                minFreeMemoryBytes = 67_108_864L, // 64MB
+                memoryStatsProvider = mockMemoryProvider
+            )
+            val memRunner = com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner(
+                cohortBenchmarkService = memService,
+                configuredOperatorToken = "",
+                timeProvider = testClock
+            )
+
+            // 1. At ~67% container idle metric (360MB / 512MB), memory headroom is healthy (< 78% cap, > 64MB free)
+            val idleMemorySnap = memService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
+
+            // 2. Run extractCachedCohortsAndReport and verify bounded streaming chunk sizes (<=20 profiles, <=25 matches, 0 bulk timelines)
+            val reportAt67Pct = memService.extractCachedCohortsAndReport(region = "euw1", targetPatch = "16.7")
+            val reportProfileChunkSizes = profileChunkSizes.toList()
+            val reportMatchChunkSizes = matchChunkSizes.toList()
+
+            // 3. Simulate container memory rising near 512MB cap: 430MB / 512MB = 80.09% (>= 78% cap!)
+            currentCgroupBytes.set(430_000_000L)
+            val nearCapSnap = memService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
+
+            // 4. Diagnostic probe under memory pressure (>= 78%) stops immediately with 0 HTTP attempts
+            val probePausedForMemory = memService.runBoundedDiagnosticRateLimitProbe(
+                region = "euw1",
+                targetPatch = "16.7",
+                explicitSeedPuuid = "stream-puuid-1"
+            )
+
+            // 5. Collector run under memory pressure (>= 78%) pauses immediately with PAUSED_MEMORY_HEADROOM (0 network calls, 0 productive batches consumed)
+            memService.saveCollectorCheckpoint(
+                CohortCollectorCheckpointDto(
+                    region = "euw1",
+                    targetPatch = "16.7",
+                    patchSelectionSource = "EXPLICIT_TARGET_PATCH",
+                    pendingCandidatePuuids = listOf("stream-puuid-1"),
+                    startedAt = nowInstant,
+                    updatedAt = nowInstant
+                )
+            )
+            val runnerPausedForMemory = memRunner.startOrResumeGuarded(
+                region = "euw1",
+                targetPatch = "16.7",
+                maxBatches = 1,
+                batchSize = 1,
+                pauseDelayMs = 0L,
+                maxPauseCycles = 2,
+                async = false
+            )
+
+            // While memory is still at 80.09%, auto-resume refuses to start
+            val autoResumeWhileNearCap = memRunner.checkAndAutoResumeOvernightSession(async = false)
+
+            // 6. Drop container memory back to ~67% idle (360MB / 512MB) -> auto-resume succeeds and finishes candidate!
+            currentCgroupBytes.set(360_000_000L)
+            coEvery { memRiotApi.fetchLeagueRankLowPriority(any(), "euw1", any(), any(), any()) } coAnswers {
+                arg<java.util.concurrent.atomic.AtomicInteger?>(3)?.incrementAndGet()
+                LeagueEntryDto(
+                    leagueId = "l-mem", queueType = "RANKED_SOLO_5x5", tier = "EMERALD", rank = "II",
+                    summonerName = "User1", puuid = "stream-puuid-1", leaguePoints = 50, wins = 20, losses = 18,
+                    veteran = false, inactive = false, freshBlood = false, hotStreak = false
+                )
+            }
+            coEvery { memRiotApi.getMatchIdsByPuuidLowPriority(any(), "euw1", 420, any(), 0, any(), any(), any()) } coAnswers {
+                arg<java.util.concurrent.atomic.AtomicInteger?>(6)?.incrementAndGet()
+                emptyList()
+            }
+            val autoResumedAfterMemoryRecovery = memRunner.checkAndAutoResumeOvernightSession(async = false)!!
+
+            Then("it should stream profiles/matches in small chunks without bulk timeline loading, stop/yield near the 512MB cap with PAUSED_MEMORY_HEADROOM, and auto-resume once memory drops back to ~67%") {
+                // Verify ~67% idle snapshot
+                idleMemorySnap.hasHeadroomForLowPriority shouldBe true
+                idleMemorySnap.nearCapStopTriggered shouldBe false
+                (idleMemorySnap.effectiveUtilizationRatio in 0.66..0.68) shouldBe true
+
+                // Verify streaming chunk bounds: 45 profiles -> [20, 20, 5]; 60 matches -> [25, 25, 10]; 0 bulk timeline multiGets
+                reportProfileChunkSizes shouldBe listOf(20, 20, 5)
+                reportMatchChunkSizes shouldBe listOf(25, 25, 10)
+                profileChunkSizes.all { it <= CohortBenchmarkService.PROFILE_SCAN_CHUNK_SIZE } shouldBe true
+                matchChunkSizes.all { it <= CohortBenchmarkService.MATCH_SCAN_CHUNK_SIZE } shouldBe true
+                bulkTimelineMultiGetCalls shouldBe 0
+                reportAt67Pct.memoryHeadroom?.hasHeadroomForLowPriority shouldBe true
+                reportAt67Pct.inventory.distinctEligibleCohortPlayers shouldBe 45
+
+                // Verify near-cap (>= 78%) snapshot triggers stop/yield
+                nearCapSnap.hasHeadroomForLowPriority shouldBe false
+                nearCapSnap.nearCapStopTriggered shouldBe true
+                (nearCapSnap.effectiveUtilizationRatio >= 0.78) shouldBe true
+
+                // Verify probe stops with 0 HTTP attempts when near memory cap
+                probePausedForMemory.probeStatus shouldBe "PAUSED_MEMORY_HEADROOM"
+                probePausedForMemory.totalHttpAttemptsMade shouldBe 0
+                probePausedForMemory.memoryHeadroom?.nearCapStopTriggered shouldBe true
+
+                // Verify runner pauses without consuming productive batch budget when near memory cap
+                runnerPausedForMemory.productiveBatchesCompleted shouldBe 0
+                runnerPausedForMemory.pauseCyclesCount shouldBe 2
+                runnerPausedForMemory.overnightSessionArmed shouldBe true
+                runnerPausedForMemory.checkpoint?.pausedForMemoryHeadroomCount shouldBe 2
+                runnerPausedForMemory.checkpoint?.lastStopReason shouldBe "PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE"
+
+                // Auto-resume stays blocked while memory is at 80%
+                autoResumeWhileNearCap shouldBe null
+
+                // Once memory recovers to ~67%, auto-resume runs and completes stream-puuid-1
+                autoResumedAfterMemoryRecovery.productiveBatchesCompleted shouldBe 1
+                autoResumedAfterMemoryRecovery.checkpoint?.processedPuuids shouldBe setOf("stream-puuid-1")
+                autoResumedAfterMemoryRecovery.checkpoint?.lastStopReason shouldBe "BATCH_BUDGET_REACHED_RESUMABLE"
+            }
+        }
     }
 })
 

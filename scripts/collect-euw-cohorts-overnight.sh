@@ -95,8 +95,8 @@ if [[ -n "${PROBE_QUERY}" ]]; then
 fi
 
 echo "[cohort-collector] Mode=SAME_PROCESS_GUARDED | Action=${ACTION} | BaseUrl=${BASE_URL} | Region=${REGION} | Patch=${TARGET_PATCH:-auto-cached}"
-echo "[cohort-collector] Guardrails: cap=10 games/player, gate=50 players + 200 games/cell, LOW priority, maxRetries=0 (single HTTP attempt/call), yields to foreground traffic & 429 Retry-After."
-echo "[cohort-collector] Notice: Resumable checkpointed run; coverage depends on verified Riot rate limits and candidate pool (no morning coverage promise)."
+echo "[cohort-collector] Guardrails: 512MB container memory headroom gate (<78% utilization & >=64MB free), chunked non-accumulating scans, cap=10 games/player, gate=50 players + 200 games/cell, LOW priority, maxRetries=0 (single HTTP attempt/call), yields to foreground traffic & 429 Retry-After."
+echo "[cohort-collector] Notice: Resumable checkpointed run; coverage depends on verified Riot rate limits, memory headroom, and candidate pool (no morning coverage promise; no paid plan)."
 
 if ! PRE_STATUS="$(http_get "${STATUS_URL}" 2>/dev/null)"; then
   echo "[cohort-collector] ERROR: Could not reach guarded same-process collector endpoint at ${STATUS_URL}." >&2
@@ -107,10 +107,13 @@ fi
 
 case "${ACTION}" in
   status)
-    echo "[cohort-collector] Live same-process collector status:"
+    echo "[cohort-collector] Live same-process collector status (including memoryHeadroom & rateLimitVerification):"
     echo "${PRE_STATUS}"
     ;;
   probe)
+    if [[ "${PRE_STATUS}" == *'"hasHeadroomForLowPriority":false'* ]]; then
+      echo "[cohort-collector] WARNING: Container/JVM memory headroom is near cap (hasHeadroomForLowPriority=false); probe will pause safely with 0 HTTP attempts if pressure persists."
+    fi
     echo "[cohort-collector] Running guarded bounded diagnostic probe (max 1 HTTP attempt per missing required endpoint, maxRetries=0):"
     PROBE_RESP="$(http_post "${PROBE_URL}")"
     echo "${PROBE_RESP}"
@@ -125,8 +128,11 @@ case "${ACTION}" in
     echo "${STOP_RESP}"
     ;;
   start|resume)
-    echo "[cohort-collector] Pre-flight same-process status:"
+    echo "[cohort-collector] Pre-flight same-process status (verifying memoryHeadroom & rateLimitVerification before bulk start):"
     echo "${PRE_STATUS}"
+    if [[ "${PRE_STATUS}" == *'"hasHeadroomForLowPriority":false'* ]]; then
+      echo "[cohort-collector] SAFETY GATE: Memory headroom is near the 512MB container cap (hasHeadroomForLowPriority=false). Collector will yield/pause (PAUSED_MEMORY_HEADROOM) until memory headroom recovers."
+    fi
     if [[ "${PRE_STATUS}" == *'"appLimitsVerifiedFromHeaders":false'* ]] || [[ "${PRE_STATUS}" != *'"missingRequiredMethodEndpoints":[]'* ]]; then
       echo "[cohort-collector] Required rate-limit headers not yet verified in-process; executing bounded diagnostic probe first (max 1 HTTP attempt/endpoint, maxRetries=0)..."
       PROBE_RESP="$(http_post "${PROBE_URL}")"
@@ -150,7 +156,7 @@ case "${ACTION}" in
           echo "${CURRENT_STATUS}"
           break
         fi
-        echo "[cohort-collector] In-process collector active or armed in cooldown; polling again in ${POLL_SECONDS}s..."
+        echo "[cohort-collector] In-process collector active or armed in cooldown/memory pause; polling again in ${POLL_SECONDS}s..."
         sleep "${POLL_SECONDS}"
       done
     fi

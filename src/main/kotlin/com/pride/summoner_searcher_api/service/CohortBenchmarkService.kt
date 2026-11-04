@@ -13,6 +13,60 @@ import kotlin.math.ceil
 import kotlin.math.floor
 import kotlin.math.roundToLong
 
+data class RawMemorySample(
+    val jvmHeapUsedBytes: Long,
+    val jvmHeapCommittedBytes: Long,
+    val jvmHeapMaxBytes: Long,
+    val jvmNonHeapUsedBytes: Long = 0L,
+    val cgroupMemoryCurrentBytes: Long? = null,
+    val cgroupMemoryMaxBytes: Long? = null
+)
+
+interface MemoryStatsProvider {
+    fun sample(): RawMemorySample
+}
+
+@org.springframework.stereotype.Component
+class SystemMemoryStatsProvider : MemoryStatsProvider {
+    override fun sample(): RawMemorySample {
+        val rt = Runtime.getRuntime()
+        val committed = rt.totalMemory().coerceAtLeast(0L)
+        val free = rt.freeMemory().coerceAtLeast(0L)
+        val used = (committed - free).coerceAtLeast(0L)
+        val max = rt.maxMemory().takeIf { it > 0L && it < Long.MAX_VALUE } ?: committed.coerceAtLeast(1L)
+        val nonHeap = try {
+            java.lang.management.ManagementFactory.getMemoryMXBean().nonHeapMemoryUsage.used.coerceAtLeast(0L)
+        } catch (_: Exception) {
+            0L
+        }
+        val cgroupCurrent = readLongFromFile("/sys/fs/cgroup/memory.current")
+            ?: readLongFromFile("/sys/fs/cgroup/memory/memory.usage_in_bytes")
+        val cgroupMax = readLongFromFile("/sys/fs/cgroup/memory.max")
+            ?: readLongFromFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")?.takeIf { it in 1L..68_719_476_736L }
+
+        return RawMemorySample(
+            jvmHeapUsedBytes = used,
+            jvmHeapCommittedBytes = committed,
+            jvmHeapMaxBytes = max,
+            jvmNonHeapUsedBytes = nonHeap,
+            cgroupMemoryCurrentBytes = cgroupCurrent,
+            cgroupMemoryMaxBytes = cgroupMax
+        )
+    }
+
+    private fun readLongFromFile(path: String): Long? {
+        return try {
+            val file = java.io.File(path)
+            if (!file.exists() || !file.canRead()) return null
+            val raw = file.readText().trim()
+            if (raw.isEmpty() || raw.equals("max", ignoreCase = true)) return null
+            raw.toLongOrNull()?.takeIf { it > 0L }
+        } catch (_: Exception) {
+            null
+        }
+    }
+}
+
 @Service
 class CohortBenchmarkService(
     private val redisCacheService: RedisCacheService,
@@ -22,14 +76,32 @@ class CohortBenchmarkService(
     private val objectMapper: ObjectMapper,
     @Value("\${cohort.network-collection.enabled:false}")
     private val networkCollectionEnabled: Boolean = false,
-    private val timeProvider: TimeProvider = SystemTimeProvider()
+    private val timeProvider: TimeProvider = SystemTimeProvider(),
+    @Value("\${cohort.collector.container-memory-limit-bytes:536870912}")
+    private val configuredContainerLimitBytes: Long = DEFAULT_CONTAINER_MEMORY_LIMIT_BYTES,
+    @Value("\${cohort.collector.max-memory-utilization-ratio:0.78}")
+    private val maxMemoryUtilizationRatio: Double = DEFAULT_MAX_MEMORY_UTILIZATION_RATIO,
+    @Value("\${cohort.collector.min-free-memory-bytes:67108864}")
+    private val minFreeMemoryBytes: Long = DEFAULT_MIN_FREE_MEMORY_BYTES,
+    private val memoryStatsProvider: MemoryStatsProvider = SystemMemoryStatsProvider()
 ) {
     private val logger = LoggerFactory.getLogger(javaClass)
+    private val lastGcHintAtMs = java.util.concurrent.atomic.AtomicLong(0L)
 
     companion object {
         const val SOLO_QUEUE_ID = 420
         const val MIN_GAME_DURATION_SECONDS = 600L
-        const val MAX_SCAN_KEYS_PER_NAMESPACE = 2_000
+        const val MAX_SCAN_KEYS_PER_NAMESPACE = 500
+        const val PROFILE_SCAN_CHUNK_SIZE = 20
+        const val SNAPSHOT_SCAN_CHUNK_SIZE = 50
+        const val MATCH_SCAN_CHUNK_SIZE = 25
+        const val MAX_IN_MEMORY_PARTICIPANT_SAMPLES = 6_000
+        const val MAX_CHECKPOINT_PROCESSED_PUUIDS = 5_000
+        const val MAX_CHECKPOINT_PROCESSED_MATCH_IDS = 10_000
+        const val MAX_CHECKPOINT_PENDING_PUUIDS = 500
+        const val DEFAULT_CONTAINER_MEMORY_LIMIT_BYTES = 536_870_912L // 512 MB Render container cap
+        const val DEFAULT_MAX_MEMORY_UTILIZATION_RATIO = 0.78
+        const val DEFAULT_MIN_FREE_MEMORY_BYTES = 67_108_864L // 64 MB minimum free headroom
         val ELIGIBLE_ROLES = setOf("TOP", "MIDDLE", "BOTTOM")
         val ALLOWED_REGIONS = setOf(
             "euw1", "na1", "kr", "eun1", "br1", "jp1", "la1", "la2",
@@ -54,6 +126,97 @@ class CohortBenchmarkService(
             "match-v5-match-by-id"
         )
     }
+
+    /**
+     * Evaluates live JVM heap + Linux container cgroup memory headroom against the 512MB container cap.
+     * Triggers a rate-limited GC hint (max once per 15s) before declaring memory exhaustion so transient
+     * young-gen JSON garbage is reclaimed first.
+     */
+    fun getMemoryHeadroomSnapshot(allowGcHintOnPressure: Boolean = true): MemoryHeadroomSnapshotDto {
+        val nowMs = timeProvider.now()
+        val raw = memoryStatsProvider.sample()
+        val snap = buildMemoryHeadroomSnapshot(raw, Instant.ofEpochMilli(nowMs))
+        if (!snap.hasHeadroomForLowPriority && allowGcHintOnPressure) {
+            val prevGc = lastGcHintAtMs.get()
+            if (nowMs - prevGc >= 15_000L && lastGcHintAtMs.compareAndSet(prevGc, nowMs)) {
+                System.gc()
+                val afterGc = memoryStatsProvider.sample()
+                return buildMemoryHeadroomSnapshot(afterGc, Instant.ofEpochMilli(timeProvider.now()))
+            }
+        }
+        return snap
+    }
+
+    private fun buildMemoryHeadroomSnapshot(raw: RawMemorySample, measuredAt: Instant): MemoryHeadroomSnapshotDto {
+        val safeContainerCap = configuredContainerLimitBytes.coerceAtLeast(1L)
+        val safeHeapMax = raw.jvmHeapMaxBytes.coerceAtLeast(1L)
+        val safeHeapUsed = raw.jvmHeapUsedBytes.coerceAtLeast(0L)
+        val safeHeapCommitted = raw.jvmHeapCommittedBytes.coerceAtLeast(safeHeapUsed)
+        val safeNonHeapUsed = raw.jvmNonHeapUsedBytes.coerceAtLeast(0L)
+
+        // Use cgroup container utilization only when running inside a bounded container cgroup (<= 2GB max)
+        val isBoundedContainerCgroup = raw.cgroupMemoryMaxBytes != null &&
+            raw.cgroupMemoryMaxBytes in 1L..2_147_483_648L &&
+            raw.cgroupMemoryCurrentBytes != null &&
+            raw.cgroupMemoryCurrentBytes > 0L
+
+        val effectiveLimitBytes = if (isBoundedContainerCgroup) {
+            minOf(safeContainerCap, raw.cgroupMemoryMaxBytes!!)
+        } else {
+            minOf(safeContainerCap, safeHeapMax)
+        }
+
+        val effectiveUsedBytes = if (isBoundedContainerCgroup) {
+            maxOf(raw.cgroupMemoryCurrentBytes!!, safeHeapUsed)
+        } else {
+            safeHeapUsed
+        }
+
+        val heapRatio = round4(safeHeapUsed.toDouble() / safeHeapMax.toDouble())
+        val containerRatio = if (isBoundedContainerCgroup) {
+            round4(raw.cgroupMemoryCurrentBytes!!.toDouble() / effectiveLimitBytes.coerceAtLeast(1L).toDouble())
+        } else {
+            round4(safeHeapUsed.toDouble() / effectiveLimitBytes.coerceAtLeast(1L).toDouble())
+        }
+        val effectiveRatio = maxOf(heapRatio, containerRatio)
+
+        val freeHeapBytes = (safeHeapMax - safeHeapUsed).coerceAtLeast(0L)
+        val freeContainerBytes = (effectiveLimitBytes - effectiveUsedBytes).coerceAtLeast(0L)
+        val estimatedFree = minOf(freeHeapBytes, freeContainerBytes)
+
+        val clampedMaxRatio = maxMemoryUtilizationRatio.coerceIn(0.10, 0.98)
+        val clampedMinFree = minFreeMemoryBytes.coerceAtLeast(0L)
+        val hasHeadroom = effectiveRatio < clampedMaxRatio && estimatedFree >= clampedMinFree
+
+        return MemoryHeadroomSnapshotDto(
+            measuredAt = measuredAt,
+            memoryMeasurementSource = if (isBoundedContainerCgroup) "CGROUP_CONTAINER_AND_JVM" else "JVM_HEAP",
+            configuredContainerLimitBytes = safeContainerCap,
+            cgroupMemoryCurrentBytes = raw.cgroupMemoryCurrentBytes,
+            cgroupMemoryMaxBytes = raw.cgroupMemoryMaxBytes,
+            jvmHeapUsedBytes = safeHeapUsed,
+            jvmHeapCommittedBytes = safeHeapCommitted,
+            jvmHeapMaxBytes = safeHeapMax,
+            jvmNonHeapUsedBytes = safeNonHeapUsed,
+            effectiveMemoryUsedBytes = effectiveUsedBytes,
+            effectiveMemoryLimitBytes = effectiveLimitBytes,
+            jvmHeapUtilizationRatio = heapRatio,
+            containerUtilizationRatio = containerRatio,
+            effectiveUtilizationRatio = effectiveRatio,
+            maxAllowedUtilizationRatio = clampedMaxRatio,
+            minRequiredFreeBytes = clampedMinFree,
+            estimatedFreeHeadroomBytes = estimatedFree,
+            hasHeadroomForLowPriority = hasHeadroom,
+            nearCapStopTriggered = !hasHeadroom,
+            scanKeyCapPerNamespace = MAX_SCAN_KEYS_PER_NAMESPACE,
+            profileScanChunkSize = PROFILE_SCAN_CHUNK_SIZE,
+            snapshotScanChunkSize = SNAPSHOT_SCAN_CHUNK_SIZE,
+            matchScanChunkSize = MATCH_SCAN_CHUNK_SIZE,
+            maxInMemoryParticipantSamples = MAX_IN_MEMORY_PARTICIPANT_SAMPLES
+        )
+    }
+
+    private fun round4(value: Double): Double = (value * 10_000.0).roundToLong() / 10_000.0
 
     private data class RankSnapshot(
         val puuid: String,
@@ -121,7 +284,8 @@ class CohortBenchmarkService(
             )
             return cachedReport.copy(
                 reportSource = "CACHED_REPORT",
-                rateLimitVerification = freshVerification
+                rateLimitVerification = freshVerification,
+                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
             )
         }
 
@@ -170,6 +334,7 @@ class CohortBenchmarkService(
                     region = normalizedRegion,
                     networkCollectionEnabled = networkCollectionEnabled
                 ),
+                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
                 cells = persistedCells,
                 methodologyNotes = listOf(
                     "Recompute cooldown active for region '$normalizedRegion'; serving persisted de-identified cells with zero Redis scans and zero DB writes."
@@ -198,10 +363,13 @@ class CohortBenchmarkService(
     }
 
     /**
-     * Bounded, cache-only cohort extraction, inventory, and aggregation for [region] (default `euw1`).
-     * Makes ZERO Riot API calls. Scans bounded Redis keys, enforces rank-snapshot freshness and match recency bounds,
-     * applies `(matchId, puuid)` deduplication, per-player game cap (`maxGamesPerPlayer`), and separates
-     * per-role lane-only CS (`114` Top/Bot, `120` Mid on 16.1+ / `114` pre-16.1) from pro-compatible total CS.
+     * Bounded, streaming, non-accumulating cache-only cohort extraction, inventory, and aggregation for [region].
+     * - Makes ZERO Riot API calls.
+     * - Streams profiles in chunks of [PROFILE_SCAN_CHUNK_SIZE] (20), rank snapshots in chunks of [SNAPSHOT_SCAN_CHUNK_SIZE] (50),
+     *   and matches in chunks of [MATCH_SCAN_CHUNK_SIZE] (25) WITHOUT `.flatMap` accumulation across chunks, so full DTOs
+     *   are immediately eligible for GC after each small chunk.
+     * - Never bulk-loads `MatchTimelineDto` maps into heap; timelines are only fetched one-at-a-time on demand if an eligible
+     *   participant lacks `challenges.laneMinionsFirst10Minutes`.
      */
     fun extractCachedCohortsAndReport(
         region: String = "euw1",
@@ -215,7 +383,7 @@ class CohortBenchmarkService(
         val maxFutureSkewInstant = scannedAt.plus(Duration.ofHours(2))
         val minMatchInstant = scannedAt.minus(MAX_MATCH_AGE)
 
-        // 1. Bounded scan of cached player profiles & Challenger leaderboard for fresh current-rank snapshots
+        // 1. Bounded streaming scan of cached player profiles (chunks of 20, zero cross-chunk accumulation)
         val rankSnapshotsByPuuid = mutableMapOf<String, RankSnapshot>()
         val profileKeys = redisCacheService.scanKeys(
             pattern = "player:profile:$normalizedRegion:*",
@@ -224,11 +392,9 @@ class CohortBenchmarkService(
         var profilesWithSoloQueueRank = 0
         var excludedStaleRankSnapshots = 0
 
-        if (profileKeys.isNotEmpty()) {
-            val profilesMap = profileKeys.chunked(200).flatMap { chunk ->
-                redisCacheService.multiGet(chunk, SummonerProfileDto::class.java).entries
-            }
-            for ((_, profile) in profilesMap) {
+        for (chunk in profileKeys.chunked(PROFILE_SCAN_CHUNK_SIZE)) {
+            val chunkProfiles = redisCacheService.multiGet(chunk, SummonerProfileDto::class.java)
+            for ((_, profile) in chunkProfiles) {
                 if (profile == null) continue
                 val puuid = profile.puuid?.takeIf { it.isNotBlank() } ?: continue
                 val rank = profile.soloQueueRank ?: continue
@@ -252,16 +418,14 @@ class CohortBenchmarkService(
             }
         }
 
-        // Also scan compact cohort rank snapshot keys (bounded, same freshness rules)
+        // Also stream compact cohort rank snapshot keys (chunks of 50, zero cross-chunk accumulation)
         val snapshotKeys = redisCacheService.scanKeys(
             pattern = "cohort:rank:snapshot:$normalizedRegion:*",
             maxKeys = MAX_SCAN_KEYS_PER_NAMESPACE
         )
-        if (snapshotKeys.isNotEmpty()) {
-            val snapshotsMap = snapshotKeys.chunked(200).flatMap { chunk ->
-                redisCacheService.multiGet(chunk, CohortRankSnapshotDto::class.java).entries
-            }
-            for ((_, snap) in snapshotsMap) {
+        for (chunk in snapshotKeys.chunked(SNAPSHOT_SCAN_CHUNK_SIZE)) {
+            val chunkSnapshots = redisCacheService.multiGet(chunk, CohortRankSnapshotDto::class.java)
+            for ((_, snap) in chunkSnapshots) {
                 if (snap == null) continue
                 val puuid = snap.puuid.takeIf { it.isNotBlank() } ?: continue
                 if (snap.queueType != "RANKED_SOLO_5x5") continue
@@ -324,7 +488,7 @@ class CohortBenchmarkService(
             .eachCount()
             .toSortedMap(compareBy { tierIndex(it) })
 
-        // 2. Bounded scan of cached matches and timelines in Redis (zero network calls)
+        // 2. Bounded single-pass streaming scan of cached matches in chunks of 25 (zero full-list accumulation)
         val matchKeys = redisCacheService.scanKeys(
             pattern = "match:$normalizedRegion:*",
             maxKeys = MAX_SCAN_KEYS_PER_NAMESPACE
@@ -333,49 +497,13 @@ class CohortBenchmarkService(
             pattern = "timeline:$normalizedRegion:*",
             maxKeys = MAX_SCAN_KEYS_PER_NAMESPACE
         )
-
-        val cachedMatches = if (matchKeys.isNotEmpty()) {
-            matchKeys.chunked(100).flatMap { chunk ->
-                redisCacheService.multiGet(chunk, MatchDto::class.java).values.filterNotNull()
-            }
-        } else {
-            emptyList()
-        }
-
-        val timelinesByMatchId = if (timelineKeys.isNotEmpty()) {
-            timelineKeys.chunked(100).flatMap { chunk ->
-                redisCacheService.multiGet(chunk, MatchTimelineDto::class.java).entries
-            }.mapNotNull { (key, timeline) ->
-                val matchId = timeline?.metadata?.matchId ?: key.substringAfterLast(":")
-                if (timeline != null && matchId.isNotBlank()) matchId to timeline else null
-            }.toMap()
-        } else {
-            emptyMap()
-        }
-
-        // Inventory matches by major.minor patch
-        val matchesByPatchCounts = mutableMapOf<String, Int>()
-        val soloQueueMatchesByPatch = mutableMapOf<String, Int>()
-        for (match in cachedMatches) {
-            val patch = extractMajorMinorPatch(match.info?.gameVersion)
-            if (patch != null) {
-                matchesByPatchCounts[patch] = (matchesByPatchCounts[patch] ?: 0) + 1
-                if (match.info?.queueId == SOLO_QUEUE_ID) {
-                    soloQueueMatchesByPatch[patch] = (soloQueueMatchesByPatch[patch] ?: 0) + 1
-                }
-            }
-        }
-
-        val latestCachedPatch = soloQueueMatchesByPatch.keys.maxWithOrNull(patchComparator)
-            ?: matchesByPatchCounts.keys.maxWithOrNull(patchComparator)
+        val timelineKeySet = timelineKeys.toHashSet()
 
         val cleanTargetPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
-        val resolvedPatch = cleanTargetPatch ?: latestCachedPatch
-        val patchSelectionSource = when {
-            cleanTargetPatch != null -> "EXPLICIT_TARGET_PATCH"
-            latestCachedPatch != null -> "LATEST_CACHED_PATCH_IN_REDIS"
-            else -> "NO_CACHED_PATCH_FOUND"
-        }
+        val matchesByPatchCounts = mutableMapOf<String, Int>()
+        val soloQueueMatchesByPatch = mutableMapOf<String, Int>()
+        var cachedMatchCount = 0
+        var highestSoloPatchSeen: String? = null
 
         var soloQueue420MatchesOnTargetPatch = 0
         var excludedNonSoloQueueMatches = 0
@@ -393,172 +521,248 @@ class CohortBenchmarkService(
         val seenMatchPuuid = mutableSetOf<Pair<String, String>>()
         val candidateSamples = mutableListOf<ParticipantSample>()
 
-        for (match in cachedMatches) {
-            val info = match.info ?: continue
-            if (info.queueId != SOLO_QUEUE_ID) {
-                excludedNonSoloQueueMatches++
-                continue
-            }
-            val patch = extractMajorMinorPatch(info.gameVersion)
-            if (patch == null) {
-                excludedMissingGameVersionMatches++
-                continue
-            }
-            if (resolvedPatch != null && patch != resolvedPatch) {
-                excludedOtherPatchMatches++
-                continue
-            }
-            val durationSeconds = info.gameDuration ?: 0L
-            val isRemakeOrEarlySurrender = durationSeconds < MIN_GAME_DURATION_SECONDS ||
-                info.participants.any { it.gameEndedInEarlySurrender == true || it.teamEarlySurrendered == true }
-            if (isRemakeOrEarlySurrender) {
-                excludedShortOrRemakeMatches++
-                continue
-            }
+        for (chunk in matchKeys.chunked(MATCH_SCAN_CHUNK_SIZE)) {
+            val chunkMatches = redisCacheService.multiGet(chunk, MatchDto::class.java).values.filterNotNull()
+            cachedMatchCount += chunkMatches.size
 
-            val gameCreation = info.gameCreation ?: 0L
-            if (gameCreation <= 0L) {
-                excludedStaleOrUnboundedMatches++
-                continue
-            }
-            val matchPlayedAt = Instant.ofEpochMilli(gameCreation)
-            if (matchPlayedAt.isBefore(minMatchInstant) || matchPlayedAt.isAfter(maxFutureSkewInstant)) {
-                excludedStaleOrUnboundedMatches++
-                continue
-            }
+            for (match in chunkMatches) {
+                val info = match.info ?: continue
+                val patch = extractMajorMinorPatch(info.gameVersion)
+                if (patch != null) {
+                    matchesByPatchCounts[patch] = (matchesByPatchCounts[patch] ?: 0) + 1
+                    if (info.queueId == SOLO_QUEUE_ID) {
+                        soloQueueMatchesByPatch[patch] = (soloQueueMatchesByPatch[patch] ?: 0) + 1
+                    }
+                }
 
-            soloQueue420MatchesOnTargetPatch++
-            val matchId = match.metadata?.matchId?.takeIf { it.isNotBlank() }
-                ?: info.gameId?.let { "${normalizedRegion.uppercase()}_$it" }
-                ?: continue
-            val durationMinutes = durationSeconds.toDouble() / 60.0
-            val timeline = timelinesByMatchId[matchId]
-            val frameAt10m = findFrameAt10Minutes(timeline)
-
-            val teamKillsByTeamId = info.participants
-                .groupBy { it.teamId ?: 0 }
-                .mapValues { (_, plist) -> plist.sumOf { it.kills ?: 0 } }
-
-            for (participant in info.participants) {
-                val role = resolveNormalizedRole(participant)
-                if (role !in ELIGIBLE_ROLES) {
-                    excludedOtherRoleParticipants++
+                if (info.queueId != SOLO_QUEUE_ID) {
+                    excludedNonSoloQueueMatches++
                     continue
                 }
-                topMidBotParticipantCandidates++
-
-                val puuid = participant.puuid?.takeIf { it.isNotBlank() }
-                if (puuid == null) {
-                    participantsWithoutRankSnapshot++
+                if (patch == null) {
+                    excludedMissingGameVersionMatches++
                     continue
                 }
 
-                // Never invent or infer historical rank when a participant has no fresh timestamped rank snapshot
-                val rankSnapshot = rankSnapshotsByPuuid[puuid]
-                if (rankSnapshot == null) {
-                    participantsWithoutRankSnapshot++
-                    continue
-                }
-
-                // Bound match timestamp proximity to rank snapshot so current rank is never projected onto old games
-                val matchToSnapshotDistance = Duration.between(matchPlayedAt, rankSnapshot.snapshotAt).abs()
-                if (matchToSnapshotDistance > MAX_MATCH_TO_SNAPSHOT_SKEW) {
-                    excludedParticipantsOutsideSnapshotWindow++
-                    continue
-                }
-                participantsWithRankSnapshot++
-
-                val dedupeKey = matchId to puuid
-                if (!seenMatchPuuid.add(dedupeKey)) {
-                    deduplicatedParticipantEntries++
-                    continue
-                }
-
-                val participantFrame10m = findParticipantFrame(frameAt10m, participant, timeline)
-
-                // Strictly lane-only RAW CS at 10m (primary metric, never percentages, never includes jungle camps)
-                val laneCs10 = participant.challenges?.laneMinionsFirst10Minutes?.toDouble()
-                    ?: participantFrame10m?.minionsKilled?.toDouble()
-
-                // Strictly lane-only CS/min at end of game (totalMinionsKilled is lane minions only in Riot Match-v5)
-                val laneOnlyCsPerMin = participant.totalMinionsKilled?.let {
-                    if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null
-                }
-
-                // Separate pro-compatible total CS metrics: missing jungle counter MUST stay null (never default to 0)
-                val totalCsPerMinWithCamps = if (
-                    participant.totalMinionsKilled != null &&
-                    participant.neutralMinionsKilled != null &&
-                    durationMinutes > 0.0
-                ) {
-                    (participant.totalMinionsKilled + participant.neutralMinionsKilled).toDouble() / durationMinutes
+                val activePatch: String = if (cleanTargetPatch != null) {
+                    cleanTargetPatch
                 } else {
-                    null
+                    val prevBest = highestSoloPatchSeen
+                    if (prevBest == null) {
+                        highestSoloPatchSeen = patch
+                        patch
+                    } else {
+                        val cmp = patchComparator.compare(patch, prevBest)
+                        if (cmp > 0) {
+                            // Found a newer Solo Queue patch in stream: fold prior patch's 420 matches into excludedOtherPatchMatches
+                            // and discard prior patch's in-memory candidate samples so only the latest patch is retained.
+                            val priorPatchMatchCount = soloQueueMatchesByPatch[prevBest] ?: 0
+                            excludedOtherPatchMatches += priorPatchMatchCount
+                            soloQueue420MatchesOnTargetPatch = 0
+                            excludedShortOrRemakeMatches = 0
+                            excludedStaleOrUnboundedMatches = 0
+                            topMidBotParticipantCandidates = 0
+                            excludedOtherRoleParticipants = 0
+                            participantsWithRankSnapshot = 0
+                            participantsWithoutRankSnapshot = 0
+                            excludedParticipantsOutsideSnapshotWindow = 0
+                            deduplicatedParticipantEntries = 0
+                            seenMatchPuuid.clear()
+                            candidateSamples.clear()
+                            highestSoloPatchSeen = patch
+                            patch
+                        } else {
+                            prevBest
+                        }
+                    }
                 }
 
-                val timelineTotalCs10WithCamps = if (
-                    participantFrame10m?.minionsKilled != null &&
-                    participantFrame10m.jungleMinionsKilled != null
-                ) {
-                    (participantFrame10m.minionsKilled + participantFrame10m.jungleMinionsKilled).toDouble()
-                } else if (
-                    participant.challenges?.laneMinionsFirst10Minutes != null &&
-                    participant.challenges.jungleCsBefore10Minutes != null
-                ) {
-                    participant.challenges.laneMinionsFirst10Minutes.toDouble() +
-                        participant.challenges.jungleCsBefore10Minutes.toDouble()
-                } else {
-                    null
+                if (patch != activePatch) {
+                    excludedOtherPatchMatches++
+                    continue
                 }
 
-                val goldPerMin = participant.challenges?.goldPerMinute?.toDouble()
-                    ?: participant.goldEarned?.let { if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null }
+                val durationSeconds = info.gameDuration ?: 0L
+                val isRemakeOrEarlySurrender = durationSeconds < MIN_GAME_DURATION_SECONDS ||
+                    info.participants.any { it.gameEndedInEarlySurrender == true || it.teamEarlySurrendered == true }
+                if (isRemakeOrEarlySurrender) {
+                    excludedShortOrRemakeMatches++
+                    continue
+                }
 
-                val damagePerMin = participant.challenges?.damagePerMinute?.toDouble()
-                    ?: participant.totalDamageDealtToChampions?.let {
-                        if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null
+                val gameCreation = info.gameCreation ?: 0L
+                if (gameCreation <= 0L) {
+                    excludedStaleOrUnboundedMatches++
+                    continue
+                }
+                val matchPlayedAt = Instant.ofEpochMilli(gameCreation)
+                if (matchPlayedAt.isBefore(minMatchInstant) || matchPlayedAt.isAfter(maxFutureSkewInstant)) {
+                    excludedStaleOrUnboundedMatches++
+                    continue
+                }
+
+                soloQueue420MatchesOnTargetPatch++
+                val matchId = match.metadata?.matchId?.takeIf { it.isNotBlank() }
+                    ?: info.gameId?.let { "${normalizedRegion.uppercase()}_$it" }
+                    ?: continue
+                val durationMinutes = durationSeconds.toDouble() / 60.0
+                var lazyTimelineLoaded = false
+                var lazyTimeline: MatchTimelineDto? = null
+                var lazyFrameAt10m: TimelineFrameDto? = null
+
+                val teamKillsByTeamId = info.participants
+                    .groupBy { it.teamId ?: 0 }
+                    .mapValues { (_, plist) -> plist.sumOf { it.kills ?: 0 } }
+
+                for (participant in info.participants) {
+                    val role = resolveNormalizedRole(participant)
+                    if (role !in ELIGIBLE_ROLES) {
+                        excludedOtherRoleParticipants++
+                        continue
+                    }
+                    topMidBotParticipantCandidates++
+
+                    val puuid = participant.puuid?.takeIf { it.isNotBlank() }
+                    if (puuid == null) {
+                        participantsWithoutRankSnapshot++
+                        continue
                     }
 
-                val visionScorePerMin = participant.challenges?.visionScorePerMinute?.toDouble()
-                    ?: participant.visionScore?.let {
-                        if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null
+                    // Never invent or infer historical rank when a participant has no fresh timestamped rank snapshot
+                    val rankSnapshot = rankSnapshotsByPuuid[puuid]
+                    if (rankSnapshot == null) {
+                        participantsWithoutRankSnapshot++
+                        continue
                     }
 
-                val kp = participant.challenges?.killParticipation?.toDouble() ?: run {
-                    val teamKills = teamKillsByTeamId[participant.teamId ?: 0] ?: 0
-                    if (teamKills > 0 && participant.kills != null && participant.assists != null) {
-                        ((participant.kills + participant.assists).toDouble() / teamKills.toDouble()).coerceIn(0.0, 1.0)
+                    // Bound match timestamp proximity to rank snapshot so current rank is never projected onto old games
+                    val matchToSnapshotDistance = Duration.between(matchPlayedAt, rankSnapshot.snapshotAt).abs()
+                    if (matchToSnapshotDistance > MAX_MATCH_TO_SNAPSHOT_SKEW) {
+                        excludedParticipantsOutsideSnapshotWindow++
+                        continue
+                    }
+                    participantsWithRankSnapshot++
+
+                    val dedupeKey = matchId to puuid
+                    if (!seenMatchPuuid.add(dedupeKey)) {
+                        deduplicatedParticipantEntries++
+                        continue
+                    }
+
+                    val needsTimelineFallback = (
+                        participant.challenges?.laneMinionsFirst10Minutes == null ||
+                            participant.challenges.jungleCsBefore10Minutes == null
+                        ) && "timeline:$normalizedRegion:$matchId" in timelineKeySet
+
+                    if (needsTimelineFallback && !lazyTimelineLoaded) {
+                        lazyTimelineLoaded = true
+                        val tKey = "timeline:$normalizedRegion:$matchId"
+                        lazyTimeline = redisCacheService.get(tKey, MatchTimelineDto::class.java)
+                            ?: redisCacheService.multiGet(listOf(tKey), MatchTimelineDto::class.java)[tKey]
+                        lazyFrameAt10m = findFrameAt10Minutes(lazyTimeline)
+                    }
+
+                    val participantFrame10m = if (lazyFrameAt10m != null) {
+                        findParticipantFrame(lazyFrameAt10m, participant, lazyTimeline)
                     } else {
                         null
                     }
-                }
 
-                val deathsPerGame = participant.deaths?.toDouble()
-                val timeSpentDeadShare = participant.totalTimeSpentDead?.let { deadSec ->
-                    if (durationSeconds > 0L) (deadSec.toDouble() / durationSeconds.toDouble()).coerceIn(0.0, 1.0) else null
-                }
+                    // Strictly lane-only RAW CS at 10m (primary metric, never percentages, never includes jungle camps)
+                    val laneCs10 = participant.challenges?.laneMinionsFirst10Minutes?.toDouble()
+                        ?: participantFrame10m?.minionsKilled?.toDouble()
 
-                candidateSamples.add(
-                    ParticipantSample(
-                        matchId = matchId,
-                        puuid = puuid,
-                        tier = rankSnapshot.tier,
-                        role = role,
-                        gameCreation = gameCreation,
-                        rankSnapshotAt = rankSnapshot.snapshotAt,
-                        laneCsAt10 = laneCs10,
-                        laneOnlyCsPerMin = laneOnlyCsPerMin,
-                        totalCsPerMinWithCamps = totalCsPerMinWithCamps,
-                        timelineTotalCsAt10WithCamps = timelineTotalCs10WithCamps,
-                        goldPerMin = goldPerMin,
-                        damagePerMin = damagePerMin,
-                        visionScorePerMin = visionScorePerMin,
-                        killParticipation = kp,
-                        deathsPerGame = deathsPerGame,
-                        timeSpentDeadShare = timeSpentDeadShare
-                    )
-                )
+                    // Strictly lane-only CS/min at end of game (totalMinionsKilled is lane minions only in Riot Match-v5)
+                    val laneOnlyCsPerMin = participant.totalMinionsKilled?.let {
+                        if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null
+                    }
+
+                    // Separate pro-compatible total CS metrics: missing jungle counter MUST stay null (never default to 0)
+                    val totalCsPerMinWithCamps = if (
+                        participant.totalMinionsKilled != null &&
+                        participant.neutralMinionsKilled != null &&
+                        durationMinutes > 0.0
+                    ) {
+                        (participant.totalMinionsKilled + participant.neutralMinionsKilled).toDouble() / durationMinutes
+                    } else {
+                        null
+                    }
+
+                    val timelineTotalCs10WithCamps = if (
+                        participantFrame10m?.minionsKilled != null &&
+                        participantFrame10m.jungleMinionsKilled != null
+                    ) {
+                        (participantFrame10m.minionsKilled + participantFrame10m.jungleMinionsKilled).toDouble()
+                    } else if (
+                        participant.challenges?.laneMinionsFirst10Minutes != null &&
+                        participant.challenges.jungleCsBefore10Minutes != null
+                    ) {
+                        participant.challenges.laneMinionsFirst10Minutes.toDouble() +
+                            participant.challenges.jungleCsBefore10Minutes.toDouble()
+                    } else {
+                        null
+                    }
+
+                    val goldPerMin = participant.challenges?.goldPerMinute?.toDouble()
+                        ?: participant.goldEarned?.let { if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null }
+
+                    val damagePerMin = participant.challenges?.damagePerMinute?.toDouble()
+                        ?: participant.totalDamageDealtToChampions?.let {
+                            if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null
+                        }
+
+                    val visionScorePerMin = participant.challenges?.visionScorePerMinute?.toDouble()
+                        ?: participant.visionScore?.let {
+                            if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null
+                        }
+
+                    val kp = participant.challenges?.killParticipation?.toDouble() ?: run {
+                        val teamKills = teamKillsByTeamId[participant.teamId ?: 0] ?: 0
+                        if (teamKills > 0 && participant.kills != null && participant.assists != null) {
+                            ((participant.kills + participant.assists).toDouble() / teamKills.toDouble()).coerceIn(0.0, 1.0)
+                        } else {
+                            null
+                        }
+                    }
+
+                    val deathsPerGame = participant.deaths?.toDouble()
+                    val timeSpentDeadShare = participant.totalTimeSpentDead?.let { deadSec ->
+                        if (durationSeconds > 0L) (deadSec.toDouble() / durationSeconds.toDouble()).coerceIn(0.0, 1.0) else null
+                    }
+
+                    if (candidateSamples.size < MAX_IN_MEMORY_PARTICIPANT_SAMPLES) {
+                        candidateSamples.add(
+                            ParticipantSample(
+                                matchId = matchId,
+                                puuid = puuid,
+                                tier = rankSnapshot.tier,
+                                role = role,
+                                gameCreation = gameCreation,
+                                rankSnapshotAt = rankSnapshot.snapshotAt,
+                                laneCsAt10 = laneCs10,
+                                laneOnlyCsPerMin = laneOnlyCsPerMin,
+                                totalCsPerMinWithCamps = totalCsPerMinWithCamps,
+                                timelineTotalCsAt10WithCamps = timelineTotalCs10WithCamps,
+                                goldPerMin = goldPerMin,
+                                damagePerMin = damagePerMin,
+                                visionScorePerMin = visionScorePerMin,
+                                killParticipation = kp,
+                                deathsPerGame = deathsPerGame,
+                                timeSpentDeadShare = timeSpentDeadShare
+                            )
+                        )
+                    }
+                }
             }
+        }
+
+        val latestCachedPatch = soloQueueMatchesByPatch.keys.maxWithOrNull(patchComparator)
+            ?: matchesByPatchCounts.keys.maxWithOrNull(patchComparator)
+        val resolvedPatch = cleanTargetPatch ?: latestCachedPatch
+        val patchSelectionSource = when {
+            cleanTargetPatch != null -> "EXPLICIT_TARGET_PATCH"
+            latestCachedPatch != null -> "LATEST_CACHED_PATCH_IN_REDIS"
+            else -> "NO_CACHED_PATCH_FOUND"
         }
 
         // 3. Group by (tier, role), enforce per-player game cap (newest games first), and compute P25/Median/P75/IQR
@@ -629,7 +833,7 @@ class CohortBenchmarkService(
                 ),
                 totalCsPerMinWithCamps = buildDistribution(
                     metricKey = "totalCsPerMinWithCamps",
-                    unit = "total_cs_per_min_including_camps",
+                    unit = "total_cs_per_min",
                     includesJungleCamps = true,
                     theoreticalSupplyCeiling = null,
                     samples = retainedSamples,
@@ -637,7 +841,7 @@ class CohortBenchmarkService(
                 ),
                 timelineTotalCsAt10WithCamps = buildDistribution(
                     metricKey = "timelineTotalCsAt10WithCamps",
-                    unit = "total_cs_at_10m_including_camps",
+                    unit = "total_cs",
                     includesJungleCamps = true,
                     theoreticalSupplyCeiling = null,
                     samples = retainedSamples,
@@ -737,8 +941,8 @@ class CohortBenchmarkService(
             cachedChallengerLeaderboardPlayers = challengerLeaderboardPlayers,
             totalDistinctRankedPlayersInCache = rankSnapshotsByPuuid.size,
             ranksByTier = ranksByTier,
-            cachedMatchCount = cachedMatches.size,
-            cachedTimelineCount = timelinesByMatchId.size,
+            cachedMatchCount = cachedMatchCount,
+            cachedTimelineCount = timelineKeys.size,
             matchesByPatch = matchesByPatchCounts.toSortedMap(patchComparator.reversed()),
             latestCachedPatch = latestCachedPatch,
             selectedTargetPatch = resolvedPatch,
@@ -766,10 +970,11 @@ class CohortBenchmarkService(
             region = normalizedRegion,
             networkCollectionEnabled = networkCollectionEnabled
         )
+        val memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
 
         val midCeilingForPatch = theoreticalLaneMinionSupplyAt10(resolvedPatch, "MIDDLE")
         val methodologyNotes = listOf(
-            "Bounded cache-only extraction scans at most $MAX_SCAN_KEYS_PER_NAMESPACE Redis keys per namespace for region '$normalizedRegion' with zero Riot API requests.",
+            "Bounded streaming cache-only extraction scans at most $MAX_SCAN_KEYS_PER_NAMESPACE Redis keys per namespace in small chunks (profiles=$PROFILE_SCAN_CHUNK_SIZE, snapshots=$SNAPSHOT_SCAN_CHUNK_SIZE, matches=$MATCH_SCAN_CHUNK_SIZE) for region '$normalizedRegion' with zero Riot API requests and zero full-list DTO accumulation.",
             "Only Ranked Solo (queueId=420) matches on selected patch '${resolvedPatch ?: "NONE"}' (source=$patchSelectionSource, latestCachedPatch=${latestCachedPatch ?: "NONE"}) with duration >= 600s and roles TOP, MIDDLE, BOTTOM are included; when inferred from cache, this reflects the latest cached patch in Redis rather than an unverified live Riot patch.",
             "Rank assignment strictly requires a fresh timestamped current-rank snapshot (age <= ${MAX_RANK_SNAPSHOT_AGE.toHours()}h) and recent match timestamp within ${MAX_MATCH_TO_SNAPSHOT_SKEW.toHours()}h of the snapshot (match age <= ${MAX_MATCH_AGE.toHours()}h); historical rank is never invented or projected onto distant games.",
             "Samples are deduplicated by (matchId, puuid) and capped at maxGamesPerPlayer=$effectiveCap newest games per player per (tier, role) cell.",
@@ -782,6 +987,7 @@ class CohortBenchmarkService(
             reportSource = "FRESH_BOUNDED_EXTRACTION",
             inventory = inventory,
             rateLimitVerification = rateLimitVerification,
+            memoryHeadroom = memoryHeadroom,
             cells = computedCells,
             methodologyNotes = methodologyNotes
         )
@@ -817,7 +1023,8 @@ class CohortBenchmarkService(
      *
      * Refuses to execute unless:
      * 1. `cohort.network-collection.enabled=true` is explicitly configured, AND
-     * 2. Actual Riot `X-App-Rate-Limit` and `X-Method-Rate-Limit` headers have been verified on [region]
+     * 2. Memory headroom is below `maxMemoryUtilizationRatio` (with `>= minFreeMemoryBytes` free), AND
+     * 3. Actual Riot `X-App-Rate-Limit` and `X-Method-Rate-Limit` headers have been verified on [region]
      *    with sufficient headroom, no active `429 Retry-After` / `service` window, and no active `HIGH`-priority user requests.
      */
     suspend fun runGuardedLowPriorityCollectionStep(
@@ -841,6 +1048,18 @@ class CohortBenchmarkService(
             )
         }
 
+        val memSnap = getMemoryHeadroomSnapshot()
+        if (!memSnap.hasHeadroomForLowPriority) {
+            return mapOf(
+                "executed" to false,
+                "reason" to "PAUSED_MEMORY_HEADROOM",
+                "region" to normalizedRegion,
+                "effectiveUtilizationRatio" to memSnap.effectiveUtilizationRatio,
+                "estimatedFreeHeadroomBytes" to memSnap.estimatedFreeHeadroomBytes,
+                "fetchedMatches" to 0
+            )
+        }
+
         if (!verification.readyForLowPriorityNetworkCollection) {
             return mapOf(
                 "executed" to false,
@@ -859,6 +1078,10 @@ class CohortBenchmarkService(
 
         var fetchedMatches = 0
         for (puuid in candidatePuuids.distinct()) {
+            if (!getMemoryHeadroomSnapshot().hasHeadroomForLowPriority) {
+                logger.info("Low-priority cohort worker pausing on {}: memory headroom near cap", normalizedRegion)
+                break
+            }
             riotApiRateLimiter.awaitLowPriorityClearance(normalizedRegion)
             val nowVerify = riotApiRateLimiter.getVerificationSnapshot(normalizedRegion, networkCollectionEnabled)
             if (!nowVerify.readyForLowPriorityNetworkCollection) {
@@ -878,6 +1101,10 @@ class CohortBenchmarkService(
                 val matchKey = "match:$normalizedRegion:$matchId"
                 if (redisCacheService.get(matchKey, MatchDto::class.java) != null) {
                     continue
+                }
+                if (!getMemoryHeadroomSnapshot().hasHeadroomForLowPriority) {
+                    logger.info("Low-priority cohort worker pausing before match fetch on {}: memory headroom near cap", normalizedRegion)
+                    break
                 }
                 riotApiRateLimiter.awaitLowPriorityClearance(normalizedRegion)
                 val matchVerify = riotApiRateLimiter.getVerificationSnapshot(normalizedRegion, networkCollectionEnabled)
@@ -905,12 +1132,14 @@ class CohortBenchmarkService(
      * capped at `10` games/player per `(tier, role)` cell, with quality gate `50` players + `200` games per cell.
      *
      * Strictly enforces:
-     * - Cache-only inventory & checkpoint initialization first.
+     * - 512MB container memory headroom safety gate (`PAUSED_MEMORY_HEADROOM`) before bulk scans, before each player,
+     *   and before each match fetch.
+     * - Bounded streaming cache-only inventory & checkpoint initialization first.
      * - Network calls start ONLY when `cohort.network-collection.enabled=true` AND actual App + Method
      *   rate-limit headers and headroom are verified, with no active `429 Retry-After` / `service` backoff
      *   and no active/recent foreground user request (`foregroundYieldActive == false`).
      * - Persists resumable checkpoint state in Redis (`cohort:collector:checkpoint:{region}:{patch}`) after each player
-     *   and immediately on any yield/backoff/headroom pause.
+     *   and immediately on any yield/backoff/headroom/memory pause.
      */
     suspend fun runResumableLowPriorityCollectorBatch(
         region: String = "euw1",
@@ -924,36 +1153,76 @@ class CohortBenchmarkService(
         val effectiveCap = maxGamesPerPlayer.coerceIn(1, CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER)
         val effectiveBatchLimit = maxPlayersPerBatch.coerceIn(1, 200)
         val nowInstant = Instant.ofEpochMilli(timeProvider.now())
+        val cleanRequestedPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
 
-        // 1. Always run bounded cache-only extraction first to establish baseline cell coverage and current patch
-        val initialReport = extractCachedCohortsAndReport(
-            region = normalizedRegion,
-            targetPatch = targetPatch,
-            maxGamesPerPlayer = effectiveCap
-        )
-        var effectivePatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
-            ?: initialReport.inventory.selectedTargetPatch
-        val patchSource = initialReport.inventory.patchSelectionSource
+        val existingCheckpoint = getCollectorCheckpoint(normalizedRegion, cleanRequestedPatch)
+            ?: if (cleanRequestedPatch != null) getCollectorCheckpoint(normalizedRegion, null) else null
 
-        val existingCheckpoint = getCollectorCheckpoint(normalizedRegion, effectivePatch)
-            ?: if (effectivePatch != null) getCollectorCheckpoint(normalizedRegion, null) else null
+        // Pre-scan memory safety check: if memory is near the 512MB cap, yield BEFORE scanning Redis or making network calls!
+        val preScanMem = getMemoryHeadroomSnapshot()
+        if (!preScanMem.hasHeadroomForLowPriority) {
+            val pausedCheckpoint = (existingCheckpoint ?: CohortCollectorCheckpointDto(
+                region = normalizedRegion,
+                targetPatch = cleanRequestedPatch,
+                patchSelectionSource = if (cleanRequestedPatch != null) "EXPLICIT_TARGET_PATCH" else "DEFERRED_MEMORY_HEADROOM",
+                maxGamesPerPlayerCap = effectiveCap,
+                cellProgress = buildAllTargetCellProgress(emptyList()),
+                startedAt = nowInstant,
+                updatedAt = nowInstant
+            )).let { base ->
+                base.copy(
+                    pausedForMemoryHeadroomCount = base.pausedForMemoryHeadroomCount + 1,
+                    lastStopReason = "PAUSED_MEMORY_HEADROOM",
+                    updatedAt = Instant.ofEpochMilli(timeProvider.now())
+                )
+            }
+            saveCollectorCheckpoint(pausedCheckpoint)
+            return pausedCheckpoint
+        }
 
-        val processedPuuids = existingCheckpoint?.processedPuuids?.toMutableSet() ?: mutableSetOf()
-        val processedMatchIds = existingCheckpoint?.processedMatchIds?.toMutableSet() ?: mutableSetOf()
+        // 1. Run bounded streaming cache-only extraction when initializing a new checkpoint or when no cell progress exists yet
+        val initialReport = if (existingCheckpoint == null || existingCheckpoint.cellProgress.isEmpty()) {
+            extractCachedCohortsAndReport(
+                region = normalizedRegion,
+                targetPatch = cleanRequestedPatch,
+                maxGamesPerPlayer = effectiveCap
+            )
+        } else {
+            null
+        }
+        var effectivePatch = cleanRequestedPatch
+            ?: existingCheckpoint?.targetPatch
+            ?: initialReport?.inventory?.selectedTargetPatch
+        val patchSource = existingCheckpoint?.patchSelectionSource
+            ?: initialReport?.inventory?.patchSelectionSource
+            ?: if (cleanRequestedPatch != null) "EXPLICIT_TARGET_PATCH" else "NO_CACHED_PATCH_FOUND"
+
+        val processedPuuids = existingCheckpoint?.processedPuuids?.take(MAX_CHECKPOINT_PROCESSED_PUUIDS)?.toMutableSet() ?: mutableSetOf()
+        val processedMatchIds = existingCheckpoint?.processedMatchIds?.take(MAX_CHECKPOINT_PROCESSED_MATCH_IDS)?.toMutableSet() ?: mutableSetOf()
         val playerCellGameCounts = existingCheckpoint?.playerCellGameCounts?.toMutableMap() ?: mutableMapOf()
         val pendingQueue = LinkedHashSet<String>()
-        seedPuuids.map { it.trim() }.filter { it.isNotBlank() && it !in processedPuuids }.forEach { pendingQueue.add(it) }
-        existingCheckpoint?.pendingCandidatePuuids?.filter { it !in processedPuuids }?.forEach { pendingQueue.add(it) }
+        seedPuuids.map { it.trim() }.filter { it.isNotBlank() && it !in processedPuuids }.forEach {
+            if (pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) pendingQueue.add(it)
+        }
+        existingCheckpoint?.pendingCandidatePuuids?.filter { it !in processedPuuids }?.forEach {
+            if (pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) pendingQueue.add(it)
+        }
 
-        // Seed additional candidates from cached profiles, rank snapshots, and cached match participants
-        val discoveredFromCache = discoverCandidatePuuidsFromCache(normalizedRegion, effectivePatch)
-        for (candidate in discoveredFromCache) {
-            if (candidate !in processedPuuids && pendingQueue.size < 1_000) {
-                pendingQueue.add(candidate)
+        // Seed additional candidates from cache only when pendingQueue needs replenishment
+        if (pendingQueue.size < effectiveBatchLimit * 2 && getMemoryHeadroomSnapshot().hasHeadroomForLowPriority) {
+            val discoveredFromCache = discoverCandidatePuuidsFromCache(normalizedRegion, effectivePatch)
+            for (candidate in discoveredFromCache) {
+                if (candidate !in processedPuuids && pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
+                    pendingQueue.add(candidate)
+                }
             }
         }
 
-        var cellProgress = buildAllTargetCellProgress(initialReport.cells)
+        var cellProgress = if (initialReport != null) {
+            buildAllTargetCellProgress(initialReport.cells)
+        } else {
+            existingCheckpoint?.cellProgress ?: buildAllTargetCellProgress(emptyList())
+        }
         var cellsPassing = cellProgress.values.count { it.passesQualityGate }
         val startedAt = existingCheckpoint?.startedAt ?: nowInstant
         var totalNetworkCalls = existingCheckpoint?.totalNetworkCallsMade ?: 0
@@ -963,6 +1232,7 @@ class CohortBenchmarkService(
         var yieldedToForeground = existingCheckpoint?.yieldedToForegroundCount ?: 0
         var pausedForRetryAfter = existingCheckpoint?.pausedForRetryAfterCount ?: 0
         var pausedForHeadroom = existingCheckpoint?.pausedForHeadroomCount ?: 0
+        var pausedForMemoryHeadroom = existingCheckpoint?.pausedForMemoryHeadroomCount ?: 0
 
         fun buildCurrentCheckpoint(stopReason: String): CohortCollectorCheckpointDto {
             return CohortCollectorCheckpointDto(
@@ -974,9 +1244,9 @@ class CohortBenchmarkService(
                 maxGamesPerPlayerCap = effectiveCap,
                 targetPlayersPerCell = CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE,
                 targetGamesPerCell = CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE,
-                processedPuuids = processedPuuids.toSet(),
-                pendingCandidatePuuids = pendingQueue.filter { it !in processedPuuids }.take(1_000),
-                processedMatchIds = processedMatchIds.toSet(),
+                processedPuuids = processedPuuids.take(MAX_CHECKPOINT_PROCESSED_PUUIDS).toSet(),
+                pendingCandidatePuuids = pendingQueue.filter { it !in processedPuuids }.take(MAX_CHECKPOINT_PENDING_PUUIDS),
+                processedMatchIds = processedMatchIds.take(MAX_CHECKPOINT_PROCESSED_MATCH_IDS).toSet(),
                 playerCellGameCounts = playerCellGameCounts.toMap(),
                 cellProgress = cellProgress,
                 cellsPassingQualityGate = cellsPassing,
@@ -988,6 +1258,7 @@ class CohortBenchmarkService(
                 yieldedToForegroundCount = yieldedToForeground,
                 pausedForRetryAfterCount = pausedForRetryAfter,
                 pausedForHeadroomCount = pausedForHeadroom,
+                pausedForMemoryHeadroomCount = pausedForMemoryHeadroom,
                 lastStopReason = stopReason,
                 startedAt = startedAt,
                 updatedAt = Instant.ofEpochMilli(timeProvider.now())
@@ -1014,10 +1285,15 @@ class CohortBenchmarkService(
             return disabledCheckpoint
         }
 
-        // 4. Enforce actual App + Method + Service rate-limit header & headroom verification before starting network calls
+        // 4. Enforce Memory Headroom + Actual App + Method + Service rate-limit header & headroom verification
         fun evaluateLivePauseReason(requiredEndpoint: String? = null): String? {
             if (shouldStop()) {
                 return "STOPPED_BY_OPERATOR"
+            }
+            val memSnap = getMemoryHeadroomSnapshot()
+            if (!memSnap.hasHeadroomForLowPriority) {
+                pausedForMemoryHeadroom++
+                return "PAUSED_MEMORY_HEADROOM"
             }
             val reqSet = if (requiredEndpoint != null) setOf(requiredEndpoint) else emptySet()
             val snap = riotApiRateLimiter.getVerificationSnapshot(
@@ -1114,7 +1390,7 @@ class CohortBenchmarkService(
                     playerTier = fetchedTier
                 } else {
                     // Unranked in Solo Queue; mark processed and checkpoint
-                    processedPuuids.add(puuid)
+                    if (processedPuuids.size < MAX_CHECKPOINT_PROCESSED_PUUIDS) processedPuuids.add(puuid)
                     pendingQueue.remove(puuid)
                     playersProcessedThisBatch++
                     saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
@@ -1131,7 +1407,7 @@ class CohortBenchmarkService(
                 !passes && playerGames < effectiveCap
             }
             if (underfilledRolesForTier.isEmpty()) {
-                processedPuuids.add(puuid)
+                if (processedPuuids.size < MAX_CHECKPOINT_PROCESSED_PUUIDS) processedPuuids.add(puuid)
                 pendingQueue.remove(puuid)
                 playersProcessedThisBatch++
                 saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
@@ -1211,7 +1487,9 @@ class CohortBenchmarkService(
                         fetchedMatches++
                     }
                 }
-                processedMatchIds.add(matchId)
+                if (processedMatchIds.size < MAX_CHECKPOINT_PROCESSED_MATCH_IDS) {
+                    processedMatchIds.add(matchId)
+                }
                 val info = match?.info ?: continue@matchLoop
                 val matchPatch = extractMajorMinorPatch(info.gameVersion)
                 if (effectivePatch == null && matchPatch != null) {
@@ -1232,7 +1510,7 @@ class CohortBenchmarkService(
                     val role = resolveNormalizedRole(participant)
                     if (role !in ELIGIBLE_ROLES) continue
                     val pPuuid = participant.puuid?.takeIf { it.isNotBlank() } ?: continue
-                    if (pPuuid !in processedPuuids && pendingQueue.size < 1_000) {
+                    if (pPuuid !in processedPuuids && pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
                         pendingQueue.add(pPuuid)
                     }
                     if (pPuuid == puuid) {
@@ -1245,23 +1523,29 @@ class CohortBenchmarkService(
                 }
             }
 
-            processedPuuids.add(puuid)
+            if (processedPuuids.size < MAX_CHECKPOINT_PROCESSED_PUUIDS) {
+                processedPuuids.add(puuid)
+            }
             pendingQueue.remove(puuid)
             playersProcessedThisBatch++
             saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
         }
 
-        // 6. Re-extract from cache to update persisted de-identified cells and cellProgress
-        val updatedReport = extractCachedCohortsAndReport(
-            region = normalizedRegion,
-            targetPatch = effectivePatch,
-            maxGamesPerPlayer = effectiveCap
-        )
-        if (effectivePatch == null) {
-            effectivePatch = updatedReport.inventory.selectedTargetPatch
+        // 6. Re-extract from cache only when new players/matches were processed and memory headroom is healthy
+        if ((playersProcessedThisBatch > 0 || fetchedMatches > (existingCheckpoint?.fetchedMatches ?: 0)) &&
+            getMemoryHeadroomSnapshot().hasHeadroomForLowPriority
+        ) {
+            val updatedReport = extractCachedCohortsAndReport(
+                region = normalizedRegion,
+                targetPatch = effectivePatch,
+                maxGamesPerPlayer = effectiveCap
+            )
+            if (effectivePatch == null) {
+                effectivePatch = updatedReport.inventory.selectedTargetPatch
+            }
+            cellProgress = buildAllTargetCellProgress(updatedReport.cells)
+            cellsPassing = cellProgress.values.count { it.passesQualityGate }
         }
-        cellProgress = buildAllTargetCellProgress(updatedReport.cells)
-        cellsPassing = cellProgress.values.count { it.passesQualityGate }
 
         if (cellsPassing >= TIER_ORDER.size * ELIGIBLE_ROLES.size) {
             stopReason = "ALL_TARGET_CELLS_SATISFIED"
@@ -1324,8 +1608,9 @@ class CohortBenchmarkService(
      *   (`league-v4-entries-by-puuid`, `match-v5-ids-by-puuid`, `match-v5-match-by-id` -> max 3 HTTP attempts total;
      *   0 HTTP attempts for any endpoint already verified in [RiotApiRateLimiter]).
      * - Immediately stops on the first `429 TooManyRequests` honoring `Retry-After` (with zero hidden retries),
-     *   or aborts before any call if foreground user traffic is active (`foregroundYieldActive` / `activeUserRequests > 0`),
-     *   if a `429 Retry-After` / `service` backoff is active, or if verified buckets lack LOW-priority headroom.
+     *   or aborts before any call if memory headroom is near cap (`PAUSED_MEMORY_HEADROOM`), if foreground user traffic
+     *   is active (`foregroundYieldActive` / `activeUserRequests > 0`), if a `429 Retry-After` / `service` backoff is active,
+     *   or if verified buckets lack LOW-priority headroom.
      * - Reports actual HTTP attempts (`totalHttpAttemptsMade` and `httpAttemptsByEndpoint`) separately from wrapper calls.
      */
     suspend fun runBoundedDiagnosticRateLimitProbe(
@@ -1352,7 +1637,42 @@ class CohortBenchmarkService(
                 stoppedOnRateLimit429 = false,
                 probedAt = nowInstant,
                 rateLimitVerification = getLiveRateLimitVerification(normalizedRegion),
+                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
                 notes = listOf("Invalid region or patch format; zero Redis or Riot HTTP attempts executed.")
+            )
+        }
+
+        // Pre-probe memory safety gate: refuse to scan or probe if memory is near the 512MB container cap
+        val initialMemSnap = getMemoryHeadroomSnapshot()
+        if (!initialMemSnap.hasHeadroomForLowPriority) {
+            val existingCp = getCollectorCheckpoint(normalizedRegion, cleanPatch)
+                ?: if (cleanPatch != null) getCollectorCheckpoint(normalizedRegion, null) else null
+            val memPausedCp = existingCp?.copy(
+                pausedForMemoryHeadroomCount = existingCp.pausedForMemoryHeadroomCount + 1,
+                lastStopReason = "PAUSED_MEMORY_HEADROOM",
+                updatedAt = Instant.ofEpochMilli(timeProvider.now())
+            )
+            if (memPausedCp != null) {
+                saveCollectorCheckpoint(memPausedCp)
+            }
+            return CohortRateLimitProbeResultDto(
+                region = normalizedRegion,
+                probeStatus = "PAUSED_MEMORY_HEADROOM",
+                maxCallsPerEndpoint = 1,
+                maxHttpAttemptsPerEndpoint = 1,
+                maxRetriesConfigured = 0,
+                totalProbeCallsMade = 0,
+                totalHttpAttemptsMade = 0,
+                httpAttemptsByEndpoint = zeroAttemptsMap,
+                stoppedOnRateLimit429 = false,
+                endpointOutcomes = REQUIRED_COLLECTOR_ENDPOINTS.associateWith { "PAUSED_MEMORY_HEADROOM" },
+                probedAt = Instant.ofEpochMilli(timeProvider.now()),
+                rateLimitVerification = getLiveRateLimitVerification(normalizedRegion),
+                memoryHeadroom = initialMemSnap,
+                checkpoint = memPausedCp,
+                notes = listOf(
+                    "Memory headroom safety gate triggered (effectiveUtilizationRatio=${initialMemSnap.effectiveUtilizationRatio} >= ${initialMemSnap.maxAllowedUtilizationRatio} or free=${initialMemSnap.estimatedFreeHeadroomBytes} < ${initialMemSnap.minRequiredFreeBytes}); 0 HTTP attempts made."
+                )
             )
         }
 
@@ -1366,7 +1686,7 @@ class CohortBenchmarkService(
                 maxGamesPerPlayer = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
             )
             val effectivePatch = cleanPatch ?: report.inventory.selectedTargetPatch
-            val candidates = discoverCandidatePuuidsFromCache(normalizedRegion, effectivePatch).take(1_000)
+            val candidates = discoverCandidatePuuidsFromCache(normalizedRegion, effectivePatch).take(MAX_CHECKPOINT_PENDING_PUUIDS)
             val cellProgress = buildAllTargetCellProgress(report.cells)
             checkpoint = CohortCollectorCheckpointDto(
                 region = normalizedRegion,
@@ -1411,6 +1731,7 @@ class CohortBenchmarkService(
                 endpointOutcomes = REQUIRED_COLLECTOR_ENDPOINTS.associateWith { "SKIPPED_ALREADY_VERIFIED" },
                 probedAt = Instant.ofEpochMilli(timeProvider.now()),
                 rateLimitVerification = preSnap,
+                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
                 checkpoint = checkpoint,
                 notes = listOf(
                     "All required App and Method rate-limit headers are already verified in-process; 0 Riot HTTP attempts made."
@@ -1440,6 +1761,7 @@ class CohortBenchmarkService(
                 endpointOutcomes = REQUIRED_COLLECTOR_ENDPOINTS.associateWith { "SKIPPED_NO_SEED_PUUID" },
                 probedAt = Instant.ofEpochMilli(timeProvider.now()),
                 rateLimitVerification = preSnap,
+                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
                 checkpoint = checkpoint,
                 notes = listOf(
                     "No cached PUUID found in Challenger leaderboard, profiles, rank snapshots, or matches for '$normalizedRegion'; 0 Riot HTTP attempts made."
@@ -1448,6 +1770,9 @@ class CohortBenchmarkService(
         }
 
         fun evaluateProbePauseReason(): String? {
+            if (!getMemoryHeadroomSnapshot().hasHeadroomForLowPriority) {
+                return "PAUSED_MEMORY_HEADROOM"
+            }
             val snap = getLiveRateLimitVerification(normalizedRegion)
             if (snap.foregroundYieldActive || snap.activeUserRequests > 0) {
                 return "PAUSED_FOREGROUND_USER_REQUEST"
@@ -1660,6 +1985,7 @@ class CohortBenchmarkService(
         }
 
         val finalSnap = getLiveRateLimitVerification(normalizedRegion)
+        val finalMemSnap = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
         val finalStatus = when {
             abortedReason != null -> abortedReason
             finalSnap.appLimitsVerifiedFromHeaders && finalSnap.missingRequiredMethodEndpoints.isEmpty() ->
@@ -1670,7 +1996,12 @@ class CohortBenchmarkService(
         val updatedCheckpoint = checkpoint.copy(
             totalNetworkCallsMade = checkpoint.totalNetworkCallsMade + totalHttpAttempts,
             pausedForRetryAfterCount = checkpoint.pausedForRetryAfterCount + if (stoppedOn429) 1 else 0,
-            lastStopReason = if (stoppedOn429) "PAUSED_RETRY_AFTER_BACKOFF" else checkpoint.lastStopReason,
+            pausedForMemoryHeadroomCount = checkpoint.pausedForMemoryHeadroomCount + if (abortedReason == "PAUSED_MEMORY_HEADROOM") 1 else 0,
+            lastStopReason = when {
+                stoppedOn429 -> "PAUSED_RETRY_AFTER_BACKOFF"
+                abortedReason == "PAUSED_MEMORY_HEADROOM" -> "PAUSED_MEMORY_HEADROOM"
+                else -> checkpoint.lastStopReason
+            },
             updatedAt = Instant.ofEpochMilli(timeProvider.now())
         )
         saveCollectorCheckpoint(updatedCheckpoint)
@@ -1691,6 +2022,7 @@ class CohortBenchmarkService(
             endpointOutcomes = outcomes,
             probedAt = Instant.ofEpochMilli(timeProvider.now()),
             rateLimitVerification = finalSnap,
+            memoryHeadroom = finalMemSnap,
             checkpoint = updatedCheckpoint,
             notes = listOf(
                 "Bounded diagnostic probe executed in-process with maxRetries=0 (max 1 actual HTTP attempt per required endpoint, wrapperCalls=$callsMade, totalHttpAttempts=$totalHttpAttempts, stoppedOn429=$stoppedOn429).",
@@ -1829,34 +2161,37 @@ class CohortBenchmarkService(
             val cachedLb = redisCacheService.get(lbKey, CachedLeaderboardDto::class.java) ?: continue
             for (entry in cachedLb.leaderboard?.entries.orEmpty()) {
                 val pid = entry.puuid?.trim()?.takeIf { it.isNotBlank() } ?: continue
-                if (discovered.size < 1_000) discovered.add(pid)
+                if (discovered.size < MAX_CHECKPOINT_PENDING_PUUIDS) discovered.add(pid)
             }
         }
-        val profileKeys = redisCacheService.scanKeys("player:profile:$region:*", maxKeys = 500)
+        val profileKeys = redisCacheService.scanKeys("player:profile:$region:*", maxKeys = MAX_SCAN_KEYS_PER_NAMESPACE)
         for (key in profileKeys) {
             val puuid = key.substringAfterLast(":").trim()
-            if (puuid.isNotBlank() && discovered.size < 1_000) discovered.add(puuid)
+            if (puuid.isNotBlank() && discovered.size < MAX_CHECKPOINT_PENDING_PUUIDS) discovered.add(puuid)
         }
-        val snapKeys = redisCacheService.scanKeys("cohort:rank:snapshot:$region:*", maxKeys = 500)
+        val snapKeys = redisCacheService.scanKeys("cohort:rank:snapshot:$region:*", maxKeys = MAX_SCAN_KEYS_PER_NAMESPACE)
         for (key in snapKeys) {
             val puuid = key.substringAfterLast(":").trim()
-            if (puuid.isNotBlank() && discovered.size < 1_000) discovered.add(puuid)
+            if (puuid.isNotBlank() && discovered.size < MAX_CHECKPOINT_PENDING_PUUIDS) discovered.add(puuid)
         }
-        val matchKeys = redisCacheService.scanKeys("match:$region:*", maxKeys = 500)
-        if (matchKeys.isNotEmpty()) {
-            val matches = matchKeys.chunked(100).flatMap { chunk ->
-                redisCacheService.multiGet(chunk, MatchDto::class.java).values.filterNotNull()
-            }
-            for (m in matches) {
-                val info = m.info ?: continue
-                if (info.queueId != SOLO_QUEUE_ID) continue
-                val p = extractMajorMinorPatch(info.gameVersion)
-                if (targetPatch != null && p != targetPatch) continue
-                for (part in info.participants) {
-                    val role = resolveNormalizedRole(part)
-                    val pid = part.puuid?.takeIf { it.isNotBlank() }
-                    if (role in ELIGIBLE_ROLES && pid != null && discovered.size < 1_000) {
-                        discovered.add(pid)
+        if (discovered.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
+            val matchKeys = redisCacheService.scanKeys("match:$region:*", maxKeys = MAX_SCAN_KEYS_PER_NAMESPACE)
+            chunkLoop@ for (chunk in matchKeys.chunked(MATCH_SCAN_CHUNK_SIZE)) {
+                if (discovered.size >= MAX_CHECKPOINT_PENDING_PUUIDS || !getMemoryHeadroomSnapshot().hasHeadroomForLowPriority) {
+                    break@chunkLoop
+                }
+                val chunkMatches = redisCacheService.multiGet(chunk, MatchDto::class.java).values.filterNotNull()
+                for (m in chunkMatches) {
+                    val info = m.info ?: continue
+                    if (info.queueId != SOLO_QUEUE_ID) continue
+                    val p = extractMajorMinorPatch(info.gameVersion)
+                    if (targetPatch != null && p != targetPatch) continue
+                    for (part in info.participants) {
+                        val role = resolveNormalizedRole(part)
+                        val pid = part.puuid?.takeIf { it.isNotBlank() }
+                        if (role in ELIGIBLE_ROLES && pid != null && discovered.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
+                            discovered.add(pid)
+                        }
                     }
                 }
             }

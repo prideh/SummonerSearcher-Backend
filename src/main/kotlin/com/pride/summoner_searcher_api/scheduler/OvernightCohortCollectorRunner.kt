@@ -297,8 +297,12 @@ class OvernightCohortCollectorRunner(
         if (!liveSnap.readyForLowPriorityNetworkCollection) {
             return null
         }
+        val memSnap = cohortBenchmarkService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = true)
+        if (!memSnap.hasHeadroomForLowPriority) {
+            return null
+        }
         logger.info(
-            "[OvernightCollector] Auto-resuming armed overnight session for region={} patch={} after cooldown/batch window.",
+            "[OvernightCollector] Auto-resuming armed overnight session for region={} patch={} after cooldown/memory/batch window.",
             region, activeTargetPatch ?: "auto-cached"
         )
         return startOrResumeGuarded(
@@ -358,7 +362,7 @@ class OvernightCohortCollectorRunner(
 
     /**
      * Bounded, read-only status inspection from the same backend JVM process.
-     * Makes zero Riot API calls and zero Redis SCANs (reads only the single checkpoint key + in-memory limiter snapshot).
+     * Makes zero Riot API calls and zero Redis SCANs (reads only the single checkpoint key + in-memory limiter & memory snapshots).
      */
     fun getStatus(
         region: String = "euw1",
@@ -377,6 +381,7 @@ class OvernightCohortCollectorRunner(
         }
 
         val verification = cohortBenchmarkService.getLiveRateLimitVerification(normalizedRegion)
+        val memoryHeadroom = cohortBenchmarkService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
         val checkpoint = cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch)
             ?: if (cleanPatch == null && activeTargetPatch != null) {
                 cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, activeTargetPatch)
@@ -413,6 +418,7 @@ class OvernightCohortCollectorRunner(
             lastRunStartedAt = lastRunStartedAt,
             lastRunCompletedAt = lastRunCompletedAt,
             rateLimitVerification = verification,
+            memoryHeadroom = memoryHeadroom,
             checkpoint = checkpoint
         )
     }
@@ -448,6 +454,7 @@ class OvernightCohortCollectorRunner(
                 stoppedOnRateLimit429 = false,
                 probedAt = nowInstant,
                 rateLimitVerification = buildInvalidParamStatus(normalizedRegion, cleanPatch, "Invalid region or patch.").rateLimitVerification,
+                memoryHeadroom = cohortBenchmarkService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
                 notes = listOf("Invalid region or patch parameter; zero Redis or Riot HTTP attempts executed.")
             )
         }
@@ -465,6 +472,7 @@ class OvernightCohortCollectorRunner(
                 stoppedOnRateLimit429 = false,
                 probedAt = nowInstant,
                 rateLimitVerification = cohortBenchmarkService.getLiveRateLimitVerification(normalizedRegion),
+                memoryHeadroom = cohortBenchmarkService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
                 checkpoint = cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch),
                 notes = listOf("Diagnostic probe is already running in this JVM process; 0 duplicate HTTP attempts made.")
             )
@@ -485,6 +493,7 @@ class OvernightCohortCollectorRunner(
                     stoppedOnRateLimit429 = false,
                     probedAt = nowInstant,
                     rateLimitVerification = cohortBenchmarkService.getLiveRateLimitVerification(normalizedRegion),
+                    memoryHeadroom = cohortBenchmarkService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
                     checkpoint = cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch),
                     notes = listOf("Diagnostic probe lock is active in Redis for '$normalizedRegion'; 0 duplicate HTTP attempts made.")
                 )
@@ -571,7 +580,8 @@ class OvernightCohortCollectorRunner(
                 "PAUSED_FOREGROUND_USER_REQUEST",
                 "PAUSED_RETRY_AFTER_BACKOFF",
                 "PAUSED_RATE_LIMIT_HEADROOM",
-                "PAUSED_NETWORK_TIMEOUT" -> {
+                "PAUSED_NETWORK_TIMEOUT",
+                "PAUSED_MEMORY_HEADROOM" -> {
                     // Pause cycles do NOT consume productive batch budget (productiveBatchesCompleted is unchanged)
                     pauseCyclesCount++
                     consecutivePauseCycles++
@@ -587,7 +597,7 @@ class OvernightCohortCollectorRunner(
                         cohortBenchmarkService.saveCollectorCheckpoint(cooldownCheckpoint)
                         lastCheckpoint = cooldownCheckpoint
                         logger.info(
-                            "[OvernightCollector] Reached maxPauseCycles={} during long rate-limit/foreground window; saved PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE (overnightSessionArmed={} for auto-resume).",
+                            "[OvernightCollector] Reached maxPauseCycles={} during long rate-limit/memory/foreground window; saved PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE (overnightSessionArmed={} for auto-resume).",
                             maxPauseCycles, overnightSessionArmed.get()
                         )
                         break
@@ -677,6 +687,7 @@ class OvernightCohortCollectorRunner(
                 networkCollectionEnabled = false,
                 readyForLowPriorityNetworkCollection = false
             ),
+            memoryHeadroom = cohortBenchmarkService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
             checkpoint = null
         )
     }
