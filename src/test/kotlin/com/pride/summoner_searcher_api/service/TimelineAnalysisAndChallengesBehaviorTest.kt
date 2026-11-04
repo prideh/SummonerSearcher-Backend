@@ -1,14 +1,13 @@
 package com.pride.summoner_searcher_api.service
 
 import com.fasterxml.jackson.databind.ObjectMapper
-import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import com.pride.summoner_searcher_api.dto.MatchDto
 import com.pride.summoner_searcher_api.dto.MatchTimelineDto
 import io.kotest.core.spec.style.BehaviorSpec
 import io.kotest.matchers.shouldBe
 
 class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
-    val mapper = ObjectMapper().registerKotlinModule()
+    val mapper: ObjectMapper = ObjectMapper().findAndRegisterModules()
     val timelineService = TimelineAnalysisService()
 
     Given("A Riot Match-V5 JSON payload containing early-CS and advanced challenge fields (#7)") {

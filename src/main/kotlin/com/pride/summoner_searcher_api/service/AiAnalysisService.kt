@@ -36,6 +36,7 @@ data class AiStreamContext(
 class AiAnalysisService(
     @Value("\${GEMINI_API_KEY:}") private val apiKey: String,
     @Value("\${gemini.model:gemini-3.5-flash-lite}") private val geminiModel: String = "gemini-3.5-flash-lite",
+    @Value("\${gemini.thinking-level:low}") private val geminiThinkingLevel: String = "low",
     private val exampleRepository: AiLearnedExampleRepository,
     private val interactionRepository: AiInteractionRepository,
     private val patternRepository: DiscoveredPatternRepository,
@@ -47,6 +48,20 @@ class AiAnalysisService(
     private val webClient = WebClient.builder()
         .baseUrl("https://generativelanguage.googleapis.com/v1beta/")
         .build()
+
+    private fun buildGenerationConfig(temperature: Double): Map<String, Any> {
+        val config = mutableMapOf<String, Any>(
+            "temperature" to temperature,
+            "maxOutputTokens" to 4096
+        )
+        if (geminiThinkingLevel.isNotBlank() &&
+            !geminiModel.startsWith("gemini-2.") &&
+            !geminiModel.startsWith("gemini-1.")
+        ) {
+            config["thinkingConfig"] = mapOf("thinkingLevel" to geminiThinkingLevel.trim().lowercase())
+        }
+        return config
+    }
     
     // Available temperatures and their initial weights
     // Weights are updated dynamically based on feedback per category
@@ -135,10 +150,7 @@ class AiAnalysisService(
                     )
                 )
             ),
-            "generationConfig" to mapOf(
-                "temperature" to temperature,
-                "maxOutputTokens" to 4096
-            )
+            "generationConfig" to buildGenerationConfig(temperature)
         )
 
         return webClient.post()
@@ -185,10 +197,7 @@ class AiAnalysisService(
                     )
                 )
             ),
-            "generationConfig" to mapOf(
-                "temperature" to temperature,
-                "maxOutputTokens" to 4096
-            )
+            "generationConfig" to buildGenerationConfig(temperature)
         )
 
         val sseType = object : ParameterizedTypeReference<ServerSentEvent<String>>() {}
