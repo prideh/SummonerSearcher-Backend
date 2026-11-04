@@ -76,11 +76,9 @@ class AiAnalysisService(
     }
 
     fun analyze(context: Map<String, Any>, messages: List<Map<String, String>>, userMessage: String, sessionId: String? = null): Mono<AiAnalysisResult> {
-        // 🚀 CONCURRENT EXECUTION OPTIMIZATION
-        // 1. Immediately run the fast local keyword matcher to build the prompt without waiting
-        val fastFallbackIntent = detectIntent(userMessage, messages)
-        val temperature = selectTemperature(fastFallbackIntent.category)
-        val prompt = constructPrompt(context, messages, userMessage, fastFallbackIntent)
+        val detectedIntent = detectIntent(userMessage, messages)
+        val temperature = selectTemperature(detectedIntent.category)
+        val prompt = constructPrompt(context, messages, userMessage, detectedIntent)
 
         val requestBody = mapOf(
             "contents" to listOf(
@@ -96,7 +94,7 @@ class AiAnalysisService(
             )
         )
 
-        val mainGenerationMono = webClient.post()
+        return webClient.post()
             .uri("models/gemini-3-flash-preview:generateContent?key={key}", apiKey)
             .bodyValue(requestBody)
             .retrieve()
@@ -114,162 +112,10 @@ class AiAnalysisService(
                     }
                     .onRetryExhaustedThrow { _, signal -> signal.failure() }
             )
-            .map { response -> extractContent(response) }
-
-        // 2. Fire the true intent classifier asynchronously in the background
-        val intentClassifierMono = classifyIntentWithGemini(userMessage, messages)
-
-        // 3. Wait for both to finish and zip them together
-        return Mono.zip(mainGenerationMono, intentClassifierMono)
-            .map { tuple -> 
-                val generatedText = tuple.t1
-                // We use the concurrently calculated intent for future analytics
-                AiAnalysisResult(generatedText, temperature, fastFallbackIntent.category) 
-            }
-    }
-
-    /**
-     * Lightweight Gemini pre-call that classifies the user's intent.
-     * Returns category + confidence + frustration flag.
-     * Falls back to keyword-based detectIntent() if the call fails or response is unparseable.
-     */
-    private fun classifyIntentWithGemini(userMessage: String, history: List<Map<String, String>>): Mono<IntentResult> {
-        val recentHistory = history.takeLast(4).joinToString("\n") { "${it["role"]}: ${it["content"]}" }
-
-        val classificationPrompt = """
-            You are an intent classifier for a League of Legends coaching assistant.
-            Classify the user's message into exactly ONE of these categories:
-
-            - cs_farming: questions about CS, farming, last-hitting, minions
-            - vision_warding: questions about wards, vision, control wards
-            - wave_management: questions about wave freeze, slow push, wave crashing
-            - trading_laning: questions about trading, poking, harassing in lane
-            - itemization_builds: questions about items, builds, what to buy
-            - macro_rotations: questions about macro play, rotations, split push
-            - teamfighting: questions about teamfights, 5v5, grouping
-            - objective_control: questions about drake, baron, objectives
-            - jungle_pathing: questions about jungle routes, clears, pathing
-            - roaming: questions about roaming, ganking, leaving lane
-            - back_timing: questions about when to recall, reset timing
-            - win_conditions: questions about win conditions, game plans
-            - champion_pool: questions about champion selection, what to play
-            - matchups: questions about champion matchups, counters, which champions to play against
-            - champion_mechanics: questions about combos, abilities, skill order
-            - power_spikes: questions about level/item power spikes
-            - positional_spacing: questions about positioning, spacing, where to stand
-            - resource_management: questions about mana, energy, health management
-            - mental_state_tilt: questions about tilt, mental game, frustration
-            - review_methodology: questions about VOD review, replay analysis
-            - full_analysis: requests for general performance review, "how am I doing", overall analysis
-            - opponent_specific: questions asking about a SPECIFIC PLAYER or SUMMONER they've faced, or asking which player/summoner they tend to perform better against.
-              Examples of opponent_specific:
-              * "is there a specific player i perform better against"
-              * "which player do i beat most often"
-              * "against which player do i have the best chances"
-              * "who do i tend to win against"
-              * "is there a summoner i consistently beat"
-              * "which opponent gives me the best odds"
-              NOTE: This is different from 'matchups' (which is about champion types/counters, not specific players)
-            - frustration: message expressing that the previous answer was wrong, unhelpful, or missed the point
-            - general: anything else that doesn't fit the above
-
-            Recent conversation:
-            $recentHistory
-
-            User's message: "$userMessage"
-
-            Reply with ONLY a JSON object in this exact format, nothing else:
-            {"category": "<category>", "confidence": <0.0-1.0>, "isFrustrated": <true|false>}
-
-            Rules:
-            - confidence should reflect how clearly the message maps to the category (0.9+ = very clear, 0.5 = ambiguous, 0.3 = vague)
-            - isFrustrated = true if the message signals the previous answer was wrong or unhelpful
-            - Use opponent_specific when the player is asking about a SPECIFIC PERSON they've played against, not champion types
-            - If the message is a short follow-up like "ok" or "then what" with no clear topic, use the most recent topic from conversation history
-        """.trimIndent()
-
-        val requestBody = mapOf(
-            "contents" to listOf(
-                mapOf(
-                    "parts" to listOf(
-                        mapOf("text" to classificationPrompt)
-                    )
-                )
-            ),
-            "generationConfig" to mapOf(
-                "temperature" to 0.1, // Very low — we want deterministic classification
-                "maxOutputTokens" to 1024
-            )
-        )
-
-        return webClient.post()
-            .uri("models/gemini-2.5-flash:generateContent?key={key}", apiKey)
-            .bodyValue(requestBody)
-            .retrieve()
-            .bodyToMono(String::class.java)
             .map { response ->
-                val content = extractContent(response)
-                logger.info("Gemini Intent Raw Response: $content")
-                parseIntentResponse(content, userMessage, history)
+                val generatedText = extractContent(response)
+                AiAnalysisResult(generatedText, temperature, detectedIntent.category)
             }
-            .onErrorResume { e ->
-                if (e is org.springframework.web.reactive.function.client.WebClientResponseException) {
-                    logger.error("Gemini Intent API ${e.statusCode}: ${e.responseBodyAsString}")
-                } else {
-                    logger.error("Gemini Intent API Failed", e)
-                }
-                Mono.just(detectIntent(userMessage, history))
-            } 
-    }
-
-    /**
-     * Parse the JSON intent classification response from Gemini.
-     * Falls back to keyword-based detection if parsing fails.
-     */
-    private fun parseIntentResponse(rawResponse: String, userMessage: String, history: List<Map<String, String>>): IntentResult {
-        return try {
-            val mapper = com.fasterxml.jackson.databind.ObjectMapper()
-            // Strip any markdown code fences if present
-            val cleaned = rawResponse.trim()
-                .removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
-            val node = mapper.readTree(cleaned)
-            val category = node.path("category").asText("general")
-            val confidence = node.path("confidence").asDouble(0.5)
-            val isFrustrated = node.path("isFrustrated").asBoolean(false)
-
-            // Validate category is one we know
-            val safeCategory = if (category in VALID_CATEGORIES) category else "general"
-
-            // Map "frustration" category to isFrustrated flag
-            val effectivelyFrustrated = isFrustrated || safeCategory == "frustration"
-            val effectiveCategory = if (safeCategory == "frustration") "general" else safeCategory
-
-            // opponent_specific always forces clarification — we don't have per-player data in context
-            if (effectiveCategory == "opponent_specific") {
-                return IntentResult(
-                    category = "opponent_specific",
-                    confidence = 0.0, // Force clarification gate
-                    isFrustrated = false,
-                    possibleMeanings = listOf(
-                        "a specific summoner (by name) you've faced recently",
-                        "which champion types or roles you tend to beat more often"
-                    )
-                )
-            }
-
-            val result = IntentResult(
-                category = effectiveCategory,
-                confidence = confidence,
-                isFrustrated = effectivelyFrustrated,
-                possibleMeanings = listOf(effectiveCategory)
-            )
-            logger.info("Parsed Intent: ${result.category} (conf=${result.confidence}, frustrated=${result.isFrustrated})")
-            return result
-        } catch (e: Exception) {
-            logger.warn("Gemini intent classifier returned malformed JSON. Falling back to keyword matching. Raw: [$rawResponse]")
-            // Fallback to keyword-based detection
-            detectIntent(userMessage, history)
-        }
     }
 
     private fun constructPrompt(context: Map<String, Any>, messages: List<Map<String, String>>, userMessage: String, intent: IntentResult? = null): String {
