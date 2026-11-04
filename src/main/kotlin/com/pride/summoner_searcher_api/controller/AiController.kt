@@ -10,6 +10,7 @@ import com.pride.summoner_searcher_api.repository.AiInteractionRepository
 import com.pride.summoner_searcher_api.repository.AiLearnedExampleRepository
 import com.pride.summoner_searcher_api.repository.CurationRunRepository
 import com.pride.summoner_searcher_api.repository.DiscoveredPatternRepository
+import com.pride.summoner_searcher_api.repository.PromptVersionRepository
 import com.pride.summoner_searcher_api.service.AiAnalysisResult
 import com.pride.summoner_searcher_api.service.AiAnalysisService
 import com.pride.summoner_searcher_api.service.FeedbackProtectionService
@@ -46,7 +47,8 @@ class AiController(
     private val exampleRepository: AiLearnedExampleRepository,
     private val curationRunRepository: CurationRunRepository,
     private val feedbackProtectionService: FeedbackProtectionService,
-    private val patternRepository: DiscoveredPatternRepository
+    private val patternRepository: DiscoveredPatternRepository,
+    private val promptVersionRepository: PromptVersionRepository
 ) {
 
     private val logger = LoggerFactory.getLogger(AiController::class.java)
@@ -76,13 +78,13 @@ class AiController(
             userQuestion = request.userMessage,
             aiResponse = result.response,
             contextFingerprint = request.sessionId ?: generateContextFingerprint(request.context),
-            promptVersion = "v1.0", // Will be dynamic later
+            promptVersion = result.promptVersion,
             responseTimeMs = responseTime,
             temperature = result.temperature
         )
         val savedInteraction = interactionRepository.save(interaction)
         
-        logger.info("AI chat response generated (temp=${result.temperature}) for user: $userEmail (${responseTime}ms)")
+        logger.info("AI chat response generated (temp=${result.temperature}, version=${result.promptVersion}) for user: $userEmail (${responseTime}ms)")
         
         return AiChatResponse(
             response = result.response,
@@ -157,7 +159,7 @@ class AiController(
                         userQuestion = request.userMessage,
                         aiResponse = finalResponseText,
                         contextFingerprint = request.sessionId ?: generateContextFingerprint(request.context),
-                        promptVersion = "v1.0",
+                        promptVersion = streamContext.promptVersion,
                         responseTimeMs = responseTime,
                         temperature = streamContext.temperature
                     )
@@ -220,6 +222,21 @@ class AiController(
             abuseScore = abuseScore
         )
         feedbackRepository.save(feedback)
+
+        // Update PromptVersion feedback counters when feedback is validated
+        if (isValidated && !interaction.promptVersion.isNullOrBlank()) {
+            try {
+                promptVersionRepository.findByVersionName(interaction.promptVersion).ifPresent { version ->
+                    when (request.feedbackType.lowercase()) {
+                        "positive" -> version.positiveFeedbackCount += 1
+                        "negative" -> version.negativeFeedbackCount += 1
+                    }
+                    promptVersionRepository.save(version)
+                }
+            } catch (e: Exception) {
+                logger.debug("Could not update PromptVersion stats for {}: {}", interaction.promptVersion, e.message)
+            }
+        }
         
         logger.info("Feedback saved - Validated: $isValidated, AbuseScore: $abuseScore")
         

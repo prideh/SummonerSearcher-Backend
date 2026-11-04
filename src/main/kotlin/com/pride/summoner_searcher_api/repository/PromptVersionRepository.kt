@@ -14,4 +14,13 @@ interface PromptVersionRepository : JpaRepository<PromptVersion, UUID> {
     
     /** Find the currently active prompt version */
     fun findByIsActiveTrue(): Optional<PromptVersion>
+
+    /** Find all active prompt versions scoped to a specific question category */
+    fun findByIsActiveTrueAndCategoryScope(categoryScope: String): List<PromptVersion>
+
+    /** Find all active global prompt versions (categoryScope is null) */
+    fun findByIsActiveTrueAndCategoryScopeIsNull(): List<PromptVersion>
+
+    /** Find all active challenger prompt versions for A/B evaluation */
+    fun findByIsActiveTrueAndIsChallengerTrue(): List<PromptVersion>
 }

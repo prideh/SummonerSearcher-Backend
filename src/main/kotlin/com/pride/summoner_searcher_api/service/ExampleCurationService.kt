@@ -3,10 +3,12 @@ package com.pride.summoner_searcher_api.service
 import com.pride.summoner_searcher_api.model.AiInteraction
 import com.pride.summoner_searcher_api.model.AiLearnedExample
 import com.pride.summoner_searcher_api.model.CurationRun
+import com.pride.summoner_searcher_api.model.PromptVersion
 import com.pride.summoner_searcher_api.repository.AiFeedbackRepository
 import com.pride.summoner_searcher_api.repository.AiInteractionRepository
 import com.pride.summoner_searcher_api.repository.AiLearnedExampleRepository
 import com.pride.summoner_searcher_api.repository.CurationRunRepository
+import com.pride.summoner_searcher_api.repository.PromptVersionRepository
 import org.slf4j.LoggerFactory
 import org.springframework.scheduling.annotation.Scheduled
 import org.springframework.stereotype.Service
@@ -23,7 +25,8 @@ class ExampleCurationService(
     private val interactionRepository: AiInteractionRepository,
     private val feedbackRepository: AiFeedbackRepository,
     private val exampleRepository: AiLearnedExampleRepository,
-    private val curationRunRepository: CurationRunRepository
+    private val curationRunRepository: CurationRunRepository,
+    private val promptVersionRepository: PromptVersionRepository
 ) {
     
     private val logger = LoggerFactory.getLogger(ExampleCurationService::class.java)
@@ -118,14 +121,60 @@ class ExampleCurationService(
         
         logger.info("Example curation complete - Added: $addedCount, Replaced: $replacedCount, Duration: ${durationMs}ms")
         
-        // 🔄 PROMPT EVOLUTION: detect underperforming categories
+        // 🔄 PROMPT EVOLUTION: detect underperforming categories and evaluate A/B challengers
+        evaluateActiveChallengers()
         detectUnderperformingCategories()
     }
     
     /**
+     * Evaluate active A/B challenger PromptVersions that have accumulated sufficient feedback.
+     * Promotes winning challengers to champion and retires underperforming challengers.
+     */
+    private fun evaluateActiveChallengers() {
+        try {
+            val activeChallengers = promptVersionRepository.findByIsActiveTrueAndIsChallengerTrue()
+            activeChallengers.forEach { challenger ->
+                val totalFeedback = challenger.positiveFeedbackCount + challenger.negativeFeedbackCount
+                if (challenger.totalUses >= 20 && totalFeedback >= 5) {
+                    val satisfactionRate = challenger.positiveFeedbackCount.toDouble() / totalFeedback
+                    val scope = challenger.categoryScope
+                    val scopedVersions = if (scope != null) {
+                        promptVersionRepository.findByIsActiveTrueAndCategoryScope(scope)
+                    } else {
+                        promptVersionRepository.findByIsActiveTrueAndCategoryScopeIsNull()
+                    }
+                    val currentChampion = scopedVersions.firstOrNull { !it.isChallenger && it.id != challenger.id }
+                    val championFeedback = (currentChampion?.positiveFeedbackCount ?: 0) + (currentChampion?.negativeFeedbackCount ?: 0)
+                    val championRate = if (championFeedback > 0) {
+                        currentChampion!!.positiveFeedbackCount.toDouble() / championFeedback
+                    } else 0.50
+
+                    if (satisfactionRate >= 0.55 && satisfactionRate >= championRate) {
+                        currentChampion?.let {
+                            it.isActive = false
+                            promptVersionRepository.save(it)
+                        }
+                        challenger.isChallenger = false
+                        promptVersionRepository.save(challenger)
+                        logger.info("Promoted challenger PromptVersion '{}' to champion (satisfaction={}%) for scope={}",
+                            challenger.versionName, (satisfactionRate * 100).toInt(), scope ?: "global")
+                    } else if (satisfactionRate < 0.40) {
+                        challenger.isActive = false
+                        promptVersionRepository.save(challenger)
+                        logger.info("Retired underperforming challenger PromptVersion '{}' (satisfaction={}%) for scope={}",
+                            challenger.versionName, (satisfactionRate * 100).toInt(), scope ?: "global")
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            logger.warn("Could not evaluate active challenger PromptVersions: ${e.message}")
+        }
+    }
+
+    /**
      * Detect question categories with high negative feedback rates.
-     * Categories with >60% negative rate and ≥20 interactions trigger a prompt evolution flag.
-     * Currently logs the finding; future: auto-generate new PromptVersion for that category.
+     * Categories with >60% negative rate and ≥20 interactions trigger creation of a scoped
+     * challenger PromptVersion for A/B testing against the current baseline.
      */
     private fun detectUnderperformingCategories() {
         val since = Instant.now().minus(30, ChronoUnit.DAYS)
@@ -142,17 +191,38 @@ class ExampleCurationService(
                 if (negativeRate > 0.60) {
                     logger.warn(
                         "PROMPT EVOLUTION TRIGGER: Category '$category' has ${(negativeRate * 100).toInt()}% " +
-                        "negative rate over last 30 days ($totalCount interactions). " +
-                        "Consider rewriting the $category section of the prompt."
+                        "negative rate over last 30 days ($totalCount interactions)."
                     )
-                    // TODO Phase 2: auto-generate new PromptVersion for this category
-                    // and A/B test it against the current champion
+                    val existingScoped = promptVersionRepository.findByIsActiveTrueAndCategoryScope(category)
+                    if (existingScoped.none { it.isChallenger }) {
+                        val safeCategorySlug = category.take(20).replace(Regex("[^a-zA-Z0-9_-]"), "")
+                        val versionName = "v1.1-$safeCategorySlug-${Instant.now().epochSecond % 100000}"
+                        val challengerTemplate = buildCategoryChallengerDirective(category)
+                        val challenger = PromptVersion(
+                            versionName = versionName.take(50),
+                            promptTemplate = challengerTemplate,
+                            isActive = true,
+                            isChallenger = true,
+                            categoryScope = category
+                        )
+                        promptVersionRepository.save(challenger)
+                        logger.info("Created A/B challenger PromptVersion '{}' for underperforming category '{}'", challenger.versionName, category)
+                    }
                 }
             }
         } catch (e: Exception) {
             logger.warn("Could not run underperforming category detection: ${e.message}")
         }
     }
+
+    private fun buildCategoryChallengerDirective(category: String): String =
+        when (category) {
+            "itemization_builds" -> "When answering item or build questions, name the exact items, explain their passive/stat synergy with the player's champion, and specify when to buy them based on enemy team composition."
+            "matchups" -> "When answering matchup questions, identify the key ability interaction or cooldown window that decides trades at levels 1-3 and level 6, and cite the player's actual win/loss record in that matchup if present."
+            "cs_farming" -> "When answering farming questions, connect CS/min to wave state around objective spawns and recall timings rather than generic last-hitting reminders."
+            "vision_warding" -> "When answering vision questions, specify exact warding timings and locations relative to upcoming dragon/baron timers and lane priority."
+            else -> "Focus strictly on the user's '$category' question with concrete, step-by-step in-game execution tailored to their champion and role, avoiding generic filler."
+        }
     
     /**
      * Calculate quality score (0-100) based on multiple factors

@@ -1,8 +1,10 @@
 package com.pride.summoner_searcher_api.service
 
+import com.pride.summoner_searcher_api.model.PromptVersion
 import com.pride.summoner_searcher_api.repository.AiInteractionRepository
 import com.pride.summoner_searcher_api.repository.AiLearnedExampleRepository
 import com.pride.summoner_searcher_api.repository.DiscoveredPatternRepository
+import com.pride.summoner_searcher_api.repository.PromptVersionRepository
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.core.ParameterizedTypeReference
@@ -19,13 +21,15 @@ import java.time.Duration
 data class AiAnalysisResult(
     val response: String,
     val temperature: Double,
-    val category: String = "general"
+    val category: String = "general",
+    val promptVersion: String = "v1.0"
 )
 
 data class AiStreamContext(
     val chunks: Flux<String>,
     val temperature: Double,
-    val category: String = "general"
+    val category: String = "general",
+    val promptVersion: String = "v1.0"
 )
 
 @Service
@@ -33,7 +37,8 @@ class AiAnalysisService(
     @Value("\${GEMINI_API_KEY:}") private val apiKey: String,
     private val exampleRepository: AiLearnedExampleRepository,
     private val interactionRepository: AiInteractionRepository,
-    private val patternRepository: DiscoveredPatternRepository
+    private val patternRepository: DiscoveredPatternRepository,
+    private val promptVersionRepository: PromptVersionRepository
 ) {
 
     private val logger = LoggerFactory.getLogger(AiAnalysisService::class.java)
@@ -84,10 +89,42 @@ class AiAnalysisService(
         return 0.7 // fallback
     }
 
+    /**
+     * Selects the active PromptVersion for the given question category, supporting A/B testing
+     * between a champion and challenger version when both are active, and increments totalUses.
+     */
+    fun selectPromptVersion(category: String): PromptVersion? {
+        return try {
+            val candidates = promptVersionRepository.findByIsActiveTrueAndCategoryScope(category)
+                .ifEmpty { promptVersionRepository.findByIsActiveTrueAndCategoryScopeIsNull() }
+            if (candidates.isEmpty()) return null
+
+            val selected = if (candidates.size == 1) {
+                candidates.first()
+            } else {
+                val challengers = candidates.filter { it.isChallenger }
+                val champions = candidates.filter { !it.isChallenger }
+                if (challengers.isNotEmpty() && champions.isNotEmpty()) {
+                    // 30% traffic to challenger for safe A/B exploration, 70% to champion
+                    if (Math.random() < 0.30) challengers.random() else champions.random()
+                } else {
+                    candidates.random()
+                }
+            }
+            selected.totalUses += 1
+            promptVersionRepository.save(selected)
+        } catch (e: Exception) {
+            logger.debug("Falling back to default v1.0 prompt version: {}", e.message)
+            null
+        }
+    }
+
     fun analyze(context: Map<String, Any>, messages: List<Map<String, String>>, userMessage: String, sessionId: String? = null): Mono<AiAnalysisResult> {
         val detectedIntent = detectIntent(userMessage, messages)
         val temperature = selectTemperature(detectedIntent.category)
-        val prompt = constructPrompt(context, messages, userMessage, detectedIntent)
+        val selectedVersion = selectPromptVersion(detectedIntent.category)
+        val versionName = selectedVersion?.versionName ?: "v1.0"
+        val prompt = constructPrompt(context, messages, userMessage, detectedIntent, selectedVersion)
 
         val requestBody = mapOf(
             "contents" to listOf(
@@ -123,7 +160,7 @@ class AiAnalysisService(
             )
             .map { response ->
                 val generatedText = extractContent(response)
-                AiAnalysisResult(generatedText, temperature, detectedIntent.category)
+                AiAnalysisResult(generatedText, temperature, detectedIntent.category, versionName)
             }
     }
 
@@ -135,7 +172,9 @@ class AiAnalysisService(
     ): AiStreamContext {
         val detectedIntent = detectIntent(userMessage, messages)
         val temperature = selectTemperature(detectedIntent.category)
-        val prompt = constructPrompt(context, messages, userMessage, detectedIntent)
+        val selectedVersion = selectPromptVersion(detectedIntent.category)
+        val versionName = selectedVersion?.versionName ?: "v1.0"
+        val prompt = constructPrompt(context, messages, userMessage, detectedIntent, selectedVersion)
 
         val requestBody = mapOf(
             "contents" to listOf(
@@ -173,10 +212,16 @@ class AiAnalysisService(
             .mapNotNull { event -> event.data()?.let { extractStreamDelta(it) } }
             .filter { it.isNotEmpty() }
 
-        return AiStreamContext(chunks, temperature, detectedIntent.category)
+        return AiStreamContext(chunks, temperature, detectedIntent.category, versionName)
     }
 
-    private fun constructPrompt(context: Map<String, Any>, messages: List<Map<String, String>>, userMessage: String, intent: IntentResult? = null): String {
+    private fun constructPrompt(
+        context: Map<String, Any>,
+        messages: List<Map<String, String>>,
+        userMessage: String,
+        intent: IntentResult? = null,
+        promptVersion: PromptVersion? = null
+    ): String {
         // 🎯 INTENT — use provided (from Gemini pre-call) or fall back to keyword detection
         val resolvedIntent = intent ?: detectIntent(userMessage, messages)
         val questionCategory = resolvedIntent.category
@@ -237,6 +282,12 @@ class AiAnalysisService(
         """.trimIndent() else ""
 
         val timelineSection = buildTimelineInsightsSection(context)
+        val promptVersionSection = promptVersion?.promptTemplate?.takeIf { it.isNotBlank() }?.let {
+            """
+            **CATEGORY COACHING DIRECTIVE (${promptVersion.versionName}):**
+            $it
+            """.trimIndent()
+        } ?: ""
 
         return """
             You are an elite, Challenger-tier professional League of Legends coach analyzing ranked performance data. Use a constructive, encouraging, and highly analytical coaching methodology.
@@ -247,6 +298,7 @@ class AiAnalysisService(
             3. **Formulate Response**: Offer deep, actionable insight with high-elo terminology.
             
             $rankOptimization
+            $promptVersionSection
             
             **COACHING STYLE & TONE:**
             - NEVER start a response with the player's name. NEVER address the player by their rank (e.g., do not say "Master I..."). Do not use the player's name ($playerName) more than once per response, and only when it's genuinely natural to do so mid-sentence. Most responses should use no name at all.
