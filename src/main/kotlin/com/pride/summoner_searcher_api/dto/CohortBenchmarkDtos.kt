@@ -28,22 +28,20 @@ data class CohortPercentileDistributionDto(
 /**
  * Bundle of separated cohort metrics for a (tier, role) cell.
  *
- * - [laneCsAt10] & [laneCsCapturePctAt10]: Lane minions only in the first 10 minutes
- *   (`challenges.laneMinionsFirst10Minutes` or timeline 10m `minionsKilled`), never mixed with jungle camps.
+ * - [laneCsAt10]: Primary CS@10 metric in RAW lane minions (`challenges.laneMinionsFirst10Minutes`
+ *   or timeline 10m `minionsKilled`), never percentages and never mixed with jungle camps.
+ *   Carries [CohortPercentileDistributionDto.theoreticalSupplyCeiling] (`114` pre-16.1, `120` for 16.1+/26.1+)
+ *   as the lane-only theoretical spawn cutoff, while bands (`p25`, `median`, `p75`) are chosen purely from
+ *   sufficient actual `(tier, role)` data (never fixed guesses).
  * - [laneOnlyCsPerMin]: End-of-game lane minions per minute (`totalMinionsKilled / durationMin`).
- * - [totalCsPerMinWithCamps] & [timelineTotalCsAt10WithCamps]: Separate total-CS metrics that include
- *   `neutralMinionsKilled` / `jungleMinionsKilled` for pro total-CS comparison compatibility.
+ * - [totalCsPerMinWithCamps] & [timelineTotalCsAt10WithCamps]: Separate total-CS reference metrics that include
+ *   `neutralMinionsKilled` / `jungleMinionsKilled` (`includesJungleCamps = true`) for pro total-CS comparison.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 data class CohortMetricsBundleDto(
     val laneCsAt10: CohortPercentileDistributionDto = CohortPercentileDistributionDto(
         metricKey = "laneCsAt10",
         unit = "lane_cs",
-        includesJungleCamps = false
-    ),
-    val laneCsCapturePctAt10: CohortPercentileDistributionDto = CohortPercentileDistributionDto(
-        metricKey = "laneCsCapturePctAt10",
-        unit = "percent_of_spawned_lane_supply",
         includesJungleCamps = false
     ),
     val laneOnlyCsPerMin: CohortPercentileDistributionDto = CohortPercentileDistributionDto(

@@ -51,7 +51,6 @@ class CohortBenchmarkService(
         val gameCreation: Long,
         val rankSnapshotAt: Instant,
         val laneCsAt10: Double?,
-        val laneCsCapturePctAt10: Double?,
         val laneOnlyCsPerMin: Double?,
         val totalCsPerMinWithCamps: Double?,
         val timelineTotalCsAt10WithCamps: Double?,
@@ -264,13 +263,9 @@ class CohortBenchmarkService(
 
                 val participantFrame10m = findParticipantFrame(frameAt10m, participant, timeline)
 
-                // Strictly lane-only CS at 10m (never includes jungle camps)
+                // Strictly lane-only RAW CS at 10m (primary metric, never percentages, never includes jungle camps)
                 val laneCs10 = participant.challenges?.laneMinionsFirst10Minutes?.toDouble()
                     ?: participantFrame10m?.minionsKilled?.toDouble()
-
-                val laneCsCapturePct10 = laneCs10?.let {
-                    ((it / theoreticalLaneCeiling.toDouble()) * 100.0).coerceAtLeast(0.0)
-                }
 
                 // Strictly lane-only CS/min at end of game (totalMinionsKilled is lane minions only in Riot Match-v5)
                 val laneOnlyCsPerMin = participant.totalMinionsKilled?.let {
@@ -331,7 +326,6 @@ class CohortBenchmarkService(
                         gameCreation = gameCreation,
                         rankSnapshotAt = rankSnapshot.snapshotAt,
                         laneCsAt10 = laneCs10,
-                        laneCsCapturePctAt10 = laneCsCapturePct10,
                         laneOnlyCsPerMin = laneOnlyCsPerMin,
                         totalCsPerMinWithCamps = totalCsPerMinWithCamps,
                         timelineTotalCsAt10WithCamps = timelineTotalCs10WithCamps,
@@ -402,14 +396,6 @@ class CohortBenchmarkService(
                     theoreticalSupplyCeiling = theoreticalLaneCeiling,
                     samples = retainedSamples,
                     extractor = { it.laneCsAt10 }
-                ),
-                laneCsCapturePctAt10 = buildDistribution(
-                    metricKey = "laneCsCapturePctAt10",
-                    unit = "percent_of_spawned_lane_supply",
-                    includesJungleCamps = false,
-                    theoreticalSupplyCeiling = theoreticalLaneCeiling,
-                    samples = retainedSamples,
-                    extractor = { it.laneCsCapturePctAt10 }
                 ),
                 laneOnlyCsPerMin = buildDistribution(
                     metricKey = "laneOnlyCsPerMin",
@@ -551,7 +537,8 @@ class CohortBenchmarkService(
             "Only Ranked Solo (queueId=420) matches on current patch '${resolvedPatch ?: "NONE"}' with duration >= 600s and roles TOP, MIDDLE, BOTTOM are included.",
             "Rank assignment strictly requires a timestamped current-rank snapshot in cache (player profile lastRefreshed or Challenger leaderboard lastRefreshed); historical rank is never invented or inferred.",
             "Samples are deduplicated by (matchId, puuid) and capped at maxGamesPerPlayer=$effectiveCap newest games per player per (tier, role) cell.",
-            "CS metrics are strictly separated: laneCsAt10 and laneCsCapturePctAt10 use lane-only minions (ceiling=$theoreticalLaneCeiling for patch ${resolvedPatch ?: "default"}), while totalCsPerMinWithCamps and timelineTotalCsAt10WithCamps include jungle camps as separate pro-compatible metrics.",
+            "RAW lane CS@10 (laneCsAt10, unit='lane_cs') is the primary CS@10 metric — never percentages and never hardcoded guesses (e.g. 95/100/105). Bands (P25/median/P75) are derived strictly from sufficient actual (tier, role) data.",
+            "Lane-only CS cutoff (theoreticalSupplyCeiling=$theoreticalLaneCeiling for patch ${resolvedPatch ?: "default"}) is kept strictly separate from pro-compatible total CS reference metrics (timelineTotalCsAt10WithCamps, totalCsPerMinWithCamps where includesJungleCamps=true).",
             "Quality gate requires >= ${CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE} distinct players AND >= ${CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE} games per cell before passesQualityGate / colorBandsEnabled becomes true."
         )
 

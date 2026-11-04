@@ -226,19 +226,15 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 cell.passesQualityGate shouldBe false
                 cell.colorBandsEnabled shouldBe false
 
-                // Verify strict separation of lane-only CS vs total CS (with jungle camps)
+                // Verify strict separation of RAW lane-only CS@10 (primary, no percentages) vs total CS (with jungle camps)
                 // Retained 3 newest games have laneCs10 = [78, 84, 90] -> median = 84.0, p25 = 81.0, p75 = 87.0, iqr = 6.0
+                cell.metrics.laneCsAt10.unit shouldBe "lane_cs"
                 cell.metrics.laneCsAt10.includesJungleCamps shouldBe false
                 cell.metrics.laneCsAt10.theoreticalSupplyCeiling shouldBe 120
                 cell.metrics.laneCsAt10.median shouldBe 84.0
                 cell.metrics.laneCsAt10.p25 shouldBe 81.0
                 cell.metrics.laneCsAt10.p75 shouldBe 87.0
                 cell.metrics.laneCsAt10.iqr shouldBe 6.0
-
-                // Capture % against 120 ceiling for median 84 -> 70.0%
-                cell.metrics.laneCsCapturePctAt10.includesJungleCamps shouldBe false
-                cell.metrics.laneCsCapturePctAt10.theoreticalSupplyCeiling shouldBe 120
-                cell.metrics.laneCsCapturePctAt10.median shouldBe 70.0
 
                 // Lane-only CS/min: [210/30=7.0, 240/30=8.0, 270/30=9.0] -> median = 8.0
                 cell.metrics.laneOnlyCsPerMin.includesJungleCamps shouldBe false
@@ -247,7 +243,9 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 // Pro-compatible total CS/min (with camps): [(210+15)/30=7.5, (240+30)/30=9.0, (270+0)/30=9.0] -> median = 9.0
                 cell.metrics.totalCsPerMinWithCamps.includesJungleCamps shouldBe true
                 cell.metrics.totalCsPerMinWithCamps.median shouldBe 9.0
+                // Total CS@10 with camps: [78+12=90.0, 84+12=96.0, 90+0=90.0] -> median = 90.0
                 cell.metrics.timelineTotalCsAt10WithCamps.includesJungleCamps shouldBe true
+                cell.metrics.timelineTotalCsAt10WithCamps.median shouldBe 90.0
             }
         }
 
