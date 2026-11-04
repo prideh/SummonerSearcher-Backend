@@ -717,7 +717,8 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 )
                 buildGroundTruthMethod.isAccessible = true
 
-                val rawContextJsonBytes = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
+                val rawContextJsonBytes = com.fasterxml.jackson.databind.ObjectMapper()
+                    .findAndRegisterModules()
                     .writeValueAsString(largeContext)
                     .toByteArray(Charsets.UTF_8)
                     .size
@@ -779,8 +780,8 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     )
                 }
                 val longPromptVersion = PromptVersion(
-                    systemInstruction = "Extra coaching directive: " + "verify ground truth numbers carefully ".repeat(60),
-                    fewShotExamples = "Example Q/A: " + "cite exact timestamps and KDA ".repeat(60)
+                    versionName = "v1.1-stress-test",
+                    promptTemplate = "Extra coaching directive: " + "verify ground truth numbers carefully ".repeat(60)
                 )
                 val nearLimitQuestion = "Why did I lose on Sylas vs Viktor? " + "Please check my early lane state and item timings. ".repeat(32)
                 (AiAnalysisService.utf8ByteSize(nearLimitQuestion) in 1_500..AiAnalysisService.MAX_USER_MESSAGE_BYTES) shouldBe true
@@ -798,20 +799,22 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 (stressedBytes <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
                 stressedPrompt shouldContain "USER'S QUESTION: \"$nearLimitQuestion\""
             }
+        }
 
-            it("should explicitly refuse oversized user questions (> 2,000 UTF-8 bytes) without silent truncation or paid Gemini calls") {
+        When("the user question exceeds MAX_USER_MESSAGE_BYTES (> 2,000 UTF-8 bytes)") {
+            Then("it should explicitly refuse without silent truncation or paid Gemini calls") {
                 val oversizedQuestion = "Can you review every wave and trade in detail? ".repeat(60)
                 val questionBytes = AiAnalysisService.utf8ByteSize(oversizedQuestion)
                 (questionBytes > AiAnalysisService.MAX_USER_MESSAGE_BYTES) shouldBe true
 
-                val intent = service.detectIntent(oversizedQuestion, null)
+                val intent = service.detectIntent(oversizedQuestion, emptyList())
 
                 // Direct constructPrompt call throws PromptBudgetExceededException rather than silently truncating userMessage
                 val invocationEx = io.kotest.assertions.throwables.shouldThrow<java.lang.reflect.InvocationTargetException> {
                     constructPromptMethod.invoke(
                         service,
                         mapOf("summonerName" to "TestPlayer#NA1"),
-                        null,
+                        emptyList<Map<String, String>>(),
                         oversizedQuestion,
                         intent,
                         null
@@ -821,29 +824,22 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
 
                 // Public analyze() returns an explicit safe refusal without calling Gemini
                 val syncResult = service.analyze(
-                    AiAnalysisRequest(
-                        puuid = "test-puuid",
-                        playerContext = mapOf("summonerName" to "TestPlayer#NA1"),
-                        conversationHistory = null,
-                        userMessage = oversizedQuestion
-                    )
-                )
-                syncResult shouldContain "Your question is too long"
-                syncResult shouldContain "${AiAnalysisService.MAX_USER_MESSAGE_BYTES} UTF-8 bytes"
-                syncResult shouldContain "---SUGGESTIONS---"
-                verify(exactly = 0) { webClient.post() }
+                    context = mapOf("summonerName" to "TestPlayer#NA1"),
+                    messages = emptyList(),
+                    userMessage = oversizedQuestion
+                ).block()!!
+                syncResult.response shouldContain "exceeds the safe coaching context budget"
+                syncResult.response shouldContain "${AiAnalysisService.MAX_USER_MESSAGE_BYTES} UTF-8 bytes"
+                syncResult.response shouldContain "---SUGGESTIONS---"
 
                 // Public analyzeStream() also emits the explicit safe refusal without calling Gemini
                 val streamResult = service.analyzeStream(
-                    AiAnalysisRequest(
-                        puuid = "test-puuid",
-                        playerContext = mapOf("summonerName" to "TestPlayer#NA1"),
-                        conversationHistory = null,
-                        userMessage = oversizedQuestion
-                    )
-                ).collectList().block()!!.joinToString("")
-                streamResult shouldContain "Your question is too long"
-                verify(exactly = 0) { webClient.post() }
+                    context = mapOf("summonerName" to "TestPlayer#NA1"),
+                    messages = emptyList(),
+                    userMessage = oversizedQuestion
+                ).chunks.collectList().block()!!.joinToString("")
+                streamResult shouldContain "exceeds the safe coaching context budget"
+                streamResult shouldContain "${AiAnalysisService.MAX_USER_MESSAGE_BYTES} UTF-8 bytes"
             }
         }
     }

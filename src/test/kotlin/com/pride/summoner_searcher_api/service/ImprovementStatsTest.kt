@@ -1,6 +1,6 @@
 package com.pride.summoner_searcher_api.service
 
-import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.pride.summoner_searcher_api.dto.*
 import io.kotest.core.spec.style.DescribeSpec
 import io.kotest.matchers.collections.shouldHaveSize
@@ -11,7 +11,7 @@ import io.kotest.matchers.shouldBe
 class ImprovementStatsTest : DescribeSpec({
 
     val service = TimelineAnalysisService()
-    val mapper = jacksonObjectMapper()
+    val mapper: ObjectMapper = ObjectMapper().findAndRegisterModules()
     val playerPuuid = "player-puuid-1"
 
     fun buildParticipant(
