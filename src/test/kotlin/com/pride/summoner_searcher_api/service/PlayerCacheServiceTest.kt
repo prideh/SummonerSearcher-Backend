@@ -199,6 +199,118 @@ class PlayerCacheServiceTest : BehaviorSpec({
             }
         }
 
+        When("fetching a cached profile whose recentMatches predate gameVersion (gameVersion == null)") {
+            val existingMatchIds = listOf("EUW1_2", "EUW1_1")
+            val legacyMatch2 = MatchDto(
+                metadata = MatchMetadata("EUW1_2", listOf(puuid)),
+                info = MatchInfo(
+                    gameCreation = System.currentTimeMillis(), gameDuration = 1200L, gameId = 2L,
+                    queueId = 420, gameMode = "CLASSIC", gameVersion = null,
+                    participants = emptyList()
+                )
+            )
+            val currentMatch1 = MatchDto(
+                metadata = MatchMetadata("EUW1_1", listOf(puuid)),
+                info = MatchInfo(
+                    gameCreation = System.currentTimeMillis() - 3600_000L, gameDuration = 1200L, gameId = 1L,
+                    queueId = 420, gameMode = "CLASSIC", gameVersion = "16.19.820.1111",
+                    participants = emptyList()
+                )
+            )
+            val (_, existingOverallStats) = MatchStatsAccumulator(puuid).getResult()
+            val cachedProfile = SummonerProfileDto(
+                puuid = puuid,
+                gameName = summonerName,
+                tagLine = tagLine,
+                summonerLevel = 100L,
+                profileIconId = 123,
+                soloQueueRank = null,
+                recentMatches = listOf(legacyMatch2, currentMatch1),
+                allMatchIds = existingMatchIds,
+                championStats = emptyList(),
+                overallStats = existingOverallStats,
+                totalMatches = 2,
+                lastRefreshed = java.time.Instant.now().minusSeconds(300)
+            )
+
+            every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            every { redisCacheService.get(any(), SummonerProfileDto::class.java) } returns cachedProfile
+            coEvery { riotApiService.fetchLeagueRank(puuid, region) } returns null
+            coEvery { riotApiService.getSummonerByPuuid(puuid, region) } returns SummonerDto("id", puuid, 125L, 456)
+            coEvery { riotApiService.fetchMatchIdsSince(puuid, region, any()) } returns existingMatchIds
+
+            // Redis match cache also has legacy entry with gameVersion == null
+            every { redisCacheService.multiGet(listOf("match:euw1:EUW1_2"), MatchDto::class.java) } returns mapOf(
+                "match:euw1:EUW1_2" to legacyMatch2
+            )
+
+            val backfilledMatch2 = legacyMatch2.copy(
+                info = legacyMatch2.info?.copy(gameVersion = "16.20.826.3891")
+            )
+            val fetchedMatchIds = mutableListOf<String>()
+            coEvery { riotApiService.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                fetchedMatchIds.add(id)
+                if (id == "EUW1_2") backfilledMatch2 else null
+            }
+
+            val cachedMatchKeys = mutableListOf<String>()
+            var savedProfile: SummonerProfileDto? = null
+            every { redisCacheService.set<MatchDto>(match { it.startsWith("match:euw1:") }, any<MatchDto>(), any<Duration>()) } answers {
+                cachedMatchKeys.add(firstArg())
+            }
+            every { redisCacheService.set<SummonerProfileDto>(match { it.startsWith("player:profile:") }, any<SummonerProfileDto>(), any<Duration>()) } answers {
+                savedProfile = secondArg()
+            }
+
+            val result = playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine)
+
+            Then("it should lazily backfill only the stale match and persist both match and profile caches") {
+                result?.recentMatches?.size shouldBe 2
+                result?.recentMatches?.get(0)?.info?.gameVersion shouldBe "16.20.826.3891"
+                result?.recentMatches?.get(1)?.info?.gameVersion shouldBe "16.19.820.1111"
+                fetchedMatchIds shouldBe listOf("EUW1_2")
+                cachedMatchKeys shouldBe listOf("match:euw1:EUW1_2")
+                savedProfile?.recentMatches?.get(0)?.info?.gameVersion shouldBe "16.20.826.3891"
+            }
+        }
+
+        When("fetching matches by IDs where a cached MatchDto entry predates gameVersion") {
+            val legacyMatch = MatchDto(
+                metadata = MatchMetadata("EUW1_10", listOf(puuid)),
+                info = MatchInfo(
+                    gameCreation = System.currentTimeMillis(), gameDuration = 1200L, gameId = 10L,
+                    queueId = 420, gameMode = "CLASSIC", gameVersion = null,
+                    participants = emptyList()
+                )
+            )
+            val freshMatch = legacyMatch.copy(
+                info = legacyMatch.info?.copy(gameVersion = "16.20.826.3891")
+            )
+
+            every { redisCacheService.multiGet(listOf("match:euw1:EUW1_10"), MatchDto::class.java) } returns mapOf(
+                "match:euw1:EUW1_10" to legacyMatch
+            )
+            val fetchedMatchIds = mutableListOf<String>()
+            coEvery { riotApiService.getMatchById("EUW1_10", region) } answers {
+                fetchedMatchIds.add(firstArg())
+                freshMatch
+            }
+            val cachedMatchKeys = mutableListOf<String>()
+            every { redisCacheService.set<MatchDto>(match { it.startsWith("match:euw1:") }, any<MatchDto>(), any<Duration>()) } answers {
+                cachedMatchKeys.add(firstArg())
+            }
+
+            val matches = playerCacheService.getMatchesByIds(listOf("EUW1_10"), region)
+
+            Then("it should re-fetch from Riot API, update Redis, and return the match with gameVersion") {
+                matches.size shouldBe 1
+                matches.first().info?.gameVersion shouldBe "16.20.826.3891"
+                fetchedMatchIds shouldBe listOf("EUW1_10")
+                cachedMatchKeys shouldBe listOf("match:euw1:EUW1_10")
+            }
+        }
+
         When("fetching a profile for a Riot ID that has no summoner on the selected region") {
             every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
             every { redisCacheService.get(any(), SummonerProfileDto::class.java) } returns null
