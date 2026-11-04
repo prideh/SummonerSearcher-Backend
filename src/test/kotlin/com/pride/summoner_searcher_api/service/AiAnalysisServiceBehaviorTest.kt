@@ -735,13 +735,14 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 val heuristicTokens = AiAnalysisService.heuristicTokenEstimate(prompt)
                 println("MEASURED_20_MATCH_FIXTURE_BYTES: rawContextJsonBytes=$rawContextJsonBytes, groundTruthBytes=$groundTruthBytes, finalPromptBytes=$promptBytes, heuristicTokens=$heuristicTokens")
 
-                // 1. Hard size budget: must stay strictly under MAX_PROMPT_BYTES (16,000 bytes / 4,000 heuristic est tokens), vs old 46.7k bytes
-                (rawContextJsonBytes > 30_000) shouldBe true
-                (groundTruthBytes in 4_000..9_500) shouldBe true
-                (promptBytes in 10_000..AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
-                (heuristicTokens <= 4_000) shouldBe true
+                // 1. Exact measured fixture sizes + hard size budget (strictly under MAX_PROMPT_BYTES = 16,000 bytes, vs old ~46.7k bytes)
+                rawContextJsonBytes shouldBe 51895
+                groundTruthBytes shouldBe 7997
+                promptBytes shouldBe 15234
+                heuristicTokens shouldBe 3809
+                (promptBytes <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
                 // User question is preserved verbatim (never silently truncated)
-                prompt shouldContain "USER'S QUESTION: \"$userQuestion\""
+                prompt shouldContain "**USER QUESTION:**\n$userQuestion"
 
                 // 2. Bounded match count + omitted rollup
                 val expandedGameLines = Regex("""^\s{4}Game \d+""", RegexOption.MULTILINE).findAll(prompt).count()
@@ -795,9 +796,10 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     longPromptVersion
                 ) as String
                 val stressedBytes = AiAnalysisService.utf8ByteSize(stressedPrompt)
-                println("MEASURED_STRESSED_PROMPT_BYTES: stressedBytes=$stressedBytes, maxAllowed=${AiAnalysisService.MAX_PROMPT_BYTES}")
+                val stressedHeuristicTokens = AiAnalysisService.heuristicTokenEstimate(stressedPrompt)
+                println("MEASURED_STRESSED_PROMPT_BYTES: stressedBytes=$stressedBytes, stressedHeuristicTokens=$stressedHeuristicTokens, maxAllowed=${AiAnalysisService.MAX_PROMPT_BYTES}")
                 (stressedBytes <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
-                stressedPrompt shouldContain "USER'S QUESTION: \"$nearLimitQuestion\""
+                stressedPrompt shouldContain "**USER QUESTION:**\n$nearLimitQuestion"
             }
         }
 
@@ -829,7 +831,7 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     userMessage = oversizedQuestion
                 ).block()!!
                 syncResult.response shouldContain "exceeds the safe coaching context budget"
-                syncResult.response shouldContain "${AiAnalysisService.MAX_USER_MESSAGE_BYTES} UTF-8 bytes"
+                syncResult.response shouldContain "${AiAnalysisService.MAX_USER_MESSAGE_BYTES} bytes"
                 syncResult.response shouldContain "---SUGGESTIONS---"
 
                 // Public analyzeStream() also emits the explicit safe refusal without calling Gemini
@@ -839,7 +841,7 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     userMessage = oversizedQuestion
                 ).chunks.collectList().block()!!.joinToString("")
                 streamResult shouldContain "exceeds the safe coaching context budget"
-                streamResult shouldContain "${AiAnalysisService.MAX_USER_MESSAGE_BYTES} UTF-8 bytes"
+                streamResult shouldContain "${AiAnalysisService.MAX_USER_MESSAGE_BYTES} bytes"
             }
         }
     }
