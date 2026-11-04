@@ -48,6 +48,7 @@ class OvernightCohortCollectorRunner(
     private val running = AtomicBoolean(false)
     private val probeRunning = AtomicBoolean(false)
     private val stopRequested = AtomicBoolean(false)
+    private val overnightSessionArmed = AtomicBoolean(false)
 
     @Volatile
     private var activeRegion: String = "euw1"
@@ -59,7 +60,19 @@ class OvernightCohortCollectorRunner(
     private var activeBatchIndex: Int = 0
 
     @Volatile
+    private var productiveBatchesCompleted: Int = 0
+
+    @Volatile
+    private var pauseCyclesCount: Int = 0
+
+    @Volatile
+    private var consecutivePauseCycles: Int = 0
+
+    @Volatile
     private var maxBatchesConfigured: Int = 20
+
+    @Volatile
+    private var maxPauseCyclesConfigured: Int = 240
 
     @Volatile
     private var batchSizeConfigured: Int = 25
@@ -80,6 +93,13 @@ class OvernightCohortCollectorRunner(
             "0:0:0:0:0:0:0:1",
             "localhost"
         )
+        private val TERMINAL_STOP_REASONS = setOf(
+            "ALL_TARGET_CELLS_SATISFIED",
+            "NO_CANDIDATES_REMAINING",
+            "NETWORK_COLLECTION_DISABLED_BY_CONFIG",
+            "RATE_LIMIT_VERIFICATION_OR_HEADROOM_NOT_READY",
+            "STOPPED_BY_OPERATOR"
+        )
     }
 
     override fun run(args: ApplicationArguments?) {
@@ -92,6 +112,7 @@ class OvernightCohortCollectorRunner(
         val maxBatches = args.getOptionValues("collect-max-batches")?.firstOrNull()?.toIntOrNull()?.coerceIn(1, 500) ?: 20
         val batchSize = args.getOptionValues("collect-batch-size")?.firstOrNull()?.toIntOrNull()?.coerceIn(1, 200) ?: 25
         val pauseDelayMs = args.getOptionValues("collect-pause-ms")?.firstOrNull()?.toLongOrNull()?.coerceIn(0L, 60_000L) ?: 2_500L
+        val maxPauseCycles = args.getOptionValues("collect-max-pause-cycles")?.firstOrNull()?.toIntOrNull()?.coerceIn(1, 10_000) ?: 240
 
         // Start asynchronously in the SAME process so the web server and ChallengerCacheWarmer run normally
         startOrResumeGuarded(
@@ -100,6 +121,7 @@ class OvernightCohortCollectorRunner(
             maxBatches = maxBatches,
             batchSize = batchSize,
             pauseDelayMs = pauseDelayMs,
+            maxPauseCycles = maxPauseCycles,
             async = true
         )
     }
@@ -144,6 +166,7 @@ class OvernightCohortCollectorRunner(
         maxBatches: Int = 20,
         batchSize: Int = 25,
         pauseDelayMs: Long = 2_500L,
+        maxPauseCycles: Int = 240,
         async: Boolean = true
     ): CohortCollectorStatusDto {
         val normalizedRegion = region.lowercase().trim()
@@ -159,6 +182,7 @@ class OvernightCohortCollectorRunner(
         val coercedMaxBatches = maxBatches.coerceIn(1, 500)
         val coercedBatchSize = batchSize.coerceIn(1, 200)
         val coercedPauseMs = pauseDelayMs.coerceIn(0L, 60_000L)
+        val coercedMaxPauseCycles = maxPauseCycles.coerceIn(1, 10_000)
 
         if (!running.compareAndSet(false, true)) {
             return getStatus(
@@ -186,10 +210,15 @@ class OvernightCohortCollectorRunner(
         }
 
         stopRequested.set(false)
+        overnightSessionArmed.set(true)
         activeRegion = normalizedRegion
         activeTargetPatch = cleanPatch
         activeBatchIndex = 0
+        productiveBatchesCompleted = 0
+        pauseCyclesCount = 0
+        consecutivePauseCycles = 0
         maxBatchesConfigured = coercedMaxBatches
+        maxPauseCyclesConfigured = coercedMaxPauseCycles
         batchSizeConfigured = coercedBatchSize
         pauseDelayMsConfigured = coercedPauseMs
         lastRunStartedAt = Instant.ofEpochMilli(timeProvider.now())
@@ -202,7 +231,8 @@ class OvernightCohortCollectorRunner(
                         targetPatch = cleanPatch,
                         maxBatches = coercedMaxBatches,
                         batchSize = coercedBatchSize,
-                        pauseDelayMs = coercedPauseMs
+                        pauseDelayMs = coercedPauseMs,
+                        maxPauseCycles = coercedMaxPauseCycles
                     )
                 } catch (e: Exception) {
                     logger.error("[OvernightCollector] Error during same-process background collector run for {}", normalizedRegion, e)
@@ -226,7 +256,8 @@ class OvernightCohortCollectorRunner(
                         targetPatch = cleanPatch,
                         maxBatches = coercedMaxBatches,
                         batchSize = coercedBatchSize,
-                        pauseDelayMs = coercedPauseMs
+                        pauseDelayMs = coercedPauseMs,
+                        maxPauseCycles = coercedMaxPauseCycles
                     )
                 }
             } finally {
@@ -238,9 +269,47 @@ class OvernightCohortCollectorRunner(
                 region = normalizedRegion,
                 targetPatch = cleanPatch ?: finalCheckpoint?.targetPatch,
                 action = "COMPLETED_SYNCHRONOUS_RUN",
-                customMessage = "Completed synchronous guarded collector run in same process (stopReason=${finalCheckpoint?.lastStopReason ?: "NONE"})."
+                customMessage = "Completed synchronous guarded collector run in same process (stopReason=${finalCheckpoint?.lastStopReason ?: "NONE"}, productiveBatches=$productiveBatchesCompleted/$coercedMaxBatches, pauseCycles=$pauseCyclesCount)."
             )
         }
+    }
+
+    /**
+     * Periodic same-process auto-resume tick for armed overnight sessions.
+     * If an overnight run paused for a long rate-limit window (`PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE`)
+     * or finished a batch chunk (`BATCH_BUDGET_REACHED_RESUMABLE`) while target cells and candidates remain,
+     * automatically resumes from the Redis checkpoint once `readyForLowPriorityNetworkCollection` is true.
+     */
+    @org.springframework.scheduling.annotation.Scheduled(
+        fixedDelayString = "\${cohort.collector.auto-resume-interval-ms:30000}",
+        initialDelayString = "\${cohort.collector.auto-resume-initial-delay-ms:30000}"
+    )
+    fun scheduledAutoResumeTick() {
+        checkAndAutoResumeOvernightSession(async = true)
+    }
+
+    fun checkAndAutoResumeOvernightSession(async: Boolean = true): CohortCollectorStatusDto? {
+        if (!overnightSessionArmed.get() || running.get() || stopRequested.get()) {
+            return null
+        }
+        val region = activeRegion
+        val liveSnap = cohortBenchmarkService.getLiveRateLimitVerification(region)
+        if (!liveSnap.readyForLowPriorityNetworkCollection) {
+            return null
+        }
+        logger.info(
+            "[OvernightCollector] Auto-resuming armed overnight session for region={} patch={} after cooldown/batch window.",
+            region, activeTargetPatch ?: "auto-cached"
+        )
+        return startOrResumeGuarded(
+            region = region,
+            targetPatch = activeTargetPatch,
+            maxBatches = maxBatchesConfigured,
+            batchSize = batchSizeConfigured,
+            pauseDelayMs = pauseDelayMsConfigured,
+            maxPauseCycles = maxPauseCyclesConfigured,
+            async = async
+        )
     }
 
     /**
@@ -261,6 +330,7 @@ class OvernightCohortCollectorRunner(
         }
 
         stopRequested.set(true)
+        overnightSessionArmed.set(false)
         val isCurrentlyRunning = running.get()
         if (!isCurrentlyRunning) {
             val existing = cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch)
@@ -279,9 +349,9 @@ class OvernightCohortCollectorRunner(
             targetPatch = cleanPatch,
             action = if (isCurrentlyRunning) "STOP_REQUESTED_IN_PROCESS" else "STOPPED",
             customMessage = if (isCurrentlyRunning) {
-                "Stop requested; collector will halt at the next safe call boundary and checkpoint."
+                "Stop requested; collector will halt at the next safe call boundary, disarm auto-resume, and checkpoint."
             } else {
-                "Collector is not currently running; checkpoint marked STOPPED_BY_OPERATOR."
+                "Collector is not currently running; auto-resume disarmed and checkpoint marked STOPPED_BY_OPERATOR."
             }
         )
     }
@@ -315,8 +385,10 @@ class OvernightCohortCollectorRunner(
             }
         val effectivePatch = cleanPatch ?: checkpoint?.targetPatch ?: activeTargetPatch
         val isRunning = running.get() && activeRegion == normalizedRegion
+        val isArmed = overnightSessionArmed.get() && activeRegion == normalizedRegion
         val defaultMsg = when {
-            isRunning -> "Collector is running in-process (batch $activeBatchIndex/$maxBatchesConfigured)."
+            isRunning -> "Collector is running in-process (productiveBatches=$productiveBatchesCompleted/$maxBatchesConfigured, pauseCycles=$pauseCyclesCount)."
+            isArmed && checkpoint != null -> "Collector paused in-process awaiting cooldown auto-resume (lastStopReason=${checkpoint.lastStopReason}, cellsPassing=${checkpoint.cellsPassingQualityGate}/${checkpoint.targetCellsCount})."
             checkpoint != null -> "Collector idle in-process (lastStopReason=${checkpoint.lastStopReason}, cellsPassing=${checkpoint.cellsPassingQualityGate}/${checkpoint.targetCellsCount})."
             else -> "Collector idle in-process; no checkpoint recorded yet for region '$normalizedRegion'."
         }
@@ -325,12 +397,17 @@ class OvernightCohortCollectorRunner(
             region = normalizedRegion,
             targetPatch = effectivePatch,
             runningInProcess = isRunning,
+            overnightSessionArmed = isArmed,
             stopRequested = stopRequested.get(),
             executionMode = "SAME_PROCESS_GUARDED",
             action = action,
             message = customMessage ?: defaultMsg,
-            activeBatchIndex = if (isRunning) activeBatchIndex else 0,
+            activeBatchIndex = if (isRunning) activeBatchIndex else productiveBatchesCompleted,
+            productiveBatchesCompleted = productiveBatchesCompleted,
+            pauseCyclesCount = pauseCyclesCount,
+            consecutivePauseCycles = consecutivePauseCycles,
             maxBatchesConfigured = maxBatchesConfigured,
+            maxPauseCyclesConfigured = maxPauseCyclesConfigured,
             batchSizeConfigured = batchSizeConfigured,
             pauseDelayMsConfigured = pauseDelayMsConfigured,
             lastRunStartedAt = lastRunStartedAt,
@@ -344,8 +421,8 @@ class OvernightCohortCollectorRunner(
      * Guarded, bounded diagnostic probe entrypoint in the same backend JVM process.
      * - Observes real Riot `X-App-Rate-Limit`, `X-App-Rate-Limit-Count`, `X-Method-Rate-Limit`, and
      *   `X-Method-Rate-Limit-Count` headers BEFORE enabling bulk network collection.
-     * - Bounded to at most 1 LOW-priority call per missing required endpoint (`<= 3` calls total;
-     *   `0` calls when already verified), respecting foreground user requests and `429 Retry-After` / `service` backoffs.
+     * - Bounded to at most 1 actual HTTP attempt (`maxRetries = 0`) per missing required endpoint (`<= 3` HTTP attempts total;
+     *   `0` HTTP attempts when already verified), stopping immediately on the first `429` honoring `Retry-After`.
      */
     fun runDiagnosticProbeGuarded(
         region: String = "euw1",
@@ -356,14 +433,22 @@ class OvernightCohortCollectorRunner(
         val normalizedRegion = region.lowercase().trim()
         val cleanPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
         val nowInstant = Instant.ofEpochMilli(timeProvider.now())
+        val zeroAttemptsMap = CohortBenchmarkService.REQUIRED_COLLECTOR_ENDPOINTS.associateWith { 0 }
 
         if (!cohortBenchmarkService.isValidRegion(normalizedRegion) || !cohortBenchmarkService.isValidPatchOrNull(cleanPatch)) {
             return CohortRateLimitProbeResultDto(
                 region = normalizedRegion,
                 probeStatus = "INVALID_PARAMETERS",
+                maxCallsPerEndpoint = 1,
+                maxHttpAttemptsPerEndpoint = 1,
+                maxRetriesConfigured = 0,
+                totalProbeCallsMade = 0,
+                totalHttpAttemptsMade = 0,
+                httpAttemptsByEndpoint = zeroAttemptsMap,
+                stoppedOnRateLimit429 = false,
                 probedAt = nowInstant,
                 rateLimitVerification = buildInvalidParamStatus(normalizedRegion, cleanPatch, "Invalid region or patch.").rateLimitVerification,
-                notes = listOf("Invalid region or patch parameter; zero Redis or Riot calls executed.")
+                notes = listOf("Invalid region or patch parameter; zero Redis or Riot HTTP attempts executed.")
             )
         }
 
@@ -371,10 +456,17 @@ class OvernightCohortCollectorRunner(
             return CohortRateLimitProbeResultDto(
                 region = normalizedRegion,
                 probeStatus = "PROBE_ALREADY_RUNNING_IN_PROCESS",
+                maxCallsPerEndpoint = 1,
+                maxHttpAttemptsPerEndpoint = 1,
+                maxRetriesConfigured = 0,
+                totalProbeCallsMade = 0,
+                totalHttpAttemptsMade = 0,
+                httpAttemptsByEndpoint = zeroAttemptsMap,
+                stoppedOnRateLimit429 = false,
                 probedAt = nowInstant,
                 rateLimitVerification = cohortBenchmarkService.getLiveRateLimitVerification(normalizedRegion),
                 checkpoint = cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch),
-                notes = listOf("Diagnostic probe is already running in this JVM process; 0 duplicate calls made.")
+                notes = listOf("Diagnostic probe is already running in this JVM process; 0 duplicate HTTP attempts made.")
             )
         }
 
@@ -384,10 +476,17 @@ class OvernightCohortCollectorRunner(
                 return CohortRateLimitProbeResultDto(
                     region = normalizedRegion,
                     probeStatus = "PROBE_COOLDOWN_LOCK_ACTIVE",
+                    maxCallsPerEndpoint = 1,
+                    maxHttpAttemptsPerEndpoint = 1,
+                    maxRetriesConfigured = 0,
+                    totalProbeCallsMade = 0,
+                    totalHttpAttemptsMade = 0,
+                    httpAttemptsByEndpoint = zeroAttemptsMap,
+                    stoppedOnRateLimit429 = false,
                     probedAt = nowInstant,
                     rateLimitVerification = cohortBenchmarkService.getLiveRateLimitVerification(normalizedRegion),
                     checkpoint = cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch),
-                    notes = listOf("Diagnostic probe lock is active in Redis for '$normalizedRegion'; 0 duplicate calls made.")
+                    notes = listOf("Diagnostic probe lock is active in Redis for '$normalizedRegion'; 0 duplicate HTTP attempts made.")
                 )
             }
             return try {
@@ -412,16 +511,18 @@ class OvernightCohortCollectorRunner(
         targetPatch: String? = null,
         maxBatches: Int = 20,
         batchSize: Int = 25,
-        pauseDelayMs: Long = 2_500L
+        pauseDelayMs: Long = 2_500L,
+        maxPauseCycles: Int = 240
     ): CohortCollectorCheckpointDto? {
         logger.info(
-            "[OvernightCollector] Starting same-process resumable LOW-priority cohort collector: region={}, patch={}, maxBatches={}, batchSize={}, maxGamesPerPlayer={}",
-            region, targetPatch ?: "auto-cached", maxBatches, batchSize, CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
+            "[OvernightCollector] Starting same-process resumable LOW-priority cohort collector: region={}, patch={}, maxProductiveBatches={}, maxPauseCycles={}, batchSize={}, maxGamesPerPlayer={}",
+            region, targetPatch ?: "auto-cached", maxBatches, maxPauseCycles, batchSize, CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
         )
 
         var lastCheckpoint: CohortCollectorCheckpointDto? = null
-        for (batchIndex in 1..maxBatches) {
+        while (productiveBatchesCompleted < maxBatches) {
             if (stopRequested.get()) {
+                overnightSessionArmed.set(false)
                 val existing = lastCheckpoint ?: cohortBenchmarkService.getCollectorCheckpoint(region, targetPatch)
                 if (existing != null) {
                     val stopped = existing.copy(
@@ -431,12 +532,16 @@ class OvernightCohortCollectorRunner(
                     cohortBenchmarkService.saveCollectorCheckpoint(stopped)
                     lastCheckpoint = stopped
                 }
-                logger.info("[OvernightCollector] Stopping before batch {} due to operator stop request.", batchIndex)
+                logger.info("[OvernightCollector] Stopping before productive batch {} due to operator stop request.", productiveBatchesCompleted + 1)
                 break
             }
 
-            activeBatchIndex = batchIndex
+            activeBatchIndex = productiveBatchesCompleted + 1
             cohortBenchmarkService.refreshCollectorProcessLock(region)
+
+            val processedBeforeBatch = lastCheckpoint?.processedPuuids?.size
+                ?: cohortBenchmarkService.getCollectorCheckpoint(region, targetPatch ?: activeTargetPatch)?.processedPuuids?.size
+                ?: 0
 
             val checkpoint = cohortBenchmarkService.runResumableLowPriorityCollectorBatch(
                 region = region,
@@ -450,33 +555,91 @@ class OvernightCohortCollectorRunner(
                 activeTargetPatch = checkpoint.targetPatch
             }
 
-            logger.info(
-                "[OvernightCollector] Batch {}/{}: region={}, patch={}, cellsPassing={}/{}, processedPuuids={}, pendingCandidates={}, networkCalls={}, stopReason={}",
-                batchIndex, maxBatches, checkpoint.region, checkpoint.targetPatch ?: "NONE",
-                checkpoint.cellsPassingQualityGate, checkpoint.targetCellsCount,
-                checkpoint.processedPuuids.size, checkpoint.pendingCandidatePuuids.size,
-                checkpoint.totalNetworkCallsMade, checkpoint.lastStopReason
-            )
-
             when (checkpoint.lastStopReason) {
-                "ALL_TARGET_CELLS_SATISFIED",
-                "NO_CANDIDATES_REMAINING",
-                "NETWORK_COLLECTION_DISABLED_BY_CONFIG",
-                "RATE_LIMIT_VERIFICATION_OR_HEADROOM_NOT_READY",
-                "STOPPED_BY_OPERATOR" -> {
-                    logger.info("[OvernightCollector] Stopping cleanly at batch {} with reason={}", batchIndex, checkpoint.lastStopReason)
+                in TERMINAL_STOP_REASONS -> {
+                    if (checkpoint.processedPuuids.size > processedBeforeBatch) {
+                        productiveBatchesCompleted++
+                        consecutivePauseCycles = 0
+                    }
+                    overnightSessionArmed.set(false)
+                    logger.info(
+                        "[OvernightCollector] Stopping cleanly (terminal): productiveBatches={}/{}, pauseCycles={}, reason={}",
+                        productiveBatchesCompleted, maxBatches, pauseCyclesCount, checkpoint.lastStopReason
+                    )
                     break
                 }
                 "PAUSED_FOREGROUND_USER_REQUEST",
                 "PAUSED_RETRY_AFTER_BACKOFF",
-                "PAUSED_RATE_LIMIT_HEADROOM" -> {
-                    if (pauseDelayMs > 0L && batchIndex < maxBatches && !stopRequested.get()) {
-                        delay(pauseDelayMs)
+                "PAUSED_RATE_LIMIT_HEADROOM",
+                "PAUSED_NETWORK_TIMEOUT" -> {
+                    // Pause cycles do NOT consume productive batch budget (productiveBatchesCompleted is unchanged)
+                    pauseCyclesCount++
+                    consecutivePauseCycles++
+                    logger.info(
+                        "[OvernightCollector] Paused without consuming productive batch budget (productiveBatches={}/{}, consecutivePause={}/{}, totalPauses={}, reason={})",
+                        productiveBatchesCompleted, maxBatches, consecutivePauseCycles, maxPauseCycles, pauseCyclesCount, checkpoint.lastStopReason
+                    )
+                    if (consecutivePauseCycles >= maxPauseCycles) {
+                        val cooldownCheckpoint = checkpoint.copy(
+                            lastStopReason = "PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE",
+                            updatedAt = Instant.ofEpochMilli(timeProvider.now())
+                        )
+                        cohortBenchmarkService.saveCollectorCheckpoint(cooldownCheckpoint)
+                        lastCheckpoint = cooldownCheckpoint
+                        logger.info(
+                            "[OvernightCollector] Reached maxPauseCycles={} during long rate-limit/foreground window; saved PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE (overnightSessionArmed={} for auto-resume).",
+                            maxPauseCycles, overnightSessionArmed.get()
+                        )
+                        break
                     }
+                    if (pauseDelayMs > 0L && !stopRequested.get()) {
+                        val waitMs = computeEffectivePauseWaitMs(region, checkpoint.lastStopReason, pauseDelayMs)
+                        delayWithStopCheckAndLockRefresh(region, waitMs)
+                    }
+                }
+                else -> {
+                    productiveBatchesCompleted++
+                    consecutivePauseCycles = 0
+                    logger.info(
+                        "[OvernightCollector] Completed productive batch {}/{}: region={}, patch={}, cellsPassing={}/{}, processedPuuids={}, pendingCandidates={}, networkCalls={}, stopReason={}",
+                        productiveBatchesCompleted, maxBatches, checkpoint.region, checkpoint.targetPatch ?: "NONE",
+                        checkpoint.cellsPassingQualityGate, checkpoint.targetCellsCount,
+                        checkpoint.processedPuuids.size, checkpoint.pendingCandidatePuuids.size,
+                        checkpoint.totalNetworkCallsMade, checkpoint.lastStopReason
+                    )
                 }
             }
         }
         return lastCheckpoint
+    }
+
+    private fun computeEffectivePauseWaitMs(
+        region: String,
+        stopReason: String,
+        pauseDelayMs: Long
+    ): Long {
+        if (pauseDelayMs <= 0L) return 0L
+        if (stopReason == "PAUSED_RETRY_AFTER_BACKOFF") {
+            val snap = cohortBenchmarkService.getLiveRateLimitVerification(region)
+            val retryUntilMs = snap.retryAfterUntil?.toEpochMilli() ?: 0L
+            val remainingMs = (retryUntilMs - timeProvider.now() + 50L).coerceAtLeast(0L)
+            val maxSingleCycleWaitMs = (pauseDelayMs * 24L).coerceAtMost(60_000L)
+            return maxOf(pauseDelayMs, remainingMs.coerceAtMost(maxSingleCycleWaitMs))
+        }
+        return pauseDelayMs
+    }
+
+    private suspend fun delayWithStopCheckAndLockRefresh(region: String, totalWaitMs: Long) {
+        var remaining = totalWaitMs
+        val sliceMs = 2_500L
+        while (remaining > 0L && !stopRequested.get()) {
+            val step = minOf(remaining, sliceMs)
+            delay(step)
+            remaining -= step
+            if (remaining > 0L && !stopRequested.get()) {
+                cohortBenchmarkService.refreshCollectorProcessLock(region)
+            }
+        }
     }
 
     private fun buildInvalidParamStatus(
@@ -488,6 +651,7 @@ class OvernightCohortCollectorRunner(
             region = region,
             targetPatch = targetPatch,
             runningInProcess = false,
+            overnightSessionArmed = false,
             stopRequested = false,
             executionMode = "SAME_PROCESS_GUARDED",
             action = "INVALID_PARAMETERS",

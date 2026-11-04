@@ -38,10 +38,14 @@ class RiotApiService(
         region: String, 
         priority: ApiPriority = ApiPriority.HIGH, 
         endpointKey: String? = null,
+        maxRetries: Int = 3,
+        httpAttemptCounter: java.util.concurrent.atomic.AtomicInteger? = null,
+        failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>? = null,
+        suppressThrowOnZeroRetryFailure: Boolean = false,
         apiCall: () -> ResponseEntity<T>?
     ): T? {
         var attempts = 0
-        val maxRetries = 3
+        val effectiveMaxRetries = maxRetries.coerceAtLeast(0)
         if (priority == ApiPriority.HIGH) {
             rateLimiter.beginUserRequest(region)
         }
@@ -60,6 +64,7 @@ class RiotApiService(
                     )
                 }
                 try {
+                    httpAttemptCounter?.incrementAndGet()
                     val httpStartMs = System.currentTimeMillis()
                     val response = withContext(Dispatchers.IO) {
                         apiCall()
@@ -92,6 +97,7 @@ class RiotApiService(
                 } catch (e: HttpClientErrorException.TooManyRequests) {
                     attempts++
                     val rateLimitType = e.responseHeaders?.getFirst("X-Rate-Limit-Type")
+                    failureReasonHolder?.set("HTTP_429_TOO_MANY_REQUESTS")
                     
                     // Update limits from the 429 response as well
                     rateLimiter.updateLimits(
@@ -112,21 +118,36 @@ class RiotApiService(
                     }
                     rateLimiter.recordRetryAfter(region, baseWaitMs, rateLimitType)
 
-                    if (attempts > maxRetries) {
-                        logger.error("Exceeded max retries ($maxRetries) for rate limit (type=${rateLimitType ?: "n/a"}). Giving up.")
+                    if (attempts > effectiveMaxRetries) {
+                        if (suppressThrowOnZeroRetryFailure && effectiveMaxRetries == 0) {
+                            logger.warn(
+                                "Hit 429 Rate Limit (type={}, endpoint={}) with maxRetries=0. Recorded Retry-After={}ms and stopping immediately without retry.",
+                                rateLimitType ?: "n/a", endpointKey ?: "unspecified", baseWaitMs
+                            )
+                            return null
+                        }
+                        logger.error("Exceeded max retries ($effectiveMaxRetries) for rate limit (type=${rateLimitType ?: "n/a"}). Giving up.")
                         throw e
                     }
                     
-                    logger.warn("Hit 429 Rate Limit (type={})! Waiting {}ms before retry {}/{}.", rateLimitType ?: "n/a", baseWaitMs, attempts, maxRetries)
+                    logger.warn("Hit 429 Rate Limit (type={})! Waiting {}ms before retry {}/{}.", rateLimitType ?: "n/a", baseWaitMs, attempts, effectiveMaxRetries)
                     kotlinx.coroutines.delay(baseWaitMs)
                 } catch (e: org.springframework.web.client.ResourceAccessException) {
                     attempts++
-                    if (attempts > maxRetries) {
-                        logger.error("Exceeded max retries ($maxRetries) for network timeout. Giving up.")
+                    failureReasonHolder?.set("NETWORK_TIMEOUT")
+                    if (attempts > effectiveMaxRetries) {
+                        if (suppressThrowOnZeroRetryFailure && effectiveMaxRetries == 0) {
+                            logger.warn(
+                                "Network timeout on endpoint={} with maxRetries=0. Stopping immediately without retry.",
+                                endpointKey ?: "unspecified"
+                            )
+                            return null
+                        }
+                        logger.error("Exceeded max retries ($effectiveMaxRetries) for network timeout. Giving up.")
                         throw e
                     }
                     val waitMs = 1000L * attempts // Exponential backoff: 1s, 2s, 3s
-                    logger.warn("Network timeout (ReadTimeout). Waiting {}ms before retry {}/{}.", waitMs, attempts, maxRetries)
+                    logger.warn("Network timeout (ReadTimeout). Waiting {}ms before retry {}/{}.", waitMs, attempts, effectiveMaxRetries)
                     kotlinx.coroutines.delay(waitMs)
                 }
             }
@@ -220,11 +241,25 @@ class RiotApiService(
         return allLeagueEntries?.find { it.queueType == "RANKED_SOLO_5x5" }
     }
 
-    suspend fun fetchLeagueRankLowPriority(puuid: String, region: String): LeagueEntryDto? {
+    suspend fun fetchLeagueRankLowPriority(
+        puuid: String,
+        region: String,
+        maxRetries: Int = 0,
+        httpAttemptCounter: java.util.concurrent.atomic.AtomicInteger? = null,
+        failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>? = null
+    ): LeagueEntryDto? {
         val platformBaseUrl = "https://${region}.api.riotgames.com"
         val leagueUri = "$platformBaseUrl/lol/league/v4/entries/by-puuid/{puuid}"
         val leagueEntriesType = object : ParameterizedTypeReference<List<LeagueEntryDto>>() {}
-        val allLeagueEntries = executeRateLimitedCall(region, ApiPriority.LOW, "league-v4-entries-by-puuid") {
+        val allLeagueEntries = executeRateLimitedCall(
+            region = region,
+            priority = ApiPriority.LOW,
+            endpointKey = "league-v4-entries-by-puuid",
+            maxRetries = maxRetries,
+            httpAttemptCounter = httpAttemptCounter,
+            failureReasonHolder = failureReasonHolder,
+            suppressThrowOnZeroRetryFailure = true
+        ) {
             try {
                 riotRestClient.get()
                     .uri(leagueUri, puuid)
@@ -242,7 +277,10 @@ class RiotApiService(
         queue: String = "RANKED_SOLO_5x5",
         tier: String,
         division: String = "I",
-        page: Int = 1
+        page: Int = 1,
+        maxRetries: Int = 0,
+        httpAttemptCounter: java.util.concurrent.atomic.AtomicInteger? = null,
+        failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>? = null
     ): List<LeagueEntryDto>? {
         val platformBaseUrl = "https://${region}.api.riotgames.com"
         val uri = "$platformBaseUrl/lol/league/v4/entries/{queue}/{tier}/{division}?page={page}"
@@ -253,7 +291,15 @@ class RiotApiService(
             "page" to page.coerceAtLeast(1)
         )
         val responseType = object : ParameterizedTypeReference<List<LeagueEntryDto>>() {}
-        return executeRateLimitedCall(region, ApiPriority.LOW, "league-v4-entries-by-tier") {
+        return executeRateLimitedCall(
+            region = region,
+            priority = ApiPriority.LOW,
+            endpointKey = "league-v4-entries-by-tier",
+            maxRetries = maxRetries,
+            httpAttemptCounter = httpAttemptCounter,
+            failureReasonHolder = failureReasonHolder,
+            suppressThrowOnZeroRetryFailure = true
+        ) {
             try {
                 riotRestClient.get()
                     .uri(uri, uriVariables)
@@ -354,7 +400,10 @@ class RiotApiService(
         region: String,
         queueId: Int = 420,
         count: Int = 20,
-        start: Int = 0
+        start: Int = 0,
+        maxRetries: Int = 0,
+        httpAttemptCounter: java.util.concurrent.atomic.AtomicInteger? = null,
+        failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>? = null
     ): List<String>? {
         val regionalRouting = mapToRegionRouting(region)
         val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
@@ -366,7 +415,15 @@ class RiotApiService(
             "start" to start
         )
         val responseType = object : ParameterizedTypeReference<List<String>>() {}
-        return executeRateLimitedCall(region, ApiPriority.LOW, "match-v5-ids-by-puuid") {
+        return executeRateLimitedCall(
+            region = region,
+            priority = ApiPriority.LOW,
+            endpointKey = "match-v5-ids-by-puuid",
+            maxRetries = maxRetries,
+            httpAttemptCounter = httpAttemptCounter,
+            failureReasonHolder = failureReasonHolder,
+            suppressThrowOnZeroRetryFailure = true
+        ) {
             try {
                 riotRestClient.get()
                     .uri(uri, uriVariables)
@@ -475,12 +532,26 @@ class RiotApiService(
         }
     }
 
-    suspend fun getMatchByIdLowPriority(matchId: String, region: String): MatchDto? {
+    suspend fun getMatchByIdLowPriority(
+        matchId: String,
+        region: String,
+        maxRetries: Int = 0,
+        httpAttemptCounter: java.util.concurrent.atomic.AtomicInteger? = null,
+        failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>? = null
+    ): MatchDto? {
         val regionalRouting = mapToRegionRouting(region)
         val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
         val uri = "$matchBaseUrl/lol/match/v5/matches/{matchId}"
 
-        return executeRateLimitedCall(region, ApiPriority.LOW, "match-v5-match-by-id") {
+        return executeRateLimitedCall(
+            region = region,
+            priority = ApiPriority.LOW,
+            endpointKey = "match-v5-match-by-id",
+            maxRetries = maxRetries,
+            httpAttemptCounter = httpAttemptCounter,
+            failureReasonHolder = failureReasonHolder,
+            suppressThrowOnZeroRetryFailure = true
+        ) {
             try {
                 riotRestClient.get()
                     .uri(uri, matchId)

@@ -20,9 +20,10 @@ REGION="${COLLECT_REGION:-euw1}"
 TARGET_PATCH="${COLLECT_PATCH:-}"
 SEED_PUUID="${COLLECT_SEED_PUUID:-}"
 SEED_MATCH_ID="${COLLECT_SEED_MATCH_ID:-}"
-MAX_BATCHES="${COLLECT_MAX_BATCHES:-20}"
+MAX_BATCHES="${COLLECT_MAX_BATCHES:-100}"
 BATCH_SIZE="${COLLECT_BATCH_SIZE:-25}"
 PAUSE_DELAY_MS="${COLLECT_PAUSE_MS:-2500}"
+MAX_PAUSE_CYCLES="${COLLECT_MAX_PAUSE_CYCLES:-240}"
 POLL_SECONDS="${COLLECT_POLL_SECONDS:-5}"
 WAIT_FOR_COMPLETION="${COLLECT_WAIT:-true}"
 BASE_URL="${COLLECT_BASE_URL:-http://127.0.0.1:${PORT:-8080}}"
@@ -94,7 +95,7 @@ if [[ -n "${PROBE_QUERY}" ]]; then
 fi
 
 echo "[cohort-collector] Mode=SAME_PROCESS_GUARDED | Action=${ACTION} | BaseUrl=${BASE_URL} | Region=${REGION} | Patch=${TARGET_PATCH:-auto-cached}"
-echo "[cohort-collector] Guardrails: cap=10 games/player, gate=50 players + 200 games/cell, LOW priority, yields to same-process foreground traffic & 429 Retry-After."
+echo "[cohort-collector] Guardrails: cap=10 games/player, gate=50 players + 200 games/cell, LOW priority, maxRetries=0 (single HTTP attempt/call), yields to foreground traffic & 429 Retry-After."
 echo "[cohort-collector] Notice: Resumable checkpointed run; coverage depends on verified Riot rate limits and candidate pool (no morning coverage promise)."
 
 if ! PRE_STATUS="$(http_get "${STATUS_URL}" 2>/dev/null)"; then
@@ -110,7 +111,7 @@ case "${ACTION}" in
     echo "${PRE_STATUS}"
     ;;
   probe)
-    echo "[cohort-collector] Running guarded bounded diagnostic probe (max 1 LOW-priority call per missing required endpoint):"
+    echo "[cohort-collector] Running guarded bounded diagnostic probe (max 1 HTTP attempt per missing required endpoint, maxRetries=0):"
     PROBE_RESP="$(http_post "${PROBE_URL}")"
     echo "${PROBE_RESP}"
     ;;
@@ -127,12 +128,12 @@ case "${ACTION}" in
     echo "[cohort-collector] Pre-flight same-process status:"
     echo "${PRE_STATUS}"
     if [[ "${PRE_STATUS}" == *'"appLimitsVerifiedFromHeaders":false'* ]] || [[ "${PRE_STATUS}" != *'"missingRequiredMethodEndpoints":[]'* ]]; then
-      echo "[cohort-collector] Required rate-limit headers not yet verified in-process; executing bounded diagnostic probe first (max 1 call/endpoint)..."
+      echo "[cohort-collector] Required rate-limit headers not yet verified in-process; executing bounded diagnostic probe first (max 1 HTTP attempt/endpoint, maxRetries=0)..."
       PROBE_RESP="$(http_post "${PROBE_URL}")"
       echo "[cohort-collector] Diagnostic probe response:"
       echo "${PROBE_RESP}"
     fi
-    START_QUERY="maxBatches=${MAX_BATCHES}&batchSize=${BATCH_SIZE}&pauseDelayMs=${PAUSE_DELAY_MS}&async=true"
+    START_QUERY="maxBatches=${MAX_BATCHES}&batchSize=${BATCH_SIZE}&pauseDelayMs=${PAUSE_DELAY_MS}&maxPauseCycles=${MAX_PAUSE_CYCLES}&async=true"
     if [[ -n "${PATCH_PARAM}" ]]; then
       START_QUERY="${START_QUERY}&${PATCH_PARAM}"
     fi
@@ -144,12 +145,12 @@ case "${ACTION}" in
     if [[ "${WAIT_FOR_COMPLETION}" == "true" ]]; then
       while true; do
         CURRENT_STATUS="$(http_get "${STATUS_URL}")"
-        if [[ "${CURRENT_STATUS}" != *'"runningInProcess":true'* ]]; then
-          echo "[cohort-collector] Same-process collector run finished or paused:"
+        if [[ "${CURRENT_STATUS}" != *'"runningInProcess":true'* ]] && [[ "${CURRENT_STATUS}" != *'"overnightSessionArmed":true'* ]]; then
+          echo "[cohort-collector] Same-process collector reached terminal or disarmed state:"
           echo "${CURRENT_STATUS}"
           break
         fi
-        echo "[cohort-collector] In-process collector active; polling again in ${POLL_SECONDS}s..."
+        echo "[cohort-collector] In-process collector active or armed in cooldown; polling again in ${POLL_SECONDS}s..."
         sleep "${POLL_SECONDS}"
       done
     fi

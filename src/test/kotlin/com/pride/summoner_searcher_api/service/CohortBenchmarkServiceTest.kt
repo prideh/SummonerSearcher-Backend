@@ -690,26 +690,26 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
 
             // 6. Verified & clear: batch 1 processes maxPlayersPerBatch=1 ("seed-p1"), caps at 10 games/player,
             // stops when encountering an older patch (16.6), and discovers "discovered-p3"
-            coEvery { riotApiService.fetchLeagueRankLowPriority("seed-p1", "euw1") } returns LeagueEntryDto(
+            coEvery { riotApiService.fetchLeagueRankLowPriority("seed-p1", "euw1", any(), any(), any()) } returns LeagueEntryDto(
                 leagueId = "l1", queueType = "RANKED_SOLO_5x5", tier = "EMERALD", rank = "II",
                 summonerName = "P1", puuid = "seed-p1", leaguePoints = 50, wins = 20, losses = 18,
                 veteran = false, inactive = false, freshBlood = false, hotStreak = false
             )
-            coEvery { riotApiService.fetchLeagueRankLowPriority("seed-p2", "euw1") } returns LeagueEntryDto(
+            coEvery { riotApiService.fetchLeagueRankLowPriority("seed-p2", "euw1", any(), any(), any()) } returns LeagueEntryDto(
                 leagueId = "l2", queueType = "RANKED_SOLO_5x5", tier = "EMERALD", rank = "I",
                 summonerName = "P2", puuid = "seed-p2", leaguePoints = 75, wins = 30, losses = 20,
                 veteran = false, inactive = false, freshBlood = false, hotStreak = false
             )
             // Return 10 match IDs for seed-p1: first 2 are on 16.7, 3rd is on older patch 16.6 (should stop at 3rd!)
             coEvery {
-                riotApiService.getMatchIdsByPuuidLowPriority("seed-p1", "euw1", 420, 10, 0)
+                riotApiService.getMatchIdsByPuuidLowPriority("seed-p1", "euw1", 420, 10, 0, any(), any(), any())
             } returns (1..10).map { "EUW1_C$it" }
             coEvery {
-                riotApiService.getMatchIdsByPuuidLowPriority("seed-p2", "euw1", 420, 10, 0)
+                riotApiService.getMatchIdsByPuuidLowPriority("seed-p2", "euw1", 420, 10, 0, any(), any(), any())
             } returns listOf("EUW1_C1") // Already cached from batch 1!
 
             val fetchedMatchCalls = mutableListOf<String>()
-            coEvery { riotApiService.getMatchByIdLowPriority(any(), "euw1") } answers {
+            coEvery { riotApiService.getMatchByIdLowPriority(any(), "euw1", any(), any(), any()) } answers {
                 val mId = firstArg<String>()
                 fetchedMatchCalls.add(mId)
                 val idx = mId.removePrefix("EUW1_C").toInt()
@@ -1070,8 +1070,9 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             var matchIdCalls = 0
             var matchDetailCalls = 0
 
-            coEvery { probeRiotApi.fetchLeagueRankLowPriority("euw-seed-puuid-1", "euw1") } coAnswers {
+            coEvery { probeRiotApi.fetchLeagueRankLowPriority("euw-seed-puuid-1", "euw1", any(), any(), any()) } coAnswers {
                 leagueCalls++
+                arg<java.util.concurrent.atomic.AtomicInteger?>(3)?.incrementAndGet()
                 probeRateLimiter.updateLimits(
                     region = "euw1",
                     limitHeader = "20:1,100:120",
@@ -1086,8 +1087,9 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                     veteran = true, inactive = false, freshBlood = false, hotStreak = true
                 )
             }
-            coEvery { probeRiotApi.getMatchIdsByPuuidLowPriority("euw-seed-puuid-1", "euw1", 420, 1, 0) } coAnswers {
+            coEvery { probeRiotApi.getMatchIdsByPuuidLowPriority("euw-seed-puuid-1", "euw1", 420, 1, 0, any(), any(), any()) } coAnswers {
                 matchIdCalls++
+                arg<java.util.concurrent.atomic.AtomicInteger?>(6)?.incrementAndGet()
                 probeRateLimiter.updateLimits(
                     region = "euw1",
                     limitHeader = "20:1,100:120",
@@ -1098,8 +1100,9 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 )
                 listOf("EUW1_PROBE_M1")
             }
-            coEvery { probeRiotApi.getMatchByIdLowPriority("EUW1_PROBE_M1", "euw1") } coAnswers {
+            coEvery { probeRiotApi.getMatchByIdLowPriority("EUW1_PROBE_M1", "euw1", any(), any(), any()) } coAnswers {
                 matchDetailCalls++
+                arg<java.util.concurrent.atomic.AtomicInteger?>(3)?.incrementAndGet()
                 probeRateLimiter.updateLimits(
                     region = "euw1",
                     limitHeader = "20:1,100:120",
@@ -1127,18 +1130,31 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
 
                 noSeedProbe.probeStatus shouldBe "NO_CACHED_SEED_PUUID_AVAILABLE"
                 noSeedProbe.totalProbeCallsMade shouldBe 0
+                noSeedProbe.totalHttpAttemptsMade shouldBe 0
                 noSeedProbe.checkpoint shouldNotBe null
                 noSeedProbe.checkpoint?.lastStopReason shouldBe "CACHE_BASELINE_INITIALIZED"
 
                 fgPausedProbe.probeStatus shouldBe "PAUSED_FOREGROUND_USER_REQUEST"
                 fgPausedProbe.totalProbeCallsMade shouldBe 0
+                fgPausedProbe.totalHttpAttemptsMade shouldBe 0
 
                 retryPausedProbe.probeStatus shouldBe "PAUSED_RETRY_AFTER_BACKOFF"
                 retryPausedProbe.totalProbeCallsMade shouldBe 0
+                retryPausedProbe.totalHttpAttemptsMade shouldBe 0
 
                 verifiedProbe.probeStatus shouldBe "ALL_REQUIRED_HEADERS_VERIFIED"
                 verifiedProbe.seedSource shouldBe "CACHED_CHALLENGER_LEADERBOARD"
+                verifiedProbe.maxCallsPerEndpoint shouldBe 1
+                verifiedProbe.maxHttpAttemptsPerEndpoint shouldBe 1
+                verifiedProbe.maxRetriesConfigured shouldBe 0
                 verifiedProbe.totalProbeCallsMade shouldBe 3
+                verifiedProbe.totalHttpAttemptsMade shouldBe 3
+                verifiedProbe.httpAttemptsByEndpoint shouldBe mapOf(
+                    "league-v4-entries-by-puuid" to 1,
+                    "match-v5-ids-by-puuid" to 1,
+                    "match-v5-match-by-id" to 1
+                )
+                verifiedProbe.stoppedOnRateLimit429 shouldBe false
                 leagueCalls shouldBe 1
                 matchIdCalls shouldBe 1
                 matchDetailCalls shouldBe 1
@@ -1156,9 +1172,314 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
 
                 repeatProbe.probeStatus shouldBe "ALREADY_VERIFIED_ZERO_CALLS"
                 repeatProbe.totalProbeCallsMade shouldBe 0
+                repeatProbe.totalHttpAttemptsMade shouldBe 0
                 leagueCalls shouldBe 1
                 matchIdCalls shouldBe 1
                 matchDetailCalls shouldBe 1
+            }
+        }
+
+        When("diagnostic probe encounters HTTP 429 TooManyRequests or timeout through real RiotApiService.executeRateLimitedCall") {
+            val clockMs = java.util.concurrent.atomic.AtomicLong(nowInstant.toEpochMilli())
+            val testClock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            val realLimiter = RiotApiRateLimiter(testClock)
+            val mockRestClient = mockk<org.springframework.web.client.RestClient>()
+            val mockReqHeadersUriSpec = mockk<org.springframework.web.client.RestClient.RequestHeadersUriSpec<*>>()
+            val mockReqHeadersSpec = mockk<org.springframework.web.client.RestClient.RequestHeadersSpec<*>>()
+            val mockResponseSpec = mockk<org.springframework.web.client.RestClient.ResponseSpec>()
+
+            every { mockRestClient.get() } returns mockReqHeadersUriSpec
+            every { mockReqHeadersUriSpec.uri(any<String>(), *anyVararg()) } returns mockReqHeadersSpec
+            every { mockReqHeadersUriSpec.uri(any<String>(), any<Map<String, Any>>()) } returns mockReqHeadersSpec
+            every { mockReqHeadersSpec.retrieve() } returns mockResponseSpec
+
+            var rawHttpAttempts = 0
+            every {
+                mockResponseSpec.toEntity(any<org.springframework.core.ParameterizedTypeReference<List<LeagueEntryDto>>>())
+            } answers {
+                rawHttpAttempts++
+                val headers = org.springframework.http.HttpHeaders().apply {
+                    add("X-App-Rate-Limit", "20:1,100:120")
+                    add("X-App-Rate-Limit-Count", "20:1,20:120")
+                    add("X-Method-Rate-Limit", "500:10")
+                    add("X-Method-Rate-Limit-Count", "1:10")
+                    add("X-Rate-Limit-Type", "application")
+                    add("Retry-After", "8")
+                }
+                throw org.springframework.web.client.HttpClientErrorException.create(
+                    org.springframework.http.HttpStatus.TOO_MANY_REQUESTS,
+                    "Too Many Requests",
+                    headers,
+                    ByteArray(0),
+                    null
+                )
+            }
+
+            // Real RiotApiService instance (exercises executeRateLimitedCall directly!)
+            val realRiotApiService = RiotApiService(mockRestClient, realLimiter)
+            val probeRedis = mockk<RedisCacheService>(relaxed = true)
+            val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
+            every { probeRedis.scanKeys(any(), any(), any()) } returns emptyList()
+            every { probeRedis.get(any(), CachedLeaderboardDto::class.java) } returns null
+            every { probeRedis.get(any(), CohortRankSnapshotDto::class.java) } returns null
+            every { probeRedis.get(any(), SummonerProfileDto::class.java) } returns null
+            every { probeRedis.get(any(), MatchDto::class.java) } returns null
+            every { probeRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
+                savedCheckpoints[firstArg()]
+            }
+            every { probeRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                val value = secondArg<Any>()
+                if (value is CohortCollectorCheckpointDto) {
+                    savedCheckpoints[key] = value
+                }
+            }
+
+            val probeService = CohortBenchmarkService(
+                redisCacheService = probeRedis,
+                cohortBenchmarkCellRepository = cohortRepo,
+                riotApiRateLimiter = realLimiter,
+                riotApiService = realRiotApiService,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = testClock
+            )
+
+            // 1. Run diagnostic probe when first endpoint returns 429 with Retry-After: 8
+            val probeOn429 = probeService.runBoundedDiagnosticRateLimitProbe(
+                region = "euw1",
+                explicitSeedPuuid = "euw-seed-429-test"
+            )
+
+            // 2. Advance past the 8s Retry-After window and test a single-attempt timeout (ResourceAccessException)
+            clockMs.addAndGet(9_000L)
+            var timeoutHttpAttempts = 0
+            every {
+                mockResponseSpec.toEntity(any<org.springframework.core.ParameterizedTypeReference<List<String>>>())
+            } answers {
+                timeoutHttpAttempts++
+                throw org.springframework.web.client.ResourceAccessException("Read timed out")
+            }
+            val probeOnTimeout = probeService.runBoundedDiagnosticRateLimitProbe(
+                region = "euw1",
+                explicitSeedPuuid = "euw-seed-429-test"
+            )
+
+            Then("it should execute exactly 1 HTTP attempt (zero hidden retries), record Retry-After and headers, and immediately stop the probe on the first 429 or timeout") {
+                // Exactly 1 HTTP attempt made on RestClient (NOT 4 attempts!)
+                rawHttpAttempts shouldBe 1
+                probeOn429.probeStatus shouldBe "STOPPED_ON_FIRST_429_RETRY_AFTER"
+                probeOn429.stoppedOnRateLimit429 shouldBe true
+                probeOn429.maxRetriesConfigured shouldBe 0
+                probeOn429.maxHttpAttemptsPerEndpoint shouldBe 1
+                probeOn429.totalProbeCallsMade shouldBe 1
+                probeOn429.totalHttpAttemptsMade shouldBe 1
+                probeOn429.httpAttemptsByEndpoint shouldBe mapOf(
+                    "league-v4-entries-by-puuid" to 1,
+                    "match-v5-ids-by-puuid" to 0,
+                    "match-v5-match-by-id" to 0
+                )
+                probeOn429.endpointOutcomes["league-v4-entries-by-puuid"] shouldBe "STOPPED_ON_FIRST_429_RETRY_AFTER"
+                probeOn429.endpointOutcomes["match-v5-ids-by-puuid"] shouldBe "SKIPPED_DUE_TO_STOPPED_ON_FIRST_429_RETRY_AFTER"
+                probeOn429.endpointOutcomes["match-v5-match-by-id"] shouldBe "SKIPPED_DUE_TO_STOPPED_ON_FIRST_429_RETRY_AFTER"
+                // Headers and Retry-After from the 429 response were recorded in realLimiter
+                probeOn429.rateLimitVerification.appLimitsVerifiedFromHeaders shouldBe true
+                probeOn429.rateLimitVerification.verifiedMethodEndpoints shouldBe setOf("league-v4-entries-by-puuid")
+                probeOn429.rateLimitVerification.retryAfterUntil shouldNotBe null
+                probeOn429.checkpoint?.pausedForRetryAfterCount shouldBe 1
+                probeOn429.checkpoint?.lastStopReason shouldBe "PAUSED_RETRY_AFTER_BACKOFF"
+
+                // After Retry-After expires: league-v4-entries-by-puuid is already verified (0 attempts),
+                // match-v5-ids-by-puuid times out on attempt 1 with 0 hidden retries and aborts remaining endpoints
+                rawHttpAttempts shouldBe 1
+                timeoutHttpAttempts shouldBe 1
+                probeOnTimeout.probeStatus shouldBe "STOPPED_ON_FIRST_TIMEOUT_NO_RETRY"
+                probeOnTimeout.totalHttpAttemptsMade shouldBe 1
+                probeOnTimeout.httpAttemptsByEndpoint shouldBe mapOf(
+                    "league-v4-entries-by-puuid" to 0,
+                    "match-v5-ids-by-puuid" to 1,
+                    "match-v5-match-by-id" to 0
+                )
+                probeOnTimeout.endpointOutcomes["league-v4-entries-by-puuid"] shouldBe "SKIPPED_ALREADY_VERIFIED"
+                probeOnTimeout.endpointOutcomes["match-v5-ids-by-puuid"] shouldBe "STOPPED_ON_FIRST_TIMEOUT_NO_RETRY"
+                probeOnTimeout.endpointOutcomes["match-v5-match-by-id"] shouldBe "SKIPPED_DUE_TO_STOPPED_ON_FIRST_TIMEOUT_NO_RETRY"
+            }
+        }
+
+        When("overnight runner experiences >20 pause cycles during a long rate-limit window and cooldown auto-resume") {
+            val clockMs = java.util.concurrent.atomic.AtomicLong(nowInstant.toEpochMilli())
+            val testClock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            val durableLimiter = RiotApiRateLimiter(testClock)
+            val durableRedis = mockk<RedisCacheService>(relaxed = true)
+            val durableRiotApi = mockk<RiotApiService>(relaxed = true)
+            val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
+            val savedSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
+            var lockHeld = false
+
+            every { durableRedis.scanKeys(any(), any(), any()) } returns emptyList()
+            every { durableRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
+                savedCheckpoints[firstArg()]
+            }
+            every { durableRedis.get(any(), CohortRankSnapshotDto::class.java) } answers {
+                savedSnapshots[firstArg()]
+            }
+            every { durableRedis.get(any(), SummonerProfileDto::class.java) } returns null
+            every { durableRedis.get(any(), MatchDto::class.java) } returns null
+            every { durableRedis.get(any(), CachedLeaderboardDto::class.java) } returns null
+            every { durableRedis.setIfAbsent(match { it.startsWith("lock:cohort:collector:active:") }, any(), any()) } answers {
+                if (lockHeld) false else {
+                    lockHeld = true
+                    true
+                }
+            }
+            every { durableRedis.delete(match { it.startsWith("lock:cohort:collector:active:") }) } answers {
+                lockHeld = false
+            }
+            every { durableRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                when (val value = secondArg<Any>()) {
+                    is CohortCollectorCheckpointDto -> savedCheckpoints[key] = value
+                    is CohortRankSnapshotDto -> savedSnapshots[key] = value
+                }
+            }
+
+            // Verify all 3 required endpoints in durableLimiter
+            for (ep in CohortBenchmarkService.REQUIRED_COLLECTOR_ENDPOINTS) {
+                durableLimiter.updateLimits(
+                    region = "euw1",
+                    limitHeader = "20:1,100:120",
+                    countHeader = "1:1,1:120",
+                    endpointKey = ep,
+                    methodLimitHeader = "500:10",
+                    methodCountHeader = "1:10"
+                )
+            }
+
+            val durableService = CohortBenchmarkService(
+                redisCacheService = durableRedis,
+                cohortBenchmarkCellRepository = cohortRepo,
+                riotApiRateLimiter = durableLimiter,
+                riotApiService = durableRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = testClock
+            )
+            val durableRunner = com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner(
+                cohortBenchmarkService = durableService,
+                configuredOperatorToken = "",
+                timeProvider = testClock
+            )
+
+            // Seed checkpoint with 2 candidates ("p-durable-1", "p-durable-2")
+            durableService.saveCollectorCheckpoint(
+                CohortCollectorCheckpointDto(
+                    region = "euw1",
+                    targetPatch = "16.7",
+                    patchSelectionSource = "EXPLICIT_TARGET_PATCH",
+                    pendingCandidatePuuids = listOf("p-durable-1", "p-durable-2"),
+                    startedAt = nowInstant,
+                    updatedAt = nowInstant
+                )
+            )
+
+            coEvery { durableRiotApi.fetchLeagueRankLowPriority(any(), "euw1", any(), any(), any()) } coAnswers {
+                val pid = firstArg<String>()
+                arg<java.util.concurrent.atomic.AtomicInteger?>(3)?.incrementAndGet()
+                LeagueEntryDto(
+                    leagueId = "l-$pid", queueType = "RANKED_SOLO_5x5", tier = "DIAMOND", rank = "I",
+                    summonerName = pid, puuid = pid, leaguePoints = 60, wins = 25, losses = 20,
+                    veteran = false, inactive = false, freshBlood = false, hotStreak = false
+                )
+            }
+            coEvery { durableRiotApi.getMatchIdsByPuuidLowPriority(any(), "euw1", 420, any(), 0, any(), any(), any()) } coAnswers {
+                arg<java.util.concurrent.atomic.AtomicInteger?>(6)?.incrementAndGet()
+                emptyList()
+            }
+
+            // Scenario A: Simulate a long 60s Retry-After window where 25 consecutive checks happen before the window clears.
+            // Previously, 20 pauses x 2.5s = 50s exhausted maxBatches=20 and silently quit with 0 productive batches!
+            durableLimiter.recordRetryAfter("euw1", 60_000L, "application")
+            var checkpointSaveCallsDuringPause = 0
+            every { durableRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                when (val value = secondArg<Any>()) {
+                    is CohortCollectorCheckpointDto -> {
+                        savedCheckpoints[key] = value
+                        if (value.lastStopReason == "PAUSED_RETRY_AFTER_BACKOFF" && key.endsWith(":16.7")) {
+                            checkpointSaveCallsDuringPause++
+                            if (checkpointSaveCallsDuringPause == 25) {
+                                // After 25 pause cycles (>20!), advance clock past the 60s Retry-After window
+                                clockMs.addAndGet(61_000L)
+                            }
+                        }
+                    }
+                    is CohortRankSnapshotDto -> savedSnapshots[key] = value
+                }
+            }
+
+            val statusAfterLongWindow = durableRunner.startOrResumeGuarded(
+                region = "euw1",
+                targetPatch = "16.7",
+                maxBatches = 2,
+                batchSize = 1,
+                pauseDelayMs = 0L,
+                maxPauseCycles = 50,
+                async = false
+            )
+
+            // Scenario B: Re-seed a candidate and set a Retry-After window that outlasts maxPauseCycles=3,
+            // verifying the runner saves PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE (not silently done), keeps
+            // overnightSessionArmed=true, and auto-resumes via checkAndAutoResumeOvernightSession once the window clears.
+            durableService.saveCollectorCheckpoint(
+                statusAfterLongWindow.checkpoint!!.copy(
+                    pendingCandidatePuuids = listOf("p-durable-3"),
+                    lastStopReason = "BATCH_BUDGET_REACHED_RESUMABLE"
+                )
+            )
+            durableLimiter.recordRetryAfter("euw1", 120_000L, "application")
+
+            val statusPausedAtCooldownCap = durableRunner.startOrResumeGuarded(
+                region = "euw1",
+                targetPatch = "16.7",
+                maxBatches = 2,
+                batchSize = 1,
+                pauseDelayMs = 0L,
+                maxPauseCycles = 3,
+                async = false
+            )
+
+            // While still inside the 120s Retry-After window, auto-resume tick is a no-op (returns null)
+            val prematureAutoResume = durableRunner.checkAndAutoResumeOvernightSession(async = false)
+
+            // Advance clock past the 120s Retry-After window -> auto-resume tick automatically resumes and finishes p-durable-3!
+            clockMs.addAndGet(125_000L)
+            val resumedAndFinishedStatus = durableRunner.checkAndAutoResumeOvernightSession(async = false)!!
+
+            Then("pause cycles should never consume productive batch budget, cooldown budget exhaustion should remain armed/resumable, and auto-resume should complete the run once the window clears") {
+                // Scenario A: 25 pause cycles did NOT consume the 2 productive batch slots
+                statusAfterLongWindow.pauseCyclesCount shouldBe 25
+                statusAfterLongWindow.productiveBatchesCompleted shouldBe 2
+                statusAfterLongWindow.checkpoint?.processedPuuids shouldBe setOf("p-durable-1", "p-durable-2")
+                statusAfterLongWindow.checkpoint?.lastStopReason shouldBe "NO_CANDIDATES_REMAINING"
+                statusAfterLongWindow.overnightSessionArmed shouldBe false
+
+                // Scenario B: Hitting maxPauseCycles=3 records explicit PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE and stays armed
+                statusPausedAtCooldownCap.productiveBatchesCompleted shouldBe 0
+                statusPausedAtCooldownCap.pauseCyclesCount shouldBe 3
+                statusPausedAtCooldownCap.checkpoint?.lastStopReason shouldBe "PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE"
+                statusPausedAtCooldownCap.overnightSessionArmed shouldBe true
+
+                prematureAutoResume shouldBe null
+
+                // Once the rate-limit window clears, checkAndAutoResumeOvernightSession resumes and completes p-durable-3
+                resumedAndFinishedStatus.productiveBatchesCompleted shouldBe 1
+                resumedAndFinishedStatus.checkpoint?.processedPuuids shouldBe setOf("p-durable-1", "p-durable-2", "p-durable-3")
+                resumedAndFinishedStatus.checkpoint?.lastStopReason shouldBe "NO_CANDIDATES_REMAINING"
+                resumedAndFinishedStatus.overnightSessionArmed shouldBe false
             }
         }
     }

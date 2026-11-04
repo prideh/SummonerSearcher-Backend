@@ -1080,9 +1080,27 @@ class CohortBenchmarkService(
                     stopReason = rankPause
                     break@outerLoop
                 }
-                val leagueEntry = riotApiService.fetchLeagueRankLowPriority(puuid, normalizedRegion)
-                totalNetworkCalls++
+                val rankAttempts = java.util.concurrent.atomic.AtomicInteger(0)
+                val rankFailure = java.util.concurrent.atomic.AtomicReference<String?>(null)
+                val leagueEntry = riotApiService.fetchLeagueRankLowPriority(
+                    puuid = puuid,
+                    region = normalizedRegion,
+                    maxRetries = 0,
+                    httpAttemptCounter = rankAttempts,
+                    failureReasonHolder = rankFailure
+                )
+                totalNetworkCalls += rankAttempts.get().coerceAtLeast(1)
                 fetchedRankSnapshots++
+                val postRankSnap = getLiveRateLimitVerification(normalizedRegion)
+                if (rankFailure.get() == "HTTP_429_TOO_MANY_REQUESTS" || postRankSnap.serviceRateLimitActive || postRankSnap.retryAfterUntil != null) {
+                    pausedForRetryAfter++
+                    stopReason = "PAUSED_RETRY_AFTER_BACKOFF"
+                    break@outerLoop
+                }
+                if (rankFailure.get() == "NETWORK_TIMEOUT") {
+                    stopReason = "PAUSED_NETWORK_TIMEOUT"
+                    break@outerLoop
+                }
                 val fetchedTier = leagueEntry?.tier?.uppercase()?.trim()?.takeIf { it in TIER_ORDER }
                 if (fetchedTier != null && leagueEntry.queueType == "RANKED_SOLO_5x5") {
                     cacheRankSnapshot(
@@ -1126,15 +1144,30 @@ class CohortBenchmarkService(
                 stopReason = matchListPause
                 break@outerLoop
             }
+            val idsAttempts = java.util.concurrent.atomic.AtomicInteger(0)
+            val idsFailure = java.util.concurrent.atomic.AtomicReference<String?>(null)
             val matchIds = riotApiService.getMatchIdsByPuuidLowPriority(
                 puuid = puuid,
                 region = normalizedRegion,
                 queueId = SOLO_QUEUE_ID,
                 count = effectiveCap,
-                start = 0
+                start = 0,
+                maxRetries = 0,
+                httpAttemptCounter = idsAttempts,
+                failureReasonHolder = idsFailure
             ).orEmpty()
-            totalNetworkCalls++
+            totalNetworkCalls += idsAttempts.get().coerceAtLeast(1)
             fetchedMatchIdLists++
+            val postIdsSnap = getLiveRateLimitVerification(normalizedRegion)
+            if (idsFailure.get() == "HTTP_429_TOO_MANY_REQUESTS" || postIdsSnap.serviceRateLimitActive || postIdsSnap.retryAfterUntil != null) {
+                pausedForRetryAfter++
+                stopReason = "PAUSED_RETRY_AFTER_BACKOFF"
+                break@outerLoop
+            }
+            if (idsFailure.get() == "NETWORK_TIMEOUT") {
+                stopReason = "PAUSED_NETWORK_TIMEOUT"
+                break@outerLoop
+            }
 
             // Step D: Inspect/fetch matches on current patch, enforcing 10-game per-player cap
             matchLoop@ for (matchId in matchIds.take(effectiveCap)) {
@@ -1153,8 +1186,26 @@ class CohortBenchmarkService(
                         stopReason = matchFetchPause
                         break@outerLoop
                     }
-                    match = riotApiService.getMatchByIdLowPriority(matchId, normalizedRegion)
-                    totalNetworkCalls++
+                    val matchAttempts = java.util.concurrent.atomic.AtomicInteger(0)
+                    val matchFailure = java.util.concurrent.atomic.AtomicReference<String?>(null)
+                    match = riotApiService.getMatchByIdLowPriority(
+                        matchId = matchId,
+                        region = normalizedRegion,
+                        maxRetries = 0,
+                        httpAttemptCounter = matchAttempts,
+                        failureReasonHolder = matchFailure
+                    )
+                    totalNetworkCalls += matchAttempts.get().coerceAtLeast(1)
+                    val postMatchSnap = getLiveRateLimitVerification(normalizedRegion)
+                    if (matchFailure.get() == "HTTP_429_TOO_MANY_REQUESTS" || postMatchSnap.serviceRateLimitActive || postMatchSnap.retryAfterUntil != null) {
+                        pausedForRetryAfter++
+                        stopReason = "PAUSED_RETRY_AFTER_BACKOFF"
+                        break@outerLoop
+                    }
+                    if (matchFailure.get() == "NETWORK_TIMEOUT") {
+                        stopReason = "PAUSED_NETWORK_TIMEOUT"
+                        break@outerLoop
+                    }
                     if (match != null) {
                         redisCacheService.set(matchKey, match, MATCH_CACHE_TTL)
                         fetchedMatches++
@@ -1269,12 +1320,13 @@ class CohortBenchmarkService(
      * - Purpose: Observe real Riot `X-App-Rate-Limit`, `X-App-Rate-Limit-Count`, `X-Method-Rate-Limit`, and
      *   `X-Method-Rate-Limit-Count` headers in the SAME backend JVM process BEFORE enabling bulk network collection
      *   (`cohort.network-collection.enabled` can remain `false`).
-     * - Strictly bounded to AT MOST 1 LOW-priority call per missing required endpoint
-     *   (`league-v4-entries-by-puuid`, `match-v5-ids-by-puuid`, `match-v5-match-by-id` -> max 3 calls total;
-     *   0 calls for any endpoint already verified in [RiotApiRateLimiter]).
-     * - Immediately aborts before any call if foreground user traffic is active (`foregroundYieldActive` / `activeUserRequests > 0`),
+     * - Strictly bounded to AT MOST 1 actual HTTP attempt (`maxRetries = 0`, zero hidden retries) per missing required endpoint
+     *   (`league-v4-entries-by-puuid`, `match-v5-ids-by-puuid`, `match-v5-match-by-id` -> max 3 HTTP attempts total;
+     *   0 HTTP attempts for any endpoint already verified in [RiotApiRateLimiter]).
+     * - Immediately stops on the first `429 TooManyRequests` honoring `Retry-After` (with zero hidden retries),
+     *   or aborts before any call if foreground user traffic is active (`foregroundYieldActive` / `activeUserRequests > 0`),
      *   if a `429 Retry-After` / `service` backoff is active, or if verified buckets lack LOW-priority headroom.
-     * - Also initializes the cache-only collector checkpoint in Redis if none exists yet.
+     * - Reports actual HTTP attempts (`totalHttpAttemptsMade` and `httpAttemptsByEndpoint`) separately from wrapper calls.
      */
     suspend fun runBoundedDiagnosticRateLimitProbe(
         region: String = "euw1",
@@ -1285,14 +1337,22 @@ class CohortBenchmarkService(
         val normalizedRegion = region.lowercase().trim()
         val cleanPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
         val nowInstant = Instant.ofEpochMilli(timeProvider.now())
+        val zeroAttemptsMap = REQUIRED_COLLECTOR_ENDPOINTS.associateWith { 0 }
 
         if (!isValidRegion(normalizedRegion) || !isValidPatchOrNull(cleanPatch)) {
             return CohortRateLimitProbeResultDto(
                 region = normalizedRegion,
                 probeStatus = "INVALID_PARAMETERS",
+                maxCallsPerEndpoint = 1,
+                maxHttpAttemptsPerEndpoint = 1,
+                maxRetriesConfigured = 0,
+                totalProbeCallsMade = 0,
+                totalHttpAttemptsMade = 0,
+                httpAttemptsByEndpoint = zeroAttemptsMap,
+                stoppedOnRateLimit429 = false,
                 probedAt = nowInstant,
                 rateLimitVerification = getLiveRateLimitVerification(normalizedRegion),
-                notes = listOf("Invalid region or patch format; zero Redis or Riot calls executed.")
+                notes = listOf("Invalid region or patch format; zero Redis or Riot HTTP attempts executed.")
             )
         }
 
@@ -1342,13 +1402,18 @@ class CohortBenchmarkService(
                 seedPuuidUsed = false,
                 seedMatchIdUsed = false,
                 maxCallsPerEndpoint = 1,
+                maxHttpAttemptsPerEndpoint = 1,
+                maxRetriesConfigured = 0,
                 totalProbeCallsMade = 0,
+                totalHttpAttemptsMade = 0,
+                httpAttemptsByEndpoint = zeroAttemptsMap,
+                stoppedOnRateLimit429 = false,
                 endpointOutcomes = REQUIRED_COLLECTOR_ENDPOINTS.associateWith { "SKIPPED_ALREADY_VERIFIED" },
                 probedAt = Instant.ofEpochMilli(timeProvider.now()),
                 rateLimitVerification = preSnap,
                 checkpoint = checkpoint,
                 notes = listOf(
-                    "All required App and Method rate-limit headers are already verified in-process; 0 Riot API calls made."
+                    "All required App and Method rate-limit headers are already verified in-process; 0 Riot HTTP attempts made."
                 )
             )
         }
@@ -1366,13 +1431,18 @@ class CohortBenchmarkService(
                 seedPuuidUsed = false,
                 seedMatchIdUsed = false,
                 maxCallsPerEndpoint = 1,
+                maxHttpAttemptsPerEndpoint = 1,
+                maxRetriesConfigured = 0,
                 totalProbeCallsMade = 0,
+                totalHttpAttemptsMade = 0,
+                httpAttemptsByEndpoint = zeroAttemptsMap,
+                stoppedOnRateLimit429 = false,
                 endpointOutcomes = REQUIRED_COLLECTOR_ENDPOINTS.associateWith { "SKIPPED_NO_SEED_PUUID" },
                 probedAt = Instant.ofEpochMilli(timeProvider.now()),
                 rateLimitVerification = preSnap,
                 checkpoint = checkpoint,
                 notes = listOf(
-                    "No cached PUUID found in Challenger leaderboard, profiles, rank snapshots, or matches for '$normalizedRegion'; 0 Riot API calls made."
+                    "No cached PUUID found in Challenger leaderboard, profiles, rank snapshots, or matches for '$normalizedRegion'; 0 Riot HTTP attempts made."
                 )
             )
         }
@@ -1395,12 +1465,17 @@ class CohortBenchmarkService(
         }
 
         val outcomes = LinkedHashMap<String, String>()
+        val httpAttemptsByEndpoint = LinkedHashMap<String, Int>().apply {
+            REQUIRED_COLLECTOR_ENDPOINTS.forEach { put(it, 0) }
+        }
         var callsMade = 0
+        var totalHttpAttempts = 0
+        var stoppedOn429 = false
         var usedMatchId = false
         var probedMatchId: String? = null
         var abortedReason: String? = null
 
-        // Step A: Probe league-v4-entries-by-puuid (max 1 call)
+        // Step A: Probe league-v4-entries-by-puuid (max 1 HTTP attempt, maxRetries=0)
         val snapBeforeLeague = getLiveRateLimitVerification(normalizedRegion)
         if (snapBeforeLeague.appLimitsVerifiedFromHeaders &&
             "league-v4-entries-by-puuid" !in snapBeforeLeague.missingRequiredMethodEndpoints
@@ -1412,8 +1487,20 @@ class CohortBenchmarkService(
                 outcomes["league-v4-entries-by-puuid"] = pause
                 abortedReason = pause
             } else {
-                val entry = riotApiService.fetchLeagueRankLowPriority(seedPuuid, normalizedRegion)
+                val attemptCounter = java.util.concurrent.atomic.AtomicInteger(0)
+                val failureHolder = java.util.concurrent.atomic.AtomicReference<String?>(null)
+                val entry = riotApiService.fetchLeagueRankLowPriority(
+                    puuid = seedPuuid,
+                    region = normalizedRegion,
+                    maxRetries = 0,
+                    httpAttemptCounter = attemptCounter,
+                    failureReasonHolder = failureHolder
+                )
+                val attemptsUsed = attemptCounter.get().coerceAtLeast(1)
                 callsMade++
+                totalHttpAttempts += attemptsUsed
+                httpAttemptsByEndpoint["league-v4-entries-by-puuid"] = attemptsUsed
+
                 val fetchedTier = entry?.tier?.uppercase()?.trim()?.takeIf { it in TIER_ORDER }
                 if (fetchedTier != null && entry.queueType == "RANKED_SOLO_5x5") {
                     cacheRankSnapshot(
@@ -1426,16 +1513,29 @@ class CohortBenchmarkService(
                     )
                 }
                 val snapAfterLeague = getLiveRateLimitVerification(normalizedRegion)
-                outcomes["league-v4-entries-by-puuid"] =
-                    if ("league-v4-entries-by-puuid" in snapAfterLeague.verifiedMethodEndpoints) {
-                        "PROBED_1_CALL_VERIFIED"
-                    } else {
-                        "PROBED_1_CALL_HEADERS_MISSING"
+                when {
+                    failureHolder.get() == "HTTP_429_TOO_MANY_REQUESTS" ||
+                        snapAfterLeague.serviceRateLimitActive ||
+                        snapAfterLeague.retryAfterUntil != null -> {
+                        outcomes["league-v4-entries-by-puuid"] = "STOPPED_ON_FIRST_429_RETRY_AFTER"
+                        stoppedOn429 = true
+                        abortedReason = "STOPPED_ON_FIRST_429_RETRY_AFTER"
                     }
+                    failureHolder.get() == "NETWORK_TIMEOUT" -> {
+                        outcomes["league-v4-entries-by-puuid"] = "STOPPED_ON_FIRST_TIMEOUT_NO_RETRY"
+                        abortedReason = "STOPPED_ON_FIRST_TIMEOUT_NO_RETRY"
+                    }
+                    "league-v4-entries-by-puuid" in snapAfterLeague.verifiedMethodEndpoints -> {
+                        outcomes["league-v4-entries-by-puuid"] = "PROBED_1_CALL_VERIFIED"
+                    }
+                    else -> {
+                        outcomes["league-v4-entries-by-puuid"] = "PROBED_1_CALL_HEADERS_MISSING"
+                    }
+                }
             }
         }
 
-        // Step B: Probe match-v5-ids-by-puuid (max 1 call, count=1)
+        // Step B: Probe match-v5-ids-by-puuid (max 1 HTTP attempt, count=1, maxRetries=0)
         if (abortedReason == null) {
             val snapBeforeIds = getLiveRateLimitVerification(normalizedRegion)
             if (snapBeforeIds.appLimitsVerifiedFromHeaders &&
@@ -1454,29 +1554,51 @@ class CohortBenchmarkService(
                     outcomes["match-v5-ids-by-puuid"] = pause
                     abortedReason = pause
                 } else {
+                    val attemptCounter = java.util.concurrent.atomic.AtomicInteger(0)
+                    val failureHolder = java.util.concurrent.atomic.AtomicReference<String?>(null)
                     val ids = riotApiService.getMatchIdsByPuuidLowPriority(
                         puuid = seedPuuid,
                         region = normalizedRegion,
                         queueId = SOLO_QUEUE_ID,
                         count = 1,
-                        start = 0
+                        start = 0,
+                        maxRetries = 0,
+                        httpAttemptCounter = attemptCounter,
+                        failureReasonHolder = failureHolder
                     ).orEmpty()
+                    val attemptsUsed = attemptCounter.get().coerceAtLeast(1)
                     callsMade++
+                    totalHttpAttempts += attemptsUsed
+                    httpAttemptsByEndpoint["match-v5-ids-by-puuid"] = attemptsUsed
                     probedMatchId = ids.firstOrNull()?.trim()?.takeIf { it.isNotBlank() }
+
                     val snapAfterIds = getLiveRateLimitVerification(normalizedRegion)
-                    outcomes["match-v5-ids-by-puuid"] =
-                        if ("match-v5-ids-by-puuid" in snapAfterIds.verifiedMethodEndpoints) {
-                            "PROBED_1_CALL_VERIFIED"
-                        } else {
-                            "PROBED_1_CALL_HEADERS_MISSING"
+                    when {
+                        failureHolder.get() == "HTTP_429_TOO_MANY_REQUESTS" ||
+                            snapAfterIds.serviceRateLimitActive ||
+                            snapAfterIds.retryAfterUntil != null -> {
+                            outcomes["match-v5-ids-by-puuid"] = "STOPPED_ON_FIRST_429_RETRY_AFTER"
+                            stoppedOn429 = true
+                            abortedReason = "STOPPED_ON_FIRST_429_RETRY_AFTER"
                         }
+                        failureHolder.get() == "NETWORK_TIMEOUT" -> {
+                            outcomes["match-v5-ids-by-puuid"] = "STOPPED_ON_FIRST_TIMEOUT_NO_RETRY"
+                            abortedReason = "STOPPED_ON_FIRST_TIMEOUT_NO_RETRY"
+                        }
+                        "match-v5-ids-by-puuid" in snapAfterIds.verifiedMethodEndpoints -> {
+                            outcomes["match-v5-ids-by-puuid"] = "PROBED_1_CALL_VERIFIED"
+                        }
+                        else -> {
+                            outcomes["match-v5-ids-by-puuid"] = "PROBED_1_CALL_HEADERS_MISSING"
+                        }
+                    }
                 }
             }
         } else {
             outcomes["match-v5-ids-by-puuid"] = "SKIPPED_DUE_TO_$abortedReason"
         }
 
-        // Step C: Probe match-v5-match-by-id (max 1 call)
+        // Step C: Probe match-v5-match-by-id (max 1 HTTP attempt, maxRetries=0)
         if (abortedReason == null) {
             val snapBeforeMatch = getLiveRateLimitVerification(normalizedRegion)
             if (snapBeforeMatch.appLimitsVerifiedFromHeaders &&
@@ -1493,19 +1615,43 @@ class CohortBenchmarkService(
                         outcomes["match-v5-match-by-id"] = pause
                         abortedReason = pause
                     } else {
-                        val match = riotApiService.getMatchByIdLowPriority(matchIdToProbe, normalizedRegion)
+                        val attemptCounter = java.util.concurrent.atomic.AtomicInteger(0)
+                        val failureHolder = java.util.concurrent.atomic.AtomicReference<String?>(null)
+                        val match = riotApiService.getMatchByIdLowPriority(
+                            matchId = matchIdToProbe,
+                            region = normalizedRegion,
+                            maxRetries = 0,
+                            httpAttemptCounter = attemptCounter,
+                            failureReasonHolder = failureHolder
+                        )
+                        val attemptsUsed = attemptCounter.get().coerceAtLeast(1)
                         callsMade++
+                        totalHttpAttempts += attemptsUsed
+                        httpAttemptsByEndpoint["match-v5-match-by-id"] = attemptsUsed
                         usedMatchId = true
                         if (match != null) {
                             redisCacheService.set("match:$normalizedRegion:$matchIdToProbe", match, MATCH_CACHE_TTL)
                         }
                         val snapAfterMatch = getLiveRateLimitVerification(normalizedRegion)
-                        outcomes["match-v5-match-by-id"] =
-                            if ("match-v5-match-by-id" in snapAfterMatch.verifiedMethodEndpoints) {
-                                "PROBED_1_CALL_VERIFIED"
-                            } else {
-                                "PROBED_1_CALL_HEADERS_MISSING"
+                        when {
+                            failureHolder.get() == "HTTP_429_TOO_MANY_REQUESTS" ||
+                                snapAfterMatch.serviceRateLimitActive ||
+                                snapAfterMatch.retryAfterUntil != null -> {
+                                outcomes["match-v5-match-by-id"] = "STOPPED_ON_FIRST_429_RETRY_AFTER"
+                                stoppedOn429 = true
+                                abortedReason = "STOPPED_ON_FIRST_429_RETRY_AFTER"
                             }
+                            failureHolder.get() == "NETWORK_TIMEOUT" -> {
+                                outcomes["match-v5-match-by-id"] = "STOPPED_ON_FIRST_TIMEOUT_NO_RETRY"
+                                abortedReason = "STOPPED_ON_FIRST_TIMEOUT_NO_RETRY"
+                            }
+                            "match-v5-match-by-id" in snapAfterMatch.verifiedMethodEndpoints -> {
+                                outcomes["match-v5-match-by-id"] = "PROBED_1_CALL_VERIFIED"
+                            }
+                            else -> {
+                                outcomes["match-v5-match-by-id"] = "PROBED_1_CALL_HEADERS_MISSING"
+                            }
+                        }
                     }
                 }
             }
@@ -1522,7 +1668,9 @@ class CohortBenchmarkService(
         }
 
         val updatedCheckpoint = checkpoint.copy(
-            totalNetworkCallsMade = checkpoint.totalNetworkCallsMade + callsMade,
+            totalNetworkCallsMade = checkpoint.totalNetworkCallsMade + totalHttpAttempts,
+            pausedForRetryAfterCount = checkpoint.pausedForRetryAfterCount + if (stoppedOn429) 1 else 0,
+            lastStopReason = if (stoppedOn429) "PAUSED_RETRY_AFTER_BACKOFF" else checkpoint.lastStopReason,
             updatedAt = Instant.ofEpochMilli(timeProvider.now())
         )
         saveCollectorCheckpoint(updatedCheckpoint)
@@ -1534,13 +1682,18 @@ class CohortBenchmarkService(
             seedPuuidUsed = true,
             seedMatchIdUsed = usedMatchId,
             maxCallsPerEndpoint = 1,
+            maxHttpAttemptsPerEndpoint = 1,
+            maxRetriesConfigured = 0,
             totalProbeCallsMade = callsMade,
+            totalHttpAttemptsMade = totalHttpAttempts,
+            httpAttemptsByEndpoint = httpAttemptsByEndpoint,
+            stoppedOnRateLimit429 = stoppedOn429,
             endpointOutcomes = outcomes,
             probedAt = Instant.ofEpochMilli(timeProvider.now()),
             rateLimitVerification = finalSnap,
             checkpoint = updatedCheckpoint,
             notes = listOf(
-                "Bounded diagnostic probe executed in-process (max 1 LOW-priority call per required endpoint, totalCalls=$callsMade).",
+                "Bounded diagnostic probe executed in-process with maxRetries=0 (max 1 actual HTTP attempt per required endpoint, wrapperCalls=$callsMade, totalHttpAttempts=$totalHttpAttempts, stoppedOn429=$stoppedOn429).",
                 "Bulk network collection remains ${if (networkCollectionEnabled) "ENABLED" else "DISABLED (cohort.network-collection.enabled=false)"}."
             )
         )
