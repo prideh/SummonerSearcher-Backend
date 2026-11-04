@@ -22,6 +22,7 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
                 "gameDuration": 1800,
                 "gameId": 7000000001,
                 "gameMode": "CLASSIC",
+                "gameVersion": "16.1.648.1234",
                 "queueId": 420,
                 "participants": [
                   {
@@ -71,8 +72,12 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
         """.trimIndent()
 
         When("Jackson deserializes the payload into MatchDto") {
-            Then("all newly mapped early-CS and challenge fields are preserved without being stripped") {
+            Then("info.gameVersion and all newly mapped early-CS and challenge fields are preserved without being stripped") {
                 val matchDto = mapper.readValue(rawJson, MatchDto::class.java)
+                matchDto.info!!.gameVersion shouldBe "16.1.648.1234"
+                val serialized = mapper.writeValueAsString(matchDto)
+                serialized.contains("\"gameVersion\":\"16.1.648.1234\"") shouldBe true
+
                 val challenges = matchDto.info!!.participants.first().challenges!!
 
                 challenges.laneMinionsFirst10Minutes shouldBe 84

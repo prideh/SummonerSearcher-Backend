@@ -60,7 +60,7 @@ class PlayerCacheServiceTest : BehaviorSpec({
                     metadata = MatchMetadata(id, listOf(puuid)),
                     info = MatchInfo(
                         gameCreation = System.currentTimeMillis(), gameDuration = 1200L, gameId = id.hashCode().toLong(),
-                        queueId = 420, gameMode = "CLASSIC",
+                        queueId = 420, gameMode = "CLASSIC", gameVersion = "16.20.826.3891",
                         participants = listOf()
                     )
                 )
@@ -87,6 +87,7 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 result?.gameName shouldBe summonerName
                 result?.allMatchIds?.size shouldBe 25
                 result?.recentMatches?.size shouldBe 20 // Should be truncated
+                result?.recentMatches?.first()?.info?.gameVersion shouldBe "16.20.826.3891"
                 result?.totalMatches shouldBe 25
             }
 

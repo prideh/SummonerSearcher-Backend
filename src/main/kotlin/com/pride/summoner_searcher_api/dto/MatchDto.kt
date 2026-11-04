@@ -33,6 +33,7 @@ data class MatchInfo(
     val gameCreation: Long?,
     val gameDuration: Long?,
     val gameMode: String?,
+    val gameVersion: String? = null,
     val queueId: Int?,
     val participants: List<ParticipantDto> = listOf()
 )
