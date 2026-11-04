@@ -80,6 +80,7 @@ data class TimelineEventDto(
     val laneType: String?,
     val towerType: String?,
     val teamId: Int?,
+    val killerTeamId: Int? = null,
     val monsterType: String?,
     val monsterSubType: String?,
     val position: TimelinePositionDto?,

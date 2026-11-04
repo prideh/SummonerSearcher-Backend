@@ -35,7 +35,45 @@ data class MatchInfo(
     val gameMode: String?,
     val gameVersion: String? = null,
     val queueId: Int?,
-    val participants: List<ParticipantDto> = listOf()
+    val participants: List<ParticipantDto> = listOf(),
+    val teams: List<TeamDto>? = null
+)
+
+/**
+ * Team-level outcome and objective summary from Riot Match-v5 `info.teams`.
+ * All fields are nullable so absent fields on legacy caches or custom modes stay `null` rather than `0`.
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TeamDto(
+    val teamId: Int? = null,
+    val win: Boolean? = null,
+    val bans: List<TeamBanDto>? = null,
+    val objectives: TeamObjectivesDto? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TeamBanDto(
+    val championId: Int? = null,
+    val pickTurn: Int? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class TeamObjectivesDto(
+    val baron: ObjectiveStatsDto? = null,
+    val champion: ObjectiveStatsDto? = null,
+    val dragon: ObjectiveStatsDto? = null,
+    @com.fasterxml.jackson.annotation.JsonAlias("grubs")
+    val horde: ObjectiveStatsDto? = null,
+    val inhibitor: ObjectiveStatsDto? = null,
+    @com.fasterxml.jackson.annotation.JsonAlias("herald")
+    val riftHerald: ObjectiveStatsDto? = null,
+    val tower: ObjectiveStatsDto? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class ObjectiveStatsDto(
+    val first: Boolean? = null,
+    val kills: Int? = null
 )
 
 /**

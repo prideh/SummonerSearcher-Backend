@@ -76,8 +76,8 @@ class TimelineController(
 
         logger.info("Analyzing {} match timelines for puuid={}", analysisInput.size, puuid)
 
-        // 5. Run analysis
-        val result = timelineAnalysisService.analyze(analysisInput, puuid)
+        // 5. Run analysis (passing all matchDtos so missing timelines are recorded in exclusions while match-level stats are preserved)
+        val result = timelineAnalysisService.analyze(analysisInput, puuid, matchDtos)
         ResponseEntity.ok(result)
     }
 }

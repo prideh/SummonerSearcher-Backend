@@ -32,6 +32,13 @@ class PlayerCacheService(
     
     private fun getMatchCacheKey(matchId: String, region: String) = "match:${region.lowercase()}:$matchId"
 
+    private val timelineAnalysisService = TimelineAnalysisService()
+
+    private fun needsMatchBackfill(cached: com.pride.summoner_searcher_api.dto.MatchDto?): Boolean {
+        val info = cached?.info ?: return true
+        return info.gameVersion == null || info.teams == null
+    }
+
     /**
      * Retrieves a player's profile, utilizing a cache-aside strategy with an "always check" update mechanism.
      * To prevent OOM, it processes matches in chunks and only stores the latest 20 in the profile.
@@ -87,19 +94,22 @@ class PlayerCacheService(
             val allMatchIds = riotApiService.fetchMatchIdsSince(puuid, region, startOfYear)
 
             // Fast-path: if we already have a cached profile, no new matches have been played,
-            // and all served recentMatches already have info.gameVersion populated,
+            // and all served recentMatches already have info.gameVersion and info.teams populated,
             // skip re-streaming and re-accumulating all matches from Redis while updating rank, level, and icon.
-            val recentMatchesHaveGameVersion = cachedProfile?.recentMatches?.all { it.info?.gameVersion != null } ?: true
-            if (cachedProfile != null && recentMatchesHaveGameVersion && (
+            val recentMatchesComplete = cachedProfile?.recentMatches?.none { needsMatchBackfill(it) } ?: true
+            if (cachedProfile != null && recentMatchesComplete && (
                 (allMatchIds.isEmpty() && cachedProfile.allMatchIds.isEmpty()) ||
                 (cachedProfile.allMatchIds.isNotEmpty() && allMatchIds.firstOrNull() == cachedProfile.allMatchIds.first() && cachedProfile.overallStats != null)
             )) {
+                val fastImprovementStats = cachedProfile.improvementStats
+                    ?: timelineAnalysisService.computeImprovementStats(emptyList(), puuid, cachedProfile.recentMatches ?: emptyList())
                 val fastUpdatedProfile = cachedProfile.copy(
                     gameName = summonerName,
                     tagLine = tagLine,
                     summonerLevel = refreshedLevel,
                     profileIconId = refreshedIconId,
                     soloQueueRank = freshRank,
+                    improvementStats = fastImprovementStats,
                     lastRefreshed = java.time.Instant.now()
                 )
                 redisCacheService.set(cacheKey, fastUpdatedProfile, Duration.ofDays(14))
@@ -125,10 +135,10 @@ class PlayerCacheService(
                 val redisKeys = chunk.map { getMatchCacheKey(it, region) }
                 val cachedMatchesMap = redisCacheService.multiGet(redisKeys, com.pride.summoner_searcher_api.dto.MatchDto::class.java)
                 
-                // Identify missing matches (or legacy cached matches with gameVersion == null)
+                // Identify missing matches (or legacy cached matches with gameVersion == null or teams == null)
                 val missingIds = chunk.filter { id ->
                     val cached = cachedMatchesMap[getMatchCacheKey(id, region)]
-                    cached == null || cached.info?.gameVersion == null
+                    needsMatchBackfill(cached)
                 }
                 
                 if (missingIds.isNotEmpty()) {
@@ -201,6 +211,11 @@ class PlayerCacheService(
             }
             
             val (championStats, overallStats) = accumulator.getResult()
+            val matchOnlyImprovementStats = timelineAnalysisService.computeImprovementStats(
+                timelines = emptyList(),
+                puuid = puuid,
+                allMatches = recentMatches
+            )
             
             val updatedProfile = SummonerProfileDto(
                 puuid = puuid,
@@ -213,6 +228,7 @@ class PlayerCacheService(
                 allMatchIds = validMatchIds,   // Only valid matches from this year
                 championStats = championStats,
                 overallStats = overallStats,
+                improvementStats = matchOnlyImprovementStats,
                 totalMatches = validMatchIds.size,
                 lastRefreshed = java.time.Instant.now()
             )
@@ -243,7 +259,7 @@ class PlayerCacheService(
         
         val missingIds = matchIds.filter { id ->
             val cached = cachedMatchesMap[getMatchCacheKey(id, region)]
-            cached == null || cached.info?.gameVersion == null
+            needsMatchBackfill(cached)
         }
         
         val fetchedMatches = missingIds.map { matchId ->

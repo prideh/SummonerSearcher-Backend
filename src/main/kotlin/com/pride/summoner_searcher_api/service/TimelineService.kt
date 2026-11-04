@@ -25,24 +25,36 @@ class TimelineService(
 
     /**
      * Fetches a single match timeline, using Redis cache with 24h TTL.
+     * Lazily backfills cached timelines that predate CHAMPION_KILL bounty/shutdownBounty fields.
      */
     suspend fun getTimeline(matchId: String, region: String): MatchTimelineDto? {
         val cacheKey = getCacheKey(matchId, region)
 
         val cached = redisCacheService.get(cacheKey, MatchTimelineDto::class.java)
-        if (cached != null) {
+        if (cached != null && !needsTimelineBackfill(cached)) {
             logger.info("Timeline Cache HIT: {}", cacheKey)
             return cached
         }
 
-        logger.info("Timeline Cache MISS: {} — fetching from Riot API", cacheKey)
+        if (cached != null) {
+            logger.info("Timeline Cache LEGACY (missing bounty fields): {} — lazily backfilling from Riot API", cacheKey)
+        } else {
+            logger.info("Timeline Cache MISS: {} — fetching from Riot API", cacheKey)
+        }
         val timeline = riotApiService.getMatchTimeline(matchId, region)
 
         if (timeline != null) {
             redisCacheService.set(cacheKey, timeline, Duration.ofHours(24))
+            return timeline
         }
 
-        return timeline
+        return cached
+    }
+
+    private fun needsTimelineBackfill(timeline: MatchTimelineDto): Boolean {
+        val frames = timeline.info?.frames ?: return true
+        val killEvents = frames.flatMap { it.events ?: emptyList() }.filter { it.type == "CHAMPION_KILL" }
+        return killEvents.isNotEmpty() && killEvents.all { it.bounty == null && it.shutdownBounty == null }
     }
 
     /**

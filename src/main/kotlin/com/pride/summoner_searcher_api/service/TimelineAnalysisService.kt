@@ -28,9 +28,11 @@ class TimelineAnalysisService {
      * @param timelines List of (matchId, timeline, matchInfo) triples
      * @param puuid     The searched player's PUUID
      */
+    @JvmOverloads
     fun analyze(
         timelines: List<Triple<String, MatchTimelineDto, MatchDto>>,
-        puuid: String
+        puuid: String,
+        allMatches: List<MatchDto>? = null
     ): TimelineAnalysisDto {
         val heatmap = mutableListOf<HeatmapPoint>()
         val deaths = mutableListOf<HeatmapPoint>()
@@ -64,10 +66,11 @@ class TimelineAnalysisService {
             val matchInfo = matchDto.info ?: continue
 
             // Resolve the tracked player's participantId within the timeline
-            val playerParticipantId = info.participants?.find { it.puuid == puuid }?.participantId ?: continue
-
-            // Find the match participant (for champion name, teamId, win)
             val playerMatchParticipant = matchInfo.participants.find { it.puuid == puuid } ?: continue
+            val playerParticipantId = info.participants?.find { it.puuid == puuid }?.participantId
+                ?: playerMatchParticipant.participantId
+                ?: continue
+
             val playerChampion = playerMatchParticipant.championName ?: "Unknown"
             val playerTeamId = playerMatchParticipant.teamId ?: 100
             val playerWin = playerMatchParticipant.win ?: false
@@ -81,6 +84,7 @@ class TimelineAnalysisService {
             }
             val opponentChampion = opponentMatchParticipant?.championName ?: "Unknown"
             val opponentParticipantId = info.participants?.find { it.puuid == opponentMatchParticipant?.puuid }?.participantId
+                ?: opponentMatchParticipant?.participantId
             
             // Map of participantId -> Champion name for all 10 players (with index and PUUID fallbacks)
             val puuidToChampion = matchInfo.participants.mapNotNull { p ->
@@ -370,6 +374,8 @@ class TimelineAnalysisService {
         val avgGold10 = if (gamesWithGoldData > 0) totalGoldLeadAt10 / gamesWithGoldData else 0.0
         val avgGold15 = if (gamesWithGoldData > 0) totalGoldLeadAt15 / gamesWithGoldData else 0.0
 
+        val improvementStats = computeImprovementStats(timelines, puuid, allMatches)
+
         return TimelineAnalysisDto(
             heatmapPositions = heatmap,
             deathPositions = deaths,
@@ -399,7 +405,1213 @@ class TimelineAnalysisService {
                     min10To20 = wardsMin10To20,
                     post20 = wardsPost20
                 )
+            ),
+            improvementStats = improvementStats
+        )
+    }
+
+    /**
+     * Computes the nullable, documented [ImprovementStatsDto] contract across all supplied matches and timelines,
+     * including overall aggregation and `byChampion` / `byRole` breakdowns.
+     *
+     * Can be invoked with both timelines and matches (from [analyze]), or with `timelines = emptyList()` and
+     * `allMatches = recentMatches` (from profile caching, populating match-sourced `deathCost` and `teamObjectives`
+     * while leaving timeline-sourced fields `null` with `excludedMissingTimelineGames = N`).
+     */
+    @JvmOverloads
+    fun computeImprovementStats(
+        timelines: List<Triple<String, MatchTimelineDto, MatchDto>>,
+        puuid: String,
+        allMatches: List<MatchDto>? = null
+    ): ImprovementStatsDto {
+        val timelineByMatchId = mutableMapOf<String, MatchTimelineDto>()
+        val orderedMatches = mutableListOf<Pair<String, MatchDto>>()
+        val seenMatchIds = mutableSetOf<String>()
+
+        for ((matchId, timeline, matchDto) in timelines) {
+            timelineByMatchId[matchId] = timeline
+            if (seenMatchIds.add(matchId)) {
+                orderedMatches.add(matchId to matchDto)
+            }
+        }
+        allMatches?.forEachIndexed { idx, matchDto ->
+            val mid = matchDto.metadata?.matchId ?: "match_$idx"
+            if (seenMatchIds.add(mid)) {
+                orderedMatches.add(mid to matchDto)
+            }
+        }
+
+        val parsedGames = mutableListOf<ParsedGameInput>()
+        var invalidDurationGames = 0
+
+        for ((matchId, matchDto) in orderedMatches) {
+            val matchInfo = matchDto.info
+            val durationSec = matchInfo?.gameDuration ?: 0L
+            if (matchInfo == null || durationSec <= 0L) {
+                invalidDurationGames++
+                continue
+            }
+            val player = matchInfo.participants.find { it.puuid == puuid } ?: continue
+            val championName = player.championName?.takeIf { it.isNotBlank() } ?: "Unknown"
+            val role = normalizeRole(player.teamPosition ?: player.individualPosition)
+            val timeline = timelineByMatchId[matchId]
+            val hasValidTimeline = timeline?.info?.frames?.isNotEmpty() == true
+
+            parsedGames.add(
+                ParsedGameInput(
+                    matchId = matchId,
+                    matchDto = matchDto,
+                    matchInfo = matchInfo,
+                    player = player,
+                    championName = championName,
+                    role = role,
+                    gameDurationSeconds = durationSec,
+                    timeline = if (hasValidTimeline) timeline else null
+                )
             )
+        }
+
+        val overallSlice = buildImprovementSlice(
+            key = "ALL",
+            games = parsedGames,
+            invalidDurationGames = invalidDurationGames
+        )
+
+        val byChampion = parsedGames
+            .groupBy { it.championName }
+            .entries
+            .sortedByDescending { it.value.size }
+            .associate { (champ, champGames) ->
+                champ to buildImprovementSlice(
+                    key = champ,
+                    games = champGames,
+                    invalidDurationGames = 0
+                )
+            }
+
+        val byRole = parsedGames
+            .groupBy { it.role }
+            .entries
+            .sortedByDescending { it.value.size }
+            .associate { (roleKey, roleGames) ->
+                roleKey to buildImprovementSlice(
+                    key = roleKey,
+                    games = roleGames,
+                    invalidDurationGames = 0
+                )
+            }
+
+        return ImprovementStatsDto(
+            totalGamesConsidered = overallSlice.totalGamesConsidered,
+            excludedInvalidDurationGames = overallSlice.excludedInvalidDurationGames,
+            excludedMissingTimelineGames = overallSlice.excludedMissingTimelineGames,
+            phaseFarming = overallSlice.phaseFarming,
+            leadRetention = overallSlice.leadRetention,
+            deathCost = overallSlice.deathCost,
+            unspentGold = overallSlice.unspentGold,
+            teamObjectives = overallSlice.teamObjectives,
+            byChampion = byChampion,
+            byRole = byRole
+        )
+    }
+
+    private data class ParsedGameInput(
+        val matchId: String,
+        val matchDto: MatchDto,
+        val matchInfo: MatchInfo,
+        val player: ParticipantDto,
+        val championName: String,
+        val role: String,
+        val gameDurationSeconds: Long,
+        val timeline: MatchTimelineDto?
+    )
+
+    private fun normalizeRole(rawRole: String?): String {
+        val upper = rawRole?.trim()?.uppercase() ?: return "UNKNOWN"
+        return when (upper) {
+            "TOP" -> "TOP"
+            "JUNGLE" -> "JUNGLE"
+            "MIDDLE", "MID" -> "MIDDLE"
+            "BOTTOM", "BOT", "ADC" -> "BOTTOM"
+            "UTILITY", "SUPPORT", "SUP" -> "UTILITY"
+            "", "NONE", "INVALID" -> "UNKNOWN"
+            else -> upper
+        }
+    }
+
+    private fun round1(v: Double): Double = (v * 10.0).roundToInt() / 10.0
+    private fun round2(v: Double): Double = (v * 100.0).roundToInt() / 100.0
+    private fun round4(v: Double): Double = (v * 10000.0).roundToInt() / 10000.0
+
+    /**
+     * Finds the timeline frame representing [targetMinute] (in minutes) using actual frame timestamps.
+     * Accepts a frame within +/- 30 seconds of `targetMinute * 60_000L` (or falls back to index if timestamps are exact).
+     */
+    private fun findCheckpointFrame(frames: List<TimelineFrameDto>, targetMinute: Int): TimelineFrameDto? {
+        val targetMs = targetMinute * 60_000L
+        return frames
+            .filter { it.timestamp != null && abs(it.timestamp - targetMs) <= 30_000L }
+            .minByOrNull { abs((it.timestamp ?: 0L) - targetMs) }
+    }
+
+    private fun buildImprovementSlice(
+        key: String,
+        games: List<ParsedGameInput>,
+        invalidDurationGames: Int
+    ): ImprovementStatsBreakdownDto {
+        val totalGames = games.size
+        val missingTimelineGames = games.count { it.timeline == null }
+
+        val phaseFarming = computePhaseFarmingStats(games, missingTimelineGames)
+        val leadRetention = computeLeadRetentionStats(games, missingTimelineGames)
+        val deathCost = computeDeathCostStats(games, missingTimelineGames)
+        val unspentGold = computeUnspentGoldStats(games, missingTimelineGames)
+        val teamObjectives = computeTeamObjectivesStats(games)
+
+        return ImprovementStatsBreakdownDto(
+            key = key,
+            totalGamesConsidered = totalGames,
+            excludedInvalidDurationGames = invalidDurationGames,
+            excludedMissingTimelineGames = missingTimelineGames,
+            phaseFarming = phaseFarming,
+            leadRetention = leadRetention,
+            deathCost = deathCost,
+            unspentGold = unspentGold,
+            teamObjectives = teamObjectives
+        )
+    }
+
+    private fun resolveTimelineParticipantId(
+        timelineInfo: MatchTimelineInfo,
+        participant: ParticipantDto?,
+        matchParticipants: List<ParticipantDto>
+    ): Int? {
+        if (participant == null) return null
+        val byPuuid = participant.puuid?.let { targetPuuid ->
+            timelineInfo.participants?.find { it.puuid == targetPuuid }?.participantId
+        }
+        if (byPuuid != null) return byPuuid
+        if (participant.participantId != null) return participant.participantId
+        val idx = matchParticipants.indexOfFirst { it === participant || (it.puuid != null && it.puuid == participant.puuid) }
+        return if (idx >= 0) idx + 1 else null
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 1. Phase Farming (10-20m and 20m-end)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun computePhaseFarmingStats(
+        games: List<ParsedGameInput>,
+        missingTimelineGames: Int
+    ): PhaseFarmingStatsDto {
+        var eligible10To20 = 0
+        var shortGames10To20 = 0
+        var missingCounters10To20 = 0
+        var sumLaneGained10To20 = 0.0
+        var sumJungleGained10To20 = 0.0
+        var sumWindowMin10To20 = 0.0
+        var sumLaneRate10To20 = 0.0
+        var sumJungleRate10To20 = 0.0
+        var sumTotalRate10To20 = 0.0
+
+        var eligible20ToEnd = 0
+        var shortGames20ToEnd = 0
+        var missingCounters20ToEnd = 0
+        var sumLaneGained20ToEnd = 0.0
+        var sumJungleGained20ToEnd = 0.0
+        var sumWindowMin20ToEnd = 0.0
+        var sumLaneRate20ToEnd = 0.0
+        var sumJungleRate20ToEnd = 0.0
+        var sumTotalRate20ToEnd = 0.0
+
+        val perMatchList = mutableListOf<MatchPhaseFarmingDto>()
+
+        for (game in games) {
+            val tInfo = game.timeline?.info ?: continue
+            val frames = tInfo.frames ?: continue
+            val playerPid = resolveTimelineParticipantId(tInfo, game.player, game.matchInfo.participants)
+            if (playerPid == null) {
+                missingCounters10To20++
+                missingCounters20ToEnd++
+                continue
+            }
+
+            val frame10 = if (game.gameDurationSeconds >= 600L) findCheckpointFrame(frames, 10) else null
+            val frame20 = if (game.gameDurationSeconds >= 1200L) findCheckpointFrame(frames, 20) else null
+            val endFrame = frames.lastOrNull { it.timestamp != null && it.participantFrames?.get(playerPid.toString()) != null }
+
+            val pf10 = frame10?.participantFrames?.get(playerPid.toString())
+            val pf20 = frame20?.participantFrames?.get(playerPid.toString())
+            val pfEnd = endFrame?.participantFrames?.get(playerPid.toString())
+
+            // --- 10-20m window ---
+            var reached10To20 = false
+            var t10Ms: Long? = null
+            var t20Ms: Long? = null
+            var lane10: Int? = null
+            var jungle10: Int? = null
+            var lane20: Int? = null
+            var jungle20: Int? = null
+            var laneGain10To20: Int? = null
+            var jungleGain10To20: Int? = null
+            var laneRate10To20: Double? = null
+            var jungleRate10To20: Double? = null
+            var totalRate10To20: Double? = null
+
+            if (game.gameDurationSeconds < 1200L || frame10?.timestamp == null || frame20?.timestamp == null || frame20.timestamp <= frame10.timestamp) {
+                shortGames10To20++
+            } else if (
+                pf10?.minionsKilled == null || pf10.jungleMinionsKilled == null ||
+                pf20?.minionsKilled == null || pf20.jungleMinionsKilled == null
+            ) {
+                missingCounters10To20++
+            } else {
+                reached10To20 = true
+                eligible10To20++
+                t10Ms = frame10.timestamp
+                t20Ms = frame20.timestamp
+                lane10 = pf10.minionsKilled
+                jungle10 = pf10.jungleMinionsKilled
+                lane20 = pf20.minionsKilled
+                jungle20 = pf20.jungleMinionsKilled
+
+                val windowMin = (t20Ms - t10Ms) / 60_000.0
+                val lGain = lane20 - lane10
+                val jGain = jungle20 - jungle10
+                val lRate = lGain / windowMin
+                val jRate = jGain / windowMin
+                val totRate = (lGain + jGain) / windowMin
+
+                laneGain10To20 = lGain
+                jungleGain10To20 = jGain
+                laneRate10To20 = round2(lRate)
+                jungleRate10To20 = round2(jRate)
+                totalRate10To20 = round2(totRate)
+
+                sumLaneGained10To20 += lGain
+                sumJungleGained10To20 += jGain
+                sumWindowMin10To20 += windowMin
+                sumLaneRate10To20 += lRate
+                sumJungleRate10To20 += jRate
+                sumTotalRate10To20 += totRate
+            }
+
+            // --- 20m-end window ---
+            var reached20ToEnd = false
+            var tEndMs: Long? = null
+            var laneEnd: Int? = null
+            var jungleEnd: Int? = null
+            var laneGain20ToEnd: Int? = null
+            var jungleGain20ToEnd: Int? = null
+            var laneRate20ToEnd: Double? = null
+            var jungleRate20ToEnd: Double? = null
+            var totalRate20ToEnd: Double? = null
+
+            if (
+                game.gameDurationSeconds <= 1200L ||
+                frame20?.timestamp == null ||
+                endFrame?.timestamp == null ||
+                endFrame.timestamp <= frame20.timestamp
+            ) {
+                shortGames20ToEnd++
+            } else if (
+                pf20?.minionsKilled == null || pf20.jungleMinionsKilled == null ||
+                pfEnd?.minionsKilled == null || pfEnd.jungleMinionsKilled == null
+            ) {
+                missingCounters20ToEnd++
+            } else {
+                reached20ToEnd = true
+                eligible20ToEnd++
+                tEndMs = endFrame.timestamp
+                laneEnd = pfEnd.minionsKilled
+                jungleEnd = pfEnd.jungleMinionsKilled
+                if (lane20 == null) lane20 = pf20.minionsKilled
+                if (jungle20 == null) jungle20 = pf20.jungleMinionsKilled
+                if (t20Ms == null) t20Ms = frame20.timestamp
+
+                val windowMin = (tEndMs - frame20.timestamp) / 60_000.0
+                val lGain = laneEnd - pf20.minionsKilled
+                val jGain = jungleEnd - pf20.jungleMinionsKilled
+                val lRate = lGain / windowMin
+                val jRate = jGain / windowMin
+                val totRate = (lGain + jGain) / windowMin
+
+                laneGain20ToEnd = lGain
+                jungleGain20ToEnd = jGain
+                laneRate20ToEnd = round2(lRate)
+                jungleRate20ToEnd = round2(jRate)
+                totalRate20ToEnd = round2(totRate)
+
+                sumLaneGained20ToEnd += lGain
+                sumJungleGained20ToEnd += jGain
+                sumWindowMin20ToEnd += windowMin
+                sumLaneRate20ToEnd += lRate
+                sumJungleRate20ToEnd += jRate
+                sumTotalRate20ToEnd += totRate
+            }
+
+            perMatchList.add(
+                MatchPhaseFarmingDto(
+                    matchId = game.matchId,
+                    championName = game.championName,
+                    role = game.role,
+                    gameDurationSeconds = game.gameDurationSeconds,
+                    reached10To20 = reached10To20,
+                    checkpoint10TimestampMs = t10Ms,
+                    checkpoint20TimestampMs = t20Ms,
+                    laneCsAt10 = lane10,
+                    jungleCsAt10 = jungle10,
+                    laneCsAt20 = lane20,
+                    jungleCsAt20 = jungle20,
+                    laneCsGained10To20 = laneGain10To20,
+                    jungleCsGained10To20 = jungleGain10To20,
+                    laneCsPerMin10To20 = laneRate10To20,
+                    jungleCsPerMin10To20 = jungleRate10To20,
+                    totalCsPerMin10To20 = totalRate10To20,
+                    reached20ToEnd = reached20ToEnd,
+                    checkpointEndTimestampMs = tEndMs,
+                    laneCsAtEnd = laneEnd,
+                    jungleCsAtEnd = jungleEnd,
+                    laneCsGained20ToEnd = laneGain20ToEnd,
+                    jungleCsGained20ToEnd = jungleGain20ToEnd,
+                    laneCsPerMin20ToEnd = laneRate20ToEnd,
+                    jungleCsPerMin20ToEnd = jungleRate20ToEnd,
+                    totalCsPerMin20ToEnd = totalRate20ToEnd
+                )
+            )
+        }
+
+        val window10To20 = PhaseFarmingWindowDto(
+            windowLabel = "10-20m",
+            eligibleGames = eligible10To20,
+            excludedShortGames = shortGames10To20,
+            excludedMissingFrameCounters = missingCounters10To20,
+            avgLaneCsGained = if (eligible10To20 > 0) round2(sumLaneGained10To20 / eligible10To20) else null,
+            avgJungleCsGained = if (eligible10To20 > 0) round2(sumJungleGained10To20 / eligible10To20) else null,
+            avgTotalCsGained = if (eligible10To20 > 0) round2((sumLaneGained10To20 + sumJungleGained10To20) / eligible10To20) else null,
+            avgWindowMinutes = if (eligible10To20 > 0) round2(sumWindowMin10To20 / eligible10To20) else null,
+            avgLaneCsPerMin = if (eligible10To20 > 0) round2(sumLaneRate10To20 / eligible10To20) else null,
+            avgJungleCsPerMin = if (eligible10To20 > 0) round2(sumJungleRate10To20 / eligible10To20) else null,
+            avgTotalCsPerMin = if (eligible10To20 > 0) round2(sumTotalRate10To20 / eligible10To20) else null
+        )
+
+        val window20ToEnd = PhaseFarmingWindowDto(
+            windowLabel = "20m-end",
+            eligibleGames = eligible20ToEnd,
+            excludedShortGames = shortGames20ToEnd,
+            excludedMissingFrameCounters = missingCounters20ToEnd,
+            avgLaneCsGained = if (eligible20ToEnd > 0) round2(sumLaneGained20ToEnd / eligible20ToEnd) else null,
+            avgJungleCsGained = if (eligible20ToEnd > 0) round2(sumJungleGained20ToEnd / eligible20ToEnd) else null,
+            avgTotalCsGained = if (eligible20ToEnd > 0) round2((sumLaneGained20ToEnd + sumJungleGained20ToEnd) / eligible20ToEnd) else null,
+            avgWindowMinutes = if (eligible20ToEnd > 0) round2(sumWindowMin20ToEnd / eligible20ToEnd) else null,
+            avgLaneCsPerMin = if (eligible20ToEnd > 0) round2(sumLaneRate20ToEnd / eligible20ToEnd) else null,
+            avgJungleCsPerMin = if (eligible20ToEnd > 0) round2(sumJungleRate20ToEnd / eligible20ToEnd) else null,
+            avgTotalCsPerMin = if (eligible20ToEnd > 0) round2(sumTotalRate20ToEnd / eligible20ToEnd) else null
+        )
+
+        return PhaseFarmingStatsDto(
+            totalGamesConsidered = games.size,
+            excludedMissingTimelineGames = missingTimelineGames,
+            min10To20 = window10To20,
+            min20ToEnd = window20ToEnd,
+            perMatch = perMatchList
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 2. Lead Retention (10m vs 20m Gold/XP Leads & Temporal Objective Events)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun computeLeadRetentionStats(
+        games: List<ParsedGameInput>,
+        missingTimelineGames: Int
+    ): LeadRetentionStatsDto {
+        var missingOpponentGames = 0
+        var shortBefore10 = 0
+        var shortBefore20 = 0
+        var eligibleAt10 = 0
+        var eligibleAt20 = 0
+
+        var sumGoldLead10 = 0.0
+        var sumXpLead10 = 0.0
+        var sumGoldLead20 = 0.0
+        var sumXpLead20 = 0.0
+
+        var aheadGoldAt10 = 0
+        var aheadGoldAt10Reaching20 = 0
+        var retainedGoldAt20 = 0
+
+        var aheadXpAt10 = 0
+        var aheadXpAt10Reaching20 = 0
+        var retainedXpAt20 = 0
+
+        var allyObj10To20 = 0
+        var enemyObj10To20 = 0
+        var allyTower10To20 = 0
+        var enemyTower10To20 = 0
+
+        val perMatchList = mutableListOf<MatchLeadRetentionDto>()
+
+        for (game in games) {
+            val tInfo = game.timeline?.info ?: continue
+            val frames = tInfo.frames ?: continue
+
+            val playerTeamId = game.player.teamId ?: 100
+            val opponent = game.matchInfo.participants.find { p ->
+                p.teamId != playerTeamId &&
+                normalizeRole(p.teamPosition ?: p.individualPosition) == game.role &&
+                game.role != "UNKNOWN"
+            }
+
+            val playerPid = resolveTimelineParticipantId(tInfo, game.player, game.matchInfo.participants)
+            val opponentPid = resolveTimelineParticipantId(tInfo, opponent, game.matchInfo.participants)
+
+            if (playerPid == null || opponent == null || opponentPid == null) {
+                missingOpponentGames++
+                continue
+            }
+
+            // Build participantId -> champion and participantId -> teamId maps for event attribution
+            val pidToChamp = mutableMapOf<Int, String>()
+            val pidToTeam = mutableMapOf<Int, Int>()
+            game.matchInfo.participants.forEachIndexed { idx, p ->
+                val pid = p.participantId ?: (idx + 1)
+                pidToChamp[pid] = p.championName ?: "Participant $pid"
+                pidToTeam[pid] = p.teamId ?: if (pid <= 5) 100 else 200
+            }
+
+            // Collect ALL relevant objective & building events in [10m, 20m] (not only personally last-hit)
+            val temporalEvents = mutableListOf<TemporalObjectiveEventDto>()
+            val allEvents = frames.flatMap { it.events ?: emptyList() }
+            for (ev in allEvents) {
+                val ts = ev.timestamp ?: continue
+                if (ts < 600_000L || ts > 1_200_000L) continue
+                val minMark = (ts / 60_000L).toInt()
+                val secMark = ((ts / 1000L) % 60L).toInt()
+                val killerChamp = ev.killerId?.let { pidToChamp[it] }
+                val assistants = ev.assistingParticipantIds?.map { pidToChamp[it] ?: "Participant $it" } ?: emptyList()
+                val playerInvolved = ev.killerId == playerPid || ev.assistingParticipantIds?.contains(playerPid) == true
+
+                when (ev.type) {
+                    "ELITE_MONSTER_KILL" -> {
+                        val killerTeam = ev.killerTeamId
+                            ?: ev.killerId?.let { pidToTeam[it] }
+                            ?: ev.teamId
+                        val securing = when (killerTeam) {
+                            playerTeamId -> "ALLY_TEAM"
+                            null -> "UNKNOWN"
+                            else -> "ENEMY_TEAM"
+                        }
+                        if (securing == "ALLY_TEAM") allyObj10To20++
+                        else if (securing == "ENEMY_TEAM") enemyObj10To20++
+
+                        temporalEvents.add(
+                            TemporalObjectiveEventDto(
+                                eventCategory = "ELITE_MONSTER_KILL",
+                                timestampMs = ts,
+                                minuteMark = minMark,
+                                secondMark = secMark,
+                                objectiveType = ev.monsterType ?: "ELITE_MONSTER",
+                                monsterSubType = ev.monsterSubType,
+                                laneType = ev.laneType,
+                                towerType = null,
+                                securingTeam = securing,
+                                killerChampion = killerChamp,
+                                assistingChampions = assistants,
+                                playerPersonallyInvolved = playerInvolved
+                            )
+                        )
+                    }
+                    "BUILDING_KILL", "TURRET_PLATE_DESTROYED" -> {
+                        val killerTeam = if (ev.killerId != null && ev.killerId > 0) {
+                            pidToTeam[ev.killerId]
+                        } else if (ev.teamId != null) {
+                            // On BUILDING_KILL / TURRET_PLATE_DESTROYED, Riot teamId is the team whose structure was destroyed
+                            if (ev.teamId == 100) 200 else if (ev.teamId == 200) 100 else null
+                        } else null
+
+                        val securing = when (killerTeam) {
+                            playerTeamId -> "ALLY_TEAM"
+                            null -> "UNKNOWN"
+                            else -> "ENEMY_TEAM"
+                        }
+                        if (securing == "ALLY_TEAM") allyTower10To20++
+                        else if (securing == "ENEMY_TEAM") enemyTower10To20++
+
+                        temporalEvents.add(
+                            TemporalObjectiveEventDto(
+                                eventCategory = ev.type,
+                                timestampMs = ts,
+                                minuteMark = minMark,
+                                secondMark = secMark,
+                                objectiveType = ev.buildingType ?: if (ev.type == "TURRET_PLATE_DESTROYED") "TURRET_PLATE" else "BUILDING",
+                                monsterSubType = null,
+                                laneType = ev.laneType,
+                                towerType = ev.towerType,
+                                securingTeam = securing,
+                                killerChampion = killerChamp,
+                                assistingChampions = assistants,
+                                playerPersonallyInvolved = playerInvolved
+                            )
+                        )
+                    }
+                }
+            }
+
+            val frame10 = if (game.gameDurationSeconds >= 600L) findCheckpointFrame(frames, 10) else null
+            val pf10 = frame10?.participantFrames?.get(playerPid.toString())
+            val of10 = frame10?.participantFrames?.get(opponentPid.toString())
+
+            if (
+                game.gameDurationSeconds < 600L ||
+                frame10 == null ||
+                pf10?.totalGold == null || pf10.xp == null ||
+                of10?.totalGold == null || of10.xp == null
+            ) {
+                shortBefore10++
+                shortBefore20++
+                continue
+            }
+
+            eligibleAt10++
+            val gLead10 = pf10.totalGold - of10.totalGold
+            val xLead10 = pf10.xp - of10.xp
+            sumGoldLead10 += gLead10
+            sumXpLead10 += xLead10
+
+            val isAheadG10 = gLead10 > 0
+            val isAheadX10 = xLead10 > 0
+            if (isAheadG10) aheadGoldAt10++
+            if (isAheadX10) aheadXpAt10++
+
+            val frame20 = if (game.gameDurationSeconds >= 1200L) findCheckpointFrame(frames, 20) else null
+            val pf20 = frame20?.participantFrames?.get(playerPid.toString())
+            val of20 = frame20?.participantFrames?.get(opponentPid.toString())
+
+            var gLead20: Int? = null
+            var xLead20: Int? = null
+            var retainedGold: Boolean? = null
+            var retainedXp: Boolean? = null
+
+            if (
+                game.gameDurationSeconds < 1200L ||
+                frame20 == null ||
+                pf20?.totalGold == null || pf20.xp == null ||
+                of20?.totalGold == null || of20.xp == null
+            ) {
+                shortBefore20++
+            } else {
+                eligibleAt20++
+                gLead20 = pf20.totalGold - of20.totalGold
+                xLead20 = pf20.xp - of20.xp
+                sumGoldLead20 += gLead20
+                sumXpLead20 += xLead20
+
+                if (isAheadG10) {
+                    aheadGoldAt10Reaching20++
+                    retainedGold = gLead20 > 0
+                    if (retainedGold) retainedGoldAt20++
+                }
+                if (isAheadX10) {
+                    aheadXpAt10Reaching20++
+                    retainedXp = xLead20 > 0
+                    if (retainedXp) retainedXpAt20++
+                }
+            }
+
+            perMatchList.add(
+                MatchLeadRetentionDto(
+                    matchId = game.matchId,
+                    championName = game.championName,
+                    opponentChampionName = opponent.championName,
+                    role = game.role,
+                    win = game.player.win == true,
+                    goldLeadAt10 = gLead10,
+                    xpLeadAt10 = xLead10,
+                    goldLeadAt20 = gLead20,
+                    xpLeadAt20 = xLead20,
+                    aheadInGoldAt10 = isAheadG10,
+                    retainedGoldLeadAt20 = retainedGold,
+                    aheadInXpAt10 = isAheadX10,
+                    retainedXpLeadAt20 = retainedXp,
+                    goldLeadDelta10To20 = if (gLead20 != null) gLead20 - gLead10 else null,
+                    xpLeadDelta10To20 = if (xLead20 != null) xLead20 - xLead10 else null,
+                    temporalEvents10To20 = temporalEvents
+                )
+            )
+        }
+
+        return LeadRetentionStatsDto(
+            totalGamesConsidered = games.size,
+            excludedMissingTimelineGames = missingTimelineGames,
+            excludedMissingOpponentGames = missingOpponentGames,
+            excludedShortGamesBefore10 = shortBefore10,
+            excludedShortGamesBefore20 = shortBefore20,
+            eligibleGamesAt10 = eligibleAt10,
+            eligibleGamesAt20 = eligibleAt20,
+            avgGoldLeadAt10 = if (eligibleAt10 > 0) round1(sumGoldLead10 / eligibleAt10) else null,
+            avgXpLeadAt10 = if (eligibleAt10 > 0) round1(sumXpLead10 / eligibleAt10) else null,
+            avgGoldLeadAt20 = if (eligibleAt20 > 0) round1(sumGoldLead20 / eligibleAt20) else null,
+            avgXpLeadAt20 = if (eligibleAt20 > 0) round1(sumXpLead20 / eligibleAt20) else null,
+            gamesAheadInGoldAt10 = aheadGoldAt10,
+            gamesAheadInGoldAt10Reaching20 = aheadGoldAt10Reaching20,
+            gamesRetainedGoldLeadAt20 = retainedGoldAt20,
+            goldLeadRetentionRate = if (aheadGoldAt10Reaching20 > 0) round4(retainedGoldAt20.toDouble() / aheadGoldAt10Reaching20) else null,
+            gamesAheadInXpAt10 = aheadXpAt10,
+            gamesAheadInXpAt10Reaching20 = aheadXpAt10Reaching20,
+            gamesRetainedXpLeadAt20 = retainedXpAt20,
+            xpLeadRetentionRate = if (aheadXpAt10Reaching20 > 0) round4(retainedXpAt20.toDouble() / aheadXpAt10Reaching20) else null,
+            allyObjectiveEvents10To20 = allyObj10To20,
+            enemyObjectiveEvents10To20 = enemyObj10To20,
+            allyTowerEvents10To20 = allyTower10To20,
+            enemyTowerEvents10To20 = enemyTower10To20,
+            perMatch = perMatchList
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 3. Death Cost (totalTimeSpentDead & Recorded Death Bounties)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun computeDeathCostStats(
+        games: List<ParsedGameInput>,
+        missingTimelineGames: Int
+    ): DeathCostStatsDto {
+        var eligibleTimeDeadGames = 0
+        var missingTimeDeadGames = 0
+        var sumTimeSpentDeadSec = 0
+        var sumDurationForDeadGamesSec = 0L
+        var sumDeadSharePerGame = 0.0
+
+        var eligibleTimelineGames = 0
+        var totalRecordedDeaths = 0
+        var deathsWithBaseBounty = 0
+        var deathsWithShutdownBounty = 0
+        var deathsWithAnyBounty = 0
+        var deathsMissingBounty = 0
+        var sumBaseBountyGold = 0
+        var sumShutdownBountyGold = 0
+        var sumCombinedBountyGold = 0
+
+        val perMatchList = mutableListOf<MatchDeathCostDto>()
+
+        for (game in games) {
+            val deadSec = game.player.totalTimeSpentDead
+            val share: Double?
+            val sharePct: Double?
+            if (deadSec == null) {
+                missingTimeDeadGames++
+                share = null
+                sharePct = null
+            } else {
+                eligibleTimeDeadGames++
+                sumTimeSpentDeadSec += deadSec
+                sumDurationForDeadGamesSec += game.gameDurationSeconds
+                val rawShare = deadSec.toDouble() / game.gameDurationSeconds.toDouble()
+                sumDeadSharePerGame += rawShare
+                share = round4(rawShare)
+                sharePct = round2(rawShare * 100.0)
+            }
+
+            val tInfo = game.timeline?.info
+            val frames = tInfo?.frames
+            val playerPid = if (tInfo != null) resolveTimelineParticipantId(tInfo, game.player, game.matchInfo.participants) else null
+
+            if (tInfo == null || frames.isNullOrEmpty() || playerPid == null) {
+                perMatchList.add(
+                    MatchDeathCostDto(
+                        matchId = game.matchId,
+                        championName = game.championName,
+                        role = game.role,
+                        gameDurationSeconds = game.gameDurationSeconds,
+                        deathsFromMatchDto = game.player.deaths,
+                        totalTimeSpentDeadSeconds = deadSec,
+                        deadTimeGameShare = share,
+                        deadTimeGameSharePct = sharePct,
+                        hasTimeline = false,
+                        recordedDeathsCount = null,
+                        totalBaseKillBountyGold = null,
+                        totalShutdownBountyGold = null,
+                        totalCombinedBountyGold = null,
+                        recordedDeaths = emptyList()
+                    )
+                )
+                continue
+            }
+
+            eligibleTimelineGames++
+            val pidToChamp = mutableMapOf<Int, String>()
+            game.matchInfo.participants.forEachIndexed { idx, p ->
+                val pid = p.participantId ?: (idx + 1)
+                pidToChamp[pid] = p.championName ?: "Participant $pid"
+            }
+
+            val playerDeathEvents = frames
+                .flatMap { it.events ?: emptyList() }
+                .filter { it.type == "CHAMPION_KILL" && it.victimId == playerPid }
+
+            var matchBaseSum = 0
+            var matchBaseCount = 0
+            var matchShutdownSum = 0
+            var matchShutdownCount = 0
+            var matchCombinedSum = 0
+            var matchAnyBountyCount = 0
+            val matchDeathDtos = mutableListOf<RecordedDeathBountyEventDto>()
+
+            for (ev in playerDeathEvents) {
+                totalRecordedDeaths++
+                val ts = ev.timestamp ?: 0L
+                val minMark = (ts / 60_000L).toInt()
+                val secMark = ((ts / 1000L) % 60L).toInt()
+                val baseBounty = ev.bounty
+                val shutdownBounty = ev.shutdownBounty
+
+                if (baseBounty != null) {
+                    deathsWithBaseBounty++
+                    matchBaseCount++
+                    sumBaseBountyGold += baseBounty
+                    matchBaseSum += baseBounty
+                }
+                if (shutdownBounty != null) {
+                    deathsWithShutdownBounty++
+                    matchShutdownCount++
+                    sumShutdownBountyGold += shutdownBounty
+                    matchShutdownSum += shutdownBounty
+                }
+
+                val combined: Int? = if (baseBounty != null || shutdownBounty != null) {
+                    val c = (baseBounty ?: 0) + (shutdownBounty ?: 0)
+                    deathsWithAnyBounty++
+                    matchAnyBountyCount++
+                    sumCombinedBountyGold += c
+                    matchCombinedSum += c
+                    c
+                } else {
+                    deathsMissingBounty++
+                    null
+                }
+
+                matchDeathDtos.add(
+                    RecordedDeathBountyEventDto(
+                        timestampMs = ts,
+                        minuteMark = minMark,
+                        secondMark = secMark,
+                        killerChampion = ev.killerId?.let { pidToChamp[it] },
+                        assistingChampions = ev.assistingParticipantIds?.map { pidToChamp[it] ?: "Participant $it" } ?: emptyList(),
+                        baseKillBountyGold = baseBounty,
+                        shutdownBountyGold = shutdownBounty,
+                        combinedBountyGold = combined
+                    )
+                )
+            }
+
+            val mDeaths = playerDeathEvents.size
+            perMatchList.add(
+                MatchDeathCostDto(
+                    matchId = game.matchId,
+                    championName = game.championName,
+                    role = game.role,
+                    gameDurationSeconds = game.gameDurationSeconds,
+                    deathsFromMatchDto = game.player.deaths,
+                    totalTimeSpentDeadSeconds = deadSec,
+                    deadTimeGameShare = share,
+                    deadTimeGameSharePct = sharePct,
+                    hasTimeline = true,
+                    recordedDeathsCount = mDeaths,
+                    totalBaseKillBountyGold = when {
+                        mDeaths == 0 -> 0
+                        matchBaseCount > 0 -> matchBaseSum
+                        else -> null
+                    },
+                    totalShutdownBountyGold = when {
+                        mDeaths == 0 -> 0
+                        matchShutdownCount > 0 -> matchShutdownSum
+                        else -> null
+                    },
+                    totalCombinedBountyGold = when {
+                        mDeaths == 0 -> 0
+                        matchAnyBountyCount > 0 -> matchCombinedSum
+                        else -> null
+                    },
+                    recordedDeaths = matchDeathDtos
+                )
+            )
+        }
+
+        val overallShare = if (eligibleTimeDeadGames > 0 && sumDurationForDeadGamesSec > 0L) {
+            sumTimeSpentDeadSec.toDouble() / sumDurationForDeadGamesSec.toDouble()
+        } else null
+        val avgShare = if (eligibleTimeDeadGames > 0) sumDeadSharePerGame / eligibleTimeDeadGames else null
+
+        val bountySummary = DeathCostBountySummaryDto(
+            eligibleTimelineGames = eligibleTimelineGames,
+            excludedMissingTimelineGames = games.size - eligibleTimelineGames,
+            totalRecordedDeaths = if (eligibleTimelineGames > 0) totalRecordedDeaths else null,
+            deathsWithBaseBountyData = deathsWithBaseBounty,
+            deathsWithShutdownBountyData = deathsWithShutdownBounty,
+            deathsWithAnyBountyData = deathsWithAnyBounty,
+            deathsMissingBountyData = deathsMissingBounty,
+            totalBaseKillBountyGold = when {
+                eligibleTimelineGames == 0 -> null
+                totalRecordedDeaths == 0 -> 0
+                deathsWithBaseBounty > 0 -> sumBaseBountyGold
+                else -> null
+            },
+            totalShutdownBountyGold = when {
+                eligibleTimelineGames == 0 -> null
+                totalRecordedDeaths == 0 -> 0
+                deathsWithShutdownBounty > 0 -> sumShutdownBountyGold
+                else -> null
+            },
+            totalCombinedBountyGold = when {
+                eligibleTimelineGames == 0 -> null
+                totalRecordedDeaths == 0 -> 0
+                deathsWithAnyBounty > 0 -> sumCombinedBountyGold
+                else -> null
+            },
+            avgBaseKillBountyPerDeath = if (deathsWithBaseBounty > 0) round2(sumBaseBountyGold.toDouble() / deathsWithBaseBounty) else null,
+            avgShutdownBountyPerDeath = if (deathsWithShutdownBounty > 0) round2(sumShutdownBountyGold.toDouble() / deathsWithShutdownBounty) else null,
+            avgCombinedBountyPerDeath = if (deathsWithAnyBounty > 0) round2(sumCombinedBountyGold.toDouble() / deathsWithAnyBounty) else null
+        )
+
+        return DeathCostStatsDto(
+            totalGamesConsidered = games.size,
+            eligibleTimeDeadGames = eligibleTimeDeadGames,
+            excludedMissingTimeSpentDeadGames = missingTimeDeadGames,
+            totalTimeSpentDeadSeconds = if (eligibleTimeDeadGames > 0) sumTimeSpentDeadSec else null,
+            avgTimeSpentDeadSeconds = if (eligibleTimeDeadGames > 0) round2(sumTimeSpentDeadSec.toDouble() / eligibleTimeDeadGames) else null,
+            avgDeadTimeGameShare = avgShare?.let { round4(it) },
+            avgDeadTimeGameSharePct = avgShare?.let { round2(it * 100.0) },
+            overallDeadTimeGameShare = overallShare?.let { round4(it) },
+            overallDeadTimeGameSharePct = overallShare?.let { round2(it * 100.0) },
+            bountyOnPlayerDeaths = bountySummary,
+            perMatch = perMatchList
+        )
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 4. Unspent Gold (1-Minute currentGold Snapshots)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun computeUnspentGoldStats(
+        games: List<ParsedGameInput>,
+        missingTimelineGames: Int
+    ): UnspentGoldStatsDto {
+        val threshold = UnspentGoldStatsDto.HIGH_UNSPENT_GOLD_THRESHOLD
+        var eligibleGames = 0
+        var noCurrentGoldGames = 0
+
+        val allGoldSamples = mutableListOf<Int>()
+        var highBalanceSamplesTotal = 0
+        val highBalanceBeforePurchaseList = mutableListOf<UnspentGoldHighBalanceSampleDto>()
+        val perMatchList = mutableListOf<MatchUnspentGoldDto>()
+
+        for (game in games) {
+            val tInfo = game.timeline?.info ?: continue
+            val frames = tInfo.frames ?: continue
+            val playerPid = resolveTimelineParticipantId(tInfo, game.player, game.matchInfo.participants)
+            if (playerPid == null) {
+                noCurrentGoldGames++
+                continue
+            }
+
+            data class GoldSample(val timestampMs: Long, val minute: Int, val currentGold: Int)
+            val matchSamples = mutableListOf<GoldSample>()
+            for (frame in frames) {
+                val ts = frame.timestamp ?: continue
+                val cg = frame.participantFrames?.get(playerPid.toString())?.currentGold ?: continue
+                matchSamples.add(GoldSample(ts, (ts / 60_000L).toInt(), cg))
+            }
+
+            if (matchSamples.isEmpty()) {
+                noCurrentGoldGames++
+                continue
+            }
+
+            eligibleGames++
+            val playerPurchases = frames
+                .flatMap { it.events ?: emptyList() }
+                .filter { it.type == "ITEM_PURCHASED" && it.participantId == playerPid && it.timestamp != null }
+                .sortedBy { it.timestamp ?: 0L }
+
+            var matchHighCount = 0
+            var matchHighBeforePurchaseCount = 0
+
+            for (sample in matchSamples) {
+                allGoldSamples.add(sample.currentGold)
+                if (sample.currentGold >= threshold) {
+                    highBalanceSamplesTotal++
+                    matchHighCount++
+                    val nextPurchase = playerPurchases.firstOrNull { (it.timestamp ?: 0L) > sample.timestampMs }
+                    if (nextPurchase != null) {
+                        matchHighBeforePurchaseCount++
+                        val nextTs = nextPurchase.timestamp!!
+                        highBalanceBeforePurchaseList.add(
+                            UnspentGoldHighBalanceSampleDto(
+                                matchId = game.matchId,
+                                championName = game.championName,
+                                role = game.role,
+                                sampledMinute = sample.minute,
+                                sampledTimestampMs = sample.timestampMs,
+                                currentGoldAtSample = sample.currentGold,
+                                nextPurchaseTimestampMs = nextTs,
+                                nextPurchaseMinute = (nextTs / 60_000L).toInt(),
+                                nextPurchaseItemId = nextPurchase.itemId
+                            )
+                        )
+                    }
+                }
+            }
+
+            val matchGoldValues = matchSamples.map { it.currentGold }
+            perMatchList.add(
+                MatchUnspentGoldDto(
+                    matchId = game.matchId,
+                    championName = game.championName,
+                    role = game.role,
+                    sampleCount = matchGoldValues.size,
+                    medianCurrentGold = computeMedian(matchGoldValues),
+                    maxCurrentGold = matchGoldValues.maxOrNull(),
+                    avgCurrentGold = round1(matchGoldValues.average()),
+                    highBalanceSampleCount = matchHighCount,
+                    highBalanceBeforePurchaseSampleCount = matchHighBeforePurchaseCount
+                )
+            )
+        }
+
+        val totalSamples = allGoldSamples.size
+        return UnspentGoldStatsDto(
+            totalGamesConsidered = games.size,
+            eligibleGames = eligibleGames,
+            excludedMissingTimelineGames = missingTimelineGames,
+            excludedNoCurrentGoldSamplesGames = noCurrentGoldGames,
+            sampleCount = totalSamples,
+            medianCurrentGold = computeMedian(allGoldSamples),
+            maxCurrentGold = allGoldSamples.maxOrNull(),
+            avgCurrentGold = if (totalSamples > 0) round1(allGoldSamples.average()) else null,
+            highBalanceThresholdGold = threshold,
+            highBalanceSampleCount = if (totalSamples > 0) highBalanceSamplesTotal else null,
+            highBalanceBeforePurchaseSampleCount = if (totalSamples > 0) highBalanceBeforePurchaseList.size else null,
+            highBalanceBeforePurchaseSamples = highBalanceBeforePurchaseList,
+            perMatch = perMatchList
+        )
+    }
+
+    private fun computeMedian(values: List<Int>): Double? {
+        if (values.isEmpty()) return null
+        val sorted = values.sorted()
+        val mid = sorted.size / 2
+        val raw = if (sorted.size % 2 == 1) {
+            sorted[mid].toDouble()
+        } else {
+            (sorted[mid - 1] + sorted[mid]) / 2.0
+        }
+        return round1(raw)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 5. Team Objectives (MatchDto.info.teams vs Personal Takedowns)
+    // ─────────────────────────────────────────────────────────────────────────
+
+    private fun computeTeamObjectivesStats(games: List<ParsedGameInput>): TeamObjectivesStatsDto {
+        var eligibleTeamGames = 0
+        var missingTeamsGames = 0
+        val perMatchList = mutableListOf<MatchTeamObjectivesDto>()
+
+        for (game in games) {
+            val playerTeamId = game.player.teamId
+            val teams = game.matchInfo.teams
+            val allyTeam = if (playerTeamId != null) teams?.find { it.teamId == playerTeamId } else null
+            val enemyTeam = if (playerTeamId != null) teams?.find { it.teamId != null && it.teamId != playerTeamId } else null
+
+            val hasTeamsData = allyTeam?.objectives != null
+            if (hasTeamsData) {
+                eligibleTeamGames++
+            } else {
+                missingTeamsGames++
+            }
+
+            perMatchList.add(
+                MatchTeamObjectivesDto(
+                    matchId = game.matchId,
+                    championName = game.championName,
+                    role = game.role,
+                    teamId = playerTeamId,
+                    win = allyTeam?.win ?: game.player.win,
+                    hasTeamsData = hasTeamsData,
+                    allyObjectives = allyTeam?.objectives,
+                    enemyObjectives = enemyTeam?.objectives,
+                    personalTurretKills = game.player.turretKills,
+                    personalTurretTakedowns = game.player.turretTakedowns,
+                    personalDragonKills = game.player.dragonKills,
+                    personalDragonTakedowns = game.player.challenges?.dragonTakedowns,
+                    personalBaronKills = game.player.baronKills,
+                    personalVoidMonsterKills = game.player.challenges?.voidMonsterKill
+                )
+            )
+        }
+
+        val towerSummary = buildObjectiveSummary(
+            key = "tower",
+            games = games,
+            allyExtractor = { it?.tower },
+            enemyExtractor = { it?.tower },
+            personalLastHitExtractor = { it.turretKills },
+            personalTakedownExtractor = { it.turretTakedowns },
+            timelineEventMatcher = { ev -> ev.type == "BUILDING_KILL" && (ev.buildingType == null || ev.buildingType == "TOWER_BUILDING") }
+        )
+
+        val dragonSummary = buildObjectiveSummary(
+            key = "dragon",
+            games = games,
+            allyExtractor = { it?.dragon },
+            enemyExtractor = { it?.dragon },
+            personalLastHitExtractor = { it.dragonKills },
+            personalTakedownExtractor = { it.challenges?.dragonTakedowns },
+            timelineEventMatcher = { ev -> ev.type == "ELITE_MONSTER_KILL" && ev.monsterType == "DRAGON" }
+        )
+
+        val baronSummary = buildObjectiveSummary(
+            key = "baron",
+            games = games,
+            allyExtractor = { it?.baron },
+            enemyExtractor = { it?.baron },
+            personalLastHitExtractor = { it.baronKills },
+            personalTakedownExtractor = { null },
+            timelineEventMatcher = { ev -> ev.type == "ELITE_MONSTER_KILL" && ev.monsterType == "BARON_NASHOR" }
+        )
+
+        val riftHeraldSummary = buildObjectiveSummary(
+            key = "riftHerald",
+            games = games,
+            allyExtractor = { it?.riftHerald },
+            enemyExtractor = { it?.riftHerald },
+            personalLastHitExtractor = { null },
+            personalTakedownExtractor = { null },
+            timelineEventMatcher = { ev -> ev.type == "ELITE_MONSTER_KILL" && ev.monsterType == "RIFTHERALD" }
+        )
+
+        val hordeSummary = buildObjectiveSummary(
+            key = "horde",
+            games = games,
+            allyExtractor = { it?.horde },
+            enemyExtractor = { it?.horde },
+            personalLastHitExtractor = { null },
+            personalTakedownExtractor = { it.challenges?.voidMonsterKill },
+            timelineEventMatcher = { ev -> ev.type == "ELITE_MONSTER_KILL" && ev.monsterType == "HORDE" }
+        )
+
+        return TeamObjectivesStatsDto(
+            totalGamesConsidered = games.size,
+            eligibleTeamObjectiveGames = eligibleTeamGames,
+            excludedMissingTeamsDataGames = missingTeamsGames,
+            tower = towerSummary,
+            dragon = dragonSummary,
+            baron = baronSummary,
+            riftHerald = riftHeraldSummary,
+            horde = hordeSummary,
+            perMatch = perMatchList
+        )
+    }
+
+    private fun buildObjectiveSummary(
+        key: String,
+        games: List<ParsedGameInput>,
+        allyExtractor: (TeamObjectivesDto?) -> ObjectiveStatsDto?,
+        enemyExtractor: (TeamObjectivesDto?) -> ObjectiveStatsDto?,
+        personalLastHitExtractor: (ParticipantDto) -> Int?,
+        personalTakedownExtractor: (ParticipantDto) -> Int?,
+        timelineEventMatcher: (TimelineEventDto) -> Boolean
+    ): ObjectiveTypeSummaryDto {
+        var eligibleKills = 0
+        var eligibleFirst = 0
+        var excludedMissingObj = 0
+        var firstCount = 0
+        var teamKillsSum = 0
+
+        var enemyEligibleKills = 0
+        var enemyKillsSum = 0
+
+        var personalLastHitGames = 0
+        var personalLastHitSum = 0
+
+        var personalTakedownGames = 0
+        var personalTakedownSum = 0
+
+        var timelineGames = 0
+        var timelineInvolvements = 0
+
+        for (game in games) {
+            val playerTeamId = game.player.teamId
+            val teams = game.matchInfo.teams
+            val allyObjectives = if (playerTeamId != null) teams?.find { it.teamId == playerTeamId }?.objectives else null
+            val enemyObjectives = if (playerTeamId != null) teams?.find { it.teamId != null && it.teamId != playerTeamId }?.objectives else null
+
+            val allyObj = allyExtractor(allyObjectives)
+            if (allyObj?.kills != null) {
+                eligibleKills++
+                teamKillsSum += allyObj.kills
+            } else {
+                excludedMissingObj++
+            }
+            if (allyObj?.first != null) {
+                eligibleFirst++
+                if (allyObj.first) firstCount++
+            }
+
+            val enemyObj = enemyExtractor(enemyObjectives)
+            if (enemyObj?.kills != null) {
+                enemyEligibleKills++
+                enemyKillsSum += enemyObj.kills
+            }
+
+            val lastHit = personalLastHitExtractor(game.player)
+            if (lastHit != null) {
+                personalLastHitGames++
+                personalLastHitSum += lastHit
+            }
+
+            val takedown = personalTakedownExtractor(game.player)
+            if (takedown != null) {
+                personalTakedownGames++
+                personalTakedownSum += takedown
+            }
+
+            val tInfo = game.timeline?.info
+            val frames = tInfo?.frames
+            val playerPid = if (tInfo != null) resolveTimelineParticipantId(tInfo, game.player, game.matchInfo.participants) else null
+            if (tInfo != null && !frames.isNullOrEmpty() && playerPid != null) {
+                timelineGames++
+                val involvedEvents = frames
+                    .flatMap { it.events ?: emptyList() }
+                    .count { ev ->
+                        timelineEventMatcher(ev) &&
+                            (ev.killerId == playerPid || ev.assistingParticipantIds?.contains(playerPid) == true)
+                    }
+                timelineInvolvements += involvedEvents
+            }
+        }
+
+        return ObjectiveTypeSummaryDto(
+            objectiveKey = key,
+            eligibleGamesWithKills = eligibleKills,
+            eligibleGamesWithFirstFlag = eligibleFirst,
+            excludedMissingObjectiveGames = excludedMissingObj,
+            teamFirstCount = if (eligibleFirst > 0) firstCount else null,
+            teamFirstRate = if (eligibleFirst > 0) round4(firstCount.toDouble() / eligibleFirst) else null,
+            teamTotalKills = if (eligibleKills > 0) teamKillsSum else null,
+            teamAvgKills = if (eligibleKills > 0) round2(teamKillsSum.toDouble() / eligibleKills) else null,
+            enemyEligibleGamesWithKills = enemyEligibleKills,
+            enemyTeamTotalKills = if (enemyEligibleKills > 0) enemyKillsSum else null,
+            enemyTeamAvgKills = if (enemyEligibleKills > 0) round2(enemyKillsSum.toDouble() / enemyEligibleKills) else null,
+            personalLastHitEligibleGames = personalLastHitGames,
+            personalTotalLastHits = if (personalLastHitGames > 0) personalLastHitSum else null,
+            personalAvgLastHits = if (personalLastHitGames > 0) round2(personalLastHitSum.toDouble() / personalLastHitGames) else null,
+            personalTakedownEligibleGames = personalTakedownGames,
+            personalTotalTakedowns = if (personalTakedownGames > 0) personalTakedownSum else null,
+            personalAvgTakedowns = if (personalTakedownGames > 0) round2(personalTakedownSum.toDouble() / personalTakedownGames) else null,
+            timelineEligibleGames = timelineGames,
+            timelinePersonalInvolvements = if (timelineGames > 0) timelineInvolvements else null
         )
     }
 
@@ -496,3 +1708,4 @@ class TimelineAnalysisService {
         return zones.maxByOrNull { it.value }?.key ?: "Unknown"
     }
 }
+

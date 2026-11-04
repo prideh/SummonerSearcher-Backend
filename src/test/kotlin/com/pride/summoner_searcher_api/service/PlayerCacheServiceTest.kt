@@ -214,7 +214,8 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 info = MatchInfo(
                     gameCreation = System.currentTimeMillis() - 3600_000L, gameDuration = 1200L, gameId = 1L,
                     queueId = 420, gameMode = "CLASSIC", gameVersion = "16.19.820.1111",
-                    participants = emptyList()
+                    participants = emptyList(),
+                    teams = emptyList()
                 )
             )
             val (_, existingOverallStats) = MatchStatsAccumulator(puuid).getResult()
@@ -239,7 +240,7 @@ class PlayerCacheServiceTest : BehaviorSpec({
             coEvery { riotApiService.getSummonerByPuuid(puuid, region) } returns SummonerDto("id", puuid, 125L, 456)
             coEvery { riotApiService.fetchMatchIdsSince(puuid, region, any()) } returns existingMatchIds
 
-            // Slow-path chunk multiGet returns legacyMatch2 (gameVersion == null) and currentMatch1 (gameVersion != null)
+            // Slow-path chunk multiGet returns legacyMatch2 (gameVersion == null) and currentMatch1 (gameVersion != null, teams != null)
             every {
                 redisCacheService.multiGet(listOf("match:euw1:EUW1_2", "match:euw1:EUW1_1"), MatchDto::class.java)
             } returns mapOf(
@@ -248,7 +249,7 @@ class PlayerCacheServiceTest : BehaviorSpec({
             )
 
             val backfilledMatch2 = legacyMatch2.copy(
-                info = legacyMatch2.info?.copy(gameVersion = "16.20.826.3891")
+                info = legacyMatch2.info?.copy(gameVersion = "16.20.826.3891", teams = emptyList())
             )
             val fetchedMatchIds = mutableListOf<String>()
             coEvery { riotApiService.getMatchById(any(), region) } answers {
@@ -289,7 +290,7 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 )
             )
             val freshMatch = legacyMatch.copy(
-                info = legacyMatch.info?.copy(gameVersion = "16.20.826.3891")
+                info = legacyMatch.info?.copy(gameVersion = "16.20.826.3891", teams = emptyList())
             )
 
             every { redisCacheService.multiGet(listOf("match:euw1:EUW1_10"), MatchDto::class.java) } returns mapOf(
@@ -312,6 +313,57 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 matches.first().info?.gameVersion shouldBe "16.20.826.3891"
                 fetchedMatchIds shouldBe listOf("EUW1_10")
                 cachedMatchKeys shouldBe listOf("match:euw1:EUW1_10")
+            }
+        }
+
+        When("fetching matches by IDs where a cached MatchDto entry has gameVersion but predates info.teams (teams == null)") {
+            val legacyNoTeamsMatch = MatchDto(
+                metadata = MatchMetadata("EUW1_11", listOf(puuid)),
+                info = MatchInfo(
+                    gameCreation = System.currentTimeMillis(), gameDuration = 1800L, gameId = 11L,
+                    queueId = 420, gameMode = "CLASSIC", gameVersion = "16.20.826.3891",
+                    participants = emptyList(),
+                    teams = null
+                )
+            )
+            val freshTeams = listOf(
+                com.pride.summoner_searcher_api.dto.TeamDto(
+                    teamId = 100,
+                    win = true,
+                    objectives = com.pride.summoner_searcher_api.dto.TeamObjectivesDto(
+                        tower = com.pride.summoner_searcher_api.dto.ObjectiveStatsDto(first = true, kills = 9),
+                        dragon = com.pride.summoner_searcher_api.dto.ObjectiveStatsDto(first = true, kills = 3),
+                        baron = com.pride.summoner_searcher_api.dto.ObjectiveStatsDto(first = true, kills = 1),
+                        riftHerald = com.pride.summoner_searcher_api.dto.ObjectiveStatsDto(first = false, kills = 0),
+                        horde = com.pride.summoner_searcher_api.dto.ObjectiveStatsDto(first = true, kills = 6)
+                    )
+                )
+            )
+            val backfilledTeamsMatch = legacyNoTeamsMatch.copy(
+                info = legacyNoTeamsMatch.info?.copy(teams = freshTeams)
+            )
+
+            every { redisCacheService.multiGet(listOf("match:euw1:EUW1_11"), MatchDto::class.java) } returns mapOf(
+                "match:euw1:EUW1_11" to legacyNoTeamsMatch
+            )
+            val fetchedMatchIds = mutableListOf<String>()
+            coEvery { riotApiService.getMatchById("EUW1_11", region) } answers {
+                fetchedMatchIds.add(firstArg())
+                backfilledTeamsMatch
+            }
+            val cachedMatchKeys = mutableListOf<String>()
+            every { redisCacheService.set<MatchDto>(match { it.startsWith("match:euw1:") }, any<MatchDto>(), any<Duration>()) } answers {
+                cachedMatchKeys.add(firstArg())
+            }
+
+            val matches = playerCacheService.getMatchesByIds(listOf("EUW1_11"), region)
+
+            Then("it should lazily backfill info.teams from Riot API and update Redis in place") {
+                matches.size shouldBe 1
+                matches.first().info?.teams?.first()?.objectives?.tower?.kills shouldBe 9
+                matches.first().info?.teams?.first()?.objectives?.horde?.kills shouldBe 6
+                fetchedMatchIds shouldBe listOf("EUW1_11")
+                cachedMatchKeys shouldBe listOf("match:euw1:EUW1_11")
             }
         }
 

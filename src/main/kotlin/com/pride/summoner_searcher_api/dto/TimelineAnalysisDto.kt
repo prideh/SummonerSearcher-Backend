@@ -23,7 +23,9 @@ data class TimelineAnalysisDto(
     /** Per-match event timeline (kills, deaths, plates, objectives for player + opponent) */
     val eventTimelines: List<MatchEventTimelineDto>,
     /** Aggregate summary stats */
-    val aggregateSummary: TimelineAggregateSummary
+    val aggregateSummary: TimelineAggregateSummary,
+    /** Nullable documented #18 improvement statistics contract (phaseFarming, leadRetention, deathCost, unspentGold, teamObjectives) */
+    val improvementStats: ImprovementStatsDto? = null
 )
 
 data class HeatmapPoint(

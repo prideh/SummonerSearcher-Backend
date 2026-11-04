@@ -46,6 +46,7 @@ data class SummonerProfileDto(
     val allMatchIds: List<String> = emptyList(),
     val championStats: List<ChampionStatsDto> = emptyList(),
     val overallStats: OverallStatsDto? = null,
+    val improvementStats: ImprovementStatsDto? = null,
     val totalMatches: Int = 0,
     val lastRefreshed: Instant? = null
 )
