@@ -470,13 +470,268 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "opponentDetails={champion=Syndra, kda=2/8/3 (0.63), cs/min=6.8, kp=38%, vision=21, plates=1, keystone=8229, subStyle=8300, items=[6655, 3020]}"
                 prompt shouldContain "topChampions: Ahri (6g, 67% WR, 4.20 KDA, 7.9 CS/m)"
 
-                // Legacy cache null fields must render as incomplete, never coerced to 0
+                // Legacy cache null fields must render as incomplete, never coerced to 0, and never label unassisted as 1v1
                 prompt shouldContain "assistedDeaths=incomplete, unassistedDeaths=incomplete"
                 prompt shouldContain "assistants=incomplete"
                 prompt shouldContain "Assisted deaths (multi-enemy involvement, not necessarily ganks): incomplete (legacy cache)"
-                prompt shouldContain "Unassisted (1v1) deaths: incomplete (legacy cache)"
+                prompt shouldContain "Unassisted deaths (single-enemy kill credit, no assist credit): incomplete (legacy cache)"
+                prompt shouldNotContain "Unassisted (1v1) deaths"
+                prompt shouldContain "never equate unassisted deaths with 1v1 duels"
                 prompt shouldContain "Wards placed by time bucket (no coordinates): incomplete (legacy cache)"
                 prompt shouldContain "Incomplete Legacy Cache Fields"
+            }
+        }
+
+        When("building a prompt from a full 20-match enriched payload with multi-turn history and few-shot examples (#17 budget & question selection)") {
+            Then("it selects relevant bounded matches for the question, summarizes omitted matches, deduplicates redundant fields, and stays strictly within the hard byte/token budget") {
+                clearMocks(exampleRepository, patternRepository)
+                every {
+                    exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc(any(), any())
+                } returns listOf(
+                    AiLearnedExample(
+                        questionCategory = "matchups",
+                        userQuestion = "How do I play melee vs ranged mid matchups without dying to early poke and ganks?",
+                        aiResponse = "Concede the first three ranged minions if needed to preserve HP for the level 3 bounce, and ward raptors at 2:30.",
+                        qualityScore = BigDecimal("94.0")
+                    ),
+                    AiLearnedExample(
+                        questionCategory = "matchups",
+                        userQuestion = "When should Sylas trade into control mages?",
+                        aiResponse = "Trade when their primary waveclear or stun cooldown is used on the wave, and avoid extending past river without jungle vision.",
+                        qualityScore = BigDecimal("91.0")
+                    )
+                )
+
+                // Build 20 full matches (recentMatches[0] = newest Game 20, recentMatches[19] = oldest Game 1)
+                // Chronological Game 3 (index 17 in recentMatches) and Game 11 (index 9 in recentMatches) are Sylas vs Viktor losses.
+                val fullTwentyMatches = (0 until 20).map { reverseIdx ->
+                    val chronoGameNum = 20 - reverseIdx // 20 down to 1
+                    val isSylasVsViktor = chronoGameNum == 3 || chronoGameNum == 11
+                    val myChamp = if (isSylasVsViktor) "Sylas" else if (chronoGameNum % 2 == 0) "Ahri" else "Orianna"
+                    val oppChamp = if (isSylasVsViktor) "Viktor" else if (chronoGameNum % 2 == 0) "Syndra" else "Zed"
+                    val win = !isSylasVsViktor && (chronoGameNum % 3 != 0)
+
+                    mapOf(
+                        "matchId" to "EUW1_70000000${chronoGameNum.toString().padStart(2, '0')}",
+                        "patch" to "16.1",
+                        "role" to "MIDDLE",
+                        "side" to if (chronoGameNum % 2 == 0) "Blue" else "Red",
+                        "champion" to myChamp,
+                        "win" to win,
+                        "kda" to if (isSylasVsViktor) "2/7/4 (0.86)" else "7/2/9 (8.00)",
+                        "csPerMin" to if (isSylasVsViktor) 6.4 else 8.1,
+                        "killParticipation" to 62.5,
+                        "keystone" to "Electrocute",
+                        "subStyle" to "Inspiration",
+                        "summonerSpells" to listOf("Flash", "Teleport"),
+                        "items" to listOf(
+                            "Luden's Companion", "Sorcerer's Shoes", "Zhonya's Hourglass",
+                            "Rabadon's Deathcap", "Void Staff", "Cryptbloom"
+                        ),
+                        "draft" to mapOf(
+                            "allies" to listOf("Gnar (TOP)", "Viego (JUNGLE)", "$myChamp (MIDDLE)", "Jinx (BOTTOM)", "Lulu (UTILITY)"),
+                            "enemies" to listOf("Renekton (TOP)", "LeeSin (JUNGLE)", "$oppChamp (MIDDLE)", "KaiSa (BOTTOM)", "Nautilus (UTILITY)")
+                        ),
+                        "damageSplitPct" to mapOf("physical" to 9, "magic" to 82, "true" to 9),
+                        "opponent" to mapOf(
+                            "name" to "EnemyMid$chronoGameNum",
+                            "champion" to oppChamp,
+                            "kda" to if (isSylasVsViktor) "9/1/7 (16.00)" else "3/6/4 (1.17)",
+                            "csPerMin" to 8.3,
+                            "killParticipation" to 68.0,
+                            "visionScore" to 29,
+                            "turretPlates" to 2,
+                            "keystone" to "Summon Aery",
+                            "subStyle" to "Precision",
+                            "items" to listOf(
+                                "Blackfire Torch", "Sorcerer's Shoes", "Lich Bane",
+                                "Zhonya's Hourglass", "Rabadon's Deathcap", "Void Staff"
+                            )
+                        ),
+                        "gameDuration" to 31.4,
+                        "visionScore" to 26,
+                        "turretPlates" to 2,
+                        "turretPlatesTaken" to 2,
+                        "controlWardsPlaced" to 3,
+                        "wardsPlaced" to 13,
+                        "wardsKilled" to 5,
+                        "damageDealtToObjectives" to 12450,
+                        "damageDealtToTurrets" to 5800,
+                        "damagePerMinute" to 780,
+                        "goldPerMinute" to 430,
+                        "soloKills" to 1,
+                        "earlyLaningPhaseGoldExpAdvantage" to -0.15,
+                        "maxCsAdvantageOnLaneOpponent" to 12.0,
+                        "visionScoreAdvantageLaneOpponent" to 0.1,
+                        "timeCCingOthers" to 22,
+                        "totalDamageShieldedOnTeammates" to 0,
+                        "totalHealsOnTeammates" to 0,
+                        "laneCsAt10" to mapOf(
+                            "actual" to 76,
+                            "spawnedSupply" to 120,
+                            "supplyLabel" to "S16 patch 26.1+ (Faster Minions: 120 spawned by 10:00)"
+                        ),
+                        "timelineAt10" to mapOf("goldDiff" to -350, "xpDiff" to -220, "csDiff" to -9),
+                        "timelineAt15" to mapOf("goldDiff" to -780, "xpDiff" to -490, "csDiff" to -16),
+                        "deathContext" to mapOf(
+                            "totalDeaths" to if (isSylasVsViktor) 7 else 2,
+                            "firstDeathMinute" to 3.5,
+                            "deathsBefore10" to if (isSylasVsViktor) 2 else 1,
+                            "assistedDeaths" to if (isSylasVsViktor) 5 else 1,
+                            "unassistedDeaths" to if (isSylasVsViktor) 2 else 1,
+                            "unknownAssistDeaths" to 0,
+                            "missingPositionDeaths" to 0,
+                            "deathsNearObjectiveWindows" to 2,
+                            "earlyDeaths" to listOf(
+                                mapOf(
+                                    "time" to "03:30",
+                                    "minute" to 3.5,
+                                    "approxZone" to "Mid Lane",
+                                    "killer" to oppChamp,
+                                    "participants" to listOf(myChamp, oppChamp, "LeeSin"),
+                                    "assistants" to listOf("LeeSin"),
+                                    "assisted" to true,
+                                    "assistantsCount" to 1
+                                ),
+                                mapOf(
+                                    "time" to "07:45",
+                                    "minute" to 7.75,
+                                    "approxZone" to "Top Side River",
+                                    "killer" to "LeeSin",
+                                    "participants" to listOf(myChamp, "LeeSin", oppChamp),
+                                    "assistants" to listOf(oppChamp),
+                                    "assisted" to true,
+                                    "assistantsCount" to 1
+                                ),
+                                mapOf(
+                                    "time" to "09:20",
+                                    "minute" to 9.33,
+                                    "approxZone" to "Mid Lane",
+                                    "killer" to oppChamp,
+                                    "participants" to listOf(myChamp, oppChamp),
+                                    "assistants" to emptyList<String>(),
+                                    "assisted" to false,
+                                    "assistantsCount" to 0
+                                )
+                            )
+                        ),
+                        "itemSpikes" to listOf(
+                            mapOf("item" to "Luden's Companion", "minute" to 11),
+                            mapOf("item" to "Zhonya's Hourglass", "minute" to 19),
+                            mapOf("item" to "Rabadon's Deathcap", "minute" to 26)
+                        ),
+                        "skillMaxOrder" to "Q > W > E"
+                    )
+                }
+
+                val largeContext = mapOf(
+                    "summonerName" to "MidLearner#EUW",
+                    "rank" to "EMERALD II (65 LP)",
+                    "totalWins" to 58,
+                    "totalLosses" to 49,
+                    "primaryRole" to "MIDDLE",
+                    "totalGamesAnalyzed" to 20,
+                    "timelineStatus" to "ANALYZED",
+                    "visionDataPrecision" to "Ward counts, types, and time-buckets only — Riot WARD_PLACED events carry no coordinates; never present ward locations.",
+                    "winRate" to "54.2%",
+                    "kda" to "3.45",
+                    "avgKills" to "6.2",
+                    "avgDeaths" to "3.8",
+                    "avgAssists" to "7.1",
+                    "avgCsPerMin" to "7.8",
+                    "avgKillParticipation" to "61.0%",
+                    "avgSoloKills" to "1.2",
+                    "avgTurretPlates" to "1.9",
+                    "avgVisionScore" to "25.4",
+                    "blueSideWinRate" to "58.0%",
+                    "redSideWinRate" to "50.0%",
+                    "topChampions" to listOf(
+                        mapOf("name" to "Ahri", "games" to 9, "winRate" to "66.7%", "kda" to "4.20"),
+                        mapOf("name" to "Orianna", "games" to 9, "winRate" to "55.6%", "kda" to "3.60"),
+                        mapOf("name" to "Sylas", "games" to 2, "winRate" to "0.0%", "kda" to "0.86")
+                    ),
+                    "opponentStats" to mapOf(
+                        "avgKda" to "2.90",
+                        "avgCsPerMin" to "7.5",
+                        "avgKillParticipation" to "55.0%",
+                        "avgSoloKills" to "0.9",
+                        "avgTurretPlates" to "1.4",
+                        "avgVisionScore" to "23.0"
+                    ),
+                    "topStrengths" to listOf(
+                        mapOf("name" to "Damage Per Minute", "consistency" to "82%"),
+                        mapOf("name" to "Kill Participation", "consistency" to "78%")
+                    ),
+                    "topWeaknesses" to listOf(
+                        mapOf("name" to "Early Deaths", "consistency" to "38%"),
+                        mapOf("name" to "Control Wards", "consistency" to "41%")
+                    ),
+                    "championMatchups" to mapOf(
+                        "Syndra" to mapOf("wins" to 6, "losses" to 3, "total" to 9, "winRate" to "66.7%"),
+                        "Zed" to mapOf("wins" to 5, "losses" to 4, "total" to 9, "winRate" to "55.6%"),
+                        "Viktor" to mapOf("wins" to 0, "losses" to 2, "total" to 2, "winRate" to "0.0%")
+                    ),
+                    "recentMatches" to fullTwentyMatches,
+                    "timelineInsights" to mapOf(
+                        "gamesAnalyzed" to 20,
+                        "avgGoldLeadAt10" to -120.0,
+                        "avgGoldLeadAt15" to -240.0,
+                        "avgFirstDeathMinute" to 5.4,
+                        "mostDangerousZone" to "Mid Lane",
+                        "wardsPlacedTotal" to 240,
+                        "wardsByTimeBucket" to mapOf("pre10" to 65, "min10To20" to 98, "post20" to 77),
+                        "killsTotal" to 124,
+                        "deathsTotal" to 76,
+                        "assistsTotal" to 142,
+                        "deathsBefore10" to 22,
+                        "assistedDeaths" to 51,
+                        "unassistedDeaths" to 25,
+                        "deathsNearObjectiveWindows" to 29
+                    )
+                )
+
+                val history = listOf(
+                    mapOf("role" to "user", "content" to "How has my mid lane pool looked over my last 20 games?"),
+                    mapOf("role" to "assistant", "content" to "Your Ahri and Orianna are solid, but your two Sylas games were tough losses."),
+                    mapOf("role" to "user", "content" to "What should I focus on fixing first?"),
+                    mapOf("role" to "assistant", "content" to "Early deaths before 10 minutes in ranged matchups are costing you lane tempo.")
+                )
+
+                val userQuestion = "Why did I struggle on Sylas against Viktor and die early?"
+                val intent = service.detectIntent(userQuestion, history)
+                val prompt = constructPromptMethod.invoke(
+                    service,
+                    largeContext,
+                    history,
+                    userQuestion,
+                    intent,
+                    null
+                ) as String
+
+                val promptBytes = AiAnalysisService.utf8ByteSize(prompt)
+                val estimatedTokens = AiAnalysisService.estimateTokens(prompt)
+
+                // 1. Hard size budget: must stay strictly under MAX_PROMPT_BYTES (16,000 bytes / 4,000 est tokens), vs old 46.7k bytes
+                (promptBytes <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+                (estimatedTokens <= 4_000) shouldBe true
+
+                // 2. Bounded match count + omitted rollup
+                val expandedGameLines = Regex("""^\s{4}Game \d+""", RegexOption.MULTILINE).findAll(prompt).count()
+                (expandedGameLines <= AiAnalysisService.MAX_SELECTED_MATCHES) shouldBe true
+                (expandedGameLines >= AiAnalysisService.MIN_SELECTED_MATCHES) shouldBe true
+                prompt shouldContain "omittedMatchesRollup:"
+                prompt shouldContain "recentMatchSummary: 12 wins / 8 losses in last 20 games"
+
+                // 3. Question-selected match relevance: older Sylas vs Viktor games (Game 3 and Game 11) + Most Recent Match (Game 20) are selected with full detail
+                prompt shouldContain "Game 3: L on Sylas vs EnemyMid3 (Viktor)"
+                prompt shouldContain "Game 11: L on Sylas vs EnemyMid11 (Viktor)"
+                prompt shouldContain "Game 20 (Most Recent Match):"
+                prompt shouldContain "opponentDetails={champion=Viktor"
+
+                // 4. Redundant earlyDeaths fields stripped & supplyLabel emitted at most once
+                prompt shouldNotContain "participants="
+                prompt shouldNotContain "assistantsCount="
+                Regex("cs10\\.supplyLabel=").findAll(prompt).count() shouldBe 1
             }
         }
     }
