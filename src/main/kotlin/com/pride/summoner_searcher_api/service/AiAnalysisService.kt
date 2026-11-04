@@ -5,16 +5,25 @@ import com.pride.summoner_searcher_api.repository.AiLearnedExampleRepository
 import com.pride.summoner_searcher_api.repository.DiscoveredPatternRepository
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Value
+import org.springframework.core.ParameterizedTypeReference
 import org.springframework.data.domain.PageRequest
+import org.springframework.http.codec.ServerSentEvent
 import org.springframework.stereotype.Service
 import org.springframework.web.reactive.function.client.WebClient
 import org.springframework.web.reactive.function.client.WebClientResponseException
+import reactor.core.publisher.Flux
 import reactor.core.publisher.Mono
 import reactor.util.retry.Retry
 import java.time.Duration
 
 data class AiAnalysisResult(
     val response: String,
+    val temperature: Double,
+    val category: String = "general"
+)
+
+data class AiStreamContext(
+    val chunks: Flux<String>,
     val temperature: Double,
     val category: String = "general"
 )
@@ -116,6 +125,55 @@ class AiAnalysisService(
                 val generatedText = extractContent(response)
                 AiAnalysisResult(generatedText, temperature, detectedIntent.category)
             }
+    }
+
+    fun analyzeStream(
+        context: Map<String, Any>,
+        messages: List<Map<String, String>>,
+        userMessage: String,
+        sessionId: String? = null
+    ): AiStreamContext {
+        val detectedIntent = detectIntent(userMessage, messages)
+        val temperature = selectTemperature(detectedIntent.category)
+        val prompt = constructPrompt(context, messages, userMessage, detectedIntent)
+
+        val requestBody = mapOf(
+            "contents" to listOf(
+                mapOf(
+                    "parts" to listOf(
+                        mapOf("text" to prompt)
+                    )
+                )
+            ),
+            "generationConfig" to mapOf(
+                "temperature" to temperature,
+                "maxOutputTokens" to 4096
+            )
+        )
+
+        val sseType = object : ParameterizedTypeReference<ServerSentEvent<String>>() {}
+        val chunks = webClient.post()
+            .uri("models/gemini-3-flash-preview:streamGenerateContent?alt=sse&key={key}", apiKey)
+            .bodyValue(requestBody)
+            .retrieve()
+            .bodyToFlux(sseType)
+            .doOnError { e ->
+                if (e is WebClientResponseException) {
+                    logger.error("Analyze stream API failed with status ${e.statusCode}. Body: ${e.responseBodyAsString}")
+                }
+            }
+            .retryWhen(
+                Retry.backoff(3, Duration.ofMillis(500))
+                    .filter { error ->
+                        error is WebClientResponseException &&
+                            (error.statusCode.value() == 429 || error.statusCode.is5xxServerError)
+                    }
+                    .onRetryExhaustedThrow { _, signal -> signal.failure() }
+            )
+            .mapNotNull { event -> event.data()?.let { extractStreamDelta(it) } }
+            .filter { it.isNotEmpty() }
+
+        return AiStreamContext(chunks, temperature, detectedIntent.category)
     }
 
     private fun constructPrompt(context: Map<String, Any>, messages: List<Map<String, String>>, userMessage: String, intent: IntentResult? = null): String {
@@ -637,6 +695,30 @@ class AiAnalysisService(
             "No content generated."
         } catch (e: Exception) {
             "Error parsing AI response: ${e.message}"
+        }
+    }
+
+    private fun extractStreamDelta(jsonChunk: String): String {
+        return try {
+            val cleaned = jsonChunk.trim().removePrefix("data:").trim()
+            if (cleaned.isEmpty() || cleaned == "[DONE]") return ""
+            val mapper = com.fasterxml.jackson.databind.ObjectMapper()
+            val root = mapper.readTree(cleaned)
+            val candidates = root.path("candidates")
+            if (candidates.isArray && candidates.size() > 0) {
+                val parts = candidates.get(0).path("content").path("parts")
+                if (parts.isArray && parts.size() > 0) {
+                    val sb = StringBuilder()
+                    parts.forEach { part ->
+                        sb.append(part.path("text").asText(""))
+                    }
+                    return sb.toString()
+                }
+            }
+            ""
+        } catch (e: Exception) {
+            logger.debug("Skipping non-JSON SSE frame in stream: {}", e.message)
+            ""
         }
     }
 }

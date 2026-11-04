@@ -1,5 +1,6 @@
 package com.pride.summoner_searcher_api.controller
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.pride.summoner_searcher_api.annotation.CurrentUser
 import com.pride.summoner_searcher_api.model.AiFeedback
 import com.pride.summoner_searcher_api.model.AiInteraction
@@ -14,6 +15,7 @@ import com.pride.summoner_searcher_api.service.AiAnalysisService
 import com.pride.summoner_searcher_api.service.FeedbackProtectionService
 import org.slf4j.LoggerFactory
 import org.springframework.http.HttpStatus
+import org.springframework.http.MediaType
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.GetMapping
 import org.springframework.web.bind.annotation.PostMapping
@@ -21,6 +23,7 @@ import org.springframework.web.bind.annotation.RequestBody
 import org.springframework.web.bind.annotation.RequestMapping
 import org.springframework.web.bind.annotation.RestController
 import org.springframework.web.server.ResponseStatusException
+import org.springframework.web.servlet.mvc.method.annotation.SseEmitter
 import java.math.BigDecimal
 import java.math.RoundingMode
 import java.time.Instant
@@ -47,6 +50,7 @@ class AiController(
 ) {
 
     private val logger = LoggerFactory.getLogger(AiController::class.java)
+    private val objectMapper = ObjectMapper()
 
     @PostMapping("/chat")
     fun chat(@CurrentUser user: User?, @RequestBody request: AiChatRequest): AiChatResponse {
@@ -84,6 +88,105 @@ class AiController(
             response = result.response,
             interactionId = savedInteraction.id.toString()
         )
+    }
+
+    @PostMapping(
+        path = ["/chat"],
+        produces = [MediaType.TEXT_EVENT_STREAM_VALUE],
+        headers = ["Accept=text/event-stream"]
+    )
+    fun chatStreamByHeader(@CurrentUser user: User?, @RequestBody request: AiChatRequest): SseEmitter =
+        streamChatInternal(user, request)
+
+    @PostMapping("/chat/stream", produces = [MediaType.TEXT_EVENT_STREAM_VALUE])
+    fun chatStream(@CurrentUser user: User?, @RequestBody request: AiChatRequest): SseEmitter =
+        streamChatInternal(user, request)
+
+    private fun streamChatInternal(user: User?, request: AiChatRequest): SseEmitter {
+        val userEmail = user?.email ?: "Anonymous"
+        logger.info("AI streaming chat request received from user: $userEmail")
+        val startTime = System.currentTimeMillis()
+        val emitter = SseEmitter(120_000L)
+        val fullResponse = StringBuilder()
+
+        val streamContext = aiAnalysisService.analyzeStream(
+            request.context,
+            request.messages,
+            request.userMessage,
+            request.sessionId
+        )
+
+        val disposable = streamContext.chunks.subscribe(
+            { chunk ->
+                fullResponse.append(chunk)
+                try {
+                    val payload = objectMapper.writeValueAsString(
+                        mapOf(
+                            "type" to "chunk",
+                            "chunk" to chunk,
+                            "delta" to chunk,
+                            "text" to chunk
+                        )
+                    )
+                    emitter.send(payload)
+                } catch (e: Exception) {
+                    logger.debug("Client disconnected during SSE chunk send: {}", e.message)
+                }
+            },
+            { error ->
+                logger.error("Error streaming AI response for user $userEmail", error)
+                try {
+                    val errorPayload = objectMapper.writeValueAsString(
+                        mapOf("type" to "error", "error" to "Error generating AI response")
+                    )
+                    emitter.send(errorPayload)
+                    emitter.complete()
+                } catch (_: Exception) {
+                    emitter.completeWithError(error)
+                }
+            },
+            {
+                val responseTime = System.currentTimeMillis() - startTime
+                val finalResponseText = fullResponse.toString().ifBlank { "No content generated." }
+                try {
+                    val interaction = AiInteraction(
+                        user = user,
+                        summonerName = request.context["summonerName"]?.toString() ?: "Unknown",
+                        summonerRank = request.context["rank"]?.toString(),
+                        summonerRole = streamContext.category.take(20),
+                        userQuestion = request.userMessage,
+                        aiResponse = finalResponseText,
+                        contextFingerprint = request.sessionId ?: generateContextFingerprint(request.context),
+                        promptVersion = "v1.0",
+                        responseTimeMs = responseTime,
+                        temperature = streamContext.temperature
+                    )
+                    val savedInteraction = interactionRepository.save(interaction)
+                    val donePayload = objectMapper.writeValueAsString(
+                        mapOf(
+                            "type" to "done",
+                            "done" to true,
+                            "interactionId" to savedInteraction.id.toString(),
+                            "response" to finalResponseText
+                        )
+                    )
+                    emitter.send(donePayload)
+                    emitter.complete()
+                } catch (e: Exception) {
+                    logger.warn("Failed finalizing streamed AI interaction: {}", e.message)
+                    emitter.complete()
+                }
+            }
+        )
+
+        emitter.onCompletion { disposable.dispose() }
+        emitter.onTimeout {
+            disposable.dispose()
+            emitter.complete()
+        }
+        emitter.onError { disposable.dispose() }
+
+        return emitter
     }
     
     @PostMapping("/feedback")
