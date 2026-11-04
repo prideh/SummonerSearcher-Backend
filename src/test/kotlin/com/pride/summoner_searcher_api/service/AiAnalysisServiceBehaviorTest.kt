@@ -708,12 +708,39 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     null
                 ) as String
 
-                val promptBytes = AiAnalysisService.utf8ByteSize(prompt)
-                val estimatedTokens = AiAnalysisService.estimateTokens(prompt)
+                val buildGroundTruthMethod = AiAnalysisService::class.java.getDeclaredMethod(
+                    "buildGroundTruthSection",
+                    Map::class.java,
+                    String::class.java,
+                    String::class.java,
+                    Int::class.javaPrimitiveType
+                )
+                buildGroundTruthMethod.isAccessible = true
 
-                // 1. Hard size budget: must stay strictly under MAX_PROMPT_BYTES (16,000 bytes / 4,000 est tokens), vs old 46.7k bytes
-                (promptBytes <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
-                (estimatedTokens <= 4_000) shouldBe true
+                val rawContextJsonBytes = com.fasterxml.jackson.module.kotlin.jacksonObjectMapper()
+                    .writeValueAsString(largeContext)
+                    .toByteArray(Charsets.UTF_8)
+                    .size
+                val groundTruthSection = buildGroundTruthMethod.invoke(
+                    service,
+                    largeContext,
+                    userQuestion,
+                    intent.category,
+                    AiAnalysisService.MAX_GROUND_TRUTH_BYTES
+                ) as String
+                val groundTruthBytes = AiAnalysisService.utf8ByteSize(groundTruthSection)
+
+                val promptBytes = AiAnalysisService.utf8ByteSize(prompt)
+                val heuristicTokens = AiAnalysisService.heuristicTokenEstimate(prompt)
+                println("MEASURED_20_MATCH_FIXTURE_BYTES: rawContextJsonBytes=$rawContextJsonBytes, groundTruthBytes=$groundTruthBytes, finalPromptBytes=$promptBytes, heuristicTokens=$heuristicTokens")
+
+                // 1. Hard size budget: must stay strictly under MAX_PROMPT_BYTES (16,000 bytes / 4,000 heuristic est tokens), vs old 46.7k bytes
+                (rawContextJsonBytes > 30_000) shouldBe true
+                (groundTruthBytes in 4_000..9_500) shouldBe true
+                (promptBytes in 10_000..AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+                (heuristicTokens <= 4_000) shouldBe true
+                // User question is preserved verbatim (never silently truncated)
+                prompt shouldContain "USER'S QUESTION: \"$userQuestion\""
 
                 // 2. Bounded match count + omitted rollup
                 val expandedGameLines = Regex("""^\s{4}Game \d+""", RegexOption.MULTILINE).findAll(prompt).count()
@@ -742,7 +769,83 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "NEVER propose or mention \"Mythic items\", \"Mythic passives\", \"Mythic paths/rushes\""
                 prompt shouldContain "Do not claim specific patch-dependent item stats, gold costs, or build-effect numbers unless the supplied patch/context data explicitly supports them"
                 prompt shouldContain "never mention Mythic items/paths or unsupported build-effect claims in suggestions"
+
+                // 6. Extreme dynamic blocks (huge conversation history + long PromptVersion + 1,800-byte user question)
+                // still enforce finalPrompt <= MAX_PROMPT_BYTES without truncating the user's question
+                val hugeHistory = (1..20).flatMap { turn ->
+                    listOf(
+                        mapOf("role" to "user", "content" to "Turn $turn question: " + "wave state and roam timer details ".repeat(25)),
+                        mapOf("role" to "assistant", "content" to "Turn $turn answer: " + "focus on crash timing before river rotations ".repeat(25))
+                    )
+                }
+                val longPromptVersion = PromptVersion(
+                    systemInstruction = "Extra coaching directive: " + "verify ground truth numbers carefully ".repeat(60),
+                    fewShotExamples = "Example Q/A: " + "cite exact timestamps and KDA ".repeat(60)
+                )
+                val nearLimitQuestion = "Why did I lose on Sylas vs Viktor? " + "Please check my early lane state and item timings. ".repeat(32)
+                (AiAnalysisService.utf8ByteSize(nearLimitQuestion) in 1_500..AiAnalysisService.MAX_USER_MESSAGE_BYTES) shouldBe true
+
+                val stressedPrompt = constructPromptMethod.invoke(
+                    service,
+                    largeContext,
+                    hugeHistory,
+                    nearLimitQuestion,
+                    intent,
+                    longPromptVersion
+                ) as String
+                val stressedBytes = AiAnalysisService.utf8ByteSize(stressedPrompt)
+                println("MEASURED_STRESSED_PROMPT_BYTES: stressedBytes=$stressedBytes, maxAllowed=${AiAnalysisService.MAX_PROMPT_BYTES}")
+                (stressedBytes <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+                stressedPrompt shouldContain "USER'S QUESTION: \"$nearLimitQuestion\""
+            }
+
+            it("should explicitly refuse oversized user questions (> 2,000 UTF-8 bytes) without silent truncation or paid Gemini calls") {
+                val oversizedQuestion = "Can you review every wave and trade in detail? ".repeat(60)
+                val questionBytes = AiAnalysisService.utf8ByteSize(oversizedQuestion)
+                (questionBytes > AiAnalysisService.MAX_USER_MESSAGE_BYTES) shouldBe true
+
+                val intent = service.detectIntent(oversizedQuestion, null)
+
+                // Direct constructPrompt call throws PromptBudgetExceededException rather than silently truncating userMessage
+                val invocationEx = io.kotest.assertions.throwables.shouldThrow<java.lang.reflect.InvocationTargetException> {
+                    constructPromptMethod.invoke(
+                        service,
+                        mapOf("summonerName" to "TestPlayer#NA1"),
+                        null,
+                        oversizedQuestion,
+                        intent,
+                        null
+                    )
+                }
+                (invocationEx.targetException is AiAnalysisService.PromptBudgetExceededException) shouldBe true
+
+                // Public analyze() returns an explicit safe refusal without calling Gemini
+                val syncResult = service.analyze(
+                    AiAnalysisRequest(
+                        puuid = "test-puuid",
+                        playerContext = mapOf("summonerName" to "TestPlayer#NA1"),
+                        conversationHistory = null,
+                        userMessage = oversizedQuestion
+                    )
+                )
+                syncResult shouldContain "Your question is too long"
+                syncResult shouldContain "${AiAnalysisService.MAX_USER_MESSAGE_BYTES} UTF-8 bytes"
+                syncResult shouldContain "---SUGGESTIONS---"
+                verify(exactly = 0) { webClient.post() }
+
+                // Public analyzeStream() also emits the explicit safe refusal without calling Gemini
+                val streamResult = service.analyzeStream(
+                    AiAnalysisRequest(
+                        puuid = "test-puuid",
+                        playerContext = mapOf("summonerName" to "TestPlayer#NA1"),
+                        conversationHistory = null,
+                        userMessage = oversizedQuestion
+                    )
+                ).collectList().block()!!.joinToString("")
+                streamResult shouldContain "Your question is too long"
+                verify(exactly = 0) { webClient.post() }
             }
         }
     }
 })
+

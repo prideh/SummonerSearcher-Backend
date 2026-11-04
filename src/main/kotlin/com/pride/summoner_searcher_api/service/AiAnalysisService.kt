@@ -135,12 +135,29 @@ class AiAnalysisService(
         }
     }
 
+    class PromptBudgetExceededException(message: String) : IllegalArgumentException(message)
+
+    private fun buildSafeBudgetRefusal(reason: String?): String =
+        "I cannot process this request because the input exceeds the safe coaching context budget (${reason ?: "prompt limit exceeded"}). Please ask a shorter, focused coaching question.\n---SUGGESTIONS--- [\"Review my recent match performance\", \"How can I reduce early deaths?\", \"Check my itemization\"]"
+
     fun analyze(context: Map<String, Any>, messages: List<Map<String, String>>, userMessage: String, sessionId: String? = null): Mono<AiAnalysisResult> {
         val detectedIntent = detectIntent(userMessage, messages)
         val temperature = selectTemperature(detectedIntent.category)
         val selectedVersion = selectPromptVersion(detectedIntent.category)
         val versionName = selectedVersion?.versionName ?: "v1.0"
-        val prompt = constructPrompt(context, messages, userMessage, detectedIntent, selectedVersion)
+        val prompt = try {
+            constructPrompt(context, messages, userMessage, detectedIntent, selectedVersion)
+        } catch (e: PromptBudgetExceededException) {
+            logger.warn("Refusing oversized coaching request before Gemini call: ${e.message}")
+            return Mono.just(
+                AiAnalysisResult(
+                    buildSafeBudgetRefusal(e.message),
+                    temperature,
+                    detectedIntent.category,
+                    versionName
+                )
+            )
+        }
 
         val requestBody = mapOf(
             "contents" to listOf(
@@ -187,7 +204,17 @@ class AiAnalysisService(
         val temperature = selectTemperature(detectedIntent.category)
         val selectedVersion = selectPromptVersion(detectedIntent.category)
         val versionName = selectedVersion?.versionName ?: "v1.0"
-        val prompt = constructPrompt(context, messages, userMessage, detectedIntent, selectedVersion)
+        val prompt = try {
+            constructPrompt(context, messages, userMessage, detectedIntent, selectedVersion)
+        } catch (e: PromptBudgetExceededException) {
+            logger.warn("Refusing oversized streaming coaching request before Gemini call: ${e.message}")
+            return AiStreamContext(
+                reactor.core.publisher.Flux.just(buildSafeBudgetRefusal(e.message)),
+                temperature,
+                detectedIntent.category,
+                versionName
+            )
+        }
 
         val requestBody = mapOf(
             "contents" to listOf(
@@ -232,6 +259,13 @@ class AiAnalysisService(
         intent: IntentResult? = null,
         promptVersion: PromptVersion? = null
     ): String {
+        val userMessageBytes = utf8ByteSize(userMessage)
+        if (userMessageBytes > MAX_USER_MESSAGE_BYTES) {
+            throw PromptBudgetExceededException(
+                "Question length ($userMessageBytes bytes) exceeds maximum allowed $MAX_USER_MESSAGE_BYTES bytes"
+            )
+        }
+
         // 🎯 INTENT — use provided (from Gemini pre-call) or fall back to keyword detection
         val resolvedIntent = intent ?: detectIntent(userMessage, messages)
         val questionCategory = resolvedIntent.category
@@ -280,13 +314,13 @@ class AiAnalysisService(
         } catch (e: Exception) { "" }
         
         // 🎯 DYNAMIC OPTIMIZATIONS
-        val playerRank = context["rank"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: "Unranked"
+        val playerRank = (context["rank"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: "Unranked").take(64)
         val rankOptimization = buildRankOptimization(playerRank)
         val sampleSizeWarning = getSampleSizeWarning((context["totalGamesAnalyzed"] as? Number)?.toInt() ?: 0)
         val streakToneAdjustment = getStreakToneAdjustment(context)
-        val playerName = context["summonerName"]?.toString() ?: "the player"
-        val timelineStatus = context["timelineStatus"]?.toString()?.trim()?.takeIf { it.isNotBlank() }
-            ?: if (context["timelineInsights"] != null) "ANALYZED" else "NOT_ANALYZED"
+        val playerName = (context["summonerName"]?.toString() ?: "the player").take(64)
+        val timelineStatus = (context["timelineStatus"]?.toString()?.trim()?.takeIf { it.isNotBlank() }
+            ?: if (context["timelineInsights"] != null) "ANALYZED" else "NOT_ANALYZED").take(32)
         
         var historyString = formatBoundedHistory(messages, MAX_HISTORY_MESSAGES, MAX_HISTORY_BYTES)
         var groundTruth = buildGroundTruthSection(
@@ -301,15 +335,15 @@ class AiAnalysisService(
             Only $gameCount games are available. Keep your strategic advice focused on what happened in these specific games, and avoid claiming long-term trends or habits yet.
         """.trimIndent() else ""
 
-        val timelineSection = buildTimelineInsightsSection(context)
-        val promptVersionSection = promptVersion?.promptTemplate?.takeIf { it.isNotBlank() }?.let {
+        var timelineSection = buildTimelineInsightsSection(context)
+        var promptVersionSection = promptVersion?.promptTemplate?.takeIf { it.isNotBlank() }?.let {
             """
-            **CATEGORY COACHING DIRECTIVE (${promptVersion.versionName}):**
-            $it
+            **CATEGORY COACHING DIRECTIVE (${promptVersion.versionName.take(64)}):**
+            ${it.take(1_200)}
             """.trimIndent()
         } ?: ""
 
-        fun assemblePrompt(gt: String, fs: String, ph: String, hist: String): String = """
+        fun assemblePrompt(gt: String, fs: String, ph: String, hist: String, pv: String, tl: String): String = """
             You are an experienced, evidence-driven League of Legends coach analyzing ranked performance data. Calibrate your coaching depth and terminology to the player's actual rank ($playerRank) while using a constructive, natural, and analytical coaching methodology.
             
             **ANALYSIS FRAMEWORK (INTERNAL CHECKLIST):**
@@ -318,7 +352,7 @@ class AiAnalysisService(
             3. **Formulate Response**: Offer actionable, evidence-tied insight calibrated to the player's rank.
             
             $rankOptimization
-            $promptVersionSection
+            $pv
             
             **COACHING STYLE & TONE:**
             - NEVER start a response with the player's name. NEVER address the player by their rank (e.g., do not say "Master I..."). Do not use the player's name ($playerName) more than once per response, and only when it's genuinely natural to do so mid-sentence. Most responses should use no name at all.
@@ -338,7 +372,7 @@ class AiAnalysisService(
             
             **🔒 GROUND TRUTH STATS:**
             $gt
-            $timelineSection
+            $tl
             
             **DATA-DRIVEN COACHING & DATA-BOUNDARY RULES:**
             - For player-specific claims (win rates, KDA, CS/min, match history, or matchups played), rely strictly on the provided GROUND TRUTH STATS and recentMatchSummary. Do not invent game events, player stats, or match results that are not listed in the data.
@@ -381,26 +415,45 @@ class AiAnalysisService(
             2. **NO OFF-TOPIC**: Refuse non-League of Legends questions.
         """.trimIndent().replace(Regex("(?m)^ {12}"), "")
 
-        var finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString)
+        var finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection)
         if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
             historyString = formatBoundedHistory(messages, 2, 800)
-            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString)
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection)
         }
         if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
             fewShotSection = ""
             patternHints = ""
-            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString)
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection)
         }
         if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
+            historyString = ""
+            promptVersionSection = ""
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection)
+        }
+        var currentGtBudget = utf8ByteSize(groundTruth)
+        while (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES && currentGtBudget > 256) {
             val overflow = utf8ByteSize(finalPrompt) - MAX_PROMPT_BYTES
-            val tighterBudget = (utf8ByteSize(groundTruth) - overflow - 256).coerceAtLeast(2_500)
-            groundTruth = buildGroundTruthSection(
+            val nextBudget = (currentGtBudget - overflow - 128).coerceAtLeast(256)
+            val nextGt = buildGroundTruthSection(
                 context = context,
                 userMessage = userMessage,
                 questionCategory = questionCategory,
-                byteBudget = tighterBudget
+                byteBudget = nextBudget
             )
-            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString)
+            if (utf8ByteSize(nextGt) >= currentGtBudget && nextBudget <= 256) break
+            groundTruth = nextGt
+            currentGtBudget = minOf(nextBudget, utf8ByteSize(groundTruth))
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection)
+            if (currentGtBudget <= 256) break
+        }
+        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
+            timelineSection = ""
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection)
+        }
+        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
+            throw PromptBudgetExceededException(
+                "Final prompt (${utf8ByteSize(finalPrompt)} bytes) exceeds hard budget of $MAX_PROMPT_BYTES bytes"
+            )
         }
         return finalPrompt
     }
@@ -469,6 +522,7 @@ class AiAnalysisService(
     companion object {
         const val MAX_PROMPT_BYTES: Int = 16_000
         const val MAX_GROUND_TRUTH_BYTES: Int = 8_500
+        const val MAX_USER_MESSAGE_BYTES: Int = 2_000
         const val MAX_SELECTED_MATCHES: Int = 8
         const val MAX_FULL_DETAIL_MATCHES: Int = 4
         const val MIN_SELECTED_MATCHES: Int = 3
@@ -476,7 +530,12 @@ class AiAnalysisService(
         const val MAX_HISTORY_BYTES: Int = 2_400
 
         fun utf8ByteSize(text: String): Int = text.toByteArray(Charsets.UTF_8).size
-        fun estimateTokens(text: String): Int = (utf8ByteSize(text) + 3) / 4
+
+        /**
+         * Heuristic approximation (`ceil(utf8Bytes / 4.0)`), NOT tokenizer-measured model tokens.
+         */
+        fun heuristicTokenEstimate(text: String): Int = (utf8ByteSize(text) + 3) / 4
+        fun estimateTokens(text: String): Int = heuristicTokenEstimate(text)
 
         val VALID_CATEGORIES: Set<String> = setOf(
             "cs_farming", "vision_warding", "wave_management", "trading_laning",
@@ -692,7 +751,7 @@ class AiAnalysisService(
             "avgSoloKills", "avgTurretPlates", "blueSideWinRate", "redSideWinRate"
         )
         scalarKeys.forEach { key ->
-            context[key]?.let { headerLines.add("  $key: $it") }
+            context[key]?.let { headerLines.add("  $key: ${it.toString().take(160)}") }
         }
         if (context["timelineStatus"] == null && headerLines.isNotEmpty()) {
             val inferredStatus = if (context["timelineInsights"] != null) "ANALYZED" else "NOT_ANALYZED"
@@ -724,7 +783,7 @@ class AiAnalysisService(
         // Opponent stats block (compact single line)
         val opponentStats = context["opponentStats"] as? Map<String, Any>
         if (!opponentStats.isNullOrEmpty()) {
-            val compactOppStats = opponentStats.entries.joinToString(", ") { (k, v) -> "$k=$v" }
+            val compactOppStats = opponentStats.entries.take(8).joinToString(", ") { (k, v) -> "$k=${v.toString().take(48)}" }
             headerLines.add("  opponentStats: {$compactOppStats}")
         }
 
@@ -732,7 +791,7 @@ class AiAnalysisService(
         val strengths = context["topStrengths"] as? List<*>
         if (!strengths.isNullOrEmpty()) {
             val formatted = strengths.take(4).joinToString(", ") { item ->
-                if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString()
+                if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString().take(48)
             }
             headerLines.add("  topStrengths: $formatted")
         }
@@ -740,7 +799,7 @@ class AiAnalysisService(
         val weaknesses = context["topWeaknesses"] as? List<*>
         if (!weaknesses.isNullOrEmpty()) {
             val formatted = weaknesses.take(4).joinToString(", ") { item ->
-                if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString()
+                if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString().take(48)
             }
             headerLines.add("  topWeaknesses: $formatted")
         }
@@ -772,7 +831,7 @@ class AiAnalysisService(
             return if (headerLines.isEmpty()) {
                 "  (no structured stats available — do not invent any numbers)"
             } else {
-                headerLines.joinToString("\n")
+                trimLinesToBudget(headerLines, byteBudget)
             }
         }
 
@@ -793,7 +852,7 @@ class AiAnalysisService(
         var maxSelected = minOf(total, MAX_SELECTED_MATCHES)
         var maxFullDetail = minOf(maxSelected, MAX_FULL_DETAIL_MATCHES)
 
-        while (true) {
+        while (maxSelected >= 1) {
             val rendered = renderBoundedMatches(
                 headerLines = headerLines,
                 scoredMatches = scoredMatches,
@@ -803,7 +862,7 @@ class AiAnalysisService(
                 questionCategory = questionCategory,
                 userMessage = userMessage
             )
-            if (utf8ByteSize(rendered) <= byteBudget || (maxSelected <= MIN_SELECTED_MATCHES && maxFullDetail <= 1)) {
+            if (utf8ByteSize(rendered) <= byteBudget) {
                 return rendered
             }
             if (maxFullDetail > 2) {
@@ -811,10 +870,26 @@ class AiAnalysisService(
             } else if (maxSelected > MIN_SELECTED_MATCHES) {
                 maxSelected--
                 maxFullDetail = minOf(maxFullDetail, maxSelected)
+            } else if (maxFullDetail > 0) {
+                maxFullDetail--
             } else {
-                maxFullDetail = 1
+                maxSelected--
             }
         }
+
+        return trimLinesToBudget(headerLines, byteBudget)
+    }
+
+    private fun trimLinesToBudget(lines: List<String>, byteBudget: Int): String {
+        val kept = mutableListOf<String>()
+        var used = 0
+        for (line in lines) {
+            val lineBytes = utf8ByteSize(line) + 1
+            if (kept.isNotEmpty() && used + lineBytes > byteBudget) break
+            kept.add(line)
+            used += lineBytes
+        }
+        return kept.joinToString("\n").take(byteBudget)
     }
 
     private data class ScoredMatch(
