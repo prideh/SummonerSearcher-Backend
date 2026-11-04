@@ -549,7 +549,8 @@ class AiAnalysisService(
             if (words.size <= 4) return true
             val followUpPrefixes = listOf(
                 "what about", "how about", "and ", "then ", "also ", "why ", "elaborate",
-                "can you explain", "tell me more", "more about", "in that case"
+                "can you explain", "can you give", "give me an example", "for example",
+                "tell me more", "more about", "in that case"
             )
             return followUpPrefixes.any { lowerQ.startsWith(it) }
         }
@@ -643,7 +644,7 @@ class AiAnalysisService(
                 val win = if (m["win"] == true) "W" else "L"
                 val kda = m["kda"] ?: "?"
                 val cs = m["csPerMin"] ?: "?"
-                val champion = m["champion"] ?: "?"
+                val champion = m["champion"] ?: m["championName"] ?: "?"
                 
                 val opponentMap = m["opponent"] as? Map<String, Any>
                 val oppName = opponentMap?.get("name") ?: "?"
@@ -654,6 +655,8 @@ class AiAnalysisService(
                 m["damagePerMinute"]?.let { advStats.add("dmg/min=$it") }
                 m["goldPerMinute"]?.let { advStats.add("gold/min=$it") }
                 m["soloKills"]?.let { advStats.add("soloKills=$it") }
+                m["laneMinionsFirst10Minutes"]?.let { advStats.add("laneCs@10=$it") }
+                m["jungleCsBefore10Minutes"]?.let { advStats.add("jungleCs@10=$it") }
                 m["earlyLaningPhaseGoldExpAdvantage"]?.let { advStats.add("earlyLaningAdvantage=$it") }
                 m["maxCsAdvantageOnLaneOpponent"]?.let { advStats.add("csAdvantage=$it") }
                 m["visionScoreAdvantageLaneOpponent"]?.let { advStats.add("visionAdvantage=$it") }

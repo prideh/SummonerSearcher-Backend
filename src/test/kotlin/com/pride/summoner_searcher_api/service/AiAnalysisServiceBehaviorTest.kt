@@ -38,10 +38,6 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
         promptVersionRepository = promptVersionRepository
     )
 
-    beforeTest {
-        clearMocks(exampleRepository, interactionRepository, patternRepository, promptVersionRepository, answers = false)
-    }
-
     Given("A multi-turn coaching conversation where the player switches topics (#6)") {
         val service = createService()
         val history = listOf(
@@ -50,20 +46,18 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
         )
 
         When("the player asks a specific question about an item build or item passive") {
-            val intent = service.detectIntent(
-                "What does Zhonya's Hourglass do and when should I buy it over Banshee's Veil?",
-                history
-            )
-
             Then("it should prioritize the current message and classify as itemization_builds rather than vision_warding") {
+                val intent = service.detectIntent(
+                    "What does Zhonya's Hourglass do and when should I buy it over Banshee's Veil?",
+                    history
+                )
                 intent.category shouldBe "itemization_builds"
             }
         }
 
         When("the player asks a short follow-up with no new topic keywords") {
-            val intent = service.detectIntent("Can you give me an example?", history)
-
             Then("it should inherit the vision_warding intent from conversation history") {
+                val intent = service.detectIntent("Can you give me an example?", history)
                 intent.category shouldBe "vision_warding"
             }
         }
@@ -79,28 +73,6 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
             AiAnalysisService.IntentResult::class.java,
             PromptVersion::class.java
         ).apply { isAccessible = true }
-
-        every {
-            exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc("cs_farming", any())
-        } returns listOf(
-            AiLearnedExample(
-                questionCategory = "cs_farming",
-                userQuestion = "How do I stop missing CS at 10 minutes?",
-                aiResponse = "Crash the third wave before roaming so minions don't die to your tower.",
-                qualityScore = BigDecimal("92.5")
-            )
-        )
-
-        every {
-            patternRepository.findByTriggerCategoryAndIsActiveTrue("cs_farming")
-        } returns listOf(
-            DiscoveredPattern(
-                triggerCategory = "cs_farming",
-                followUpCategory = "wave_management",
-                occurrenceCount = 15,
-                confidenceScore = 0.72
-            )
-        )
 
         val context = mapOf(
             "summonerName" to "TestPlayer",
@@ -141,70 +113,86 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
         )
 
         When("building the coaching prompt for a cs_farming query") {
-            val intent = service.detectIntent("Why is my CS low in the first 10 minutes?")
-            val prompt = constructPromptMethod.invoke(
-                service,
-                context,
-                emptyList<Map<String, String>>(),
-                "Why is my CS low in the first 10 minutes?",
-                intent,
-                activePromptVersion
-            ) as String
+            Then("it should inject learned examples, discovered patterns, PromptVersion directive, domain guardrails, and early-CS stats") {
+                clearMocks(exampleRepository, patternRepository)
+                every {
+                    exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc("cs_farming", any())
+                } returns listOf(
+                    AiLearnedExample(
+                        questionCategory = "cs_farming",
+                        userQuestion = "How do I stop missing CS at 10 minutes?",
+                        aiResponse = "Crash the third wave before roaming so minions don't die to your tower.",
+                        qualityScore = BigDecimal("92.5")
+                    )
+                )
 
-            Then("it should inject the learned few-shot example and discovered follow-up pattern (#1)") {
+                every {
+                    patternRepository.findByTriggerCategoryAndIsActiveTrue("cs_farming")
+                } returns listOf(
+                    DiscoveredPattern(
+                        triggerCategory = "cs_farming",
+                        followUpCategory = "wave_management",
+                        occurrenceCount = 15,
+                        confidenceScore = 0.72
+                    )
+                )
+
+                val intent = service.detectIntent("Why is my CS low in the first 10 minutes?")
+                val prompt = constructPromptMethod.invoke(
+                    service,
+                    context,
+                    emptyList<Map<String, String>>(),
+                    "Why is my CS low in the first 10 minutes?",
+                    intent,
+                    activePromptVersion
+                ) as String
+
                 prompt shouldContain "PROVEN EXAMPLES"
                 prompt shouldContain "Crash the third wave before roaming"
                 prompt shouldContain "wave_management (72% of users ask this next)"
-            }
-
-            Then("it should include the active PromptVersion directive (#11)") {
                 prompt shouldContain "CATEGORY COACHING DIRECTIVE (v1.1-cs_farming-challenger)"
                 prompt shouldContain "Connect early CS@10 numbers to wave state before first dragon."
-            }
-
-            Then("it should allow general League domain knowledge while grounding player stats (#6)") {
                 prompt shouldContain "Direct Answer Priority (#1 Rule)"
                 prompt shouldContain "For general League of Legends domain questions (such as item descriptions"
-            }
-
-            Then("it should include both laner laneMinionsFirst10Minutes and jungler jungleCsBefore10Minutes (#7)") {
-                prompt shouldContain "82 CS"
-                prompt shouldContain "64 JG CS"
+                prompt shouldContain "laneCs@10=82"
+                prompt shouldContain "jungleCs@10=64.0"
             }
         }
     }
 
     Given("Champion and Challenger PromptVersion A/B selection (#11)") {
         val service = createService()
-        val champion = PromptVersion(
-            id = UUID.randomUUID(),
-            versionName = "v1.0-builds",
-            promptTemplate = "Baseline builds prompt",
-            isActive = true,
-            isChallenger = false,
-            categoryScope = "itemization_builds",
-            totalUses = 10
-        )
-        val challenger = PromptVersion(
-            id = UUID.randomUUID(),
-            versionName = "v1.1-builds-challenger",
-            promptTemplate = "Challenger builds prompt",
-            isActive = true,
-            isChallenger = true,
-            categoryScope = "itemization_builds",
-            totalUses = 5
-        )
-
-        every { promptVersionRepository.findByIsActiveTrueAndCategoryScope("itemization_builds") } returns listOf(champion, challenger)
-        every { promptVersionRepository.save(any()) } answers { firstArg() }
 
         When("selecting a prompt version across 40 requests") {
-            val chosenNames = (1..40).mapNotNull { service.selectPromptVersion("itemization_builds")?.versionName }.toSet()
-
             Then("both champion and challenger receive traffic and totalUses is incremented") {
+                clearMocks(promptVersionRepository)
+                val champion = PromptVersion(
+                    id = UUID.randomUUID(),
+                    versionName = "v1.0-builds",
+                    promptTemplate = "Baseline builds prompt",
+                    isActive = true,
+                    isChallenger = false,
+                    categoryScope = "itemization_builds",
+                    totalUses = 10
+                )
+                val challenger = PromptVersion(
+                    id = UUID.randomUUID(),
+                    versionName = "v1.1-builds-challenger",
+                    promptTemplate = "Challenger builds prompt",
+                    isActive = true,
+                    isChallenger = true,
+                    categoryScope = "itemization_builds",
+                    totalUses = 5
+                )
+
+                every { promptVersionRepository.findByIsActiveTrueAndCategoryScope("itemization_builds") } returns listOf(champion, challenger)
+                every { promptVersionRepository.save(any<PromptVersion>()) } answers { firstArg<PromptVersion>() }
+
+                val chosenNames = (1..40).mapNotNull { service.selectPromptVersion("itemization_builds")?.versionName }.toSet()
+
                 chosenNames shouldContain "v1.0-builds"
                 chosenNames shouldContain "v1.1-builds-challenger"
-                verify(exactly = 40) { promptVersionRepository.save(any()) }
+                verify(exactly = 40) { promptVersionRepository.save(any<PromptVersion>()) }
             }
         }
     }
@@ -229,38 +217,38 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
         ).apply { isAccessible = true }
 
         When("building generationConfig for gemini-3.5-flash-lite vs legacy gemini-2.5-flash") {
-            @Suppress("UNCHECKED_CAST")
-            val config35 = buildConfigMethod.invoke(service35, 0.7) as Map<String, Any>
-            @Suppress("UNCHECKED_CAST")
-            val config25 = buildConfigMethod.invoke(service25, 0.7) as Map<String, Any>
-
             Then("gemini-3.5-flash-lite includes thinkingConfig.thinkingLevel=low while gemini-2.5-flash omits it") {
+                @Suppress("UNCHECKED_CAST")
+                val config35 = buildConfigMethod.invoke(service35, 0.7) as Map<String, Any>
+                @Suppress("UNCHECKED_CAST")
+                val config25 = buildConfigMethod.invoke(service25, 0.7) as Map<String, Any>
+
                 config35["thinkingConfig"] shouldBe mapOf("thinkingLevel" to "low")
                 config25.containsKey("thinkingConfig") shouldBe false
             }
         }
 
         When("extracting standard and SSE responses that contain internal thought parts") {
-            val samplePayload = """
-                {
-                  "candidates": [
-                    {
-                      "finishReason": "STOP",
-                      "content": {
-                        "parts": [
-                          { "thought": true, "text": "Internal reasoning step that should not leak to user. " },
-                          { "text": "Buy **Zhonya's Hourglass** second against Zed to negate Death Mark." }
-                        ]
-                      }
-                    }
-                  ]
-                }
-            """.trimIndent()
-
-            val standardText = extractContentMethod.invoke(service35, samplePayload) as String
-            val streamDelta = extractStreamDeltaMethod.invoke(service35, samplePayload) as String
-
             Then("internal thought parts are stripped and only the coaching answer is returned") {
+                val samplePayload = """
+                    {
+                      "candidates": [
+                        {
+                          "finishReason": "STOP",
+                          "content": {
+                            "parts": [
+                              { "thought": true, "text": "Internal reasoning step that should not leak to user. " },
+                              { "text": "Buy **Zhonya's Hourglass** second against Zed to negate Death Mark." }
+                            ]
+                          }
+                        }
+                      ]
+                    }
+                """.trimIndent()
+
+                val standardText = extractContentMethod.invoke(service35, samplePayload) as String
+                val streamDelta = extractStreamDeltaMethod.invoke(service35, samplePayload) as String
+
                 standardText shouldBe "Buy **Zhonya's Hourglass** second against Zed to negate Death Mark."
                 standardText shouldNotContain "Internal reasoning"
                 streamDelta shouldBe "Buy **Zhonya's Hourglass** second against Zed to negate Death Mark."

@@ -71,10 +71,10 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
         """.trimIndent()
 
         When("Jackson deserializes the payload into MatchDto") {
-            val matchDto = mapper.readValue(rawJson, MatchDto::class.java)
-            val challenges = matchDto.info!!.participants.first().challenges!!
-
             Then("all newly mapped early-CS and challenge fields are preserved without being stripped") {
+                val matchDto = mapper.readValue(rawJson, MatchDto::class.java)
+                val challenges = matchDto.info!!.participants.first().challenges!!
+
                 challenges.laneMinionsFirst10Minutes shouldBe 84
                 challenges.jungleCsBefore10Minutes shouldBe 4.0f
                 challenges.killParticipation shouldBe 0.68f
@@ -95,87 +95,87 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
         }
 
         When("TimelineAnalysisService analyzes a timeline containing KILL, ASSIST, PLATE, and OBJECTIVE events") {
-            val matchDto = mapper.readValue(rawJson, MatchDto::class.java)
-            val timelineJson = """
-                {
-                  "metadata": {
-                    "matchId": "EUW1_7000000001",
-                    "participants": ["puuid-1", "puuid-2"]
-                  },
-                  "info": {
-                    "frameInterval": 60000,
-                    "participants": [
-                      { "participantId": 1, "puuid": "puuid-1" },
-                      { "participantId": 6, "puuid": "puuid-2" }
-                    ],
-                    "frames": [
-                      {
-                        "timestamp": 300000,
-                        "participantFrames": {
-                          "1": {
-                            "participantId": 1,
-                            "totalGold": 2100,
-                            "level": 6,
-                            "xp": 2000,
-                            "currentGold": 800,
-                            "minionsKilled": 42,
-                            "jungleMinionsKilled": 0,
-                            "position": { "x": 7500, "y": 7500 }
-                          },
-                          "6": {
-                            "participantId": 6,
-                            "totalGold": 1800,
-                            "level": 5,
-                            "xp": 1850,
-                            "currentGold": 500,
-                            "minionsKilled": 36,
-                            "jungleMinionsKilled": 0,
-                            "position": { "x": 7700, "y": 7700 }
-                          }
-                        },
-                        "events": [
+            Then("the gold chart timeline point retains ASSIST and OBJECTIVE events alongside KILL and PLATE") {
+                val matchDto = mapper.readValue(rawJson, MatchDto::class.java)
+                val timelineJson = """
+                    {
+                      "metadata": {
+                        "matchId": "EUW1_7000000001",
+                        "participants": ["puuid-1", "puuid-2"]
+                      },
+                      "info": {
+                        "frameInterval": 60000,
+                        "participants": [
+                          { "participantId": 1, "puuid": "puuid-1" },
+                          { "participantId": 6, "puuid": "puuid-2" }
+                        ],
+                        "frames": [
                           {
-                            "type": "CHAMPION_KILL",
-                            "timestamp": 250000,
-                            "killerId": 1,
-                            "victimId": 6,
-                            "assistingParticipantIds": [],
-                            "position": { "x": 7600, "y": 7600 }
-                          },
-                          {
-                            "type": "CHAMPION_KILL",
-                            "timestamp": 260000,
-                            "killerId": 2,
-                            "victimId": 7,
-                            "assistingParticipantIds": [1],
-                            "position": { "x": 7400, "y": 7400 }
-                          },
-                          {
-                            "type": "TURRET_PLATE_DESTROYED",
-                            "timestamp": 275000,
-                            "killerId": 1
-                          },
-                          {
-                            "type": "ELITE_MONSTER_KILL",
-                            "timestamp": 290000,
-                            "killerId": 1,
-                            "monsterType": "DRAGON"
+                            "timestamp": 300000,
+                            "participantFrames": {
+                              "1": {
+                                "participantId": 1,
+                                "totalGold": 2100,
+                                "level": 6,
+                                "xp": 2000,
+                                "currentGold": 800,
+                                "minionsKilled": 42,
+                                "jungleMinionsKilled": 0,
+                                "position": { "x": 7500, "y": 7500 }
+                              },
+                              "6": {
+                                "participantId": 6,
+                                "totalGold": 1800,
+                                "level": 5,
+                                "xp": 1850,
+                                "currentGold": 500,
+                                "minionsKilled": 36,
+                                "jungleMinionsKilled": 0,
+                                "position": { "x": 7700, "y": 7700 }
+                              }
+                            },
+                            "events": [
+                              {
+                                "type": "CHAMPION_KILL",
+                                "timestamp": 305000,
+                                "killerId": 1,
+                                "victimId": 6,
+                                "assistingParticipantIds": [],
+                                "position": { "x": 7600, "y": 7600 }
+                              },
+                              {
+                                "type": "CHAMPION_KILL",
+                                "timestamp": 315000,
+                                "killerId": 2,
+                                "victimId": 7,
+                                "assistingParticipantIds": [1],
+                                "position": { "x": 7400, "y": 7400 }
+                              },
+                              {
+                                "type": "TURRET_PLATE_DESTROYED",
+                                "timestamp": 325000,
+                                "killerId": 1
+                              },
+                              {
+                                "type": "ELITE_MONSTER_KILL",
+                                "timestamp": 340000,
+                                "killerId": 1,
+                                "monsterType": "DRAGON"
+                              }
+                            ]
                           }
                         ]
                       }
-                    ]
-                  }
-                }
-            """.trimIndent()
-            val timelineDto = mapper.readValue(timelineJson, MatchTimelineDto::class.java)
+                    }
+                """.trimIndent()
+                val timelineDto = mapper.readValue(timelineJson, MatchTimelineDto::class.java)
 
-            val analysis = timelineService.analyze(
-                listOf(Triple("EUW1_7000000001", timelineDto, matchDto)),
-                "puuid-1"
-            )
-            val pointEvents = analysis.powerSpikeTimelines.first().points.first().events.map { it.type }
+                val analysis = timelineService.analyze(
+                    listOf(Triple("EUW1_7000000001", timelineDto, matchDto)),
+                    "puuid-1"
+                )
+                val pointEvents = analysis.powerSpikeTimelines.first().points.first().events.map { it.type }
 
-            Then("the gold chart timeline point retains ASSIST and OBJECTIVE events alongside KILL and PLATE") {
                 pointEvents.containsAll(listOf("KILL", "ASSIST", "PLATE", "OBJECTIVE")) shouldBe true
             }
         }

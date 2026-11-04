@@ -22,37 +22,34 @@ class SitemapControllerBehaviorTest : BehaviorSpec({
         baseUrl = "https://summonersearcher.com"
     )
 
-    beforeTest {
-        clearMocks(indexedPlayerRepository, redisCacheService, answers = false)
-    }
-
     Given("The dynamic /api/sitemap.xml endpoint (#9)") {
         When("Redis has no cached sitemap XML") {
-            every { redisCacheService.get("seo:sitemap:xml", String::class.java) } returns null
-            every { indexedPlayerRepository.findTop5000ByOrderByLastSeenAtDesc() } returns listOf(
-                IndexedPlayer(
-                    puuid = "puuid-1",
-                    gameName = "Faker",
-                    tagLine = "KR1",
-                    region = "kr",
-                    profileIconId = 1,
-                    summonerLevel = 850L,
-                    lastSeenAt = Instant.parse("2026-11-04T08:00:00Z")
-                ),
-                IndexedPlayer(
-                    puuid = "puuid-2",
-                    gameName = "Hide on bush",
-                    tagLine = "EU&W",
-                    region = "euw1",
-                    profileIconId = 2,
-                    summonerLevel = 420L,
-                    lastSeenAt = Instant.parse("2026-11-03T12:00:00Z")
-                )
-            )
-
-            val response = controller.getSitemap()
-
             Then("it generates valid sitemap XML with URL-encoded profile paths and caches it in Redis") {
+                clearMocks(indexedPlayerRepository, redisCacheService)
+                every { redisCacheService.get("seo:sitemap:xml", String::class.java) } returns null
+                every { indexedPlayerRepository.findTop5000ByOrderByLastSeenAtDesc() } returns listOf(
+                    IndexedPlayer(
+                        puuid = "puuid-1",
+                        gameName = "Faker",
+                        tagLine = "KR1",
+                        region = "kr",
+                        profileIconId = 1,
+                        summonerLevel = 850L,
+                        lastSeenAt = Instant.parse("2026-11-04T08:00:00Z")
+                    ),
+                    IndexedPlayer(
+                        puuid = "puuid-2",
+                        gameName = "Hide on bush",
+                        tagLine = "EU&W",
+                        region = "euw1",
+                        profileIconId = 2,
+                        summonerLevel = 420L,
+                        lastSeenAt = Instant.parse("2026-11-03T12:00:00Z")
+                    )
+                )
+
+                val response = controller.getSitemap()
+
                 response.statusCode shouldBe HttpStatus.OK
                 val body = response.body!!
                 body shouldContain "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
@@ -65,12 +62,13 @@ class SitemapControllerBehaviorTest : BehaviorSpec({
         }
 
         When("Redis already has a cached sitemap XML") {
-            val cachedXml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset></urlset>"
-            every { redisCacheService.get("seo:sitemap:xml", String::class.java) } returns cachedXml
-
-            val response = controller.getSitemap()
-
             Then("it serves the cached XML without querying PostgreSQL") {
+                clearMocks(indexedPlayerRepository, redisCacheService)
+                val cachedXml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><urlset></urlset>"
+                every { redisCacheService.get("seo:sitemap:xml", String::class.java) } returns cachedXml
+
+                val response = controller.getSitemap()
+
                 response.statusCode shouldBe HttpStatus.OK
                 response.body shouldBe cachedXml
                 verify(exactly = 0) { indexedPlayerRepository.findTop5000ByOrderByLastSeenAtDesc() }
