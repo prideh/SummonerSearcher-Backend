@@ -732,6 +732,16 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldNotContain "participants="
                 prompt shouldNotContain "assistantsCount="
                 Regex("cs10\\.supplyLabel=").findAll(prompt).count() shouldBe 1
+
+                // 5. Observed facts vs hypotheses, conditional recommendations, and no stale Mythic/unsupported build-effect claims (including suggestions)
+                prompt shouldContain "Observed Facts vs. Hypotheses & Conditional Recommendations"
+                prompt shouldContain "Death events do **not** prove bad trades, overextension"
+                prompt shouldContain "frame all coaching recommendations **conditionally**"
+                prompt shouldContain "No Stale Mythic-Era or Unsupported Build-Effect Claims (Including `---SUGGESTIONS---`)"
+                prompt shouldContain "The Mythic item system was removed in Season 14"
+                prompt shouldContain "NEVER propose or mention \"Mythic items\", \"Mythic passives\", \"Mythic paths/rushes\""
+                prompt shouldContain "Do not claim specific patch-dependent item stats, gold costs, or build-effect numbers unless the supplied patch/context data explicitly supports them"
+                prompt shouldContain "never mention Mythic items/paths or unsupported build-effect claims in suggestions"
             }
         }
     }
