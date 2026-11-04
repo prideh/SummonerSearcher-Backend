@@ -353,7 +353,12 @@ class TimelineAnalysisService {
             opponentItemsByMinute[minute]?.let { opponentItems.addAll(it) }
 
             // Events occurring in this minute
-            val eventsThisMinute = matchEvents.filter { it.minuteMark == minute && (it.type == "KILL" || it.type == "DEATH" || it.type == "PLATE") }
+            val eventsThisMinute = matchEvents.filter {
+                it.minuteMark == minute && (
+                    it.type == "KILL" || it.type == "DEATH" || it.type == "ASSIST" ||
+                    it.type == "PLATE" || it.type == "OBJECTIVE"
+                )
+            }
 
             // Only emit one point per minute (skip duplicate timestamps)
             if (points.none { it.minute == minute }) {

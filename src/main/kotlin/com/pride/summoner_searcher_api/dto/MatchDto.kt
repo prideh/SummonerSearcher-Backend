@@ -205,6 +205,14 @@ data class ChallengesDto(
     val getTakedownsInAllLanesEarlyJungleAsLaner: Int?,
     val soloKills: Int?,
     val turretPlatesTaken: Int?,
+    val laneMinionsFirst10Minutes: Int? = null,
+    val jungleCsBefore10Minutes: Float? = null,
+    val scuttleCrabKills: Int? = null,
+    val wardTakedowns: Int? = null,
+    val kda: Float? = null,
+    val killParticipation: Float? = null,
+    val goldPerMinute: Float? = null,
+    val visionScorePerMinute: Float? = null,
 )
 
 /**
