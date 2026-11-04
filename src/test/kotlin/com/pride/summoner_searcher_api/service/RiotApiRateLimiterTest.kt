@@ -93,4 +93,30 @@ class RiotApiRateLimiterTest {
         // We expect the time to have advanced to at least 1000ms
         assertTrue(end >= 1000, "Should have waited for short term window. Time is $end")
     }
+
+    @Test
+    fun `should reserve headroom for HIGH priority when LOW priority reaches 80 percent`() = runTest {
+        val timeProvider = TestTimeProvider(this)
+        val rateLimiter = RiotApiRateLimiter(timeProvider)
+        val region = "kr"
+
+        // Short term limit is 20 req / 1s -> 80% for LOW priority is 16 requests
+        val lowBurstStart = currentTime
+        repeat(16) {
+            rateLimiter.acquirePermit(region, ApiPriority.LOW)
+        }
+        assertTrue(currentTime - lowBurstStart == 0L, "First 16 LOW priority requests should not wait")
+
+        // HIGH priority should still be able to use the remaining 4 permits immediately without waiting
+        val highStart = currentTime
+        repeat(4) {
+            rateLimiter.acquirePermit(region, ApiPriority.HIGH)
+        }
+        assertTrue(currentTime - highStart == 0L, "HIGH priority requests should use reserved 20% headroom immediately")
+
+        // A subsequent LOW priority request must wait until usage drops below 16
+        val throttledLowStart = currentTime
+        rateLimiter.acquirePermit(region, ApiPriority.LOW)
+        assertTrue(currentTime - throttledLowStart >= 1000L, "LOW priority request above 80% threshold must wait for window expiry")
+    }
 }

@@ -202,28 +202,25 @@ class RiotApiRateLimiter(
                     val now = timeProvider.now()
                     cleanUp(now)
 
-                    if (timestamps.size < capacity) {
-                        // Dynamic Spacing: 
-                        // If we have high capacity (e.g. 500/10s = 50 req/s), we want spacing ~ 20ms.
-                        // If we have low capacity (e.g. 20/1s = 20 req/s), spacing ~ 50ms.
-                        // Formula: 1000ms / (RequestsPerSecond * Factor)
-                        // Factor > 1.0 means we allow some burst. Factor 1.0 is strict pacing.
-                        // Let's use a factor of 1.2 to allow slight bursting but keep it smooth.
-                        
-                        // Removed artificial spacing to allow full bursting.
-                        // The capacity check above is sufficient to respect the rate limit.
-                        
+                    // Reserve 20% headroom for HIGH priority requests by capping LOW priority at 80% capacity
+                    val effectiveCapacity = when (priority) {
+                        ApiPriority.HIGH -> capacity
+                        ApiPriority.LOW -> (capacity * 0.8).toInt().coerceAtLeast(1)
+                    }
+
+                    if (timestamps.size < effectiveCapacity) {
                         timestamps.addLast(timeProvider.now())
                         return
                     }
 
-                    // Window is full
-                    val oldest = timestamps.first()
-                    val expiryTime = oldest + windowMs
+                    // Effective window is full for this priority; wait for enough entries to expire
+                    val targetIndex = (timestamps.size - effectiveCapacity).coerceIn(0, timestamps.size - 1)
+                    val targetTimestamp = timestamps[targetIndex]
+                    val expiryTime = targetTimestamp + windowMs
                     val waitTime = expiryTime - now
 
                     if (waitTime > 0) {
-                        logger.debug("[{}] Limit reached ({}/{}). Waiting {}ms...", name, timestamps.size, capacity, waitTime)
+                        logger.debug("[{}] Limit reached for {} ({}/{}). Waiting {}ms...", name, priority, timestamps.size, effectiveCapacity, waitTime)
                         mutex.unlock()
                         try {
                             delay(waitTime + 10)
