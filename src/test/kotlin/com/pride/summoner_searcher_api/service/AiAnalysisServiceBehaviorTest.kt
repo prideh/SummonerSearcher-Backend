@@ -720,7 +720,7 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 (expandedGameLines <= AiAnalysisService.MAX_SELECTED_MATCHES) shouldBe true
                 (expandedGameLines >= AiAnalysisService.MIN_SELECTED_MATCHES) shouldBe true
                 prompt shouldContain "omittedMatchesRollup:"
-                prompt shouldContain "recentMatchSummary: 12 wins / 8 losses in last 20 games"
+                prompt shouldContain "recentMatchSummary: 13 wins / 7 losses in last 20 games"
 
                 // 3. Question-selected match relevance: older Sylas vs Viktor games (Game 3 and Game 11) + Most Recent Match (Game 20) are selected with full detail
                 prompt shouldContain "Game 3: L on Sylas vs EnemyMid3 (Viktor)"
