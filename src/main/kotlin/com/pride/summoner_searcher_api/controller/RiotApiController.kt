@@ -71,9 +71,15 @@ class RiotApiController(
         @PathVariable region: String,
         @PathVariable summonerName: String,
         @PathVariable tagLine: String,
+        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "false") refresh: Boolean = false,
         @CurrentUser user: User?
     ): ResponseEntity<SummonerProfileDto?> = runBlocking {
-        val summonerProfile = summonerProfileService.getSummonerProfile(region, summonerName, tagLine)
+        val summonerProfile = summonerProfileService.getSummonerProfile(
+            region = region,
+            summonerName = summonerName,
+            tagLine = tagLine,
+            explicitRefresh = refresh
+        )
 
         // If the summoner was found and we have a logged-in user, add the search to the user's recent search history.
         if (summonerProfile != null && user != null) {
@@ -128,18 +134,17 @@ class RiotApiController(
     }
 
     /**
-     * Runs a cache-only cohort extraction + rate-limit verification report for [region] (zero Riot API calls).
+     * Returns the cached or recompute-guarded cohort extraction + rate-limit verification report for [region]
+     * (zero Riot API calls, bounded scans, no unguarded public recomputation).
      */
     @GetMapping("/cohorts/{region}/report")
     fun getCohortExtractionReport(
         @PathVariable region: String,
-        @org.springframework.web.bind.annotation.RequestParam(required = false) patch: String? = null,
-        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "10") maxGamesPerPlayer: Int = 10
+        @org.springframework.web.bind.annotation.RequestParam(required = false) patch: String? = null
     ): ResponseEntity<com.pride.summoner_searcher_api.dto.CohortExtractionReportDto?> {
-        val report = cohortBenchmarkService?.extractCachedCohortsAndReport(
+        val report = cohortBenchmarkService?.getPublicCohortReport(
             region = region,
-            targetPatch = patch,
-            maxGamesPerPlayer = maxGamesPerPlayer
+            targetPatch = patch
         )
         return ResponseEntity.ok(report)
     }

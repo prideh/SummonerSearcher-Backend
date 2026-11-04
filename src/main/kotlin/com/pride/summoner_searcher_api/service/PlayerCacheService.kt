@@ -29,13 +29,17 @@ import java.util.concurrent.ConcurrentHashMap
 class PlayerCacheService(
     private val redisCacheService: RedisCacheService,
     private val riotApiService: RiotApiService,
-    private val indexedPlayerRepository: com.pride.summoner_searcher_api.repository.IndexedPlayerRepository
+    private val indexedPlayerRepository: com.pride.summoner_searcher_api.repository.IndexedPlayerRepository,
+    private val timeProvider: TimeProvider = SystemTimeProvider(),
+    private val lockPollIntervalMs: Long = LOCK_POLL_INTERVAL_MS,
+    private val lockMaxPollAttempts: Int = LOCK_MAX_POLL_ATTEMPTS
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
     private val timelineAnalysisService = TimelineAnalysisService()
     private val inFlightMutex = Mutex()
     private val inFlightRefreshes = ConcurrentHashMap<String, CompletableDeferred<SummonerProfileDto?>>()
+    private val lastBackgroundRefreshAtMs = ConcurrentHashMap<String, Long>()
     private val backgroundRefreshScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     companion object {
@@ -43,9 +47,11 @@ class PlayerCacheService(
         private const val CHUNK_SIZE = 50
         private val PROFILE_CACHE_TTL = Duration.ofDays(14)
         private val MATCH_CACHE_TTL = Duration.ofDays(60)
-        private val PROFILE_LOCK_TTL = Duration.ofSeconds(60)
-        private const val LOCK_POLL_INTERVAL_MS = 250L
-        private const val LOCK_MAX_POLL_ATTEMPTS = 120 // Up to 30s wait for cross-instance cold loads
+        val PROFILE_FRESHNESS_WINDOW: Duration = Duration.ofMinutes(5)
+        val EXPLICIT_REFRESH_MIN_COOLDOWN: Duration = Duration.ofSeconds(60)
+        val PROFILE_LOCK_TTL: Duration = Duration.ofSeconds(60)
+        const val LOCK_POLL_INTERVAL_MS = 250L
+        const val LOCK_MAX_POLL_ATTEMPTS = 240 // Full 60s wait matching PROFILE_LOCK_TTL (240 * 250ms = 60s)
     }
 
     /**
@@ -56,6 +62,9 @@ class PlayerCacheService(
     private fun getMatchCacheKey(matchId: String, region: String) = "match:${region.lowercase()}:$matchId"
 
     private fun getLockKey(puuid: String, region: String) = "lock:profile:${region.lowercase()}:$puuid"
+
+    private fun getRefreshCooldownKey(puuid: String, region: String) =
+        "cooldown:profile:refresh:${region.lowercase()}:$puuid"
 
     private fun getFlightKey(puuid: String, region: String) = "${region.lowercase()}:$puuid"
 
@@ -76,7 +85,7 @@ class PlayerCacheService(
     }
 
     /**
-     * A cached profile is ready for immediate cache-hit response (with asynchronous background refresh)
+     * A cached profile is ready for immediate cache-hit response
      * when its full-season `overallStats`, `improvementStats`, and enriched `recentMatches` are present.
      */
     internal fun isProfileReadyForImmediateServe(cached: SummonerProfileDto?): Boolean {
@@ -87,19 +96,55 @@ class PlayerCacheService(
         return recent?.none { needsMatchBackfill(it) } ?: true
     }
 
+    internal fun isProfileWithinFreshnessWindow(
+        cached: SummonerProfileDto?,
+        now: Instant,
+        window: Duration = PROFILE_FRESHNESS_WINDOW
+    ): Boolean {
+        val refreshedAt = cached?.lastRefreshed ?: return false
+        return !refreshedAt.isBefore(now.minus(window))
+    }
+
     /**
-     * Retrieves a player's profile:
-     * - If a complete profile with enriched `recentMatches` is already in Redis, returns it immediately
-     *   and triggers a non-blocking background refresh (`cached-immediate/background refresh`).
-     * - Otherwise (cache miss or legacy un-enriched cache entry), coordinates a single-flight refresh.
+     * Retrieves a player's profile with bounded freshness and explicit-refresh semantics:
+     * - If a ready cached profile exists and [explicitRefresh] is `false`:
+     *   - Within [PROFILE_FRESHNESS_WINDOW] (5m): returns `cachedProfile` immediately with **zero** Riot API calls
+     *     and **zero** background refresh tasks.
+     *   - Older than [PROFILE_FRESHNESS_WINDOW]: returns `cachedProfile` immediately and triggers at most one
+     *     cooldown-guarded background refresh.
+     * - If [explicitRefresh] is `true`:
+     *   - If refreshed within [EXPLICIT_REFRESH_MIN_COOLDOWN] (60s), returns `cachedProfile` immediately.
+     *   - Otherwise performs a single-flight synchronous refresh.
+     * - If cache miss or legacy un-enriched cache entry: performs a single-flight synchronous refresh.
      */
-    suspend fun getPlayerProfile(puuid: String, region: String, summonerName: String, tagLine: String): SummonerProfileDto? {
+    suspend fun getPlayerProfile(
+        puuid: String,
+        region: String,
+        summonerName: String,
+        tagLine: String,
+        explicitRefresh: Boolean = false
+    ): SummonerProfileDto? {
         val cacheKey = getProfileCacheKey(puuid, region)
         val cachedProfile = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
+        val now = Instant.ofEpochMilli(timeProvider.now())
 
         if (isProfileReadyForImmediateServe(cachedProfile)) {
-            logger.info("Immediate cache hit for $summonerName#$tagLine ($region); serving cached profile and triggering background refresh.")
-            triggerBackgroundRefresh(puuid, region, summonerName, tagLine)
+            if (explicitRefresh) {
+                if (isProfileWithinFreshnessWindow(cachedProfile, now, EXPLICIT_REFRESH_MIN_COOLDOWN)) {
+                    logger.info("Explicit refresh requested within 60s cooldown for $summonerName#$tagLine ($region); serving fresh cached profile.")
+                    return cachedProfile
+                }
+                logger.info("Explicit refresh requested for $summonerName#$tagLine ($region); refreshing synchronously.")
+                return refreshPlayerProfile(puuid, region, summonerName, tagLine)
+            }
+
+            if (isProfileWithinFreshnessWindow(cachedProfile, now, PROFILE_FRESHNESS_WINDOW)) {
+                logger.info("Fresh cache hit for $summonerName#$tagLine ($region); serving cached profile with zero Riot calls.")
+                return cachedProfile
+            }
+
+            logger.info("Stale cache hit for $summonerName#$tagLine ($region); serving cached profile and checking background refresh cooldown.")
+            triggerBackgroundRefreshIfCooldownAllows(puuid, region, summonerName, tagLine)
             return cachedProfile
         }
 
@@ -107,14 +152,37 @@ class PlayerCacheService(
     }
 
     /**
-     * Triggers an asynchronous background refresh if one is not already in flight for `(region, puuid)`.
+     * Triggers an asynchronous background refresh only if:
+     * 1. No refresh is currently in flight for `(region, puuid)`, AND
+     * 2. Neither the in-process cooldown nor the Redis cooldown key (`cooldown:profile:refresh:{region}:{puuid}`)
+     *    was triggered within [PROFILE_FRESHNESS_WINDOW].
      */
-    fun triggerBackgroundRefresh(puuid: String, region: String, summonerName: String, tagLine: String) {
+    fun triggerBackgroundRefreshIfCooldownAllows(
+        puuid: String,
+        region: String,
+        summonerName: String,
+        tagLine: String
+    ): Boolean {
         val flightKey = getFlightKey(puuid, region)
         val existing = inFlightRefreshes[flightKey]
         if (existing != null && existing.isActive) {
-            return
+            return false
         }
+
+        val nowMs = timeProvider.now()
+        val windowMs = PROFILE_FRESHNESS_WINDOW.toMillis()
+        val prevMs = lastBackgroundRefreshAtMs[flightKey]
+        if (prevMs != null && (nowMs - prevMs) < windowMs) {
+            return false
+        }
+
+        val cooldownKey = getRefreshCooldownKey(puuid, region)
+        val acquiredCooldown = redisCacheService.setIfAbsent(cooldownKey, "COOLDOWN", PROFILE_FRESHNESS_WINDOW)
+        if (!acquiredCooldown) {
+            return false
+        }
+
+        lastBackgroundRefreshAtMs[flightKey] = nowMs
         backgroundRefreshScope.launch {
             try {
                 refreshPlayerProfile(puuid, region, summonerName, tagLine)
@@ -122,6 +190,7 @@ class PlayerCacheService(
                 logger.warn("Background profile refresh failed for $summonerName#$tagLine ($region): ${e.message}")
             }
         }
+        return true
     }
 
     /**
@@ -176,18 +245,18 @@ class PlayerCacheService(
     ): SummonerProfileDto? = coroutineScope {
         val cacheKey = getProfileCacheKey(puuid, region)
         val lockKey = getLockKey(puuid, region)
-        val waitStart = Instant.now()
+        val waitStart = Instant.ofEpochMilli(timeProvider.now())
 
-        val acquired = redisCacheService.setIfAbsent(lockKey, "LOCKED", PROFILE_LOCK_TTL)
+        var ownsLock = redisCacheService.setIfAbsent(lockKey, "LOCKED", PROFILE_LOCK_TTL)
 
-        if (!acquired) {
-            logger.info("Profile refresh lock held externally for $summonerName#$tagLine ($region). Waiting for completion.")
+        if (!ownsLock) {
+            logger.info("Profile refresh lock held externally for $summonerName#$tagLine ($region). Waiting up to ${lockMaxPollAttempts * lockPollIntervalMs}ms.")
             val immediateCached = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
             if (isProfileReadyForImmediateServe(immediateCached)) {
                 return@coroutineScope immediateCached
             }
 
-            repeat(LOCK_MAX_POLL_ATTEMPTS) {
+            repeat(lockMaxPollAttempts) {
                 val cached = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
                 if (cached != null && (
                         cached.lastRefreshed?.isAfter(waitStart.minusSeconds(10)) == true ||
@@ -197,18 +266,33 @@ class PlayerCacheService(
                     logger.info("Cache populated during lock wait for $summonerName#$tagLine ($region)")
                     return@coroutineScope cached
                 }
-                delay(LOCK_POLL_INTERVAL_MS)
+                delay(lockPollIntervalMs)
             }
 
             val afterWaitCached = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
             if (afterWaitCached != null) {
                 return@coroutineScope afterWaitCached
             }
-            logger.warn("Lock wait expired with empty cache for $summonerName#$tagLine ($region); proceeding with fallback refresh.")
+
+            // Never bypass a still-held cross-instance lock! Only proceed if the previous lock expired
+            // AND this caller successfully acquires the lock.
+            ownsLock = redisCacheService.setIfAbsent(lockKey, "LOCKED", PROFILE_LOCK_TTL)
+            if (!ownsLock) {
+                logger.warn("Cross-instance lock still held after wait for $summonerName#$tagLine ($region); refusing to bypass lock or duplicate cold refresh.")
+                return@coroutineScope redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
+            }
+
+            val postAcquireCached = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
+            if (postAcquireCached != null) {
+                redisCacheService.delete(lockKey)
+                ownsLock = false
+                return@coroutineScope postAcquireCached
+            }
+            logger.warn("Previous lock expired with empty cache for $summonerName#$tagLine ($region); acquired lock and proceeding with fallback refresh.")
         }
 
         try {
-            val refreshStartMs = System.currentTimeMillis()
+            val refreshStartMs = timeProvider.now()
             val cachedProfile = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
 
             if (cachedProfile != null) {
@@ -432,12 +516,12 @@ class PlayerCacheService(
                 overallStats = overallStats,
                 improvementStats = matchOnlyImprovementStats,
                 totalMatches = validMatchIds.size,
-                lastRefreshed = Instant.now()
+                lastRefreshed = Instant.ofEpochMilli(timeProvider.now())
             )
             
             redisCacheService.set(cacheKey, updatedProfile, PROFILE_CACHE_TTL)
-            val matchProcessingMs = System.currentTimeMillis() - matchProcessingStartMs
-            val totalRefreshMs = System.currentTimeMillis() - refreshStartMs
+            val matchProcessingMs = timeProvider.now() - matchProcessingStartMs
+            val totalRefreshMs = timeProvider.now() - refreshStartMs
             logger.info(
                 "Refreshed profile for {}#{} ({}): totalMs={}, metadataAndIdsMs={}, matchProcessingMs={}, validMatches={}/{}, cacheHits={}, missingFetches={}, recent20Backfills={}, skippedOlderBackfills={}",
                 summonerName, tagLine, region, totalRefreshMs, metadataAndIdsMs, matchProcessingMs,
@@ -448,7 +532,7 @@ class PlayerCacheService(
             return@coroutineScope updatedProfile
 
         } finally {
-            if (acquired) {
+            if (ownsLock) {
                 redisCacheService.delete(lockKey)
             }
         }

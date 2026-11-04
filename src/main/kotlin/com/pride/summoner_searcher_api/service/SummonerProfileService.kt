@@ -22,14 +22,25 @@ class SummonerProfileService(
      * @param tagLine The tag line part of the Riot ID.
      * @return A [SummonerProfileDto] if the summoner is found on the specified region, otherwise null.
      */
-    suspend fun getSummonerProfile(region: String, summonerName: String, tagLine: String): SummonerProfileDto? {
+    suspend fun getSummonerProfile(
+        region: String,
+        summonerName: String,
+        tagLine: String,
+        explicitRefresh: Boolean = false
+    ): SummonerProfileDto? {
         // Step 1: Get the global account PUUID from the Riot ID. This call is not cached.
         val accountDto = riotApiService.getAccountByRiotId(summonerName, tagLine, region)
         val puuid = accountDto?.puuid?.takeIf { it.isNotBlank() } ?: return null
 
-        // Step 2: Get full profile from cache (or fetch if missing)
-        val fullProfile = playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine) ?: return null
-        
+        // Step 2: Get full profile from cache (or refresh if missing / explicitly requested)
+        val fullProfile = playerCacheService.getPlayerProfile(
+            puuid = puuid,
+            region = region,
+            summonerName = summonerName,
+            tagLine = tagLine,
+            explicitRefresh = explicitRefresh
+        ) ?: return null
+
         // Step 3: Return profile with only the first page of matches (e.g., 20)
         // We keep the stats as they are calculated from the full history.
         return fullProfile.copy(

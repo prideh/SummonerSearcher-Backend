@@ -17,12 +17,18 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
     val cohortRepo = mockk<CohortBenchmarkCellRepository>(relaxed = true)
     val riotApiService = mockk<RiotApiService>(relaxed = true)
 
+    val nowInstant = Instant.parse("2026-11-04T12:00:00Z")
+    val snapshotTime = Instant.parse("2026-11-04T10:00:00Z")
+    val fixedTimeProvider = object : TimeProvider {
+        override fun now(): Long = nowInstant.toEpochMilli()
+    }
+
     fun buildParticipant(
         puuid: String,
         role: String,
         laneCs10: Int,
         totalMinions: Int,
-        neutralMinions: Int,
+        neutralMinions: Int?,
         kills: Int = 6,
         deaths: Int = 3,
         assists: Int = 7,
@@ -31,6 +37,12 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
         visionScore: Int = 30,
         timeSpentDead: Int = 90
     ): ParticipantDto {
+        val neutralJsonField = if (neutralMinions != null) """"neutralMinionsKilled": $neutralMinions,""" else ""
+        val jungleChallengeField = if (neutralMinions != null) {
+            """"jungleCsBefore10Minutes": ${neutralMinions.coerceAtMost(12).toFloat()},"""
+        } else {
+            ""
+        }
         val json = """
             {
               "puuid": "$puuid",
@@ -41,7 +53,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
               "deaths": $deaths,
               "assists": $assists,
               "totalMinionsKilled": $totalMinions,
-              "neutralMinionsKilled": $neutralMinions,
+              $neutralJsonField
               "goldEarned": $goldEarned,
               "totalDamageDealtToChampions": $damageToChamps,
               "visionScore": $visionScore,
@@ -49,7 +61,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
               "win": true,
               "challenges": {
                 "laneMinionsFirst10Minutes": $laneCs10,
-                "jungleCsBefore10Minutes": ${neutralMinions.coerceAtMost(12).toFloat()},
+                $jungleChallengeField
                 "goldPerMinute": ${(goldEarned / 30.0).toFloat()},
                 "damagePerMinute": ${(damageToChamps / 30.0).toFloat()},
                 "visionScorePerMinute": ${(visionScore / 30.0).toFloat()},
@@ -67,23 +79,27 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
     }
 
     Given("CohortBenchmarkService cache-only extraction on euw1") {
-        val snapshotTime = Instant.parse("2026-11-04T10:00:00Z")
 
-        When("extracting from cached profiles and matches with deduplication, per-player cap, and missing rank snapshots") {
-            val rateLimiter = RiotApiRateLimiter(SystemTimeProvider())
+        When("extracting from cached profiles and matches with per-role 114/120 ceilings, missing jungle counters, freshness bounds, and honest patch labeling") {
+            val rateLimiter = RiotApiRateLimiter(fixedTimeProvider)
             val service = CohortBenchmarkService(
                 redisCacheService = redisCacheService,
                 cohortBenchmarkCellRepository = cohortRepo,
                 riotApiRateLimiter = rateLimiter,
                 riotApiService = riotApiService,
                 objectMapper = objectMapper,
-                networkCollectionEnabled = false
+                networkCollectionEnabled = false,
+                timeProvider = fixedTimeProvider
             )
 
-            val profileKey1 = "player:profile:euw1:puuid-mid-1"
-            val profileKey2 = "player:profile:euw1:puuid-top-1"
-            every { redisCacheService.scanKeys("player:profile:euw1:*") } returns listOf(profileKey1, profileKey2)
-            every { redisCacheService.scanKeys("leaderboard:euw1:*") } returns emptyList()
+            val profileKeyMid = "player:profile:euw1:puuid-mid-1"
+            val profileKeyTop = "player:profile:euw1:puuid-top-1"
+            val profileKeyBot = "player:profile:euw1:puuid-bot-1"
+            val profileKeyStale = "player:profile:euw1:puuid-stale-rank"
+            val allProfileKeys = listOf(profileKeyMid, profileKeyTop, profileKeyBot, profileKeyStale)
+
+            every { redisCacheService.scanKeys("player:profile:euw1:*", any(), any()) } returns allProfileKeys
+            every { redisCacheService.scanKeys("leaderboard:euw1:*", any(), any()) } returns emptyList()
             every { redisCacheService.get(match { it.startsWith("leaderboard:") }, CachedLeaderboardDto::class.java) } returns null
 
             val rankEmerald = LeagueEntryDto(
@@ -92,39 +108,52 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 leagueId = "l1", queueType = "RANKED_SOLO_5x5", tier = "EMERALD", summonerName = null
             )
             every {
-                redisCacheService.multiGet(listOf(profileKey1, profileKey2), SummonerProfileDto::class.java)
+                redisCacheService.multiGet(allProfileKeys, SummonerProfileDto::class.java)
             } returns mapOf(
-                profileKey1 to SummonerProfileDto(
+                profileKeyMid to SummonerProfileDto(
                     puuid = "puuid-mid-1", gameName = "MidOne", tagLine = "EUW",
                     summonerLevel = 200, profileIconId = 1, soloQueueRank = rankEmerald,
                     recentMatches = emptyList(), lastRefreshed = snapshotTime
                 ),
-                profileKey2 to SummonerProfileDto(
+                profileKeyTop to SummonerProfileDto(
                     puuid = "puuid-top-1", gameName = "TopOne", tagLine = "EUW",
                     summonerLevel = 180, profileIconId = 2,
                     soloQueueRank = rankEmerald.copy(puuid = "puuid-top-1", tier = "DIAMOND"),
                     recentMatches = emptyList(), lastRefreshed = snapshotTime.plusSeconds(60)
+                ),
+                profileKeyBot to SummonerProfileDto(
+                    puuid = "puuid-bot-1", gameName = "BotOne", tagLine = "EUW",
+                    summonerLevel = 190, profileIconId = 3,
+                    soloQueueRank = rankEmerald.copy(puuid = "puuid-bot-1", tier = "EMERALD"),
+                    recentMatches = emptyList(), lastRefreshed = snapshotTime
+                ),
+                // Stale rank snapshot (10 days old > 7d bound) -> must be excluded!
+                profileKeyStale to SummonerProfileDto(
+                    puuid = "puuid-stale-rank", gameName = "StaleRank", tagLine = "EUW",
+                    summonerLevel = 150, profileIconId = 4,
+                    soloQueueRank = rankEmerald.copy(puuid = "puuid-stale-rank", tier = "PLATINUM"),
+                    recentMatches = emptyList(), lastRefreshed = nowInstant.minusSeconds(10 * 24 * 3600L)
                 )
             )
 
-            // Create 5 matches on patch 16.7 (queue 420), 1 ARAM match (queue 450), and 1 old patch match (16.6)
-            // Player puuid-mid-1 appears in all 5 valid matches (and duplicated twice in EUW1_1 to test (matchId, puuid) dedupe),
-            // with maxGamesPerPlayer = 3 so 2 oldest games are excluded over cap!
-            // Also include an unranked/uncached participant "puuid-no-snapshot" who must NEVER get an invented rank.
-            val matchKeys = (1..7).map { "match:euw1:EUW1_$it" }
-            every { redisCacheService.scanKeys("match:euw1:*") } returns matchKeys
-            every { redisCacheService.scanKeys("timeline:euw1:*") } returns emptyList()
+            val recentGameMs = snapshotTime.minusSeconds(3600).toEpochMilli()
+            val matchKeys = (1..9).map { "match:euw1:EUW1_$it" }
+            every { redisCacheService.scanKeys("match:euw1:*", any(), any()) } returns matchKeys
+            every { redisCacheService.scanKeys("timeline:euw1:*", any(), any()) } returns emptyList()
 
             val matchesMap = mapOf(
                 "match:euw1:EUW1_1" to MatchDto(
-                    metadata = MatchMetadata("EUW1_1", listOf("puuid-mid-1", "puuid-no-snapshot")),
+                    metadata = MatchMetadata("EUW1_1", listOf("puuid-mid-1", "puuid-top-1", "puuid-bot-1", "puuid-no-snapshot")),
                     info = MatchInfo(
-                        gameId = 1L, gameCreation = 5000L, gameDuration = 1800L, gameMode = "CLASSIC",
+                        gameId = 1L, gameCreation = recentGameMs + 5000L, gameDuration = 1800L, gameMode = "CLASSIC",
                         gameVersion = "16.7.612.1111", queueId = 420,
                         participants = listOf(
                             buildParticipant("puuid-mid-1", "MIDDLE", laneCs10 = 84, totalMinions = 240, neutralMinions = 30),
                             // Duplicate (matchId, puuid) entry in same match payload to verify deduplication
                             buildParticipant("puuid-mid-1", "MIDDLE", laneCs10 = 84, totalMinions = 240, neutralMinions = 30),
+                            // TOP and BOTTOM on patch 16.7 with NULL jungle counters -> must have 114 ceiling and null totalCsWithCamps!
+                            buildParticipant("puuid-top-1", "TOP", laneCs10 = 79, totalMinions = 210, neutralMinions = null),
+                            buildParticipant("puuid-bot-1", "BOTTOM", laneCs10 = 82, totalMinions = 225, neutralMinions = null),
                             // Participant with no cached rank snapshot + JUNGLE participant
                             buildParticipant("puuid-no-snapshot", "BOTTOM", laneCs10 = 70, totalMinions = 200, neutralMinions = 0),
                             buildParticipant("puuid-jg", "JUNGLE", laneCs10 = 10, totalMinions = 30, neutralMinions = 180)
@@ -134,7 +163,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 "match:euw1:EUW1_2" to MatchDto(
                     metadata = MatchMetadata("EUW1_2", listOf("puuid-mid-1")),
                     info = MatchInfo(
-                        gameId = 2L, gameCreation = 4000L, gameDuration = 1800L, gameMode = "CLASSIC",
+                        gameId = 2L, gameCreation = recentGameMs + 4000L, gameDuration = 1800L, gameMode = "CLASSIC",
                         gameVersion = "16.7.612.1111", queueId = 420,
                         participants = listOf(
                             buildParticipant("puuid-mid-1", "MIDDLE", laneCs10 = 78, totalMinions = 210, neutralMinions = 15)
@@ -144,7 +173,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 "match:euw1:EUW1_3" to MatchDto(
                     metadata = MatchMetadata("EUW1_3", listOf("puuid-mid-1")),
                     info = MatchInfo(
-                        gameId = 3L, gameCreation = 3000L, gameDuration = 1800L, gameMode = "CLASSIC",
+                        gameId = 3L, gameCreation = recentGameMs + 3000L, gameDuration = 1800L, gameMode = "CLASSIC",
                         gameVersion = "16.7.612.1111", queueId = 420,
                         participants = listOf(
                             buildParticipant("puuid-mid-1", "MIDDLE", laneCs10 = 90, totalMinions = 270, neutralMinions = 0)
@@ -154,10 +183,10 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 "match:euw1:EUW1_4" to MatchDto(
                     metadata = MatchMetadata("EUW1_4", listOf("puuid-mid-1")),
                     info = MatchInfo(
-                        gameId = 4L, gameCreation = 2000L, gameDuration = 1800L, gameMode = "CLASSIC",
+                        gameId = 4L, gameCreation = recentGameMs + 2000L, gameDuration = 1800L, gameMode = "CLASSIC",
                         gameVersion = "16.7.612.1111", queueId = 420,
                         participants = listOf(
-                            // Older game beyond maxGamesPerPlayer=3 -> should be excluded by per-player cap!
+                            // Older game beyond maxGamesPerPlayer=3 -> excluded by per-player cap
                             buildParticipant("puuid-mid-1", "MIDDLE", laneCs10 = 30, totalMinions = 90, neutralMinions = 0)
                         )
                     )
@@ -165,10 +194,10 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 "match:euw1:EUW1_5" to MatchDto(
                     metadata = MatchMetadata("EUW1_5", listOf("puuid-mid-1")),
                     info = MatchInfo(
-                        gameId = 5L, gameCreation = 1000L, gameDuration = 1800L, gameMode = "CLASSIC",
+                        gameId = 5L, gameCreation = recentGameMs + 1000L, gameDuration = 1800L, gameMode = "CLASSIC",
                         gameVersion = "16.7.612.1111", queueId = 420,
                         participants = listOf(
-                            // Older game beyond maxGamesPerPlayer=3 -> should be excluded by per-player cap!
+                            // Older game beyond maxGamesPerPlayer=3 -> excluded by per-player cap
                             buildParticipant("puuid-mid-1", "MIDDLE", laneCs10 = 20, totalMinions = 60, neutralMinions = 0)
                         )
                     )
@@ -176,7 +205,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 "match:euw1:EUW1_6" to MatchDto(
                     metadata = MatchMetadata("EUW1_6", listOf("puuid-mid-1")),
                     info = MatchInfo(
-                        gameId = 6L, gameCreation = 6000L, gameDuration = 1200L, gameMode = "ARAM",
+                        gameId = 6L, gameCreation = recentGameMs + 6000L, gameDuration = 1200L, gameMode = "ARAM",
                         gameVersion = "16.7.612.1111", queueId = 450,
                         participants = emptyList()
                     )
@@ -184,9 +213,33 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 "match:euw1:EUW1_7" to MatchDto(
                     metadata = MatchMetadata("EUW1_7", listOf("puuid-mid-1")),
                     info = MatchInfo(
-                        gameId = 7L, gameCreation = 6000L, gameDuration = 1800L, gameMode = "CLASSIC",
+                        gameId = 7L, gameCreation = recentGameMs + 6000L, gameDuration = 1800L, gameMode = "CLASSIC",
                         gameVersion = "16.6.600.1000", queueId = 420,
                         participants = emptyList()
+                    )
+                ),
+                // Match 8: 9 days before rankSnapshot (within 14d match age, but > 7d skew from rankSnapshot) -> participant excluded!
+                "match:euw1:EUW1_8" to MatchDto(
+                    metadata = MatchMetadata("EUW1_8", listOf("puuid-mid-1")),
+                    info = MatchInfo(
+                        gameId = 8L, gameCreation = snapshotTime.minusSeconds(9 * 24 * 3600L).toEpochMilli(),
+                        gameDuration = 1800L, gameMode = "CLASSIC",
+                        gameVersion = "16.7.612.1111", queueId = 420,
+                        participants = listOf(
+                            buildParticipant("puuid-mid-1", "MIDDLE", laneCs10 = 99, totalMinions = 300, neutralMinions = 10)
+                        )
+                    )
+                ),
+                // Match 9: 20 days old (> 14d match age bound) -> match excluded as stale!
+                "match:euw1:EUW1_9" to MatchDto(
+                    metadata = MatchMetadata("EUW1_9", listOf("puuid-mid-1")),
+                    info = MatchInfo(
+                        gameId = 9L, gameCreation = nowInstant.minusSeconds(20 * 24 * 3600L).toEpochMilli(),
+                        gameDuration = 1800L, gameMode = "CLASSIC",
+                        gameVersion = "16.7.612.1111", queueId = 420,
+                        participants = listOf(
+                            buildParticipant("puuid-mid-1", "MIDDLE", laneCs10 = 99, totalMinions = 300, neutralMinions = 10)
+                        )
                     )
                 )
             )
@@ -198,59 +251,71 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 maxGamesPerPlayer = 3
             )
 
-            Then("it should make zero Riot API network calls, select latest patch 16.7, dedupe (matchId, puuid), cap per-player games, and exclude participants without rank snapshots") {
+            Then("it should enforce per-role 114/120 ceilings, keep missing jungle counters null, bound snapshot/match freshness, and label latestCachedPatch honestly") {
                 coVerify(exactly = 0) { riotApiService.getMatchById(any(), any()) }
                 coVerify(exactly = 0) { riotApiService.getMatchIdsByPuuid(any(), any(), any(), any(), any(), any(), any()) }
 
+                report.inventory.latestCachedPatch shouldBe "16.7"
                 report.inventory.selectedTargetPatch shouldBe "16.7"
-                report.inventory.soloQueue420MatchesOnTargetPatch shouldBe 5
+                report.inventory.patchSelectionSource shouldBe "LATEST_CACHED_PATCH_IN_REDIS"
+                report.inventory.excludedStaleRankSnapshots shouldBe 1
+                report.inventory.excludedStaleOrUnboundedMatches shouldBe 1
+                report.inventory.excludedParticipantsOutsideSnapshotWindow shouldBe 1
+                report.inventory.soloQueue420MatchesOnTargetPatch shouldBe 6
                 report.inventory.excludedNonSoloQueueMatches shouldBe 1
                 report.inventory.excludedOtherPatchMatches shouldBe 1
                 report.inventory.excludedOtherRoleParticipants shouldBe 1
                 report.inventory.participantsWithoutRankSnapshot shouldBe 1
                 report.inventory.deduplicatedParticipantEntries shouldBe 1
                 report.inventory.excludedOverPlayerCapSamples shouldBe 2
-                report.inventory.eligibleCohortSamples shouldBe 3
+                report.inventory.eligibleCohortSamples shouldBe 5
 
-                report.cells shouldHaveSize 1
-                val cell = report.cells.first()
-                cell.tier shouldBe "EMERALD"
-                cell.role shouldBe "MIDDLE"
-                cell.distinctPlayers shouldBe 1
-                cell.eligibleGames shouldBe 3
-                cell.excludedOverPlayerCapGames shouldBe 2
-                cell.earliestRankSnapshotAt shouldBe snapshotTime
-                cell.latestRankSnapshotAt shouldBe snapshotTime
+                report.cells shouldHaveSize 3
+                val midCell = report.cells.first { it.tier == "EMERALD" && it.role == "MIDDLE" }
+                val botCell = report.cells.first { it.tier == "EMERALD" && it.role == "BOTTOM" }
+                val topCell = report.cells.first { it.tier == "DIAMOND" && it.role == "TOP" }
 
-                // Quality gate must be FALSE (1 < 50 players, 3 < 200 games)
-                cell.passesQualityGate shouldBe false
-                cell.colorBandsEnabled shouldBe false
+                midCell.patchSelectionSource shouldBe "LATEST_CACHED_PATCH_IN_REDIS"
+                midCell.distinctPlayers shouldBe 1
+                midCell.eligibleGames shouldBe 3
+                midCell.excludedOverPlayerCapGames shouldBe 2
+                midCell.passesQualityGate shouldBe false
+                midCell.colorBandsEnabled shouldBe false
 
-                // Verify strict separation of RAW lane-only CS@10 (primary, no percentages) vs total CS (with jungle camps)
-                // Retained 3 newest games have laneCs10 = [78, 84, 90] -> median = 84.0, p25 = 81.0, p75 = 87.0, iqr = 6.0
-                cell.metrics.laneCsAt10.unit shouldBe "lane_cs"
-                cell.metrics.laneCsAt10.includesJungleCamps shouldBe false
-                cell.metrics.laneCsAt10.theoreticalSupplyCeiling shouldBe 120
-                cell.metrics.laneCsAt10.median shouldBe 84.0
-                cell.metrics.laneCsAt10.p25 shouldBe 81.0
-                cell.metrics.laneCsAt10.p75 shouldBe 87.0
-                cell.metrics.laneCsAt10.iqr shouldBe 6.0
+                // MIDDLE on patch 16.7 has 120 lane minion ceiling
+                midCell.metrics.laneCsAt10.unit shouldBe "lane_cs"
+                midCell.metrics.laneCsAt10.includesJungleCamps shouldBe false
+                midCell.metrics.laneCsAt10.theoreticalSupplyCeiling shouldBe 120
+                midCell.metrics.laneCsAt10.median shouldBe 84.0
+                midCell.metrics.laneCsAt10.p25 shouldBe 81.0
+                midCell.metrics.laneCsAt10.p75 shouldBe 87.0
+                midCell.metrics.laneCsAt10.iqr shouldBe 6.0
 
-                // Lane-only CS/min: [210/30=7.0, 240/30=8.0, 270/30=9.0] -> median = 8.0
-                cell.metrics.laneOnlyCsPerMin.includesJungleCamps shouldBe false
-                cell.metrics.laneOnlyCsPerMin.median shouldBe 8.0
+                // TOP and BOTTOM on patch 16.7 MUST have 114 lane minion ceiling (never universal 120!)
+                topCell.metrics.laneCsAt10.theoreticalSupplyCeiling shouldBe 114
+                topCell.metrics.laneCsAt10.median shouldBe 79.0
+                botCell.metrics.laneCsAt10.theoreticalSupplyCeiling shouldBe 114
+                botCell.metrics.laneCsAt10.median shouldBe 82.0
 
-                // Pro-compatible total CS/min (with camps): [(210+15)/30=7.5, (240+30)/30=9.0, (270+0)/30=9.0] -> median = 9.0
-                cell.metrics.totalCsPerMinWithCamps.includesJungleCamps shouldBe true
-                cell.metrics.totalCsPerMinWithCamps.median shouldBe 9.0
-                // Total CS@10 with camps: [78+12=90.0, 84+12=96.0, 90+0=90.0] -> median = 90.0
-                cell.metrics.timelineTotalCsAt10WithCamps.includesJungleCamps shouldBe true
-                cell.metrics.timelineTotalCsAt10WithCamps.median shouldBe 90.0
+                // Missing jungle counter (neutralMinionsKilled = null, jungleCsBefore10Minutes = null) on TOP/BOTTOM
+                // MUST stay null (sampleGames = 0, median = null), NEVER default to 0!
+                topCell.metrics.totalCsPerMinWithCamps.sampleGames shouldBe 0
+                topCell.metrics.totalCsPerMinWithCamps.median shouldBe null
+                topCell.metrics.timelineTotalCsAt10WithCamps.sampleGames shouldBe 0
+                topCell.metrics.timelineTotalCsAt10WithCamps.median shouldBe null
+                // While lane-only CS/min is still computed accurately from totalMinionsKilled (210 / 30 = 7.0)
+                topCell.metrics.laneOnlyCsPerMin.median shouldBe 7.0
+
+                // MIDDLE had non-null neutralMinionsKilled, so totalCsPerMinWithCamps and timelineTotalCsAt10WithCamps are populated
+                midCell.metrics.totalCsPerMinWithCamps.includesJungleCamps shouldBe true
+                midCell.metrics.totalCsPerMinWithCamps.median shouldBe 9.0
+                midCell.metrics.timelineTotalCsAt10WithCamps.includesJungleCamps shouldBe true
+                midCell.metrics.timelineTotalCsAt10WithCamps.median shouldBe 90.0
             }
         }
 
         When("a cohort cell reaches >= 50 distinct players and >= 200 eligible games on patch 14.24 (114 lane minion ceiling)") {
-            val rateLimiter = RiotApiRateLimiter(SystemTimeProvider())
+            val rateLimiter = RiotApiRateLimiter(fixedTimeProvider)
             val savedEntities = mutableListOf<CohortBenchmarkCellEntity>()
             every { cohortRepo.findByRegionAndPatchAndQueueIdAndTierAndRole(any(), any(), any(), any(), any()) } returns null
             every { cohortRepo.save(any()) } answers {
@@ -265,14 +330,15 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 riotApiRateLimiter = rateLimiter,
                 riotApiService = riotApiService,
                 objectMapper = objectMapper,
-                networkCollectionEnabled = false
+                networkCollectionEnabled = false,
+                timeProvider = fixedTimeProvider
             )
 
             // 50 distinct DIAMOND TOP players, 4 games each = 200 eligible games
             val playerIds = (1..50).map { "puuid-dia-$it" }
             val profileKeys = playerIds.map { "player:profile:euw1:$it" }
-            every { redisCacheService.scanKeys("player:profile:euw1:*") } returns profileKeys
-            every { redisCacheService.scanKeys("leaderboard:euw1:*") } returns emptyList()
+            every { redisCacheService.scanKeys("player:profile:euw1:*", any(), any()) } returns profileKeys
+            every { redisCacheService.scanKeys("leaderboard:euw1:*", any(), any()) } returns emptyList()
             every { redisCacheService.get(match { it.startsWith("leaderboard:") }, CachedLeaderboardDto::class.java) } returns null
 
             every { redisCacheService.multiGet(any(), SummonerProfileDto::class.java) } answers {
@@ -293,10 +359,10 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 }
             }
 
-            // 200 matches (each match has 1 of the 50 players playing TOP, 4 matches per player)
+            val baseGameCreation = snapshotTime.minusSeconds(7200).toEpochMilli()
             val matchKeys = (1..200).map { "match:euw1:EUW1_M$it" }
-            every { redisCacheService.scanKeys("match:euw1:*") } returns matchKeys
-            every { redisCacheService.scanKeys("timeline:euw1:*") } returns emptyList()
+            every { redisCacheService.scanKeys("match:euw1:*", any(), any()) } returns matchKeys
+            every { redisCacheService.scanKeys("timeline:euw1:*", any(), any()) } returns emptyList()
 
             every { redisCacheService.multiGet(any(), MatchDto::class.java) } answers {
                 val keys = firstArg<List<String>>()
@@ -308,7 +374,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                         metadata = MatchMetadata(matchId, listOf(pid)),
                         info = MatchInfo(
                             gameId = idx.toLong(),
-                            gameCreation = 10_000L + idx,
+                            gameCreation = baseGameCreation + idx * 1000L,
                             gameDuration = 1800L,
                             gameMode = "CLASSIC",
                             gameVersion = "14.24.500.1000",
@@ -323,7 +389,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
 
             val report = service.extractCachedCohortsAndReport("euw1")
 
-            Then("it should pass the 50-player / 200-game quality gate, enable colorBandsEnabled, use the 114 ceiling for patch 14.24, and persist de-identified aggregates") {
+            Then("it should pass the 50-player / 200-game quality gate, enable colorBandsEnabled, use the 114 ceiling, and persist de-identified aggregates") {
                 report.cells shouldHaveSize 1
                 val cell = report.cells.first()
                 cell.distinctPlayers shouldBe 50
@@ -341,15 +407,104 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             }
         }
 
+        When("serving public GET /cohorts/{region}/report with cached report, recompute cooldown guard, and input validation") {
+            val rateLimiter = RiotApiRateLimiter(fixedTimeProvider)
+            val service = CohortBenchmarkService(
+                redisCacheService = redisCacheService,
+                cohortBenchmarkCellRepository = cohortRepo,
+                riotApiRateLimiter = rateLimiter,
+                riotApiService = riotApiService,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = fixedTimeProvider
+            )
+
+            // 1. Invalid region -> rejected with 0 Redis scans
+            val invalidRegionReport = service.getPublicCohortReport("invalid_region")
+
+            // 2. Invalid patch format -> rejected with 0 Redis scans
+            val invalidPatchReport = service.getPublicCohortReport("euw1", "16.7;DROP")
+
+            // 3. Cached report present -> served from Redis with 0 scans
+            val cachedReportFixture = CohortExtractionReportDto(
+                reportSource = "FRESH_BOUNDED_EXTRACTION",
+                inventory = CohortCacheInventoryDto(
+                    region = "euw1",
+                    scannedAt = snapshotTime,
+                    cachedProfileCount = 10,
+                    profilesWithSoloQueueRankSnapshot = 10,
+                    cachedChallengerLeaderboardPlayers = 0,
+                    totalDistinctRankedPlayersInCache = 10,
+                    ranksByTier = mapOf("EMERALD" to 10),
+                    cachedMatchCount = 25,
+                    cachedTimelineCount = 0,
+                    matchesByPatch = mapOf("16.7" to 25),
+                    latestCachedPatch = "16.7",
+                    selectedTargetPatch = "16.7",
+                    patchSelectionSource = "LATEST_CACHED_PATCH_IN_REDIS",
+                    soloQueue420MatchesOnTargetPatch = 25,
+                    excludedNonSoloQueueMatches = 0,
+                    excludedMissingGameVersionMatches = 0,
+                    excludedOtherPatchMatches = 0,
+                    excludedShortOrRemakeMatches = 0,
+                    topMidBotParticipantCandidates = 25,
+                    excludedOtherRoleParticipants = 0,
+                    participantsWithRankSnapshot = 25,
+                    participantsWithoutRankSnapshot = 0,
+                    deduplicatedParticipantEntries = 0,
+                    excludedOverPlayerCapSamples = 0,
+                    eligibleCohortSamples = 25,
+                    distinctEligibleCohortPlayers = 10,
+                    cellsTotal = 1,
+                    cellsPassingQualityGate = 0
+                ),
+                rateLimitVerification = rateLimiter.getVerificationSnapshot("euw1", false),
+                cells = emptyList(),
+                methodologyNotes = emptyList()
+            )
+            every {
+                redisCacheService.get("cohort:report:euw1:latest", CohortExtractionReportDto::class.java)
+            } returns cachedReportFixture
+
+            val cachedHitReport = service.getPublicCohortReport("euw1", null)
+
+            // 4. Cache miss while recompute guard lock is held/on cooldown -> serves persisted cells with 0 scans
+            every {
+                redisCacheService.get("cohort:report:euw1:16.7", CohortExtractionReportDto::class.java)
+            } returns null
+            every {
+                redisCacheService.setIfAbsent("lock:cohort:report:euw1:16.7", "LOCKED", any())
+            } returns false
+            every {
+                redisCacheService.get("cohort:benchmarks:euw1:16.7", Array<CohortBenchmarkCellDto>::class.java)
+            } returns emptyArray()
+            every {
+                cohortRepo.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc("euw1", "16.7", 420)
+            } returns emptyList()
+
+            val guardedFallbackReport = service.getPublicCohortReport("euw1", "16.7")
+
+            Then("it should never execute Redis scanKeys or DB saves on invalid input, cached report hits, or guarded cooldown hits") {
+                invalidRegionReport.reportSource shouldBe "INVALID_REGION"
+                invalidPatchReport.reportSource shouldBe "INVALID_PATCH_FORMAT"
+                cachedHitReport.reportSource shouldBe "CACHED_REPORT"
+                guardedFallbackReport.reportSource shouldBe "GUARDED_COOLDOWN_FALLBACK"
+
+                verify(exactly = 0) { redisCacheService.scanKeys(any(), any(), any()) }
+                verify(exactly = 0) { cohortRepo.save(any()) }
+            }
+        }
+
         When("verifying rate-limit guardrails for low-priority network collection") {
-            val rateLimiter = RiotApiRateLimiter(SystemTimeProvider())
+            val rateLimiter = RiotApiRateLimiter(fixedTimeProvider)
             val serviceHeld = CohortBenchmarkService(
                 redisCacheService = redisCacheService,
                 cohortBenchmarkCellRepository = cohortRepo,
                 riotApiRateLimiter = rateLimiter,
                 riotApiService = riotApiService,
                 objectMapper = objectMapper,
-                networkCollectionEnabled = false
+                networkCollectionEnabled = false,
+                timeProvider = fixedTimeProvider
             )
             val serviceEnabled = CohortBenchmarkService(
                 redisCacheService = redisCacheService,
@@ -357,7 +512,8 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 riotApiRateLimiter = rateLimiter,
                 riotApiService = riotApiService,
                 objectMapper = objectMapper,
-                networkCollectionEnabled = true
+                networkCollectionEnabled = true,
+                timeProvider = fixedTimeProvider
             )
 
             val heldResult = serviceHeld.runGuardedLowPriorityCollectionStep("euw1", listOf("p1"))

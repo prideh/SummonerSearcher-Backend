@@ -21,19 +21,31 @@ class CohortBenchmarkService(
     private val riotApiService: RiotApiService,
     private val objectMapper: ObjectMapper,
     @Value("\${cohort.network-collection.enabled:false}")
-    private val networkCollectionEnabled: Boolean = false
+    private val networkCollectionEnabled: Boolean = false,
+    private val timeProvider: TimeProvider = SystemTimeProvider()
 ) {
     private val logger = LoggerFactory.getLogger(javaClass)
 
     companion object {
         const val SOLO_QUEUE_ID = 420
         const val MIN_GAME_DURATION_SECONDS = 600L
+        const val MAX_SCAN_KEYS_PER_NAMESPACE = 2_000
         val ELIGIBLE_ROLES = setOf("TOP", "MIDDLE", "BOTTOM")
+        val ALLOWED_REGIONS = setOf(
+            "euw1", "na1", "kr", "eun1", "br1", "jp1", "la1", "la2",
+            "oc1", "tr1", "ru", "ph2", "sg2", "th2", "tw2", "vn2", "me1"
+        )
+        private val PATCH_REGEX = Regex("^\\d{1,2}\\.\\d{1,2}$")
         val TIER_ORDER = listOf(
             "IRON", "BRONZE", "SILVER", "GOLD", "PLATINUM",
             "EMERALD", "DIAMOND", "MASTER", "GRANDMASTER", "CHALLENGER"
         )
+        val MAX_RANK_SNAPSHOT_AGE: Duration = Duration.ofDays(7)
+        val MAX_MATCH_AGE: Duration = Duration.ofDays(14)
+        val MAX_MATCH_TO_SNAPSHOT_SKEW: Duration = Duration.ofDays(7)
         private val BENCHMARK_CACHE_TTL = Duration.ofHours(24)
+        private val REPORT_CACHE_TTL = Duration.ofMinutes(15)
+        private val RECOMPUTE_GUARD_TTL = Duration.ofMinutes(5)
         private val MATCH_CACHE_TTL = Duration.ofDays(7)
     }
 
@@ -63,10 +75,127 @@ class CohortBenchmarkService(
     )
 
     /**
-     * Cache-only cohort extraction, inventory, and aggregation for [region] (default `euw1`).
-     * Makes ZERO Riot API calls. Scans existing Redis keys, applies strict rank-snapshot timestamping,
-     * `(matchId, puuid)` deduplication, per-player game cap (`maxGamesPerPlayer`), and separates
-     * lane-only CS (`114`/`120` ceiling) from pro-compatible total CS (camps included).
+     * Public-safe, cached and recompute-guarded report endpoint entrypoint.
+     * - Validates [region] and optional [targetPatch] before touching Redis.
+     * - Serves cached report (`cohort:report:{region}:{patch}`) with zero Redis scans and zero DB writes.
+     * - Guards cache-miss recomputation with a cooldown lock (`lock:cohort:report:{region}:{patch}`) so
+     *   public `GET` requests can never trigger unbounded or repeated scans/persistence.
+     */
+    fun getPublicCohortReport(
+        region: String,
+        targetPatch: String? = null
+    ): CohortExtractionReportDto {
+        val normalizedRegion = region.lowercase().trim()
+        val now = Instant.ofEpochMilli(timeProvider.now())
+        if (normalizedRegion !in ALLOWED_REGIONS) {
+            return buildEmptyGuardedReport(
+                region = normalizedRegion,
+                now = now,
+                reportSource = "INVALID_REGION",
+                note = "Unsupported region '$normalizedRegion'; no Redis scan executed."
+            )
+        }
+
+        val cleanPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
+        if (cleanPatch != null && !PATCH_REGEX.matches(cleanPatch)) {
+            return buildEmptyGuardedReport(
+                region = normalizedRegion,
+                now = now,
+                reportSource = "INVALID_PATCH_FORMAT",
+                note = "Invalid patch parameter '$cleanPatch' (expected major.minor); no Redis scan executed."
+            )
+        }
+
+        val rKey = reportCacheKey(normalizedRegion, cleanPatch)
+        val cachedReport = redisCacheService.get(rKey, CohortExtractionReportDto::class.java)
+        if (cachedReport != null) {
+            val freshVerification = riotApiRateLimiter.getVerificationSnapshot(
+                region = normalizedRegion,
+                networkCollectionEnabled = networkCollectionEnabled
+            )
+            return cachedReport.copy(
+                reportSource = "CACHED_REPORT",
+                rateLimitVerification = freshVerification
+            )
+        }
+
+        val guardKey = recomputeGuardLockKey(normalizedRegion, cleanPatch)
+        val acquiredGuard = redisCacheService.setIfAbsent(guardKey, "LOCKED", RECOMPUTE_GUARD_TTL)
+        if (!acquiredGuard) {
+            val persistedCells = getPersistedCohortCells(normalizedRegion, cleanPatch)
+            val fallbackPatch = cleanPatch ?: persistedCells.firstOrNull()?.patch
+            return CohortExtractionReportDto(
+                reportSource = "GUARDED_COOLDOWN_FALLBACK",
+                inventory = CohortCacheInventoryDto(
+                    region = normalizedRegion,
+                    scannedAt = now,
+                    scanKeyCapPerNamespace = MAX_SCAN_KEYS_PER_NAMESPACE,
+                    maxRankSnapshotAgeHours = MAX_RANK_SNAPSHOT_AGE.toHours(),
+                    maxMatchAgeHours = MAX_MATCH_AGE.toHours(),
+                    maxMatchToSnapshotSkewHours = MAX_MATCH_TO_SNAPSHOT_SKEW.toHours(),
+                    cachedProfileCount = 0,
+                    profilesWithSoloQueueRankSnapshot = 0,
+                    cachedChallengerLeaderboardPlayers = 0,
+                    totalDistinctRankedPlayersInCache = 0,
+                    ranksByTier = emptyMap(),
+                    cachedMatchCount = 0,
+                    cachedTimelineCount = 0,
+                    matchesByPatch = emptyMap(),
+                    latestCachedPatch = fallbackPatch,
+                    selectedTargetPatch = fallbackPatch,
+                    patchSelectionSource = if (cleanPatch != null) "EXPLICIT_TARGET_PATCH" else "PERSISTED_CACHE_FALLBACK",
+                    soloQueue420MatchesOnTargetPatch = 0,
+                    excludedNonSoloQueueMatches = 0,
+                    excludedMissingGameVersionMatches = 0,
+                    excludedOtherPatchMatches = 0,
+                    excludedShortOrRemakeMatches = 0,
+                    topMidBotParticipantCandidates = 0,
+                    excludedOtherRoleParticipants = 0,
+                    participantsWithRankSnapshot = 0,
+                    participantsWithoutRankSnapshot = 0,
+                    deduplicatedParticipantEntries = 0,
+                    excludedOverPlayerCapSamples = 0,
+                    eligibleCohortSamples = persistedCells.sumOf { it.eligibleGames },
+                    distinctEligibleCohortPlayers = persistedCells.sumOf { it.distinctPlayers },
+                    cellsTotal = persistedCells.size,
+                    cellsPassingQualityGate = persistedCells.count { it.passesQualityGate }
+                ),
+                rateLimitVerification = riotApiRateLimiter.getVerificationSnapshot(
+                    region = normalizedRegion,
+                    networkCollectionEnabled = networkCollectionEnabled
+                ),
+                cells = persistedCells,
+                methodologyNotes = listOf(
+                    "Recompute cooldown active for region '$normalizedRegion'; serving persisted de-identified cells with zero Redis scans and zero DB writes."
+                )
+            )
+        }
+
+        val freshReport = extractCachedCohortsAndReport(
+            region = normalizedRegion,
+            targetPatch = cleanPatch,
+            maxGamesPerPlayer = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
+        )
+        try {
+            redisCacheService.set(rKey, freshReport, REPORT_CACHE_TTL)
+            if (cleanPatch == null && freshReport.inventory.selectedTargetPatch != null) {
+                redisCacheService.set(
+                    reportCacheKey(normalizedRegion, freshReport.inventory.selectedTargetPatch),
+                    freshReport,
+                    REPORT_CACHE_TTL
+                )
+            }
+        } catch (e: Exception) {
+            logger.warn("Failed to cache cohort report for {}: {}", normalizedRegion, e.message)
+        }
+        return freshReport
+    }
+
+    /**
+     * Bounded, cache-only cohort extraction, inventory, and aggregation for [region] (default `euw1`).
+     * Makes ZERO Riot API calls. Scans bounded Redis keys, enforces rank-snapshot freshness and match recency bounds,
+     * applies `(matchId, puuid)` deduplication, per-player game cap (`maxGamesPerPlayer`), and separates
+     * per-role lane-only CS (`114` Top/Bot, `120` Mid on 16.1+ / `114` pre-16.1) from pro-compatible total CS.
      */
     fun extractCachedCohortsAndReport(
         region: String = "euw1",
@@ -75,12 +204,19 @@ class CohortBenchmarkService(
     ): CohortExtractionReportDto {
         val normalizedRegion = region.lowercase().trim()
         val effectiveCap = maxGamesPerPlayer.coerceAtLeast(1)
-        val scannedAt = Instant.now()
+        val scannedAt = Instant.ofEpochMilli(timeProvider.now())
+        val minSnapshotInstant = scannedAt.minus(MAX_RANK_SNAPSHOT_AGE)
+        val maxFutureSkewInstant = scannedAt.plus(Duration.ofHours(2))
+        val minMatchInstant = scannedAt.minus(MAX_MATCH_AGE)
 
-        // 1. Scan cached player profiles & Challenger leaderboard for timestamped current-rank snapshots
+        // 1. Bounded scan of cached player profiles & Challenger leaderboard for fresh current-rank snapshots
         val rankSnapshotsByPuuid = mutableMapOf<String, RankSnapshot>()
-        val profileKeys = redisCacheService.scanKeys("player:profile:$normalizedRegion:*")
+        val profileKeys = redisCacheService.scanKeys(
+            pattern = "player:profile:$normalizedRegion:*",
+            maxKeys = MAX_SCAN_KEYS_PER_NAMESPACE
+        )
         var profilesWithSoloQueueRank = 0
+        var excludedStaleRankSnapshots = 0
 
         if (profileKeys.isNotEmpty()) {
             val profilesMap = profileKeys.chunked(200).flatMap { chunk ->
@@ -93,6 +229,10 @@ class CohortBenchmarkService(
                 val tier = rank.tier?.uppercase()?.trim()?.takeIf { it.isNotBlank() } ?: continue
                 if (rank.queueType != null && rank.queueType != "RANKED_SOLO_5x5") continue
                 val snapshotAt = profile.lastRefreshed ?: continue
+                if (snapshotAt.isBefore(minSnapshotInstant) || snapshotAt.isAfter(maxFutureSkewInstant)) {
+                    excludedStaleRankSnapshots++
+                    continue
+                }
                 profilesWithSoloQueueRank++
 
                 val existing = rankSnapshotsByPuuid[puuid]
@@ -106,9 +246,12 @@ class CohortBenchmarkService(
             }
         }
 
-        // Also scan Challenger leaderboard cache keys for the region
+        // Also scan Challenger leaderboard cache keys for the region (bounded)
         val leaderboardKeys = (
-            redisCacheService.scanKeys("leaderboard:$normalizedRegion:*") +
+            redisCacheService.scanKeys(
+                pattern = "leaderboard:$normalizedRegion:*",
+                maxKeys = 50
+            ) +
                 listOf(
                     "leaderboard:$normalizedRegion::RANKED_SOLO_5x5",
                     "leaderboard:$normalizedRegion:RANKED_SOLO_5x5"
@@ -121,6 +264,10 @@ class CohortBenchmarkService(
             val snapshotAt = cachedLb.lastRefreshed ?: continue
             val queue = cachedLb.leaderboard?.queue
             if (queue != null && queue != "RANKED_SOLO_5x5") continue
+            if (snapshotAt.isBefore(minSnapshotInstant) || snapshotAt.isAfter(maxFutureSkewInstant)) {
+                excludedStaleRankSnapshots += cachedLb.leaderboard?.entries?.size ?: 0
+                continue
+            }
             val lbTier = cachedLb.leaderboard?.tier?.uppercase()?.trim()?.takeIf { it.isNotBlank() } ?: "CHALLENGER"
             for (entry in cachedLb.leaderboard?.entries.orEmpty()) {
                 val puuid = entry.puuid?.takeIf { it.isNotBlank() } ?: continue
@@ -141,9 +288,15 @@ class CohortBenchmarkService(
             .eachCount()
             .toSortedMap(compareBy { tierIndex(it) })
 
-        // 2. Scan cached matches and timelines in Redis (zero network calls)
-        val matchKeys = redisCacheService.scanKeys("match:$normalizedRegion:*")
-        val timelineKeys = redisCacheService.scanKeys("timeline:$normalizedRegion:*")
+        // 2. Bounded scan of cached matches and timelines in Redis (zero network calls)
+        val matchKeys = redisCacheService.scanKeys(
+            pattern = "match:$normalizedRegion:*",
+            maxKeys = MAX_SCAN_KEYS_PER_NAMESPACE
+        )
+        val timelineKeys = redisCacheService.scanKeys(
+            pattern = "timeline:$normalizedRegion:*",
+            maxKeys = MAX_SCAN_KEYS_PER_NAMESPACE
+        )
 
         val cachedMatches = if (matchKeys.isNotEmpty()) {
             matchKeys.chunked(100).flatMap { chunk ->
@@ -177,21 +330,28 @@ class CohortBenchmarkService(
             }
         }
 
-        val resolvedPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
-            ?: soloQueueMatchesByPatch.keys.maxWithOrNull( patchComparator )
-            ?: matchesByPatchCounts.keys.maxWithOrNull( patchComparator )
+        val latestCachedPatch = soloQueueMatchesByPatch.keys.maxWithOrNull(patchComparator)
+            ?: matchesByPatchCounts.keys.maxWithOrNull(patchComparator)
 
-        val theoreticalLaneCeiling = theoreticalLaneMinionSupplyAt10(resolvedPatch)
+        val cleanTargetPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
+        val resolvedPatch = cleanTargetPatch ?: latestCachedPatch
+        val patchSelectionSource = when {
+            cleanTargetPatch != null -> "EXPLICIT_TARGET_PATCH"
+            latestCachedPatch != null -> "LATEST_CACHED_PATCH_IN_REDIS"
+            else -> "NO_CACHED_PATCH_FOUND"
+        }
 
         var soloQueue420MatchesOnTargetPatch = 0
         var excludedNonSoloQueueMatches = 0
         var excludedMissingGameVersionMatches = 0
         var excludedOtherPatchMatches = 0
         var excludedShortOrRemakeMatches = 0
+        var excludedStaleOrUnboundedMatches = 0
         var topMidBotParticipantCandidates = 0
         var excludedOtherRoleParticipants = 0
         var participantsWithRankSnapshot = 0
         var participantsWithoutRankSnapshot = 0
+        var excludedParticipantsOutsideSnapshotWindow = 0
         var deduplicatedParticipantEntries = 0
 
         val seenMatchPuuid = mutableSetOf<Pair<String, String>>()
@@ -220,12 +380,22 @@ class CohortBenchmarkService(
                 continue
             }
 
+            val gameCreation = info.gameCreation ?: 0L
+            if (gameCreation <= 0L) {
+                excludedStaleOrUnboundedMatches++
+                continue
+            }
+            val matchPlayedAt = Instant.ofEpochMilli(gameCreation)
+            if (matchPlayedAt.isBefore(minMatchInstant) || matchPlayedAt.isAfter(maxFutureSkewInstant)) {
+                excludedStaleOrUnboundedMatches++
+                continue
+            }
+
             soloQueue420MatchesOnTargetPatch++
             val matchId = match.metadata?.matchId?.takeIf { it.isNotBlank() }
                 ?: info.gameId?.let { "${normalizedRegion.uppercase()}_$it" }
                 ?: continue
             val durationMinutes = durationSeconds.toDouble() / 60.0
-            val gameCreation = info.gameCreation ?: 0L
             val timeline = timelinesByMatchId[matchId]
             val frameAt10m = findFrameAt10Minutes(timeline)
 
@@ -247,10 +417,17 @@ class CohortBenchmarkService(
                     continue
                 }
 
-                // Never invent or infer historical rank when a participant has no timestamped rank snapshot
+                // Never invent or infer historical rank when a participant has no fresh timestamped rank snapshot
                 val rankSnapshot = rankSnapshotsByPuuid[puuid]
                 if (rankSnapshot == null) {
                     participantsWithoutRankSnapshot++
+                    continue
+                }
+
+                // Bound match timestamp proximity to rank snapshot so current rank is never projected onto old games
+                val matchToSnapshotDistance = Duration.between(matchPlayedAt, rankSnapshot.snapshotAt).abs()
+                if (matchToSnapshotDistance > MAX_MATCH_TO_SNAPSHOT_SKEW) {
+                    excludedParticipantsOutsideSnapshotWindow++
                     continue
                 }
                 participantsWithRankSnapshot++
@@ -272,14 +449,22 @@ class CohortBenchmarkService(
                     if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null
                 }
 
-                // Separate pro-compatible total CS metrics (including neutral/jungle camps, never mixed into laneCsAt10)
-                val totalCsPerMinWithCamps = participant.totalMinionsKilled?.let { laneMinions ->
-                    val neutralCamps = participant.neutralMinionsKilled ?: 0
-                    if (durationMinutes > 0.0) (laneMinions + neutralCamps).toDouble() / durationMinutes else null
+                // Separate pro-compatible total CS metrics: missing jungle counter MUST stay null (never default to 0)
+                val totalCsPerMinWithCamps = if (
+                    participant.totalMinionsKilled != null &&
+                    participant.neutralMinionsKilled != null &&
+                    durationMinutes > 0.0
+                ) {
+                    (participant.totalMinionsKilled + participant.neutralMinionsKilled).toDouble() / durationMinutes
+                } else {
+                    null
                 }
 
-                val timelineTotalCs10WithCamps = if (participantFrame10m?.minionsKilled != null) {
-                    (participantFrame10m.minionsKilled + (participantFrame10m.jungleMinionsKilled ?: 0)).toDouble()
+                val timelineTotalCs10WithCamps = if (
+                    participantFrame10m?.minionsKilled != null &&
+                    participantFrame10m.jungleMinionsKilled != null
+                ) {
+                    (participantFrame10m.minionsKilled + participantFrame10m.jungleMinionsKilled).toDouble()
                 } else if (
                     participant.challenges?.laneMinionsFirst10Minutes != null &&
                     participant.challenges.jungleCsBefore10Minutes != null
@@ -387,13 +572,14 @@ class CohortBenchmarkService(
 
             val earliestSnapshot = retainedSamples.minOfOrNull { it.rankSnapshotAt }
             val latestSnapshot = retainedSamples.maxOfOrNull { it.rankSnapshotAt }
+            val roleLaneCeiling = theoreticalLaneMinionSupplyAt10(resolvedPatch, role)
 
             val metricsBundle = CohortMetricsBundleDto(
                 laneCsAt10 = buildDistribution(
                     metricKey = "laneCsAt10",
                     unit = "lane_cs",
                     includesJungleCamps = false,
-                    theoreticalSupplyCeiling = theoreticalLaneCeiling,
+                    theoreticalSupplyCeiling = roleLaneCeiling,
                     samples = retainedSamples,
                     extractor = { it.laneCsAt10 }
                 ),
@@ -475,6 +661,7 @@ class CohortBenchmarkService(
                 CohortBenchmarkCellDto(
                     region = normalizedRegion,
                     patch = effectivePatchLabel,
+                    patchSelectionSource = patchSelectionSource,
                     queueId = SOLO_QUEUE_ID,
                     tier = tier,
                     role = role,
@@ -493,32 +680,44 @@ class CohortBenchmarkService(
             )
         }
 
-        // 4. Persist compact de-identified cells to PostgreSQL/JPA and Redis
-        if (resolvedPatch != null && computedCells.isNotEmpty()) {
+        // 4. Persist compact de-identified cells to PostgreSQL/JPA and Redis only when using canonical game cap
+        if (resolvedPatch != null &&
+            computedCells.isNotEmpty() &&
+            effectiveCap == CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
+        ) {
             persistDeidentifiedCells(normalizedRegion, resolvedPatch, computedCells)
         }
 
         val inventory = CohortCacheInventoryDto(
             region = normalizedRegion,
             scannedAt = scannedAt,
+            scanKeyCapPerNamespace = MAX_SCAN_KEYS_PER_NAMESPACE,
+            maxRankSnapshotAgeHours = MAX_RANK_SNAPSHOT_AGE.toHours(),
+            maxMatchAgeHours = MAX_MATCH_AGE.toHours(),
+            maxMatchToSnapshotSkewHours = MAX_MATCH_TO_SNAPSHOT_SKEW.toHours(),
             cachedProfileCount = profileKeys.size,
             profilesWithSoloQueueRankSnapshot = profilesWithSoloQueueRank,
+            excludedStaleRankSnapshots = excludedStaleRankSnapshots,
             cachedChallengerLeaderboardPlayers = challengerLeaderboardPlayers,
             totalDistinctRankedPlayersInCache = rankSnapshotsByPuuid.size,
             ranksByTier = ranksByTier,
             cachedMatchCount = cachedMatches.size,
             cachedTimelineCount = timelinesByMatchId.size,
             matchesByPatch = matchesByPatchCounts.toSortedMap(patchComparator.reversed()),
+            latestCachedPatch = latestCachedPatch,
             selectedTargetPatch = resolvedPatch,
+            patchSelectionSource = patchSelectionSource,
             soloQueue420MatchesOnTargetPatch = soloQueue420MatchesOnTargetPatch,
             excludedNonSoloQueueMatches = excludedNonSoloQueueMatches,
             excludedMissingGameVersionMatches = excludedMissingGameVersionMatches,
             excludedOtherPatchMatches = excludedOtherPatchMatches,
             excludedShortOrRemakeMatches = excludedShortOrRemakeMatches,
+            excludedStaleOrUnboundedMatches = excludedStaleOrUnboundedMatches,
             topMidBotParticipantCandidates = topMidBotParticipantCandidates,
             excludedOtherRoleParticipants = excludedOtherRoleParticipants,
             participantsWithRankSnapshot = participantsWithRankSnapshot,
             participantsWithoutRankSnapshot = participantsWithoutRankSnapshot,
+            excludedParticipantsOutsideSnapshotWindow = excludedParticipantsOutsideSnapshotWindow,
             deduplicatedParticipantEntries = deduplicatedParticipantEntries,
             excludedOverPlayerCapSamples = totalExcludedOverPlayerCap,
             eligibleCohortSamples = totalEligibleSamples,
@@ -532,17 +731,19 @@ class CohortBenchmarkService(
             networkCollectionEnabled = networkCollectionEnabled
         )
 
+        val midCeilingForPatch = theoreticalLaneMinionSupplyAt10(resolvedPatch, "MIDDLE")
         val methodologyNotes = listOf(
-            "Cache-only extraction scans Redis keys for region '$normalizedRegion' with zero Riot API requests.",
-            "Only Ranked Solo (queueId=420) matches on current patch '${resolvedPatch ?: "NONE"}' with duration >= 600s and roles TOP, MIDDLE, BOTTOM are included.",
-            "Rank assignment strictly requires a timestamped current-rank snapshot in cache (player profile lastRefreshed or Challenger leaderboard lastRefreshed); historical rank is never invented or inferred.",
+            "Bounded cache-only extraction scans at most $MAX_SCAN_KEYS_PER_NAMESPACE Redis keys per namespace for region '$normalizedRegion' with zero Riot API requests.",
+            "Only Ranked Solo (queueId=420) matches on selected patch '${resolvedPatch ?: "NONE"}' (source=$patchSelectionSource, latestCachedPatch=${latestCachedPatch ?: "NONE"}) with duration >= 600s and roles TOP, MIDDLE, BOTTOM are included; when inferred from cache, this reflects the latest cached patch in Redis rather than an unverified live Riot patch.",
+            "Rank assignment strictly requires a fresh timestamped current-rank snapshot (age <= ${MAX_RANK_SNAPSHOT_AGE.toHours()}h) and recent match timestamp within ${MAX_MATCH_TO_SNAPSHOT_SKEW.toHours()}h of the snapshot (match age <= ${MAX_MATCH_AGE.toHours()}h); historical rank is never invented or projected onto distant games.",
             "Samples are deduplicated by (matchId, puuid) and capped at maxGamesPerPlayer=$effectiveCap newest games per player per (tier, role) cell.",
             "RAW lane CS@10 (laneCsAt10, unit='lane_cs') is the primary CS@10 metric — never percentages and never hardcoded guesses (e.g. 95/100/105). Bands (P25/median/P75) are derived strictly from sufficient actual (tier, role) data.",
-            "Lane-only CS cutoff (theoreticalSupplyCeiling=$theoreticalLaneCeiling for patch ${resolvedPatch ?: "default"}) is kept strictly separate from pro-compatible total CS reference metrics (timelineTotalCsAt10WithCamps, totalCsPerMinWithCamps where includesJungleCamps=true).",
+            "Per-role lane-only CS@10 theoretical supply ceiling (TOP=114, BOTTOM=114, MIDDLE=$midCeilingForPatch for patch ${resolvedPatch ?: "default"}) is kept strictly separate from pro-compatible total CS reference metrics (timelineTotalCsAt10WithCamps, totalCsPerMinWithCamps where includesJungleCamps=true and missing jungle counters stay null).",
             "Quality gate requires >= ${CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE} distinct players AND >= ${CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE} games per cell before passesQualityGate / colorBandsEnabled becomes true."
         )
 
         return CohortExtractionReportDto(
+            reportSource = "FRESH_BOUNDED_EXTRACTION",
             inventory = inventory,
             rateLimitVerification = rateLimitVerification,
             cells = computedCells,
@@ -816,11 +1017,15 @@ class CohortBenchmarkService(
     }
 
     /**
-     * Theoretical lane-minion spawn supply in the first 10:00 of Summoner's Rift:
-     * - Season 2026 / Patch 16.1+ (or 26.1+): 120 lane minions
-     * - Pre-16.1 patches: 114 lane minions
+     * Per-role theoretical lane-minion supply in the first 10:00 of Summoner's Rift:
+     * - TOP and BOTTOM sidelanes have a longer lane travel path: 114 lane minions arrive by 10:00.
+     * - MIDDLE lane (shorter path): 120 lane minions on Season 2026 / Patch 16.1+ (or 26.1+), 114 pre-16.1.
      */
-    internal fun theoreticalLaneMinionSupplyAt10(patch: String?): Int {
+    internal fun theoreticalLaneMinionSupplyAt10(patch: String?, role: String = "MIDDLE"): Int {
+        val normalizedRole = role.uppercase().trim()
+        if (normalizedRole == "TOP" || normalizedRole == "BOTTOM") {
+            return 114
+        }
         val major = patch?.substringBefore(".")?.toIntOrNull() ?: 16
         return if (major >= 16) 120 else 114
     }
@@ -858,6 +1063,63 @@ class CohortBenchmarkService(
 
     private fun benchmarkCacheKey(region: String, patch: String): String =
         "cohort:benchmarks:${region.lowercase()}:$patch"
+
+    private fun reportCacheKey(region: String, patch: String?): String =
+        "cohort:report:${region.lowercase()}:${patch ?: "latest"}"
+
+    private fun recomputeGuardLockKey(region: String, patch: String?): String =
+        "lock:cohort:report:${region.lowercase()}:${patch ?: "latest"}"
+
+    private fun buildEmptyGuardedReport(
+        region: String,
+        now: Instant,
+        reportSource: String,
+        note: String
+    ): CohortExtractionReportDto {
+        return CohortExtractionReportDto(
+            reportSource = reportSource,
+            inventory = CohortCacheInventoryDto(
+                region = region,
+                scannedAt = now,
+                scanKeyCapPerNamespace = MAX_SCAN_KEYS_PER_NAMESPACE,
+                maxRankSnapshotAgeHours = MAX_RANK_SNAPSHOT_AGE.toHours(),
+                maxMatchAgeHours = MAX_MATCH_AGE.toHours(),
+                maxMatchToSnapshotSkewHours = MAX_MATCH_TO_SNAPSHOT_SKEW.toHours(),
+                cachedProfileCount = 0,
+                profilesWithSoloQueueRankSnapshot = 0,
+                cachedChallengerLeaderboardPlayers = 0,
+                totalDistinctRankedPlayersInCache = 0,
+                ranksByTier = emptyMap(),
+                cachedMatchCount = 0,
+                cachedTimelineCount = 0,
+                matchesByPatch = emptyMap(),
+                latestCachedPatch = null,
+                selectedTargetPatch = null,
+                patchSelectionSource = reportSource,
+                soloQueue420MatchesOnTargetPatch = 0,
+                excludedNonSoloQueueMatches = 0,
+                excludedMissingGameVersionMatches = 0,
+                excludedOtherPatchMatches = 0,
+                excludedShortOrRemakeMatches = 0,
+                topMidBotParticipantCandidates = 0,
+                excludedOtherRoleParticipants = 0,
+                participantsWithRankSnapshot = 0,
+                participantsWithoutRankSnapshot = 0,
+                deduplicatedParticipantEntries = 0,
+                excludedOverPlayerCapSamples = 0,
+                eligibleCohortSamples = 0,
+                distinctEligibleCohortPlayers = 0,
+                cellsTotal = 0,
+                cellsPassingQualityGate = 0
+            ),
+            rateLimitVerification = riotApiRateLimiter.getVerificationSnapshot(
+                region = region,
+                networkCollectionEnabled = networkCollectionEnabled
+            ),
+            cells = emptyList(),
+            methodologyNotes = listOf(note)
+        )
+    }
 
     private fun tierIndex(tier: String): Int {
         val idx = TIER_ORDER.indexOf(tier.uppercase())

@@ -567,12 +567,23 @@ class PlayerCacheServiceTest : BehaviorSpec({
             }
         }
 
-        When("fetching a warm cached profile that is already complete and enriched (cached-immediate/background refresh)") {
-            val nowMs = System.currentTimeMillis()
+        When("reading a warm cached profile repeatedly across fresh, stale, and explicitRefresh states") {
+            val baseTimeMs = java.util.concurrent.atomic.AtomicLong(1_762_250_000_000L)
+            val controllableClock = object : TimeProvider {
+                override fun now(): Long = baseTimeMs.get()
+            }
+            val scopedService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = controllableClock
+            )
+
+            val freshPuuid = "warm-fresh-puuid"
             val enrichedRecentMatch = MatchDto(
-                metadata = MatchMetadata("EUW1_1", listOf(puuid)),
+                metadata = MatchMetadata("EUW1_1", listOf(freshPuuid)),
                 info = MatchInfo(
-                    gameCreation = nowMs - 120_000L,
+                    gameCreation = baseTimeMs.get() - 120_000L,
                     gameDuration = 1800L,
                     gameId = 1L,
                     queueId = 420,
@@ -582,9 +593,9 @@ class PlayerCacheServiceTest : BehaviorSpec({
                     teams = emptyList()
                 )
             )
-            val (_, existingOverallStats) = MatchStatsAccumulator(puuid).getResult()
-            val warmCachedProfile = SummonerProfileDto(
-                puuid = puuid,
+            val (_, existingOverallStats) = MatchStatsAccumulator(freshPuuid).getResult()
+            val freshCachedProfile = SummonerProfileDto(
+                puuid = freshPuuid,
                 gameName = summonerName,
                 tagLine = tagLine,
                 summonerLevel = 150L,
@@ -596,35 +607,219 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 overallStats = existingOverallStats,
                 improvementStats = com.pride.summoner_searcher_api.dto.ImprovementStatsDto(),
                 totalMatches = 1,
-                lastRefreshed = java.time.Instant.now().minusSeconds(600)
+                // Refreshed 30s ago (within both 5m freshness window and 60s explicitRefresh cooldown)
+                lastRefreshed = java.time.Instant.ofEpochMilli(baseTimeMs.get() - 30_000L)
             )
 
-            val backgroundSaved = kotlinx.coroutines.CompletableDeferred<SummonerProfileDto>()
-            every { redisCacheService.get("player:profile:euw1:$puuid", SummonerProfileDto::class.java) } returns warmCachedProfile
+            val summonerApiCalls = java.util.concurrent.atomic.AtomicInteger(0)
+            every { redisCacheService.get("player:profile:euw1:$freshPuuid", SummonerProfileDto::class.java) } returns freshCachedProfile
             every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
-            coEvery { riotApiService.getSummonerByPuuid(puuid, region) } coAnswers {
-                kotlinx.coroutines.delay(80)
-                SummonerDto("id", puuid, 151L, 88)
+            coEvery { riotApiService.getSummonerByPuuid(freshPuuid, region) } coAnswers {
+                summonerApiCalls.incrementAndGet()
+                SummonerDto("id", freshPuuid, 151L, 88)
             }
-            coEvery { riotApiService.fetchLeagueRank(puuid, region) } returns null
-            coEvery { riotApiService.fetchMatchIdsSince(puuid, region, any()) } returns listOf("EUW1_1")
+            coEvery { riotApiService.fetchLeagueRank(freshPuuid, region) } returns null
+            coEvery { riotApiService.fetchMatchIdsSince(freshPuuid, region, any()) } returns listOf("EUW1_1")
+
+            // 1. 5 repeated reads within the 5-minute freshness window + 1 explicitRefresh within 60s cooldown
+            val repeatedFreshReads = (1..5).map {
+                scopedService.getPlayerProfile(freshPuuid, region, summonerName, tagLine, explicitRefresh = false)
+            }
+            val cooldownExplicitRead = scopedService.getPlayerProfile(
+                freshPuuid, region, summonerName, tagLine, explicitRefresh = true
+            )
+            val callsAfterFreshReads = summonerApiCalls.get()
+
+            // 2. Advance clock by 2 minutes (profile is now 2m30s old: still < 5m fresh, but > 60s explicit cooldown)
+            baseTimeMs.addAndGet(120_000L)
+            val explicitRefreshedProfile = scopedService.getPlayerProfile(
+                freshPuuid, region, summonerName, tagLine, explicitRefresh = true
+            )
+            val callsAfterExplicitRefresh = summonerApiCalls.get()
+
+            // 3. Advance clock by 10 minutes so cached profile is stale (> 5m old) and read 3 times
+            baseTimeMs.addAndGet(600_000L)
+            val backgroundSaved = kotlinx.coroutines.CompletableDeferred<SummonerProfileDto>()
             every {
-                redisCacheService.set<SummonerProfileDto>("player:profile:euw1:$puuid", any(), any())
+                redisCacheService.set<SummonerProfileDto>("player:profile:euw1:$freshPuuid", any(), any())
             } answers {
                 backgroundSaved.complete(secondArg())
             }
-
-            val immediateResult = playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine)
+            val staleRead1 = scopedService.getPlayerProfile(freshPuuid, region, summonerName, tagLine, explicitRefresh = false)
+            val staleRead2 = scopedService.getPlayerProfile(freshPuuid, region, summonerName, tagLine, explicitRefresh = false)
+            val staleRead3 = scopedService.getPlayerProfile(freshPuuid, region, summonerName, tagLine, explicitRefresh = false)
             val refreshedInBackground = kotlinx.coroutines.withTimeout(2_000L) { backgroundSaved.await() }
+            val totalCallsAfterStaleReads = summonerApiCalls.get()
 
-            Then("it should return the cached profile immediately and complete the refresh in the background") {
-                immediateResult?.summonerLevel shouldBe 150L
+            Then("it should make 0 Riot calls on repeated fresh reads, honor explicitRefresh after 60s, and trigger only 1 background refresh across repeated stale reads") {
+                repeatedFreshReads.all { it?.summonerLevel == 150L } shouldBe true
+                cooldownExplicitRead?.summonerLevel shouldBe 150L
+                callsAfterFreshReads shouldBe 0
+
+                explicitRefreshedProfile?.summonerLevel shouldBe 151L
+                callsAfterExplicitRefresh shouldBe 1
+
+                staleRead1?.summonerLevel shouldBe 150L
+                staleRead2?.summonerLevel shouldBe 150L
+                staleRead3?.summonerLevel shouldBe 150L
                 refreshedInBackground.summonerLevel shouldBe 151L
-                refreshedInBackground.profileIconId shouldBe 88
+                // 1 from explicitRefresh + 1 from the single cooldown-guarded background refresh = 2 total
+                totalCallsAfterStaleReads shouldBe 2
             }
         }
 
-        When("two concurrent requests arrive for the same cold uncached profile (duplicate-lock single-flight fix)") {
+        When("running a 450-match cached seasonal refresh vs a 450-match cold seasonal load (measured regression)") {
+            val matchIds450 = (1..450).map { "EUW1_$it" }
+            val nowMs = System.currentTimeMillis()
+            val mapper = com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules()
+            val sampleParticipant = mapper.readValue(
+                """
+                {
+                  "puuid": "$puuid",
+                  "championName": "Ahri",
+                  "teamId": 100,
+                  "teamPosition": "MIDDLE",
+                  "win": true,
+                  "kills": 7,
+                  "deaths": 2,
+                  "assists": 9,
+                  "totalMinionsKilled": 215,
+                  "neutralMinionsKilled": 12,
+                  "visionScore": 28
+                }
+                """.trimIndent(),
+                com.pride.summoner_searcher_api.dto.ParticipantDto::class.java
+            )
+
+            // Part A: 450-match cached seasonal refresh (recent 20 lack teams, older 430 cached without teams)
+            val cachedPuuid = "seasonal-450-cached-puuid"
+            val cachedParticipant = mapper.readValue(
+                mapper.writeValueAsString(sampleParticipant).replace(puuid, cachedPuuid),
+                com.pride.summoner_searcher_api.dto.ParticipantDto::class.java
+            )
+            every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            every { redisCacheService.get("player:profile:euw1:$cachedPuuid", SummonerProfileDto::class.java) } returns null
+            coEvery { riotApiService.getSummonerByPuuid(cachedPuuid, region) } returns SummonerDto("id", cachedPuuid, 250L, 10)
+            coEvery { riotApiService.fetchLeagueRank(cachedPuuid, region) } returns null
+            coEvery { riotApiService.fetchMatchIdsSince(cachedPuuid, region, any()) } returns matchIds450
+
+            val cachedMultiGetChunks = java.util.concurrent.atomic.AtomicInteger(0)
+            every { redisCacheService.multiGet(any(), MatchDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                cachedMultiGetChunks.incrementAndGet()
+                keys.associateWith { key ->
+                    val id = key.substringAfterLast(":")
+                    val idx = id.substringAfter("_").toInt()
+                    MatchDto(
+                        metadata = MatchMetadata(id, listOf(cachedPuuid)),
+                        info = MatchInfo(
+                            gameCreation = nowMs - idx * 60_000L,
+                            gameDuration = 1800L,
+                            gameId = idx.toLong(),
+                            queueId = 420,
+                            gameMode = "CLASSIC",
+                            gameVersion = "16.7.1",
+                            participants = listOf(cachedParticipant),
+                            teams = null
+                        )
+                    )
+                }
+            }
+
+            val cachedModeFetchedIds = java.util.Collections.synchronizedList(mutableListOf<String>())
+            coEvery { riotApiService.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                cachedModeFetchedIds.add(id)
+                val idx = id.substringAfter("_").toInt()
+                MatchDto(
+                    metadata = MatchMetadata(id, listOf(cachedPuuid)),
+                    info = MatchInfo(
+                        gameCreation = nowMs - idx * 60_000L,
+                        gameDuration = 1800L,
+                        gameId = idx.toLong(),
+                        queueId = 420,
+                        gameMode = "CLASSIC",
+                        gameVersion = "16.7.1",
+                        participants = listOf(cachedParticipant),
+                        teams = emptyList()
+                    )
+                )
+            }
+
+            val cachedStartNs = System.nanoTime()
+            val cached450Result = playerCacheService.getPlayerProfile(cachedPuuid, region, summonerName, tagLine)
+            val cachedElapsedMs = (System.nanoTime() - cachedStartNs) / 1_000_000
+
+            // Part B: 450-match cold seasonal load (all 450 matches missing from Redis)
+            val cold450Puuid = "seasonal-450-cold-puuid"
+            val coldParticipant = mapper.readValue(
+                mapper.writeValueAsString(sampleParticipant).replace(puuid, cold450Puuid),
+                com.pride.summoner_searcher_api.dto.ParticipantDto::class.java
+            )
+            every { redisCacheService.get("player:profile:euw1:$cold450Puuid", SummonerProfileDto::class.java) } returns null
+            coEvery { riotApiService.getSummonerByPuuid(cold450Puuid, region) } returns SummonerDto("id", cold450Puuid, 260L, 11)
+            coEvery { riotApiService.fetchLeagueRank(cold450Puuid, region) } returns null
+            coEvery { riotApiService.fetchMatchIdsSince(cold450Puuid, region, any()) } returns matchIds450
+
+            val coldMultiGetChunks = java.util.concurrent.atomic.AtomicInteger(0)
+            every { redisCacheService.multiGet(any(), MatchDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                coldMultiGetChunks.incrementAndGet()
+                keys.associateWith { null }
+            }
+
+            val coldModeFetchedIds = java.util.Collections.synchronizedList(mutableListOf<String>())
+            val coldMatchWrites = java.util.concurrent.atomic.AtomicInteger(0)
+            every {
+                redisCacheService.set<MatchDto>(match { it.startsWith("match:euw1:") }, any<MatchDto>(), any<Duration>())
+            } answers {
+                coldMatchWrites.incrementAndGet()
+            }
+            coEvery { riotApiService.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                coldModeFetchedIds.add(id)
+                val idx = id.substringAfter("_").toInt()
+                MatchDto(
+                    metadata = MatchMetadata(id, listOf(cold450Puuid)),
+                    info = MatchInfo(
+                        gameCreation = nowMs - idx * 60_000L,
+                        gameDuration = 1800L,
+                        gameId = idx.toLong(),
+                        queueId = 420,
+                        gameMode = "CLASSIC",
+                        gameVersion = "16.7.1",
+                        participants = listOf(coldParticipant),
+                        teams = emptyList()
+                    )
+                )
+            }
+
+            val coldStartNs = System.nanoTime()
+            val cold450Result = playerCacheService.getPlayerProfile(cold450Puuid, region, summonerName, tagLine)
+            val coldElapsedMs = (System.nanoTime() - coldStartNs) / 1_000_000
+
+            println(
+                "[MEASURED_450_REGRESSION] cached450: getMatchById=${cachedModeFetchedIds.size}, multiGetChunks=${cachedMultiGetChunks.get()}, totalMatches=${cached450Result?.totalMatches}, elapsedMs=${cachedElapsedMs}ms | " +
+                    "cold450: getMatchById=${coldModeFetchedIds.size}, multiGetChunks=${coldMultiGetChunks.get()}, matchRedisWrites=${coldMatchWrites.get()}, totalMatches=${cold450Result?.totalMatches}, elapsedMs=${coldElapsedMs}ms"
+            )
+
+            Then("cached 450-match refresh should fetch only 20 matches (skipping 430 older backfills) while cold 450-match load fetches and caches all 450") {
+                cachedModeFetchedIds.size shouldBe 20
+                cachedMultiGetChunks.get() shouldBe 9
+                cached450Result?.recentMatches?.size shouldBe 20
+                cached450Result?.totalMatches shouldBe 450
+                cached450Result?.overallStats?.wins shouldBe 450
+
+                coldModeFetchedIds.size shouldBe 450
+                coldMultiGetChunks.get() shouldBe 9
+                coldMatchWrites.get() shouldBe 450
+                cold450Result?.recentMatches?.size shouldBe 20
+                cold450Result?.totalMatches shouldBe 450
+                cold450Result?.overallStats?.wins shouldBe 450
+            }
+        }
+
+        When("two concurrent requests arrive for the same cold uncached profile in the same JVM (in-process single-flight)") {
             val coldPuuid = "cold-concurrent-puuid"
             val summonerCalls = java.util.concurrent.atomic.AtomicInteger(0)
             val matchIdsCalls = java.util.concurrent.atomic.AtomicInteger(0)
@@ -657,6 +852,61 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 res2?.summonerLevel shouldBe 300L
                 summonerCalls.get() shouldBe 1
                 matchIdsCalls.get() shouldBe 1
+            }
+        }
+
+        When("a cross-instance 60s lock is held vs when it expires with empty cache") {
+            val fastPollService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                lockPollIntervalMs = 1L,
+                lockMaxPollAttempts = 240
+            )
+
+            // Case 1: Lock remains held by another instance across all 240 poll attempts (setIfAbsent returns false both before and after wait)
+            val heldLockPuuid = "cross-instance-held-lock-puuid"
+            val heldLockSummonerCalls = java.util.concurrent.atomic.AtomicInteger(0)
+            every { redisCacheService.get("player:profile:euw1:$heldLockPuuid", SummonerProfileDto::class.java) } returns null
+            every { redisCacheService.setIfAbsent("lock:profile:euw1:$heldLockPuuid", "LOCKED", any()) } returns false
+            coEvery { riotApiService.getSummonerByPuuid(heldLockPuuid, region) } coAnswers {
+                heldLockSummonerCalls.incrementAndGet()
+                SummonerDto("id", heldLockPuuid, 400L, 12)
+            }
+
+            val heldLockResult = fastPollService.getPlayerProfile(heldLockPuuid, region, summonerName, tagLine)
+
+            // Case 2: Lock was held initially (false), then expired after the 240-attempt wait so the second setIfAbsent returns true
+            val expiredLockPuuid = "cross-instance-expired-lock-puuid"
+            val expiredLockSummonerCalls = java.util.concurrent.atomic.AtomicInteger(0)
+            val lockAcquireCalls = java.util.concurrent.atomic.AtomicInteger(0)
+            val lockDeleted = java.util.concurrent.atomic.AtomicBoolean(false)
+            every { redisCacheService.get("player:profile:euw1:$expiredLockPuuid", SummonerProfileDto::class.java) } returns null
+            every { redisCacheService.setIfAbsent("lock:profile:euw1:$expiredLockPuuid", "LOCKED", any()) } answers {
+                // 1st call -> false (held by crashed instance); 2nd call after 240 polls -> true (lock expired)
+                lockAcquireCalls.incrementAndGet() >= 2
+            }
+            every { redisCacheService.delete("lock:profile:euw1:$expiredLockPuuid") } answers {
+                lockDeleted.set(true)
+            }
+            coEvery { riotApiService.getSummonerByPuuid(expiredLockPuuid, region) } coAnswers {
+                expiredLockSummonerCalls.incrementAndGet()
+                SummonerDto("id", expiredLockPuuid, 410L, 13)
+            }
+            coEvery { riotApiService.fetchLeagueRank(expiredLockPuuid, region) } returns null
+            coEvery { riotApiService.fetchMatchIdsSince(expiredLockPuuid, region, any()) } returns emptyList()
+
+            val expiredLockResult = fastPollService.getPlayerProfile(expiredLockPuuid, region, summonerName, tagLine)
+
+            Then("it must never bypass a still-held 60s lock (0 Riot calls), and only fallback-refresh after acquiring an expired lock") {
+                heldLockResult shouldBe null
+                heldLockSummonerCalls.get() shouldBe 0
+                verify(exactly = 0) { redisCacheService.delete("lock:profile:euw1:$heldLockPuuid") }
+
+                expiredLockResult?.summonerLevel shouldBe 410L
+                expiredLockSummonerCalls.get() shouldBe 1
+                lockAcquireCalls.get() shouldBe 2
+                lockDeleted.get() shouldBe true
             }
         }
     }

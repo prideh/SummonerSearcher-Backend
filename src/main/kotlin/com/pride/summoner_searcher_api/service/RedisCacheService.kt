@@ -129,10 +129,16 @@ class RedisCacheService(
     }
 
     /**
-     * Non-blocking cursor-based key scan matching [pattern] (e.g., `match:euw1:*` or `player:profile:euw1:*`).
+     * Bounded cursor-based key scan matching [pattern] (e.g., `match:euw1:*` or `player:profile:euw1:*`).
+     * Enforces [maxKeys] (capped at [HARD_MAX_SCAN_KEYS]) so Redis scans are never unbounded.
      * Falls back to `redisTemplate.keys(pattern)` only when `scan` is unstubbed in unit tests.
      */
-    fun scanKeys(pattern: String, countHint: Long = 200): List<String> {
+    fun scanKeys(
+        pattern: String,
+        countHint: Long = 200,
+        maxKeys: Int = DEFAULT_MAX_SCAN_KEYS
+    ): List<String> {
+        val effectiveLimit = maxKeys.coerceIn(1, HARD_MAX_SCAN_KEYS)
         return try {
             val options = org.springframework.data.redis.core.ScanOptions.scanOptions()
                 .match(pattern)
@@ -140,18 +146,18 @@ class RedisCacheService(
                 .build()
             val found = mutableSetOf<String>()
             redisTemplate.scan(options).use { cursor ->
-                while (cursor.hasNext()) {
+                while (cursor.hasNext() && found.size < effectiveLimit) {
                     found.add(cursor.next())
                 }
             }
             if (found.isNotEmpty()) {
-                found.sorted()
+                found.sorted().take(effectiveLimit)
             } else {
-                redisTemplate.keys(pattern)?.sorted() ?: emptyList()
+                redisTemplate.keys(pattern)?.sorted()?.take(effectiveLimit) ?: emptyList()
             }
         } catch (e: Exception) {
             try {
-                redisTemplate.keys(pattern)?.sorted() ?: emptyList()
+                redisTemplate.keys(pattern)?.sorted()?.take(effectiveLimit) ?: emptyList()
             } catch (_: Exception) {
                 emptyList()
             }
@@ -172,5 +178,7 @@ class RedisCacheService(
 
     companion object {
         private const val COMPRESSION_PREFIX = "GZIP_B64:"
+        const val DEFAULT_MAX_SCAN_KEYS = 2_000
+        const val HARD_MAX_SCAN_KEYS = 5_000
     }
 }
