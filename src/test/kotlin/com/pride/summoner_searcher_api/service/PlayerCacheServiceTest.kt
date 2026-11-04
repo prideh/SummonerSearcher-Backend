@@ -164,5 +164,38 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 cachedMatches.any { it.contains("EUW1_6") } shouldBe false
             }
         }
+
+        When("fetching a profile on cache hit with no new matches") {
+            val existingMatchIds = listOf("EUW1_2", "EUW1_1")
+            val (_, existingOverallStats) = MatchStatsAccumulator(puuid).getResult()
+            val cachedProfile = SummonerProfileDto(
+                puuid = puuid,
+                gameName = summonerName,
+                tagLine = tagLine,
+                summonerLevel = 100L,
+                profileIconId = 123,
+                soloQueueRank = null,
+                recentMatches = emptyList(),
+                allMatchIds = existingMatchIds,
+                championStats = emptyList(),
+                overallStats = existingOverallStats,
+                totalMatches = 2,
+                lastRefreshed = java.time.Instant.now().minusSeconds(300)
+            )
+
+            every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            every { redisCacheService.get(any(), SummonerProfileDto::class.java) } returns cachedProfile
+            coEvery { riotApiService.fetchLeagueRank(puuid, region) } returns null
+            coEvery { riotApiService.getSummonerByPuuid(puuid, region) } returns SummonerDto("id", puuid, 125L, 456)
+            coEvery { riotApiService.fetchMatchIdsSince(puuid, region, any()) } returns existingMatchIds
+
+            val result = playerCacheService.getPlayerProfile(puuid, region, summonerName, tagLine)
+
+            Then("it should refresh summonerLevel and profileIconId without re-processing matches") {
+                result?.summonerLevel shouldBe 125L
+                result?.profileIconId shouldBe 456
+                verify(exactly = 0) { redisCacheService.multiGet(any(), MatchDto::class.java) }
+            }
+        }
     }
 })

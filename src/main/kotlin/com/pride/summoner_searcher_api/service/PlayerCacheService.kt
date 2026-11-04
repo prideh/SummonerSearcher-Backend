@@ -70,11 +70,33 @@ class PlayerCacheService(
             // Calculate Start of Year (Jan 1st) in Epoch Seconds
             val startOfYear = java.time.Year.now().atDay(1).atStartOfDay(java.time.ZoneOffset.UTC).toEpochSecond()
 
-            // 1. Fetch current rank (fast, lightweight)
+            // 1. Fetch current rank and fresh summoner metadata (level & icon)
             val freshRank = riotApiService.fetchLeagueRank(puuid, region)
+            val freshSummoner = riotApiService.getSummonerByPuuid(puuid, region)
+            val refreshedLevel = freshSummoner?.summonerLevel ?: cachedProfile?.summonerLevel
+            val refreshedIconId = freshSummoner?.profileIconId ?: cachedProfile?.profileIconId
             
             // 2. Fetch ALL match IDs since start of year (pagination handled in service)
             val allMatchIds = riotApiService.fetchMatchIdsSince(puuid, region, startOfYear)
+
+            // Fast-path: if we already have a cached profile and no new matches have been played,
+            // skip re-streaming and re-accumulating all matches from Redis while updating rank, level, and icon.
+            if (cachedProfile != null && (
+                (allMatchIds.isEmpty() && cachedProfile.allMatchIds.isEmpty()) ||
+                (cachedProfile.allMatchIds.isNotEmpty() && allMatchIds.firstOrNull() == cachedProfile.allMatchIds.first() && cachedProfile.overallStats != null)
+            )) {
+                val fastUpdatedProfile = cachedProfile.copy(
+                    gameName = summonerName,
+                    tagLine = tagLine,
+                    summonerLevel = refreshedLevel,
+                    profileIconId = refreshedIconId,
+                    soloQueueRank = freshRank,
+                    lastRefreshed = java.time.Instant.now()
+                )
+                redisCacheService.set(cacheKey, fastUpdatedProfile, Duration.ofDays(14))
+                logger.info("Fast-path refresh for $summonerName (no new matches since ${cachedProfile.allMatchIds.firstOrNull()}).")
+                return@coroutineScope fastUpdatedProfile
+            }
             
             // 3. Process matches in chunks to calculate stats without holding everything in memory
             val accumulator = MatchStatsAccumulator(puuid)
@@ -172,8 +194,8 @@ class PlayerCacheService(
                 puuid = puuid,
                 gameName = summonerName,
                 tagLine = tagLine,
-                summonerLevel = cachedProfile?.summonerLevel ?: riotApiService.getSummonerByPuuid(puuid, region)?.summonerLevel, // Fallback if needed
-                profileIconId = cachedProfile?.profileIconId ?: riotApiService.getSummonerByPuuid(puuid, region)?.profileIconId,
+                summonerLevel = refreshedLevel,
+                profileIconId = refreshedIconId,
                 soloQueueRank = freshRank,
                 recentMatches = recentMatches, // Only 20 matches
                 allMatchIds = validMatchIds,   // Only valid matches from this year
