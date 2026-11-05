@@ -27,7 +27,29 @@ jobs:
       run: |
         docker run -d --name ss-postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=summoner_searcher postgres:16-alpine
         docker run -d --name ss-redis -p 6379:6379 redis:7-alpine
-        ./gradlew bootJar --no-daemon -x test
+        cat << 'EOF' > /tmp/init.gradle
+        beforeSettings { settings ->
+            settings.pluginManagement.repositories {
+                maven { url "https://maven-central.storage-download.googleapis.com/maven2/" }
+                gradlePluginPortal()
+                mavenCentral()
+            }
+        }
+        allprojects {
+            buildscript {
+                repositories {
+                    maven { url "https://maven-central.storage-download.googleapis.com/maven2/" }
+                    gradlePluginPortal()
+                    mavenCentral()
+                }
+            }
+            repositories {
+                maven { url "https://maven-central.storage-download.googleapis.com/maven2/" }
+                mavenCentral()
+            }
+        }
+        EOF
+        ./gradlew bootJar --no-daemon -x test --init-script /tmp/init.gradle
         cat << 'EOF' > Dockerfile.proof
         FROM eclipse-temurin:21-jre-alpine
         WORKDIR /app
