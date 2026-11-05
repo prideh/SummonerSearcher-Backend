@@ -56,9 +56,8 @@ jobs:
         RUN addgroup -S spring && adduser -S spring -G spring
         USER spring:spring
         COPY build/libs/*.jar app.jar
-        ENV MALLOC_ARENA_MAX=2
         EXPOSE 8080
-        ENTRYPOINT ["java", "-XX:NativeMemoryTracking=detail", "-XX:+UseSerialGC", "-Xms32m", "-XX:MaxRAMPercentage=40.0", "-XX:MinHeapFreeRatio=10", "-XX:MaxHeapFreeRatio=25", "-XX:-ShrinkHeapInSteps", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=32m", "-XX:CICompilerCount=2", "-XX:MaxDirectMemorySize=32m", "-Dio.netty.noPreferDirect=true", "-Dio.netty.maxDirectMemory=0", "-Djdk.nio.maxCachedBufferSize=32768", "-Xss384k", "-jar", "app.jar"]
+        ENTRYPOINT ["java", "-XX:NativeMemoryTracking=detail", "-XX:TieredStopAtLevel=1", "-XX:+UseSerialGC", "-Xms32m", "-XX:MaxRAMPercentage=40.0", "-XX:MinHeapFreeRatio=10", "-XX:MaxHeapFreeRatio=25", "-XX:-ShrinkHeapInSteps", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=32m", "-XX:CICompilerCount=2", "-XX:MaxDirectMemorySize=32m", "-Dio.netty.noPreferDirect=true", "-Dio.netty.maxDirectMemory=0", "-Djdk.nio.maxCachedBufferSize=32768", "-Xss384k", "-jar", "app.jar"]
         EOF
         docker build -f Dockerfile.proof -t ss-backend:512m-proof .
         openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/mockriot.key -out /tmp/mockriot.crt -days 1 \

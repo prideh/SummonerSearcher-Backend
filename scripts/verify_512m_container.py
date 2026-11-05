@@ -296,7 +296,7 @@ def main():
     httpd = start_mock_riot_server(cert_file, key_file)
     time.sleep(1)
 
-    print("=== Starting ss-backend-512m Docker container (--memory=512m --memory-swap=512m, MALLOC_ARENA_MAX=2) ===", flush=True)
+    print("=== Starting ss-backend-512m Docker container (--memory=512m --memory-swap=512m, -XX:TieredStopAtLevel=1) ===", flush=True)
     subprocess.check_call([
         "docker", "run", "-d",
         "--name", "ss-backend-512m",
@@ -311,7 +311,6 @@ def main():
         "--add-host=americas.api.riotgames.com:host-gateway",
         "--add-host=asia.api.riotgames.com:host-gateway",
         "-v", "/tmp/cacerts:/opt/java/openjdk/lib/security/cacerts:ro",
-        "-e", "MALLOC_ARENA_MAX=2",
         "-e", "PORT=10000",
         "-e", "DB_HOST=host.docker.internal",
         "-e", "DB_PORT=5432",
