@@ -404,57 +404,196 @@ def main():
         "cycles": {}
     }
 
-    print("=== 3. RUNNING 10 CYCLES OF (450-MATCH PROFILE LOAD + COHORT REPORT + MEMORY SNAPSHOT) ===", flush=True)
+    proof_mode = os.environ.get("PROOF_MODE", "10_CYCLE")
     cycle_metrics = []
-    for cycle in range(1, 11):
-        t0 = time.time()
-        # Flush the player profile + cooldown and cohort report + lock keys before cycles 2..10 so every cycle executes full work
-        if cycle > 1:
-            subprocess.check_call(
-                ["docker", "exec", "ss-redis", "redis-cli", "DEL",
-                 "player:profile:euw1:puuid-main-450",
-                 "cooldown:profile:refresh:euw1:puuid-main-450",
-                 "cohort:report:euw1:16.7",
-                 "lock:cohort:report:euw1:16.7"],
-                stdout=subprocess.DEVNULL
-            )
-        prof = http_json(
-            f"{base_url}/api/riot/summoner/euw1/TestPlayer/EUW?refresh=true",
-            method="GET",
-            timeout=120
-        )
-        t_prof = (time.time() - t0) * 1000.0
-        t1 = time.time()
-        rep = http_json(f"{base_url}/api/riot/cohorts/euw1/report?patch=16.7", timeout=60)
-        t_rep = (time.time() - t1) * 1000.0
-        snap = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=15)["memoryHeadroom"]
-        curr_host = sample_host_proc_and_cgroup(host_pid)
-        host_samples_by_stage["cycles"][str(cycle)] = curr_host
-
-        row = {
-            "cycle": cycle,
-            "recentMatchesCount": len(prof.get("recentMatches") or []),
-            "reportSource": rep.get("reportSource"),
-            "profileLoadMs": round(t_prof, 1),
-            "reportMs": round(t_rep, 1),
-            "cgroupCurrentMiB": round(snap["cgroupMemoryCurrentBytes"] / (1024 * 1024), 2),
-            "cgroupRatioPct": round(snap["containerUtilizationRatio"] * 100.0, 2),
-            "heapUsedMiB": round(snap["jvmHeapUsedBytes"] / (1024 * 1024), 2),
-            "heapCommittedMiB": round(snap["jvmHeapCommittedBytes"] / (1024 * 1024), 2),
-            "heapUnusedCommittedMiB": round(snap["jvmHeapUnusedCommittedBytes"] / (1024 * 1024), 2),
-            "metaspacePoolUsedMiB": round(snap["jvmMetaspaceUsedBytes"] / (1024 * 1024), 2),
-            "metaspacePoolCommittedMiB": round(snap["jvmMetaspaceCommittedBytes"] / (1024 * 1024), 2),
-            "compressedClassUsedMiB": round(snap["jvmCompressedClassSpaceUsedBytes"] / (1024 * 1024), 2),
-            "compressedClassCommittedMiB": round(snap["jvmCompressedClassSpaceCommittedBytes"] / (1024 * 1024), 2),
-            "codeCacheUsedMiB": round(snap["jvmCodeCacheUsedBytes"] / (1024 * 1024), 2),
-            "nonHeapTotalUsedMiB": round(snap["jvmNonHeapUsedBytes"] / (1024 * 1024), 2),
-            "directUsedMiB": round(snap["directBufferUsedBytes"] / (1024 * 1024), 2),
-            "nativeResidualMiB": round(snap["estimatedNativeResidualBytes"] / (1024 * 1024), 2),
-            "threads": snap["jvmThreadCount"],
-            "hasHeadroom": snap["hasHeadroomForLowPriority"]
+    if proof_mode == "SUSTAINED_30M":
+        print("=== 3. RUNNING SUSTAINED 30-MINUTE (1800s) GATED LOAD (SAMPLED AT LEAST EVERY 30s, MOCK RIOT SERVER != LIVE INTERNET) ===", flush=True)
+        sustained_t0 = time.time()
+        last_sample_ts = sustained_t0
+        # Record initial sample 0 at t=0.0s before the ~13.5s cold 450-match load so sample interval is strictly <= 30s
+        snap0 = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=15)["memoryHeadroom"]
+        mstat0 = parse_kv_bytes_file(f"/proc/{host_pid}/root/sys/fs/cgroup/memory.stat")
+        rollup0 = parse_proc_kb_file(f"/proc/{host_pid}/smaps_rollup")
+        row0 = {
+            "sample": 0,
+            "elapsedSec": 0.0,
+            "deltaSec": 0.0,
+            "recentMatchesCount": 0,
+            "reportSource": "PRE_LOAD_BASELINE",
+            "profileLoadMs": 0.0,
+            "reportMs": 0.0,
+            "cgroupCurrentMiB": round(snap0["cgroupMemoryCurrentBytes"] / (1024 * 1024), 2),
+            "cgroupRatioPct": round(snap0["containerUtilizationRatio"] * 100.0, 2),
+            "cgroupAnonMiB": round(mstat0.get("anon", 0) / (1024 * 1024), 2),
+            "cgroupFileMiB": round(mstat0.get("file", 0) / (1024 * 1024), 2),
+            "cgroupSlabMiB": round(mstat0.get("slab", 0) / (1024 * 1024), 2),
+            "cgroupSockMiB": round(mstat0.get("sock", 0) / (1024 * 1024), 2),
+            "smapsRssMiB": round(rollup0.get("Rss", 0) / (1024 * 1024), 2),
+            "heapUsedMiB": round(snap0["jvmHeapUsedBytes"] / (1024 * 1024), 2),
+            "heapCommittedMiB": round(snap0["jvmHeapCommittedBytes"] / (1024 * 1024), 2),
+            "heapUnusedCommittedMiB": round(snap0["jvmHeapUnusedCommittedBytes"] / (1024 * 1024), 2),
+            "metaspacePoolUsedMiB": round(snap0["jvmMetaspaceUsedBytes"] / (1024 * 1024), 2),
+            "metaspacePoolCommittedMiB": round(snap0["jvmMetaspaceCommittedBytes"] / (1024 * 1024), 2),
+            "compressedClassUsedMiB": round(snap0["jvmCompressedClassSpaceUsedBytes"] / (1024 * 1024), 2),
+            "compressedClassCommittedMiB": round(snap0["jvmCompressedClassSpaceCommittedBytes"] / (1024 * 1024), 2),
+            "codeCacheUsedMiB": round(snap0["jvmCodeCacheUsedBytes"] / (1024 * 1024), 2),
+            "nonHeapTotalUsedMiB": round(snap0["jvmNonHeapUsedBytes"] / (1024 * 1024), 2),
+            "directUsedMiB": round(snap0["directBufferUsedBytes"] / (1024 * 1024), 2),
+            "nativeResidualMiB": round(snap0["estimatedNativeResidualBytes"] / (1024 * 1024), 2),
+            "threads": snap0["jvmThreadCount"],
+            "hasHeadroom": snap0["hasHeadroomForLowPriority"]
         }
-        cycle_metrics.append(row)
-        print(f"CYCLE {cycle:02d}: {json.dumps(row)}", flush=True)
+        cycle_metrics.append(row0)
+        print(f"SUSTAINED_SAMPLE 00: {json.dumps(row0)}", flush=True)
+
+        sample_idx = 0
+        while True:
+            sample_idx += 1
+            t0 = time.time()
+            if sample_idx > 1:
+                subprocess.check_call(
+                    ["docker", "exec", "ss-redis", "redis-cli", "DEL",
+                     "player:profile:euw1:puuid-main-450",
+                     "cooldown:profile:refresh:euw1:puuid-main-450",
+                     "cohort:report:euw1:16.7",
+                     "lock:cohort:report:euw1:16.7"],
+                    stdout=subprocess.DEVNULL
+                )
+            prof = http_json(
+                f"{base_url}/api/riot/summoner/euw1/TestPlayer/EUW?refresh=true",
+                method="GET",
+                timeout=120
+            )
+            t_prof = (time.time() - t0) * 1000.0
+            t1 = time.time()
+            rep = http_json(f"{base_url}/api/riot/cohorts/euw1/report?patch=16.7", timeout=60)
+            t_rep = (time.time() - t1) * 1000.0
+            snap = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=15)["memoryHeadroom"]
+            now_ts = time.time()
+            elapsed_sec = now_ts - sustained_t0
+            delta_sec = now_ts - last_sample_ts
+            last_sample_ts = now_ts
+
+            mstat = parse_kv_bytes_file(f"/proc/{host_pid}/root/sys/fs/cgroup/memory.stat")
+            rollup = parse_proc_kb_file(f"/proc/{host_pid}/smaps_rollup")
+            if sample_idx in (1, 6, 7) or elapsed_sec >= 1800.0:
+                curr_host = sample_host_proc_and_cgroup(host_pid)
+                if sample_idx in (1, 6, 7):
+                    host_samples_by_stage["cycles"][str(sample_idx)] = curr_host
+                if elapsed_sec >= 1800.0:
+                    host_samples_by_stage["cycles"]["10"] = curr_host
+
+            row = {
+                "sample": sample_idx,
+                "elapsedSec": round(elapsed_sec, 2),
+                "deltaSec": round(delta_sec, 2),
+                "recentMatchesCount": len(prof.get("recentMatches") or []),
+                "reportSource": rep.get("reportSource"),
+                "profileLoadMs": round(t_prof, 1),
+                "reportMs": round(t_rep, 1),
+                "cgroupCurrentMiB": round(snap["cgroupMemoryCurrentBytes"] / (1024 * 1024), 2),
+                "cgroupRatioPct": round(snap["containerUtilizationRatio"] * 100.0, 2),
+                "cgroupAnonMiB": round(mstat.get("anon", 0) / (1024 * 1024), 2),
+                "cgroupFileMiB": round(mstat.get("file", 0) / (1024 * 1024), 2),
+                "cgroupSlabMiB": round(mstat.get("slab", 0) / (1024 * 1024), 2),
+                "cgroupSockMiB": round(mstat.get("sock", 0) / (1024 * 1024), 2),
+                "smapsRssMiB": round(rollup.get("Rss", 0) / (1024 * 1024), 2),
+                "heapUsedMiB": round(snap["jvmHeapUsedBytes"] / (1024 * 1024), 2),
+                "heapCommittedMiB": round(snap["jvmHeapCommittedBytes"] / (1024 * 1024), 2),
+                "heapUnusedCommittedMiB": round(snap["jvmHeapUnusedCommittedBytes"] / (1024 * 1024), 2),
+                "metaspacePoolUsedMiB": round(snap["jvmMetaspaceUsedBytes"] / (1024 * 1024), 2),
+                "metaspacePoolCommittedMiB": round(snap["jvmMetaspaceCommittedBytes"] / (1024 * 1024), 2),
+                "compressedClassUsedMiB": round(snap["jvmCompressedClassSpaceUsedBytes"] / (1024 * 1024), 2),
+                "compressedClassCommittedMiB": round(snap["jvmCompressedClassSpaceCommittedBytes"] / (1024 * 1024), 2),
+                "codeCacheUsedMiB": round(snap["jvmCodeCacheUsedBytes"] / (1024 * 1024), 2),
+                "nonHeapTotalUsedMiB": round(snap["jvmNonHeapUsedBytes"] / (1024 * 1024), 2),
+                "directUsedMiB": round(snap["directBufferUsedBytes"] / (1024 * 1024), 2),
+                "nativeResidualMiB": round(snap["estimatedNativeResidualBytes"] / (1024 * 1024), 2),
+                "threads": snap["jvmThreadCount"],
+                "hasHeadroom": snap["hasHeadroomForLowPriority"]
+            }
+            cycle_metrics.append(row)
+            print(f"SUSTAINED_SAMPLE {sample_idx:02d}: {json.dumps(row)}", flush=True)
+            if elapsed_sec >= 1800.0:
+                break
+            remaining_to_1800 = 1800.0 - elapsed_sec
+            sleep_sec = min(25.0, max(1.0, remaining_to_1800))
+            time.sleep(sleep_sec)
+
+        warm_rows = [r for r in cycle_metrics if r.get("sample", 0) >= 2]
+        max_delta_sec = max(r["deltaSec"] for r in cycle_metrics)
+        sustained_summary = {
+            "proofMode": "SUSTAINED_30M",
+            "totalDurationSec": cycle_metrics[-1]["elapsedSec"],
+            "sampleCount": len(cycle_metrics),
+            "maxSampleIntervalSec": max_delta_sec,
+            "minCgroupCurrentMiB": min(r["cgroupCurrentMiB"] for r in cycle_metrics),
+            "maxCgroupCurrentMiB": max(r["cgroupCurrentMiB"] for r in cycle_metrics),
+            "finalCgroupCurrentMiB": cycle_metrics[-1]["cgroupCurrentMiB"],
+            "minCgroupRatioPct": min(r["cgroupRatioPct"] for r in cycle_metrics),
+            "maxCgroupRatioPct": max(r["cgroupRatioPct"] for r in cycle_metrics),
+            "finalCgroupRatioPct": cycle_metrics[-1]["cgroupRatioPct"],
+            "warmProfileLoadMsMin": min(r["profileLoadMs"] for r in warm_rows),
+            "warmProfileLoadMsMax": max(r["profileLoadMs"] for r in warm_rows),
+            "warmProfileLoadMsAvg": round(sum(r["profileLoadMs"] for r in warm_rows) / len(warm_rows), 1),
+            "warmReportMsMin": min(r["reportMs"] for r in warm_rows),
+            "warmReportMsMax": max(r["reportMs"] for r in warm_rows),
+            "warmReportMsAvg": round(sum(r["reportMs"] for r in warm_rows) / len(warm_rows), 1),
+            "liveRiotMemoryProofNote": "Mocked local HTTPS Riot server does not prove live internet Riot memory."
+        }
+        print("=== SUSTAINED 30-MINUTE SUMMARY ===", flush=True)
+        print(json.dumps(sustained_summary, indent=2), flush=True)
+    else:
+        print("=== 3. RUNNING 10 CYCLES OF (450-MATCH PROFILE LOAD + COHORT REPORT + MEMORY SNAPSHOT) ===", flush=True)
+        for cycle in range(1, 11):
+            t0 = time.time()
+            # Flush the player profile + cooldown and cohort report + lock keys before cycles 2..10 so every cycle executes full work
+            if cycle > 1:
+                subprocess.check_call(
+                    ["docker", "exec", "ss-redis", "redis-cli", "DEL",
+                     "player:profile:euw1:puuid-main-450",
+                     "cooldown:profile:refresh:euw1:puuid-main-450",
+                     "cohort:report:euw1:16.7",
+                     "lock:cohort:report:euw1:16.7"],
+                    stdout=subprocess.DEVNULL
+                )
+            prof = http_json(
+                f"{base_url}/api/riot/summoner/euw1/TestPlayer/EUW?refresh=true",
+                method="GET",
+                timeout=120
+            )
+            t_prof = (time.time() - t0) * 1000.0
+            t1 = time.time()
+            rep = http_json(f"{base_url}/api/riot/cohorts/euw1/report?patch=16.7", timeout=60)
+            t_rep = (time.time() - t1) * 1000.0
+            snap = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=15)["memoryHeadroom"]
+            curr_host = sample_host_proc_and_cgroup(host_pid)
+            host_samples_by_stage["cycles"][str(cycle)] = curr_host
+
+            row = {
+                "cycle": cycle,
+                "recentMatchesCount": len(prof.get("recentMatches") or []),
+                "reportSource": rep.get("reportSource"),
+                "profileLoadMs": round(t_prof, 1),
+                "reportMs": round(t_rep, 1),
+                "cgroupCurrentMiB": round(snap["cgroupMemoryCurrentBytes"] / (1024 * 1024), 2),
+                "cgroupRatioPct": round(snap["containerUtilizationRatio"] * 100.0, 2),
+                "heapUsedMiB": round(snap["jvmHeapUsedBytes"] / (1024 * 1024), 2),
+                "heapCommittedMiB": round(snap["jvmHeapCommittedBytes"] / (1024 * 1024), 2),
+                "heapUnusedCommittedMiB": round(snap["jvmHeapUnusedCommittedBytes"] / (1024 * 1024), 2),
+                "metaspacePoolUsedMiB": round(snap["jvmMetaspaceUsedBytes"] / (1024 * 1024), 2),
+                "metaspacePoolCommittedMiB": round(snap["jvmMetaspaceCommittedBytes"] / (1024 * 1024), 2),
+                "compressedClassUsedMiB": round(snap["jvmCompressedClassSpaceUsedBytes"] / (1024 * 1024), 2),
+                "compressedClassCommittedMiB": round(snap["jvmCompressedClassSpaceCommittedBytes"] / (1024 * 1024), 2),
+                "codeCacheUsedMiB": round(snap["jvmCodeCacheUsedBytes"] / (1024 * 1024), 2),
+                "nonHeapTotalUsedMiB": round(snap["jvmNonHeapUsedBytes"] / (1024 * 1024), 2),
+                "directUsedMiB": round(snap["directBufferUsedBytes"] / (1024 * 1024), 2),
+                "nativeResidualMiB": round(snap["estimatedNativeResidualBytes"] / (1024 * 1024), 2),
+                "threads": snap["jvmThreadCount"],
+                "hasHeadroom": snap["hasHeadroomForLowPriority"]
+            }
+            cycle_metrics.append(row)
+            print(f"CYCLE {cycle:02d}: {json.dumps(row)}", flush=True)
 
     # Persist passive host samples so the separate non-gating diagnostic step can inspect them even if an assert fails below
     with open("/tmp/proof_host_samples.json", "w") as f:
@@ -493,8 +632,11 @@ def main():
     assert not cg_final["oomKilled"], "Container was OOMKilled!"
     assert cg_final["restartCount"] == 0, "Container restarted unexpectedly!"
     assert recovered_cp is not None and recovered_cp.get("totalNetworkCallsMade", 0) > 0, "Postgres checkpoint recovery failed!"
+    if proof_mode == "SUSTAINED_30M":
+        assert cycle_metrics[-1]["elapsedSec"] >= 1800.0, f"Sustained run was shorter than 1800s ({cycle_metrics[-1]['elapsedSec']}s)!"
+        assert max(r["deltaSec"] for r in cycle_metrics) <= 30.0, f"Sample interval exceeded 30s ({max(r['deltaSec'] for r in cycle_metrics)}s)!"
     assert all(c["cgroupRatioPct"] < 78.0 for c in cycle_metrics), (
-        f"Memory exceeded 78.0% gate during 10-cycle load! Max was {max(c['cgroupRatioPct'] for c in cycle_metrics):.2f}%"
+        f"Memory exceeded 78.0% gate! Max was {max(c['cgroupRatioPct'] for c in cycle_metrics):.2f}%"
     )
     print("=== ALL 512 MB CONTAINER PROOFS PASSED ===", flush=True)
 
