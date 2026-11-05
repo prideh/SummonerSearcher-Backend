@@ -2,7 +2,7 @@ name: Backend CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [ main, master, mem/container-proof-512m ]
   pull_request:
     branches: [ main, master ]
 
@@ -20,3 +20,18 @@ jobs:
       run: chmod +x gradlew scripts/preflight.sh
     - name: Run shared preflight (compileKotlin compileTestKotlin + full test)
       run: ./scripts/preflight.sh
+    - name: Run Real 512 MB Container Proof (--memory=512m --memory-swap=512m)
+      if: github.ref == 'refs/heads/mem/container-proof-512m'
+      run: |
+        docker run -d --name ss-postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=summoner_searcher postgres:16-alpine
+        docker run -d --name ss-redis -p 6379:6379 redis:7-alpine
+        docker build -t ss-backend:512m-proof .
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/mockriot.key -out /tmp/mockriot.crt -days 1 \
+          -subj "/CN=api.riotgames.com" \
+          -addext "subjectAltName=DNS:euw1.api.riotgames.com,DNS:na1.api.riotgames.com,DNS:kr.api.riotgames.com,DNS:europe.api.riotgames.com,DNS:americas.api.riotgames.com,DNS:asia.api.riotgames.com"
+        cid=$(docker create ss-backend:512m-proof)
+        docker cp "$cid:/opt/java/openjdk/lib/security/cacerts" /tmp/cacerts
+        docker rm "$cid"
+        keytool -importcert -noprompt -trustcacerts -alias mockriot -file /tmp/mockriot.crt -keystore /tmp/cacerts -storepass changeit
+        chmod 644 /tmp/cacerts
+        sudo python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
