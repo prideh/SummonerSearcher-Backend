@@ -18,6 +18,16 @@ data class RawMemorySample(
     val jvmHeapCommittedBytes: Long,
     val jvmHeapMaxBytes: Long,
     val jvmNonHeapUsedBytes: Long = 0L,
+    val jvmMetaspaceUsedBytes: Long = 0L,
+    val jvmMetaspaceCommittedBytes: Long = 0L,
+    val jvmCompressedClassSpaceUsedBytes: Long = 0L,
+    val jvmCompressedClassSpaceCommittedBytes: Long = 0L,
+    val jvmCodeCacheUsedBytes: Long = 0L,
+    val jvmCodeCacheCommittedBytes: Long = 0L,
+    val directBufferUsedBytes: Long = 0L,
+    val directBufferCapacityBytes: Long = 0L,
+    val mappedBufferUsedBytes: Long = 0L,
+    val jvmThreadCount: Int = 0,
     val cgroupMemoryCurrentBytes: Long? = null,
     val cgroupMemoryMaxBytes: Long? = null
 )
@@ -39,6 +49,60 @@ class SystemMemoryStatsProvider : MemoryStatsProvider {
         } catch (_: Exception) {
             0L
         }
+
+        var metaspaceUsed = 0L
+        var metaspaceCommitted = 0L
+        var compressedClassUsed = 0L
+        var compressedClassCommitted = 0L
+        var codeCacheUsed = 0L
+        var codeCacheCommitted = 0L
+        try {
+            for (pool in java.lang.management.ManagementFactory.getMemoryPoolMXBeans()) {
+                val poolName = pool.name ?: continue
+                val usage = pool.usage ?: continue
+                when {
+                    poolName.contains("Metaspace", ignoreCase = true) -> {
+                        metaspaceUsed = usage.used.coerceAtLeast(0L)
+                        metaspaceCommitted = usage.committed.coerceAtLeast(0L)
+                    }
+                    poolName.contains("Compressed Class", ignoreCase = true) -> {
+                        compressedClassUsed = usage.used.coerceAtLeast(0L)
+                        compressedClassCommitted = usage.committed.coerceAtLeast(0L)
+                    }
+                    poolName.contains("CodeCache", ignoreCase = true) || poolName.contains("CodeHeap", ignoreCase = true) -> {
+                        codeCacheUsed += usage.used.coerceAtLeast(0L)
+                        codeCacheCommitted += usage.committed.coerceAtLeast(0L)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        var directUsed = 0L
+        var directCap = 0L
+        var mappedUsed = 0L
+        try {
+            for (bp in java.lang.management.ManagementFactory.getPlatformMXBeans(java.lang.management.BufferPoolMXBean::class.java)) {
+                val bpName = bp.name ?: continue
+                when {
+                    bpName.equals("direct", ignoreCase = true) -> {
+                        directUsed = bp.memoryUsed.coerceAtLeast(0L)
+                        directCap = bp.totalCapacity.coerceAtLeast(0L)
+                    }
+                    bpName.equals("mapped", ignoreCase = true) -> {
+                        mappedUsed += bp.memoryUsed.coerceAtLeast(0L)
+                    }
+                }
+            }
+        } catch (_: Exception) {
+        }
+
+        val threadCount = try {
+            java.lang.management.ManagementFactory.getThreadMXBean().threadCount.coerceAtLeast(0)
+        } catch (_: Exception) {
+            0
+        }
+
         val cgroupCurrent = readLongFromFile("/sys/fs/cgroup/memory.current")
             ?: readLongFromFile("/sys/fs/cgroup/memory/memory.usage_in_bytes")
         val cgroupMax = readLongFromFile("/sys/fs/cgroup/memory.max")
@@ -49,6 +113,16 @@ class SystemMemoryStatsProvider : MemoryStatsProvider {
             jvmHeapCommittedBytes = committed,
             jvmHeapMaxBytes = max,
             jvmNonHeapUsedBytes = nonHeap,
+            jvmMetaspaceUsedBytes = metaspaceUsed,
+            jvmMetaspaceCommittedBytes = metaspaceCommitted,
+            jvmCompressedClassSpaceUsedBytes = compressedClassUsed,
+            jvmCompressedClassSpaceCommittedBytes = compressedClassCommitted,
+            jvmCodeCacheUsedBytes = codeCacheUsed,
+            jvmCodeCacheCommittedBytes = codeCacheCommitted,
+            directBufferUsedBytes = directUsed,
+            directBufferCapacityBytes = directCap,
+            mappedBufferUsedBytes = mappedUsed,
+            jvmThreadCount = threadCount,
             cgroupMemoryCurrentBytes = cgroupCurrent,
             cgroupMemoryMaxBytes = cgroupMax
         )
@@ -102,6 +176,7 @@ class CohortBenchmarkService(
         const val DEFAULT_CONTAINER_MEMORY_LIMIT_BYTES = 536_870_912L // 512 MB Render container cap
         const val DEFAULT_MAX_MEMORY_UTILIZATION_RATIO = 0.78
         const val DEFAULT_MIN_FREE_MEMORY_BYTES = 67_108_864L // 64 MB minimum free headroom
+        const val UNCOMMITTED_HEAP_GC_TRIGGER_BYTES = 33_554_432L // 32 MiB unused committed heap
         val ELIGIBLE_ROLES = setOf("TOP", "MIDDLE", "BOTTOM")
         val ALLOWED_REGIONS = setOf(
             "euw1", "na1", "kr", "eun1", "br1", "jp1", "la1", "la2",
@@ -129,16 +204,20 @@ class CohortBenchmarkService(
 
     /**
      * Evaluates live JVM heap + Linux container cgroup memory headroom against the 512MB container cap.
-     * Triggers a rate-limited GC hint (max once per 15s) before declaring memory exhaustion so transient
-     * young-gen JSON garbage is reclaimed first.
+     * Triggers a rate-limited GC hint (max once per 10s) when near the cap or when unused committed heap
+     * exceeds [UNCOMMITTED_HEAP_GC_TRIGGER_BYTES] (32 MiB) so SerialGC with `-Xms32m -XX:MaxHeapFreeRatio=25 -XX:-ShrinkHeapInSteps`
+     * returns unused committed heap pages to the OS before utilization reaches 78%.
      */
     fun getMemoryHeadroomSnapshot(allowGcHintOnPressure: Boolean = true): MemoryHeadroomSnapshotDto {
         val nowMs = timeProvider.now()
         val raw = memoryStatsProvider.sample()
         val snap = buildMemoryHeadroomSnapshot(raw, Instant.ofEpochMilli(nowMs))
-        if (!snap.hasHeadroomForLowPriority && allowGcHintOnPressure) {
+        val shouldHintGc = !snap.hasHeadroomForLowPriority ||
+            snap.effectiveUtilizationRatio >= 0.70 ||
+            snap.jvmHeapUnusedCommittedBytes >= UNCOMMITTED_HEAP_GC_TRIGGER_BYTES
+        if (shouldHintGc && allowGcHintOnPressure) {
             val prevGc = lastGcHintAtMs.get()
-            if (nowMs - prevGc >= 15_000L && lastGcHintAtMs.compareAndSet(prevGc, nowMs)) {
+            if (nowMs - prevGc >= 10_000L && lastGcHintAtMs.compareAndSet(prevGc, nowMs)) {
                 System.gc()
                 val afterGc = memoryStatsProvider.sample()
                 return buildMemoryHeadroomSnapshot(afterGc, Instant.ofEpochMilli(timeProvider.now()))
@@ -152,7 +231,9 @@ class CohortBenchmarkService(
         val safeHeapMax = raw.jvmHeapMaxBytes.coerceAtLeast(1L)
         val safeHeapUsed = raw.jvmHeapUsedBytes.coerceAtLeast(0L)
         val safeHeapCommitted = raw.jvmHeapCommittedBytes.coerceAtLeast(safeHeapUsed)
+        val unusedCommittedHeap = (safeHeapCommitted - safeHeapUsed).coerceAtLeast(0L)
         val safeNonHeapUsed = raw.jvmNonHeapUsedBytes.coerceAtLeast(0L)
+        val safeDirectUsed = raw.directBufferUsedBytes.coerceAtLeast(0L)
 
         // Use cgroup container utilization only when running inside a bounded container cgroup (<= 2GB max)
         val isBoundedContainerCgroup = raw.cgroupMemoryMaxBytes != null &&
@@ -170,6 +251,12 @@ class CohortBenchmarkService(
             maxOf(raw.cgroupMemoryCurrentBytes!!, safeHeapUsed)
         } else {
             safeHeapUsed
+        }
+
+        val estimatedNativeResidual = if (raw.cgroupMemoryCurrentBytes != null && raw.cgroupMemoryCurrentBytes > 0L) {
+            (raw.cgroupMemoryCurrentBytes - safeHeapCommitted - safeNonHeapUsed - safeDirectUsed).coerceAtLeast(0L)
+        } else {
+            0L
         }
 
         val heapRatio = round4(safeHeapUsed.toDouble() / safeHeapMax.toDouble())
@@ -196,8 +283,20 @@ class CohortBenchmarkService(
             cgroupMemoryMaxBytes = raw.cgroupMemoryMaxBytes,
             jvmHeapUsedBytes = safeHeapUsed,
             jvmHeapCommittedBytes = safeHeapCommitted,
+            jvmHeapUnusedCommittedBytes = unusedCommittedHeap,
             jvmHeapMaxBytes = safeHeapMax,
             jvmNonHeapUsedBytes = safeNonHeapUsed,
+            jvmMetaspaceUsedBytes = raw.jvmMetaspaceUsedBytes.coerceAtLeast(0L),
+            jvmMetaspaceCommittedBytes = raw.jvmMetaspaceCommittedBytes.coerceAtLeast(0L),
+            jvmCompressedClassSpaceUsedBytes = raw.jvmCompressedClassSpaceUsedBytes.coerceAtLeast(0L),
+            jvmCompressedClassSpaceCommittedBytes = raw.jvmCompressedClassSpaceCommittedBytes.coerceAtLeast(0L),
+            jvmCodeCacheUsedBytes = raw.jvmCodeCacheUsedBytes.coerceAtLeast(0L),
+            jvmCodeCacheCommittedBytes = raw.jvmCodeCacheCommittedBytes.coerceAtLeast(0L),
+            directBufferUsedBytes = safeDirectUsed,
+            directBufferCapacityBytes = raw.directBufferCapacityBytes.coerceAtLeast(0L),
+            mappedBufferUsedBytes = raw.mappedBufferUsedBytes.coerceAtLeast(0L),
+            jvmThreadCount = raw.jvmThreadCount.coerceAtLeast(0),
+            estimatedNativeResidualBytes = estimatedNativeResidual,
             effectiveMemoryUsedBytes = effectiveUsedBytes,
             effectiveMemoryLimitBytes = effectiveLimitBytes,
             jvmHeapUtilizationRatio = heapRatio,

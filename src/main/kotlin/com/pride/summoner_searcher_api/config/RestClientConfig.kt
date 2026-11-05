@@ -29,7 +29,8 @@ class RestClientConfig {
         val logger = org.slf4j.LoggerFactory.getLogger(RestClientConfig::class.java)
 
         val provider = reactor.netty.resources.ConnectionProvider.builder("riot-api-pool")
-            .maxConnections(1000)
+            .maxConnections(24)
+            .pendingAcquireMaxCount(64)
             .maxIdleTime(java.time.Duration.ofSeconds(10))
             .maxLifeTime(java.time.Duration.ofSeconds(50))
             .pendingAcquireTimeout(java.time.Duration.ofSeconds(60))

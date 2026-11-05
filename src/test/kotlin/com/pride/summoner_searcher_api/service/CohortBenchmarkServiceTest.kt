@@ -1625,6 +1625,16 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                     jvmHeapCommittedBytes = 220_000_000L,
                     jvmHeapMaxBytes = maxHeapBytes,
                     jvmNonHeapUsedBytes = 95_000_000L,
+                    jvmMetaspaceUsedBytes = 68_000_000L,
+                    jvmMetaspaceCommittedBytes = 72_000_000L,
+                    jvmCompressedClassSpaceUsedBytes = 8_000_000L,
+                    jvmCompressedClassSpaceCommittedBytes = 10_000_000L,
+                    jvmCodeCacheUsedBytes = 19_000_000L,
+                    jvmCodeCacheCommittedBytes = 22_000_000L,
+                    directBufferUsedBytes = 5_000_000L,
+                    directBufferCapacityBytes = 8_000_000L,
+                    mappedBufferUsedBytes = 0L,
+                    jvmThreadCount = 24,
                     cgroupMemoryCurrentBytes = currentCgroupBytes.get(),
                     cgroupMemoryMaxBytes = containerMaxBytes
                 )
@@ -1720,10 +1730,18 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             val autoResumedAfterMemoryRecovery = memRunner.checkAndAutoResumeOvernightSession(async = false)!!
 
             Then("it should stream profiles/matches in small chunks without bulk timeline loading, stop/yield near the 512MB cap with PAUSED_MEMORY_HEADROOM, and auto-resume once memory drops back to ~67%") {
-                // Verify ~67% idle snapshot
+                // Verify ~67% idle snapshot and pool breakdown
                 idleMemorySnap.hasHeadroomForLowPriority shouldBe true
                 idleMemorySnap.nearCapStopTriggered shouldBe false
                 (idleMemorySnap.effectiveUtilizationRatio in 0.66..0.68) shouldBe true
+                idleMemorySnap.jvmHeapUnusedCommittedBytes shouldBe 40_000_000L
+                idleMemorySnap.jvmMetaspaceUsedBytes shouldBe 68_000_000L
+                idleMemorySnap.jvmCompressedClassSpaceUsedBytes shouldBe 8_000_000L
+                idleMemorySnap.jvmCodeCacheUsedBytes shouldBe 19_000_000L
+                idleMemorySnap.directBufferUsedBytes shouldBe 5_000_000L
+                idleMemorySnap.jvmThreadCount shouldBe 24
+                // 360MB cgroup - 220MB heapCommitted - 95MB nonHeap - 5MB direct = 40MB native residual
+                idleMemorySnap.estimatedNativeResidualBytes shouldBe 40_000_000L
 
                 // Verify streaming chunk bounds: 45 profiles -> [20, 20, 5]; 60 matches -> [25, 25, 10]; 0 bulk timeline multiGets
                 reportProfileChunkSizes shouldBe listOf(20, 20, 5)
