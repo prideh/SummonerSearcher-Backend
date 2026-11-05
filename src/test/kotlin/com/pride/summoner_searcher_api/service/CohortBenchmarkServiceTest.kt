@@ -1743,9 +1743,9 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 // 360MB cgroup - 220MB heapCommitted - 95MB nonHeap - 5MB direct = 40MB native residual
                 idleMemorySnap.estimatedNativeResidualBytes shouldBe 40_000_000L
 
-                // Verify streaming chunk bounds: 45 profiles -> [20, 20, 5]; 60 matches -> [25, 25, 10]; 0 bulk timeline multiGets
-                reportProfileChunkSizes shouldBe listOf(20, 20, 5)
-                reportMatchChunkSizes shouldBe listOf(25, 25, 10)
+                // Verify streaming chunk bounds: 45 profiles -> [10, 10, 10, 10, 5]; 60 matches -> [10, 10, 10, 10, 10, 10]; 0 bulk timeline multiGets
+                reportProfileChunkSizes shouldBe listOf(10, 10, 10, 10, 5)
+                reportMatchChunkSizes shouldBe listOf(10, 10, 10, 10, 10, 10)
                 profileChunkSizes.all { it <= CohortBenchmarkService.PROFILE_SCAN_CHUNK_SIZE } shouldBe true
                 matchChunkSizes.all { it <= CohortBenchmarkService.MATCH_SCAN_CHUNK_SIZE } shouldBe true
                 bulkTimelineMultiGetCalls shouldBe 0

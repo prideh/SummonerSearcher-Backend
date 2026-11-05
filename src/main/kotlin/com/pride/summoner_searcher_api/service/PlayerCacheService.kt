@@ -182,13 +182,11 @@ class PlayerCacheService(
             return false
         }
 
-        if (lastBackgroundRefreshAtMs.size >= 1_000) {
-            val cutoffMs = nowMs - windowMs
-            lastBackgroundRefreshAtMs.entries.removeIf { it.value < cutoffMs }
-            if (lastBackgroundRefreshAtMs.size >= 2_000) {
-                val oldestKey = lastBackgroundRefreshAtMs.entries.minByOrNull { it.value }?.key
-                if (oldestKey != null) lastBackgroundRefreshAtMs.remove(oldestKey)
-            }
+        val cutoffMs = nowMs - windowMs
+        lastBackgroundRefreshAtMs.entries.removeIf { it.value < cutoffMs }
+        while (lastBackgroundRefreshAtMs.size >= 256) {
+            val oldestKey = lastBackgroundRefreshAtMs.entries.minByOrNull { it.value }?.key ?: break
+            lastBackgroundRefreshAtMs.remove(oldestKey)
         }
         lastBackgroundRefreshAtMs[flightKey] = nowMs
         backgroundRefreshScope.launch {
