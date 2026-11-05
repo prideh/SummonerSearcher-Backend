@@ -2,7 +2,7 @@ name: Backend CI
 
 on:
   push:
-    branches: [ main, master, mem/container-proof-512m ]
+    branches: [ main, master, mem/container-proof-gated ]
   pull_request:
     branches: [ main, master ]
 
@@ -20,10 +20,10 @@ jobs:
     - name: Grant execute permission for gradlew and preflight script
       run: chmod +x gradlew scripts/preflight.sh
     - name: Run shared preflight (compileKotlin compileTestKotlin + full test)
-      if: github.ref != 'refs/heads/mem/container-proof-512m'
+      if: github.ref != 'refs/heads/mem/container-proof-gated'
       run: ./scripts/preflight.sh
-    - name: Run Real 512 MB Container Proof (--memory=512m --memory-swap=512m)
-      if: github.ref == 'refs/heads/mem/container-proof-512m'
+    - name: Run Real 512 MB Container Proof (--memory=512m --memory-swap=512m) [Strict <78% Gate]
+      if: github.ref == 'refs/heads/mem/container-proof-gated'
       run: |
         docker run -d --name ss-postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=summoner_searcher postgres:16-alpine
         docker run -d --name ss-redis -p 6379:6379 redis:7-alpine
@@ -34,6 +34,7 @@ jobs:
         RUN addgroup -S spring && adduser -S spring -G spring
         USER spring:spring
         COPY build/libs/*.jar app.jar
+        ENV MALLOC_ARENA_MAX=2
         EXPOSE 8080
         ENTRYPOINT ["java", "-XX:NativeMemoryTracking=detail", "-XX:+UseSerialGC", "-Xms32m", "-XX:MaxRAMPercentage=40.0", "-XX:MinHeapFreeRatio=10", "-XX:MaxHeapFreeRatio=25", "-XX:-ShrinkHeapInSteps", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=32m", "-XX:CICompilerCount=2", "-XX:MaxDirectMemorySize=32m", "-Dio.netty.noPreferDirect=true", "-Dio.netty.maxDirectMemory=0", "-Djdk.nio.maxCachedBufferSize=32768", "-Xss384k", "-jar", "app.jar"]
         EOF
@@ -47,3 +48,8 @@ jobs:
         keytool -importcert -noprompt -trustcacerts -alias mockriot -file /tmp/mockriot.crt -keystore /tmp/cacerts -storepass changeit
         chmod 644 /tmp/cacerts
         sudo python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
+    - name: Collect Non-Gating Diagnostics (NMT, memory.stat, smaps)
+      if: always() && github.ref == 'refs/heads/mem/container-proof-gated'
+      continue-on-error: true
+      run: sudo python3 ./scripts/collect_512m_diagnostics.py
+
