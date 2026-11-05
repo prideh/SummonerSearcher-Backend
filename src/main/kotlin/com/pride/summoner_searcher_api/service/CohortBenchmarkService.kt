@@ -3,8 +3,11 @@ package com.pride.summoner_searcher_api.service
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.pride.summoner_searcher_api.dto.*
 import com.pride.summoner_searcher_api.model.CohortBenchmarkCellEntity
+import com.pride.summoner_searcher_api.model.CohortCollectorCheckpointEntity
 import com.pride.summoner_searcher_api.repository.CohortBenchmarkCellRepository
+import com.pride.summoner_searcher_api.repository.CohortCollectorCheckpointRepository
 import org.slf4j.LoggerFactory
+import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
 import java.time.Duration
@@ -157,7 +160,9 @@ class CohortBenchmarkService(
     private val maxMemoryUtilizationRatio: Double = DEFAULT_MAX_MEMORY_UTILIZATION_RATIO,
     @Value("\${cohort.collector.min-free-memory-bytes:67108864}")
     private val minFreeMemoryBytes: Long = DEFAULT_MIN_FREE_MEMORY_BYTES,
-    private val memoryStatsProvider: MemoryStatsProvider = SystemMemoryStatsProvider()
+    private val memoryStatsProvider: MemoryStatsProvider = SystemMemoryStatsProvider(),
+    @Autowired(required = false)
+    private val cohortCollectorCheckpointRepository: CohortCollectorCheckpointRepository? = null
 ) {
     private val logger = LoggerFactory.getLogger(javaClass)
     private val lastGcHintAtMs = java.util.concurrent.atomic.AtomicLong(0L)
@@ -2192,16 +2197,76 @@ class CohortBenchmarkService(
 
     fun getCollectorCheckpoint(region: String, targetPatch: String? = null): CohortCollectorCheckpointDto? {
         val normalizedRegion = region.lowercase().trim()
-        val key = collectorCheckpointKey(normalizedRegion, targetPatch?.trim()?.takeIf { it.isNotBlank() })
-        return redisCacheService.get(key, CohortCollectorCheckpointDto::class.java)
+        val cleanPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
+        val key = collectorCheckpointKey(normalizedRegion, cleanPatch)
+        val cached = redisCacheService.get(key, CohortCollectorCheckpointDto::class.java)
+        if (cached != null) return cached
+
+        val repo = cohortCollectorCheckpointRepository ?: return null
+        return try {
+            val entity = if (cleanPatch != null) {
+                repo.findByRegionAndTargetPatchAndQueueId(normalizedRegion, cleanPatch, SOLO_QUEUE_ID)
+            } else {
+                repo.findByRegionAndTargetPatchAndQueueId(normalizedRegion, "latest", SOLO_QUEUE_ID)
+                    ?: repo.findFirstByRegionAndQueueIdOrderByUpdatedAtDesc(normalizedRegion, SOLO_QUEUE_ID)
+            } ?: return null
+
+            val restored = objectMapper.readValue(entity.checkpointJson, CohortCollectorCheckpointDto::class.java)
+            redisCacheService.set(key, restored, MAX_RANK_SNAPSHOT_AGE)
+            if (restored.targetPatch != null) {
+                redisCacheService.set(
+                    collectorCheckpointKey(normalizedRegion, restored.targetPatch),
+                    restored,
+                    MAX_RANK_SNAPSHOT_AGE
+                )
+            }
+            restored
+        } catch (e: Exception) {
+            logger.warn("Failed to restore collector checkpoint from Postgres for {} {}: {}", normalizedRegion, cleanPatch ?: "latest", e.message)
+            null
+        }
     }
 
     fun saveCollectorCheckpoint(checkpoint: CohortCollectorCheckpointDto) {
         val normalizedRegion = checkpoint.region.lowercase().trim()
-        val primaryKey = collectorCheckpointKey(normalizedRegion, checkpoint.targetPatch)
+        val cleanPatch = checkpoint.targetPatch?.trim()?.takeIf { it.isNotBlank() }
+        val primaryKey = collectorCheckpointKey(normalizedRegion, cleanPatch)
         redisCacheService.set(primaryKey, checkpoint, MAX_RANK_SNAPSHOT_AGE)
-        if (checkpoint.targetPatch != null) {
+        if (cleanPatch != null) {
             redisCacheService.set(collectorCheckpointKey(normalizedRegion, null), checkpoint, MAX_RANK_SNAPSHOT_AGE)
+        }
+        persistCollectorCheckpointToPostgres(normalizedRegion, cleanPatch, checkpoint)
+    }
+
+    private fun persistCollectorCheckpointToPostgres(
+        normalizedRegion: String,
+        cleanPatch: String?,
+        checkpoint: CohortCollectorCheckpointDto
+    ) {
+        val repo = cohortCollectorCheckpointRepository ?: return
+        try {
+            val patchKey = cleanPatch ?: "latest"
+            val json = objectMapper.writeValueAsString(checkpoint)
+            val upsertKeys = if (cleanPatch != null) listOf(cleanPatch, "latest") else listOf("latest")
+            for (pKey in upsertKeys) {
+                val existing = repo.findByRegionAndTargetPatchAndQueueId(normalizedRegion, pKey, checkpoint.queueId)
+                val entity = existing ?: CohortCollectorCheckpointEntity(
+                    region = normalizedRegion,
+                    targetPatch = pKey,
+                    queueId = checkpoint.queueId
+                )
+                entity.lastStopReason = checkpoint.lastStopReason
+                entity.totalNetworkCallsMade = checkpoint.totalNetworkCallsMade
+                entity.processedPuuidsCount = checkpoint.processedPuuids.size
+                entity.pendingCandidatesCount = checkpoint.pendingCandidatePuuids.size
+                entity.cellsPassingQualityGate = checkpoint.cellsPassingQualityGate
+                entity.checkpointJson = json
+                entity.startedAt = checkpoint.startedAt
+                entity.updatedAt = checkpoint.updatedAt
+                repo.save(entity)
+            }
+        } catch (e: Exception) {
+            logger.warn("Failed to persist collector checkpoint to Postgres for {} {}: {}", normalizedRegion, cleanPatch ?: "latest", e.message)
         }
     }
 

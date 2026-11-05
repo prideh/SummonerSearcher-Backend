@@ -3,7 +3,9 @@ package com.pride.summoner_searcher_api.service
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.pride.summoner_searcher_api.dto.*
 import com.pride.summoner_searcher_api.model.CohortBenchmarkCellEntity
+import com.pride.summoner_searcher_api.model.CohortCollectorCheckpointEntity
 import com.pride.summoner_searcher_api.repository.CohortBenchmarkCellRepository
+import com.pride.summoner_searcher_api.repository.CohortCollectorCheckpointRepository
 import io.kotest.core.spec.style.BehaviorSpec
 import io.kotest.matchers.collections.shouldHaveSize
 import io.kotest.matchers.shouldBe
@@ -1778,6 +1780,97 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 autoResumedAfterMemoryRecovery.checkpoint?.lastStopReason shouldBe "BATCH_BUDGET_REACHED_RESUMABLE"
             }
         }
+
+        When("persisting collector checkpoints to Postgres and recovering after a Redis flush") {
+            val pgRedis = mockk<RedisCacheService>(relaxed = true)
+            val pgCheckpointRepo = mockk<CohortCollectorCheckpointRepository>(relaxed = true)
+            val redisStore = mutableMapOf<String, CohortCollectorCheckpointDto>()
+            val pgStore = mutableMapOf<String, CohortCollectorCheckpointEntity>()
+
+            every { pgRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                val value = secondArg<Any>()
+                if (value is CohortCollectorCheckpointDto) {
+                    redisStore[key] = value
+                }
+            }
+            every { pgRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
+                redisStore[firstArg()]
+            }
+            every { pgCheckpointRepo.findByRegionAndTargetPatchAndQueueId(any(), any(), any()) } answers {
+                val r = firstArg<String>()
+                val p = secondArg<String>()
+                val q = thirdArg<Int>()
+                pgStore["$r:$p:$q"]
+            }
+            every { pgCheckpointRepo.findFirstByRegionAndQueueIdOrderByUpdatedAtDesc(any(), any()) } answers {
+                val r = firstArg<String>()
+                val q = secondArg<Int>()
+                pgStore.values.filter { it.region == r && it.queueId == q }.maxByOrNull { it.updatedAt }
+            }
+            every { pgCheckpointRepo.save(any<CohortCollectorCheckpointEntity>()) } answers {
+                val ent = firstArg<CohortCollectorCheckpointEntity>()
+                pgStore["${ent.region}:${ent.targetPatch}:${ent.queueId}"] = ent
+                ent
+            }
+
+            val pgService = CohortBenchmarkService(
+                redisCacheService = pgRedis,
+                cohortBenchmarkCellRepository = cohortRepo,
+                riotApiRateLimiter = RiotApiRateLimiter(fixedTimeProvider),
+                riotApiService = riotApiService,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = fixedTimeProvider,
+                cohortCollectorCheckpointRepository = pgCheckpointRepo
+            )
+
+            val savedCp = CohortCollectorCheckpointDto(
+                region = "euw1",
+                targetPatch = "16.7",
+                patchSelectionSource = "EXPLICIT_TARGET_PATCH",
+                processedPuuids = setOf("puuid-a", "puuid-b"),
+                pendingCandidatePuuids = listOf("puuid-c"),
+                processedMatchIds = setOf("EUW1_101", "EUW1_102"),
+                playerCellGameCounts = mapOf("EMERALD:TOP:puuid-a" to 4),
+                totalNetworkCallsMade = 12,
+                fetchedRankSnapshots = 2,
+                fetchedMatchIdLists = 2,
+                fetchedMatches = 8,
+                lastStopReason = "BATCH_BUDGET_REACHED_RESUMABLE",
+                startedAt = nowInstant,
+                updatedAt = nowInstant
+            )
+            pgService.saveCollectorCheckpoint(savedCp)
+
+            // Simulate complete Redis cache eviction / restart flush
+            redisStore.clear()
+            val recoveredExplicitPatch = pgService.getCollectorCheckpoint("euw1", "16.7")
+            val rewarmedInRedisAfterExplicit = redisStore["cohort:collector:checkpoint:euw1:16.7"]
+
+            redisStore.clear()
+            val recoveredLatestPatch = pgService.getCollectorCheckpoint("euw1", null)
+
+            Then("it should write through to cohort_collector_checkpoints in Postgres, recover full checkpoint state on Redis miss, and re-warm Redis") {
+                pgStore["euw1:16.7:420"] shouldNotBe null
+                pgStore["euw1:latest:420"] shouldNotBe null
+                pgStore["euw1:16.7:420"]?.processedPuuidsCount shouldBe 2
+                pgStore["euw1:16.7:420"]?.pendingCandidatesCount shouldBe 1
+                pgStore["euw1:16.7:420"]?.totalNetworkCallsMade shouldBe 12
+                pgStore["euw1:16.7:420"]?.lastStopReason shouldBe "BATCH_BUDGET_REACHED_RESUMABLE"
+
+                recoveredExplicitPatch shouldNotBe null
+                recoveredExplicitPatch?.processedPuuids shouldBe setOf("puuid-a", "puuid-b")
+                recoveredExplicitPatch?.pendingCandidatePuuids shouldBe listOf("puuid-c")
+                recoveredExplicitPatch?.playerCellGameCounts?.get("EMERALD:TOP:puuid-a") shouldBe 4
+                rewarmedInRedisAfterExplicit?.totalNetworkCallsMade shouldBe 12
+
+                recoveredLatestPatch shouldNotBe null
+                recoveredLatestPatch?.targetPatch shouldBe "16.7"
+                recoveredLatestPatch?.processedMatchIds shouldBe setOf("EUW1_101", "EUW1_102")
+            }
+        }
     }
 })
+
 
