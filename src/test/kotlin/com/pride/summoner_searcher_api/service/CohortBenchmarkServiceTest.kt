@@ -1890,9 +1890,17 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             every { capRedis.get(any(), CohortRankSnapshotDto::class.java) } answers {
                 savedSnapshots[firstArg()]
             }
-            every { capRedis.setIfAbsent(match { it.startsWith("lock:cohort:collector:active:") }, any(), any()) } answers {
-                if (lockHeld) false else {
-                    lockHeld = true
+            every { capRedis.get(any(), SummonerProfileDto::class.java) } returns null
+            every { capRedis.get(any(), MatchDto::class.java) } returns null
+            every { capRedis.get(any(), CachedLeaderboardDto::class.java) } returns null
+            every { capRedis.setIfAbsent(match { it.startsWith("lock:cohort:collector:") }, any(), any()) } answers {
+                val key = firstArg<String>()
+                if (key.contains(":active:")) {
+                    if (lockHeld) false else {
+                        lockHeld = true
+                        true
+                    }
+                } else {
                     true
                 }
             }
@@ -1905,6 +1913,27 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                     is CohortCollectorCheckpointDto -> savedCheckpoints[key] = value
                     is CohortRankSnapshotDto -> savedSnapshots[key] = value
                 }
+            }
+
+            val capMemoryProvider = object : MemoryStatsProvider {
+                override fun sample(): RawMemorySample = RawMemorySample(
+                    jvmHeapUsedBytes = 180_000_000L,
+                    jvmHeapCommittedBytes = 220_000_000L,
+                    jvmHeapMaxBytes = 268_435_456L,
+                    jvmNonHeapUsedBytes = 95_000_000L,
+                    jvmMetaspaceUsedBytes = 68_000_000L,
+                    jvmMetaspaceCommittedBytes = 72_000_000L,
+                    jvmCompressedClassSpaceUsedBytes = 8_000_000L,
+                    jvmCompressedClassSpaceCommittedBytes = 10_000_000L,
+                    jvmCodeCacheUsedBytes = 19_000_000L,
+                    jvmCodeCacheCommittedBytes = 22_000_000L,
+                    directBufferUsedBytes = 5_000_000L,
+                    directBufferCapacityBytes = 8_000_000L,
+                    mappedBufferUsedBytes = 0L,
+                    jvmThreadCount = 24,
+                    cgroupMemoryCurrentBytes = 360_000_000L,
+                    cgroupMemoryMaxBytes = 536_870_912L
+                )
             }
 
             CohortBenchmarkService.REQUIRED_COLLECTOR_ENDPOINTS.forEach { ep ->
@@ -1925,7 +1954,11 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 riotApiService = capRiotApi,
                 objectMapper = objectMapper,
                 networkCollectionEnabled = true,
-                timeProvider = testClock
+                timeProvider = testClock,
+                configuredContainerLimitBytes = 536_870_912L,
+                maxMemoryUtilizationRatio = 0.78,
+                minFreeMemoryBytes = 67_108_864L,
+                memoryStatsProvider = capMemoryProvider
             )
             val capRunner = com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner(
                 cohortBenchmarkService = capService,
