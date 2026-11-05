@@ -1870,6 +1870,179 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 recoveredLatestPatch?.processedMatchIds shouldBe setOf("EUW1_101", "EUW1_102")
             }
         }
+
+        When("enforcing session-level hard caps (maxTotalProductiveBatches and maxTotalNetworkCalls) across auto-resume ticks") {
+            val clockMs = java.util.concurrent.atomic.AtomicLong(nowInstant.toEpochMilli())
+            val testClock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            val capLimiter = RiotApiRateLimiter(testClock)
+            val capRedis = mockk<RedisCacheService>(relaxed = true)
+            val capRiotApi = mockk<RiotApiService>(relaxed = true)
+            val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
+            val savedSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
+            var lockHeld = false
+
+            every { capRedis.scanKeys(any(), any(), any()) } returns emptyList()
+            every { capRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
+                savedCheckpoints[firstArg()]
+            }
+            every { capRedis.get(any(), CohortRankSnapshotDto::class.java) } answers {
+                savedSnapshots[firstArg()]
+            }
+            every { capRedis.setIfAbsent(match { it.startsWith("lock:cohort:collector:active:") }, any(), any()) } answers {
+                if (lockHeld) false else {
+                    lockHeld = true
+                    true
+                }
+            }
+            every { capRedis.delete(match { it.startsWith("lock:cohort:collector:active:") }) } answers {
+                lockHeld = false
+            }
+            every { capRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                when (val value = secondArg<Any>()) {
+                    is CohortCollectorCheckpointDto -> savedCheckpoints[key] = value
+                    is CohortRankSnapshotDto -> savedSnapshots[key] = value
+                }
+            }
+
+            CohortBenchmarkService.REQUIRED_COLLECTOR_ENDPOINTS.forEach { ep ->
+                capLimiter.updateLimits(
+                    region = "euw1",
+                    limitHeader = "20:1,100:120",
+                    countHeader = "1:1,5:120",
+                    endpointKey = ep,
+                    methodLimitHeader = "500:10",
+                    methodCountHeader = "1:10"
+                )
+            }
+
+            val capService = CohortBenchmarkService(
+                redisCacheService = capRedis,
+                cohortBenchmarkCellRepository = cohortRepo,
+                riotApiRateLimiter = capLimiter,
+                riotApiService = capRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = testClock
+            )
+            val capRunner = com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner(
+                cohortBenchmarkService = capService,
+                configuredOperatorToken = "",
+                timeProvider = testClock
+            )
+
+            capService.saveCollectorCheckpoint(
+                CohortCollectorCheckpointDto(
+                    region = "euw1",
+                    targetPatch = "16.7",
+                    patchSelectionSource = "EXPLICIT_TARGET_PATCH",
+                    pendingCandidatePuuids = listOf("cap-p-1", "cap-p-2", "cap-p-3", "cap-p-4", "cap-p-5", "cap-p-6"),
+                    startedAt = nowInstant,
+                    updatedAt = nowInstant
+                )
+            )
+
+            val totalRiotHttpCalls = java.util.concurrent.atomic.AtomicInteger(0)
+            coEvery { capRiotApi.fetchLeagueRankLowPriority(any(), "euw1", any(), any(), any()) } coAnswers {
+                val pid = firstArg<String>()
+                arg<java.util.concurrent.atomic.AtomicInteger?>(3)?.incrementAndGet()
+                totalRiotHttpCalls.incrementAndGet()
+                LeagueEntryDto(
+                    leagueId = "l-$pid", queueType = "RANKED_SOLO_5x5", tier = "DIAMOND", rank = "I",
+                    summonerName = pid, puuid = pid, leaguePoints = 60, wins = 25, losses = 20,
+                    veteran = false, inactive = false, freshBlood = false, hotStreak = false
+                )
+            }
+            coEvery { capRiotApi.getMatchIdsByPuuidLowPriority(any(), "euw1", 420, any(), 0, any(), any(), any()) } coAnswers {
+                val pid = firstArg<String>()
+                arg<java.util.concurrent.atomic.AtomicInteger?>(6)?.incrementAndGet()
+                totalRiotHttpCalls.incrementAndGet()
+                if (pid == "cap-p-3") {
+                    // Simulate a 60s Retry-After window starting right after cap-p-3 completes so the chunk pauses before cap-p-4
+                    capLimiter.recordRetryAfter("euw1", 60_000L, "application")
+                }
+                emptyList()
+            }
+
+            // Part 1: Start with per-chunk maxBatches=1 and session cap maxTotalProductiveBatches=2 (6 candidates available).
+            val chunk1Status = capRunner.startOrResumeGuarded(
+                region = "euw1",
+                targetPatch = "16.7",
+                maxBatches = 1,
+                batchSize = 1,
+                pauseDelayMs = 0L,
+                maxPauseCycles = 3,
+                maxTotalProductiveBatches = 2,
+                maxTotalNetworkCalls = 60,
+                async = false
+            )
+            // Auto-resume tick #1 runs the 2nd productive batch (sessionProductiveBatchesCompleted reaches 2/2) -> disarms and stops with SESSION_BATCH_CAP_REACHED!
+            val autoResumeBatch2Status = capRunner.checkAndAutoResumeOvernightSession(async = false)!!
+            // Subsequent auto-resume ticks (#2 and scheduledAutoResumeTick) must be blocked and make 0 additional calls!
+            val autoResumeBlockedAfterBatchCap = capRunner.checkAndAutoResumeOvernightSession(async = false)
+            capRunner.scheduledAutoResumeTick()
+            val callsAfterBatchCap = totalRiotHttpCalls.get()
+
+            // Part 2: Start a new session on the existing checkpoint (baseline=4 calls) with maxTotalNetworkCalls=3 and maxTotalProductiveBatches=5.
+            // cap-p-3 consumes 2 calls (sessionNetworkCallsMade=2/3) and triggers a 60s Retry-After pause before cap-p-4.
+            val netCapChunk1Status = capRunner.startOrResumeGuarded(
+                region = "euw1",
+                targetPatch = "16.7",
+                maxBatches = 2,
+                batchSize = 1,
+                pauseDelayMs = 0L,
+                maxPauseCycles = 2,
+                maxTotalProductiveBatches = 5,
+                maxTotalNetworkCalls = 3,
+                async = false
+            )
+            // Advance clock past the 60s Retry-After window -> auto-resume tick resumes with 1 remaining call in the 3-call session cap!
+            clockMs.addAndGet(65_000L)
+            val netCapAutoResumedStatus = capRunner.checkAndAutoResumeOvernightSession(async = false)!!
+            val autoResumeBlockedAfterNetCap = capRunner.checkAndAutoResumeOvernightSession(async = false)
+            capRunner.scheduledAutoResumeTick()
+            val callsAfterNetCap = totalRiotHttpCalls.get()
+
+            Then("auto-resume should never reset session counters, should disarm and persist SESSION_BATCH_CAP_REACHED or SESSION_NETWORK_CALL_CAP_REACHED when reached, and should make zero calls past the cap") {
+                // Part 1 assertions: maxTotalProductiveBatches = 2
+                chunk1Status.productiveBatchesCompleted shouldBe 1
+                chunk1Status.sessionProductiveBatchesCompleted shouldBe 1
+                chunk1Status.overnightSessionArmed shouldBe true
+                chunk1Status.checkpoint?.lastStopReason shouldBe "BATCH_BUDGET_REACHED_RESUMABLE"
+
+                autoResumeBatch2Status.productiveBatchesCompleted shouldBe 1
+                autoResumeBatch2Status.sessionProductiveBatchesCompleted shouldBe 2
+                autoResumeBatch2Status.maxSessionProductiveBatchesConfigured shouldBe 2
+                autoResumeBatch2Status.overnightSessionArmed shouldBe false
+                autoResumeBatch2Status.checkpoint?.lastStopReason shouldBe "SESSION_BATCH_CAP_REACHED"
+                autoResumeBatch2Status.checkpoint?.sessionProductiveBatchesCompleted shouldBe 2
+                autoResumeBatch2Status.checkpoint?.maxSessionProductiveBatches shouldBe 2
+                autoResumeBatch2Status.checkpoint?.processedPuuids shouldBe setOf("cap-p-1", "cap-p-2")
+
+                autoResumeBlockedAfterBatchCap shouldBe null
+                callsAfterBatchCap shouldBe 4
+
+                // Part 2 assertions: maxTotalNetworkCalls = 3 (starting from baseline=4 -> ceiling=7 total calls)
+                netCapChunk1Status.productiveBatchesCompleted shouldBe 1
+                netCapChunk1Status.sessionProductiveBatchesCompleted shouldBe 1
+                netCapChunk1Status.sessionNetworkCallsMade shouldBe 2
+                netCapChunk1Status.overnightSessionArmed shouldBe true
+                netCapChunk1Status.checkpoint?.lastStopReason shouldBe "PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE"
+
+                netCapAutoResumedStatus.overnightSessionArmed shouldBe false
+                netCapAutoResumedStatus.sessionNetworkCallsMade shouldBe 3
+                netCapAutoResumedStatus.maxSessionNetworkCallsConfigured shouldBe 3
+                netCapAutoResumedStatus.checkpoint?.lastStopReason shouldBe "SESSION_NETWORK_CALL_CAP_REACHED"
+                netCapAutoResumedStatus.checkpoint?.sessionNetworkCallsMade shouldBe 3
+                netCapAutoResumedStatus.checkpoint?.maxSessionNetworkCalls shouldBe 3
+                netCapAutoResumedStatus.checkpoint?.totalNetworkCallsMade shouldBe 7
+
+                autoResumeBlockedAfterNetCap shouldBe null
+                callsAfterNetCap shouldBe 7
+            }
+        }
     }
 })
 

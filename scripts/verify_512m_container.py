@@ -478,9 +478,9 @@ def main():
         }
     }, indent=2), flush=True)
 
-    # Run 1 productive collector batch (batchSize=2) so checkpoint has processedPuuids, pendingCandidatePuuids, and cached matches
+    # Run 1 productive collector batch (batchSize=2, maxTotalProductiveBatches=1, maxTotalNetworkCalls=30) so checkpoint has processedPuuids, pendingCandidatePuuids, cached matches, and disarms at session cap
     batch_res = http_json(
-        f"{base_url}/api/riot/cohorts/euw1/collector/start?patch=16.7&maxBatches=1&batchSize=2&async=false",
+        f"{base_url}/api/riot/cohorts/euw1/collector/start?patch=16.7&maxBatches=1&batchSize=2&maxTotalProductiveBatches=1&maxTotalNetworkCalls=30&async=false",
         method="POST",
         headers=op_headers,
         timeout=60
@@ -488,6 +488,11 @@ def main():
     print("=== 1-BATCH COLLECTOR RUNNER RESULT ===", flush=True)
     print(json.dumps({
         "productiveBatchesCompleted": batch_res.get("productiveBatchesCompleted"),
+        "sessionProductiveBatchesCompleted": batch_res.get("sessionProductiveBatchesCompleted"),
+        "maxSessionProductiveBatchesConfigured": batch_res.get("maxSessionProductiveBatchesConfigured"),
+        "sessionNetworkCallsMade": batch_res.get("sessionNetworkCallsMade"),
+        "maxSessionNetworkCallsConfigured": batch_res.get("maxSessionNetworkCallsConfigured"),
+        "overnightSessionArmed": batch_res.get("overnightSessionArmed"),
         "processedPuuids": batch_res.get("checkpoint", {}).get("processedPuuids"),
         "pendingCount": len(batch_res.get("checkpoint", {}).get("pendingCandidatePuuids", [])),
         "totalNetworkCallsMade": batch_res.get("checkpoint", {}).get("totalNetworkCallsMade"),

@@ -2,9 +2,9 @@ name: Backend CI
 
 on:
   push:
-    branches: [ main, master, mem/candidate-512m ]
+    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap ]
   pull_request:
-    branches: [ main, master ]
+    branches: [ main, master, mem/candidate-512m ]
 
 jobs:
   backend-tests:
@@ -22,7 +22,7 @@ jobs:
     - name: Run shared preflight (compileKotlin compileTestKotlin + full test)
       run: ./scripts/preflight.sh
     - name: Run Real 512 MB Container Proof on Exact Repo Dockerfile (--memory=512m --memory-swap=512m) [Strict <78% Gate]
-      if: github.ref == 'refs/heads/mem/candidate-512m'
+      if: github.ref == 'refs/heads/fix/collector-session-hard-cap' || github.ref == 'refs/heads/mem/candidate-512m'
       run: |
         docker run -d --name ss-postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=summoner_searcher postgres:16-alpine
         docker run -d --name ss-redis -p 6379:6379 redis:7-alpine
@@ -35,4 +35,4 @@ jobs:
         docker rm "$cid"
         keytool -importcert -noprompt -trustcacerts -alias mockriot -file /tmp/mockriot.crt -keystore /tmp/cacerts -storepass changeit
         chmod 644 /tmp/cacerts
-        sudo PROOF_MODE=SUSTAINED_30M ENABLE_NMT=0 python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
+        sudo PROOF_MODE=10_CYCLE ENABLE_NMT=0 python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key

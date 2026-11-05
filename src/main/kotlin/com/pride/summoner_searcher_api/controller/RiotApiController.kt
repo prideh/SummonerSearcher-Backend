@@ -223,10 +223,12 @@ class RiotApiController(
     fun startOrResumeCohortCollector(
         @PathVariable region: String,
         @org.springframework.web.bind.annotation.RequestParam(required = false) patch: String? = null,
-        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "20") maxBatches: Int = 20,
-        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "25") batchSize: Int = 25,
+        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "2") maxBatches: Int = 2,
+        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "5") batchSize: Int = 5,
         @org.springframework.web.bind.annotation.RequestParam(defaultValue = "2500") pauseDelayMs: Long = 2_500L,
         @org.springframework.web.bind.annotation.RequestParam(defaultValue = "240") maxPauseCycles: Int = 240,
+        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "4") maxTotalProductiveBatches: Int = 4,
+        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "60") maxTotalNetworkCalls: Int = 60,
         @org.springframework.web.bind.annotation.RequestParam(defaultValue = "true") async: Boolean = true,
         @org.springframework.web.bind.annotation.RequestHeader(name = "X-Cohort-Operator-Token", required = false) operatorToken: String? = null,
         httpRequest: jakarta.servlet.http.HttpServletRequest
@@ -242,6 +244,8 @@ class RiotApiController(
             batchSize = batchSize,
             pauseDelayMs = pauseDelayMs,
             maxPauseCycles = maxPauseCycles,
+            maxTotalProductiveBatches = maxTotalProductiveBatches,
+            maxTotalNetworkCalls = maxTotalNetworkCalls,
             async = async
         )
         return ResponseEntity.ok(status)

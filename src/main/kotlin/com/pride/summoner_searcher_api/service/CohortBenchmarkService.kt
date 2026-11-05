@@ -1253,6 +1253,10 @@ class CohortBenchmarkService(
         seedPuuids: List<String> = emptyList(),
         maxPlayersPerBatch: Int = 25,
         maxGamesPerPlayer: Int = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER,
+        maxSessionNetworkCalls: Int? = null,
+        sessionBaselineNetworkCalls: Int = 0,
+        sessionProductiveBatchesBeforeBatch: Int = 0,
+        maxSessionProductiveBatches: Int = 0,
         shouldStop: () -> Boolean = { false }
     ): CohortCollectorCheckpointDto {
         val normalizedRegion = region.lowercase().trim()
@@ -1278,6 +1282,10 @@ class CohortBenchmarkService(
             )).let { base ->
                 base.copy(
                     pausedForMemoryHeadroomCount = base.pausedForMemoryHeadroomCount + 1,
+                    sessionProductiveBatchesCompleted = sessionProductiveBatchesBeforeBatch,
+                    maxSessionProductiveBatches = maxSessionProductiveBatches,
+                    sessionNetworkCallsMade = (base.totalNetworkCallsMade - sessionBaselineNetworkCalls).coerceAtLeast(0),
+                    maxSessionNetworkCalls = maxSessionNetworkCalls ?: 0,
                     lastStopReason = "PAUSED_MEMORY_HEADROOM",
                     updatedAt = Instant.ofEpochMilli(timeProvider.now())
                 )
@@ -1300,6 +1308,7 @@ class CohortBenchmarkService(
             ?: if (cleanRequestedPatch != null) "EXPLICIT_TARGET_PATCH" else "NO_CACHED_PATCH_FOUND"
 
         val processedPuuids = existingCheckpoint?.processedPuuids?.take(MAX_CHECKPOINT_PROCESSED_PUUIDS)?.toMutableSet() ?: mutableSetOf()
+        val initialProcessedPuuidCount = processedPuuids.size
         val processedMatchIds = existingCheckpoint?.processedMatchIds?.take(MAX_CHECKPOINT_PROCESSED_MATCH_IDS)?.toMutableSet() ?: mutableSetOf()
         val playerCellGameCounts = existingCheckpoint?.playerCellGameCounts?.toMutableMap() ?: mutableMapOf()
         val pendingQueue = LinkedHashSet<String>()
@@ -1336,6 +1345,16 @@ class CohortBenchmarkService(
         var pausedForHeadroom = existingCheckpoint?.pausedForHeadroomCount ?: 0
         var pausedForMemoryHeadroom = existingCheckpoint?.pausedForMemoryHeadroomCount ?: 0
 
+        fun currentSessionNetworkCalls(): Int = (totalNetworkCalls - sessionBaselineNetworkCalls).coerceAtLeast(0)
+
+        fun currentSessionProductiveBatches(): Int {
+            return if (processedPuuids.size > initialProcessedPuuidCount) {
+                sessionProductiveBatchesBeforeBatch + 1
+            } else {
+                sessionProductiveBatchesBeforeBatch
+            }
+        }
+
         fun buildCurrentCheckpoint(stopReason: String): CohortCollectorCheckpointDto {
             return CohortCollectorCheckpointDto(
                 region = normalizedRegion,
@@ -1361,6 +1380,10 @@ class CohortBenchmarkService(
                 pausedForRetryAfterCount = pausedForRetryAfter,
                 pausedForHeadroomCount = pausedForHeadroom,
                 pausedForMemoryHeadroomCount = pausedForMemoryHeadroom,
+                sessionProductiveBatchesCompleted = currentSessionProductiveBatches(),
+                maxSessionProductiveBatches = maxSessionProductiveBatches,
+                sessionNetworkCallsMade = currentSessionNetworkCalls(),
+                maxSessionNetworkCalls = maxSessionNetworkCalls ?: 0,
                 lastStopReason = stopReason,
                 startedAt = startedAt,
                 updatedAt = Instant.ofEpochMilli(timeProvider.now())
@@ -1387,10 +1410,13 @@ class CohortBenchmarkService(
             return disabledCheckpoint
         }
 
-        // 4. Enforce Memory Headroom + Actual App + Method + Service rate-limit header & headroom verification
+        // 4. Enforce Session Network Call Cap + Memory Headroom + Actual App + Method + Service rate-limit header & headroom verification
         fun evaluateLivePauseReason(requiredEndpoint: String? = null): String? {
             if (shouldStop()) {
                 return "STOPPED_BY_OPERATOR"
+            }
+            if (maxSessionNetworkCalls != null && currentSessionNetworkCalls() >= maxSessionNetworkCalls) {
+                return "SESSION_NETWORK_CALL_CAP_REACHED"
             }
             val memSnap = getMemoryHeadroomSnapshot()
             if (!memSnap.hasHeadroomForLowPriority) {
@@ -1656,6 +1682,10 @@ class CohortBenchmarkService(
 
         if (cellsPassing >= TIER_ORDER.size * ELIGIBLE_ROLES.size) {
             stopReason = "ALL_TARGET_CELLS_SATISFIED"
+        } else if (maxSessionNetworkCalls != null && currentSessionNetworkCalls() >= maxSessionNetworkCalls &&
+            (stopReason == "BATCH_BUDGET_REACHED_RESUMABLE" || stopReason == "SESSION_NETWORK_CALL_CAP_REACHED")
+        ) {
+            stopReason = "SESSION_NETWORK_CALL_CAP_REACHED"
         } else if (stopReason == "BATCH_BUDGET_REACHED_RESUMABLE" && pendingQueue.none { it !in processedPuuids }) {
             if (getMemoryHeadroomSnapshot(allowGcHintOnPressure = false).hasHeadroomForLowPriority) {
                 for (candidate in discoverCandidatePuuidsFromCache(normalizedRegion, effectivePatch)) {
@@ -1666,7 +1696,11 @@ class CohortBenchmarkService(
             }
             if (pendingQueue.none { it !in processedPuuids }) {
                 stopReason = "NO_CANDIDATES_REMAINING"
+            } else if (maxSessionProductiveBatches > 0 && currentSessionProductiveBatches() >= maxSessionProductiveBatches) {
+                stopReason = "SESSION_BATCH_CAP_REACHED"
             }
+        } else if (stopReason == "BATCH_BUDGET_REACHED_RESUMABLE" && maxSessionProductiveBatches > 0 && currentSessionProductiveBatches() >= maxSessionProductiveBatches) {
+            stopReason = "SESSION_BATCH_CAP_REACHED"
         }
 
         val finalCheckpoint = buildCurrentCheckpoint(stopReason)

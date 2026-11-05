@@ -69,16 +69,31 @@ class OvernightCohortCollectorRunner(
     private var consecutivePauseCycles: Int = 0
 
     @Volatile
-    private var maxBatchesConfigured: Int = 20
+    private var maxBatchesConfigured: Int = DEFAULT_MAX_BATCHES_PER_CHUNK
 
     @Volatile
     private var maxPauseCyclesConfigured: Int = 240
 
     @Volatile
-    private var batchSizeConfigured: Int = 25
+    private var batchSizeConfigured: Int = DEFAULT_BATCH_SIZE
 
     @Volatile
     private var pauseDelayMsConfigured: Long = 2_500L
+
+    @Volatile
+    private var sessionProductiveBatchesCompleted: Int = 0
+
+    @Volatile
+    private var maxSessionProductiveBatchesConfigured: Int = DEFAULT_MAX_SESSION_PRODUCTIVE_BATCHES
+
+    @Volatile
+    private var sessionBaselineNetworkCalls: Int = 0
+
+    @Volatile
+    private var sessionNetworkCallsMade: Int = 0
+
+    @Volatile
+    private var maxSessionNetworkCallsConfigured: Int = DEFAULT_MAX_SESSION_NETWORK_CALLS
 
     @Volatile
     private var lastRunStartedAt: Instant? = null
@@ -87,6 +102,13 @@ class OvernightCohortCollectorRunner(
     private var lastRunCompletedAt: Instant? = null
 
     companion object {
+        const val DEFAULT_MAX_BATCHES_PER_CHUNK = 2
+        const val DEFAULT_BATCH_SIZE = 5
+        const val DEFAULT_MAX_SESSION_PRODUCTIVE_BATCHES = 4
+        const val DEFAULT_MAX_SESSION_NETWORK_CALLS = 60
+        const val STOP_REASON_SESSION_BATCH_CAP = "SESSION_BATCH_CAP_REACHED"
+        const val STOP_REASON_SESSION_NETWORK_CALL_CAP = "SESSION_NETWORK_CALL_CAP_REACHED"
+
         private val LOOPBACK_ADDRESSES = setOf(
             "127.0.0.1",
             "::1",
@@ -98,7 +120,9 @@ class OvernightCohortCollectorRunner(
             "NO_CANDIDATES_REMAINING",
             "NETWORK_COLLECTION_DISABLED_BY_CONFIG",
             "RATE_LIMIT_VERIFICATION_OR_HEADROOM_NOT_READY",
-            "STOPPED_BY_OPERATOR"
+            "STOPPED_BY_OPERATOR",
+            STOP_REASON_SESSION_BATCH_CAP,
+            STOP_REASON_SESSION_NETWORK_CALL_CAP
         )
     }
 
@@ -109,10 +133,12 @@ class OvernightCohortCollectorRunner(
 
         val region = args.getOptionValues("collect-region")?.firstOrNull()?.lowercase()?.trim() ?: "euw1"
         val targetPatch = args.getOptionValues("collect-patch")?.firstOrNull()?.trim()?.takeIf { it.isNotBlank() }
-        val maxBatches = args.getOptionValues("collect-max-batches")?.firstOrNull()?.toIntOrNull()?.coerceIn(1, 500) ?: 20
-        val batchSize = args.getOptionValues("collect-batch-size")?.firstOrNull()?.toIntOrNull()?.coerceIn(1, 200) ?: 25
+        val maxBatches = args.getOptionValues("collect-max-batches")?.firstOrNull()?.toIntOrNull()?.coerceIn(1, 500) ?: DEFAULT_MAX_BATCHES_PER_CHUNK
+        val batchSize = args.getOptionValues("collect-batch-size")?.firstOrNull()?.toIntOrNull()?.coerceIn(1, 200) ?: DEFAULT_BATCH_SIZE
         val pauseDelayMs = args.getOptionValues("collect-pause-ms")?.firstOrNull()?.toLongOrNull()?.coerceIn(0L, 60_000L) ?: 2_500L
         val maxPauseCycles = args.getOptionValues("collect-max-pause-cycles")?.firstOrNull()?.toIntOrNull()?.coerceIn(1, 10_000) ?: 240
+        val maxTotalProductiveBatches = args.getOptionValues("collect-max-session-batches")?.firstOrNull()?.toIntOrNull()?.coerceIn(1, 500) ?: DEFAULT_MAX_SESSION_PRODUCTIVE_BATCHES
+        val maxTotalNetworkCalls = args.getOptionValues("collect-max-session-network-calls")?.firstOrNull()?.toIntOrNull()?.coerceIn(1, 5_000) ?: DEFAULT_MAX_SESSION_NETWORK_CALLS
 
         // Start asynchronously in the SAME process so the web server and ChallengerCacheWarmer run normally
         startOrResumeGuarded(
@@ -122,6 +148,8 @@ class OvernightCohortCollectorRunner(
             batchSize = batchSize,
             pauseDelayMs = pauseDelayMs,
             maxPauseCycles = maxPauseCycles,
+            maxTotalProductiveBatches = maxTotalProductiveBatches,
+            maxTotalNetworkCalls = maxTotalNetworkCalls,
             async = true
         )
     }
@@ -159,15 +187,46 @@ class OvernightCohortCollectorRunner(
      * Guarded same-process start/resume entrypoint.
      * Ensures at most one collector job runs at a time (in-process [AtomicBoolean] + Redis lock)
      * inside the same backend JVM sharing [com.pride.summoner_searcher_api.service.RiotApiRateLimiter].
+     *
+     * Initializes session-level hard caps ([maxTotalProductiveBatches] and [maxTotalNetworkCalls])
+     * that periodic auto-resume ticks ([scheduledAutoResumeTick]) NEVER reset.
      */
     fun startOrResumeGuarded(
         region: String = "euw1",
         targetPatch: String? = null,
-        maxBatches: Int = 20,
-        batchSize: Int = 25,
+        maxBatches: Int = DEFAULT_MAX_BATCHES_PER_CHUNK,
+        batchSize: Int = DEFAULT_BATCH_SIZE,
         pauseDelayMs: Long = 2_500L,
         maxPauseCycles: Int = 240,
+        maxTotalProductiveBatches: Int = DEFAULT_MAX_SESSION_PRODUCTIVE_BATCHES,
+        maxTotalNetworkCalls: Int = DEFAULT_MAX_SESSION_NETWORK_CALLS,
         async: Boolean = true
+    ): CohortCollectorStatusDto {
+        return startOrResumeInternal(
+            region = region,
+            targetPatch = targetPatch,
+            maxBatches = maxBatches,
+            batchSize = batchSize,
+            pauseDelayMs = pauseDelayMs,
+            maxPauseCycles = maxPauseCycles,
+            maxTotalProductiveBatches = maxTotalProductiveBatches,
+            maxTotalNetworkCalls = maxTotalNetworkCalls,
+            async = async,
+            isAutoResume = false
+        )
+    }
+
+    private fun startOrResumeInternal(
+        region: String,
+        targetPatch: String?,
+        maxBatches: Int,
+        batchSize: Int,
+        pauseDelayMs: Long,
+        maxPauseCycles: Int,
+        maxTotalProductiveBatches: Int,
+        maxTotalNetworkCalls: Int,
+        async: Boolean,
+        isAutoResume: Boolean
     ): CohortCollectorStatusDto {
         val normalizedRegion = region.lowercase().trim()
         val cleanPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
@@ -183,6 +242,8 @@ class OvernightCohortCollectorRunner(
         val coercedBatchSize = batchSize.coerceIn(1, 200)
         val coercedPauseMs = pauseDelayMs.coerceIn(0L, 60_000L)
         val coercedMaxPauseCycles = maxPauseCycles.coerceIn(1, 10_000)
+        val coercedMaxSessionBatches = maxTotalProductiveBatches.coerceIn(1, 500)
+        val coercedMaxSessionNetworkCalls = maxTotalNetworkCalls.coerceIn(1, 5_000)
 
         if (!running.compareAndSet(false, true)) {
             return getStatus(
@@ -209,10 +270,11 @@ class OvernightCohortCollectorRunner(
             )
         }
 
+        val existingCheckpoint = cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch)
         stopRequested.set(false)
         overnightSessionArmed.set(true)
         activeRegion = normalizedRegion
-        activeTargetPatch = cleanPatch
+        activeTargetPatch = cleanPatch ?: existingCheckpoint?.targetPatch ?: activeTargetPatch
         activeBatchIndex = 0
         productiveBatchesCompleted = 0
         pauseCyclesCount = 0
@@ -221,7 +283,19 @@ class OvernightCohortCollectorRunner(
         maxPauseCyclesConfigured = coercedMaxPauseCycles
         batchSizeConfigured = coercedBatchSize
         pauseDelayMsConfigured = coercedPauseMs
+        if (!isAutoResume) {
+            sessionProductiveBatchesCompleted = 0
+            maxSessionProductiveBatchesConfigured = coercedMaxSessionBatches
+            sessionBaselineNetworkCalls = existingCheckpoint?.totalNetworkCallsMade ?: 0
+            sessionNetworkCallsMade = 0
+            maxSessionNetworkCallsConfigured = coercedMaxSessionNetworkCalls
+        } else if (existingCheckpoint != null) {
+            sessionNetworkCallsMade = (existingCheckpoint.totalNetworkCallsMade - sessionBaselineNetworkCalls).coerceAtLeast(0)
+        }
         lastRunStartedAt = Instant.ofEpochMilli(timeProvider.now())
+
+        val remainingSessionBatches = (maxSessionProductiveBatchesConfigured - sessionProductiveBatchesCompleted).coerceAtLeast(0)
+        val effectiveChunkMaxBatches = minOf(coercedMaxBatches, remainingSessionBatches)
 
         if (async) {
             scope.launch {
@@ -229,7 +303,7 @@ class OvernightCohortCollectorRunner(
                     executeResumableRun(
                         region = normalizedRegion,
                         targetPatch = cleanPatch,
-                        maxBatches = coercedMaxBatches,
+                        maxBatches = effectiveChunkMaxBatches,
                         batchSize = coercedBatchSize,
                         pauseDelayMs = coercedPauseMs,
                         maxPauseCycles = coercedMaxPauseCycles
@@ -254,7 +328,7 @@ class OvernightCohortCollectorRunner(
                     executeResumableRun(
                         region = normalizedRegion,
                         targetPatch = cleanPatch,
-                        maxBatches = coercedMaxBatches,
+                        maxBatches = effectiveChunkMaxBatches,
                         batchSize = coercedBatchSize,
                         pauseDelayMs = coercedPauseMs,
                         maxPauseCycles = coercedMaxPauseCycles
@@ -269,7 +343,7 @@ class OvernightCohortCollectorRunner(
                 region = normalizedRegion,
                 targetPatch = cleanPatch ?: finalCheckpoint?.targetPatch,
                 action = "COMPLETED_SYNCHRONOUS_RUN",
-                customMessage = "Completed synchronous guarded collector run in same process (stopReason=${finalCheckpoint?.lastStopReason ?: "NONE"}, productiveBatches=$productiveBatchesCompleted/$coercedMaxBatches, pauseCycles=$pauseCyclesCount)."
+                customMessage = "Completed synchronous guarded collector run in same process (stopReason=${finalCheckpoint?.lastStopReason ?: "NONE"}, productiveBatches=$productiveBatchesCompleted/$coercedMaxBatches, sessionBatches=$sessionProductiveBatchesCompleted/$maxSessionProductiveBatchesConfigured, sessionNetworkCalls=$sessionNetworkCallsMade/$maxSessionNetworkCallsConfigured, pauseCycles=$pauseCyclesCount)."
             )
         }
     }
@@ -277,8 +351,9 @@ class OvernightCohortCollectorRunner(
     /**
      * Periodic same-process auto-resume tick for armed overnight sessions.
      * If an overnight run paused for a long rate-limit window (`PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE`)
-     * or finished a batch chunk (`BATCH_BUDGET_REACHED_RESUMABLE`) while target cells and candidates remain,
-     * automatically resumes from the Redis checkpoint once `readyForLowPriorityNetworkCollection` is true.
+     * or finished a batch chunk (`BATCH_BUDGET_REACHED_RESUMABLE`) while target cells and candidates remain
+     * AND session-level hard caps ([maxSessionProductiveBatchesConfigured], [maxSessionNetworkCallsConfigured])
+     * have not been reached, automatically resumes from the checkpoint once `readyForLowPriorityNetworkCollection` is true.
      */
     @org.springframework.scheduling.annotation.Scheduled(
         fixedDelayString = "\${cohort.collector.auto-resume-interval-ms:30000}",
@@ -293,6 +368,39 @@ class OvernightCohortCollectorRunner(
             return null
         }
         val region = activeRegion
+        val currentCheckpoint = cohortBenchmarkService.getCollectorCheckpoint(region, activeTargetPatch)
+        if (currentCheckpoint != null) {
+            sessionNetworkCallsMade = (currentCheckpoint.totalNetworkCallsMade - sessionBaselineNetworkCalls).coerceAtLeast(0)
+        }
+        if (sessionProductiveBatchesCompleted >= maxSessionProductiveBatchesConfigured ||
+            sessionNetworkCallsMade >= maxSessionNetworkCallsConfigured
+        ) {
+            overnightSessionArmed.set(false)
+            val capReason = if (sessionNetworkCallsMade >= maxSessionNetworkCallsConfigured) {
+                STOP_REASON_SESSION_NETWORK_CALL_CAP
+            } else {
+                STOP_REASON_SESSION_BATCH_CAP
+            }
+            if (currentCheckpoint != null && currentCheckpoint.lastStopReason != capReason) {
+                cohortBenchmarkService.saveCollectorCheckpoint(
+                    currentCheckpoint.copy(
+                        sessionProductiveBatchesCompleted = sessionProductiveBatchesCompleted,
+                        maxSessionProductiveBatches = maxSessionProductiveBatchesConfigured,
+                        sessionNetworkCallsMade = sessionNetworkCallsMade,
+                        maxSessionNetworkCalls = maxSessionNetworkCallsConfigured,
+                        lastStopReason = capReason,
+                        updatedAt = Instant.ofEpochMilli(timeProvider.now())
+                    )
+                )
+            }
+            logger.info(
+                "[OvernightCollector] Disarming auto-resume for region={} patch={}: session hard cap reached ({}, sessionBatches={}/{}, sessionNetworkCalls={}/{}).",
+                region, activeTargetPatch ?: "auto-cached", capReason,
+                sessionProductiveBatchesCompleted, maxSessionProductiveBatchesConfigured,
+                sessionNetworkCallsMade, maxSessionNetworkCallsConfigured
+            )
+            return null
+        }
         val liveSnap = cohortBenchmarkService.getLiveRateLimitVerification(region)
         if (!liveSnap.readyForLowPriorityNetworkCollection) {
             return null
@@ -302,17 +410,22 @@ class OvernightCohortCollectorRunner(
             return null
         }
         logger.info(
-            "[OvernightCollector] Auto-resuming armed overnight session for region={} patch={} after cooldown/memory/batch window.",
-            region, activeTargetPatch ?: "auto-cached"
+            "[OvernightCollector] Auto-resuming armed overnight session for region={} patch={} after cooldown/memory/batch window (sessionBatches={}/{}, sessionNetworkCalls={}/{}).",
+            region, activeTargetPatch ?: "auto-cached",
+            sessionProductiveBatchesCompleted, maxSessionProductiveBatchesConfigured,
+            sessionNetworkCallsMade, maxSessionNetworkCallsConfigured
         )
-        return startOrResumeGuarded(
+        return startOrResumeInternal(
             region = region,
             targetPatch = activeTargetPatch,
             maxBatches = maxBatchesConfigured,
             batchSize = batchSizeConfigured,
             pauseDelayMs = pauseDelayMsConfigured,
             maxPauseCycles = maxPauseCyclesConfigured,
-            async = async
+            maxTotalProductiveBatches = maxSessionProductiveBatchesConfigured,
+            maxTotalNetworkCalls = maxSessionNetworkCallsConfigured,
+            async = async,
+            isAutoResume = true
         )
     }
 
@@ -392,9 +505,9 @@ class OvernightCohortCollectorRunner(
         val isRunning = running.get() && activeRegion == normalizedRegion
         val isArmed = overnightSessionArmed.get() && activeRegion == normalizedRegion
         val defaultMsg = when {
-            isRunning -> "Collector is running in-process (productiveBatches=$productiveBatchesCompleted/$maxBatchesConfigured, pauseCycles=$pauseCyclesCount)."
-            isArmed && checkpoint != null -> "Collector paused in-process awaiting cooldown auto-resume (lastStopReason=${checkpoint.lastStopReason}, cellsPassing=${checkpoint.cellsPassingQualityGate}/${checkpoint.targetCellsCount})."
-            checkpoint != null -> "Collector idle in-process (lastStopReason=${checkpoint.lastStopReason}, cellsPassing=${checkpoint.cellsPassingQualityGate}/${checkpoint.targetCellsCount})."
+            isRunning -> "Collector is running in-process (productiveBatches=$productiveBatchesCompleted/$maxBatchesConfigured, sessionBatches=$sessionProductiveBatchesCompleted/$maxSessionProductiveBatchesConfigured, sessionNetworkCalls=$sessionNetworkCallsMade/$maxSessionNetworkCallsConfigured, pauseCycles=$pauseCyclesCount)."
+            isArmed && checkpoint != null -> "Collector paused in-process awaiting cooldown auto-resume (lastStopReason=${checkpoint.lastStopReason}, sessionBatches=$sessionProductiveBatchesCompleted/$maxSessionProductiveBatchesConfigured, sessionNetworkCalls=$sessionNetworkCallsMade/$maxSessionNetworkCallsConfigured, cellsPassing=${checkpoint.cellsPassingQualityGate}/${checkpoint.targetCellsCount})."
+            checkpoint != null -> "Collector idle in-process (lastStopReason=${checkpoint.lastStopReason}, sessionBatches=$sessionProductiveBatchesCompleted/$maxSessionProductiveBatchesConfigured, sessionNetworkCalls=$sessionNetworkCallsMade/$maxSessionNetworkCallsConfigured, cellsPassing=${checkpoint.cellsPassingQualityGate}/${checkpoint.targetCellsCount})."
             else -> "Collector idle in-process; no checkpoint recorded yet for region '$normalizedRegion'."
         }
 
@@ -415,6 +528,10 @@ class OvernightCohortCollectorRunner(
             maxPauseCyclesConfigured = maxPauseCyclesConfigured,
             batchSizeConfigured = batchSizeConfigured,
             pauseDelayMsConfigured = pauseDelayMsConfigured,
+            sessionProductiveBatchesCompleted = sessionProductiveBatchesCompleted,
+            maxSessionProductiveBatchesConfigured = maxSessionProductiveBatchesConfigured,
+            sessionNetworkCallsMade = sessionNetworkCallsMade,
+            maxSessionNetworkCallsConfigured = maxSessionNetworkCallsConfigured,
             lastRunStartedAt = lastRunStartedAt,
             lastRunCompletedAt = lastRunCompletedAt,
             rateLimitVerification = verification,
@@ -518,14 +635,17 @@ class OvernightCohortCollectorRunner(
     suspend fun executeResumableRun(
         region: String = "euw1",
         targetPatch: String? = null,
-        maxBatches: Int = 20,
-        batchSize: Int = 25,
+        maxBatches: Int = DEFAULT_MAX_BATCHES_PER_CHUNK,
+        batchSize: Int = DEFAULT_BATCH_SIZE,
         pauseDelayMs: Long = 2_500L,
         maxPauseCycles: Int = 240
     ): CohortCollectorCheckpointDto? {
         logger.info(
-            "[OvernightCollector] Starting same-process resumable LOW-priority cohort collector: region={}, patch={}, maxProductiveBatches={}, maxPauseCycles={}, batchSize={}, maxGamesPerPlayer={}",
-            region, targetPatch ?: "auto-cached", maxBatches, maxPauseCycles, batchSize, CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
+            "[OvernightCollector] Starting same-process resumable LOW-priority cohort collector: region={}, patch={}, maxProductiveBatches={}, maxSessionBatches={}/{}, maxSessionNetworkCalls={}/{}, maxPauseCycles={}, batchSize={}, maxGamesPerPlayer={}",
+            region, targetPatch ?: "auto-cached", maxBatches,
+            sessionProductiveBatchesCompleted, maxSessionProductiveBatchesConfigured,
+            sessionNetworkCallsMade, maxSessionNetworkCallsConfigured,
+            maxPauseCycles, batchSize, CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
         )
 
         var lastCheckpoint: CohortCollectorCheckpointDto? = null
@@ -535,6 +655,10 @@ class OvernightCohortCollectorRunner(
                 val existing = lastCheckpoint ?: cohortBenchmarkService.getCollectorCheckpoint(region, targetPatch)
                 if (existing != null) {
                     val stopped = existing.copy(
+                        sessionProductiveBatchesCompleted = sessionProductiveBatchesCompleted,
+                        maxSessionProductiveBatches = maxSessionProductiveBatchesConfigured,
+                        sessionNetworkCallsMade = sessionNetworkCallsMade,
+                        maxSessionNetworkCalls = maxSessionNetworkCallsConfigured,
                         lastStopReason = "STOPPED_BY_OPERATOR",
                         updatedAt = Instant.ofEpochMilli(timeProvider.now())
                     )
@@ -542,6 +666,37 @@ class OvernightCohortCollectorRunner(
                     lastCheckpoint = stopped
                 }
                 logger.info("[OvernightCollector] Stopping before productive batch {} due to operator stop request.", productiveBatchesCompleted + 1)
+                break
+            }
+
+            if (sessionProductiveBatchesCompleted >= maxSessionProductiveBatchesConfigured ||
+                sessionNetworkCallsMade >= maxSessionNetworkCallsConfigured
+            ) {
+                overnightSessionArmed.set(false)
+                val capReason = if (sessionNetworkCallsMade >= maxSessionNetworkCallsConfigured) {
+                    STOP_REASON_SESSION_NETWORK_CALL_CAP
+                } else {
+                    STOP_REASON_SESSION_BATCH_CAP
+                }
+                val existing = lastCheckpoint ?: cohortBenchmarkService.getCollectorCheckpoint(region, targetPatch ?: activeTargetPatch)
+                if (existing != null && existing.lastStopReason != capReason) {
+                    val capped = existing.copy(
+                        sessionProductiveBatchesCompleted = sessionProductiveBatchesCompleted,
+                        maxSessionProductiveBatches = maxSessionProductiveBatchesConfigured,
+                        sessionNetworkCallsMade = sessionNetworkCallsMade,
+                        maxSessionNetworkCalls = maxSessionNetworkCallsConfigured,
+                        lastStopReason = capReason,
+                        updatedAt = Instant.ofEpochMilli(timeProvider.now())
+                    )
+                    cohortBenchmarkService.saveCollectorCheckpoint(capped)
+                    lastCheckpoint = capped
+                }
+                logger.info(
+                    "[OvernightCollector] Stopping before batch {}: session hard cap reached ({}, sessionBatches={}/{}, sessionNetworkCalls={}/{}).",
+                    productiveBatchesCompleted + 1, capReason,
+                    sessionProductiveBatchesCompleted, maxSessionProductiveBatchesConfigured,
+                    sessionNetworkCallsMade, maxSessionNetworkCallsConfigured
+                )
                 break
             }
 
@@ -557,9 +712,14 @@ class OvernightCohortCollectorRunner(
                 targetPatch = targetPatch ?: lastCheckpoint?.targetPatch,
                 maxPlayersPerBatch = batchSize,
                 maxGamesPerPlayer = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER,
+                maxSessionNetworkCalls = maxSessionNetworkCallsConfigured,
+                sessionBaselineNetworkCalls = sessionBaselineNetworkCalls,
+                sessionProductiveBatchesBeforeBatch = sessionProductiveBatchesCompleted,
+                maxSessionProductiveBatches = maxSessionProductiveBatchesConfigured,
                 shouldStop = { stopRequested.get() }
             )
             lastCheckpoint = checkpoint
+            sessionNetworkCallsMade = (checkpoint.totalNetworkCallsMade - sessionBaselineNetworkCalls).coerceAtLeast(0)
             if (activeTargetPatch == null && checkpoint.targetPatch != null) {
                 activeTargetPatch = checkpoint.targetPatch
             }
@@ -568,12 +728,16 @@ class OvernightCohortCollectorRunner(
                 in TERMINAL_STOP_REASONS -> {
                     if (checkpoint.processedPuuids.size > processedBeforeBatch) {
                         productiveBatchesCompleted++
+                        sessionProductiveBatchesCompleted++
                         consecutivePauseCycles = 0
                     }
                     overnightSessionArmed.set(false)
                     logger.info(
-                        "[OvernightCollector] Stopping cleanly (terminal): productiveBatches={}/{}, pauseCycles={}, reason={}",
-                        productiveBatchesCompleted, maxBatches, pauseCyclesCount, checkpoint.lastStopReason
+                        "[OvernightCollector] Stopping cleanly (terminal): productiveBatches={}/{}, sessionBatches={}/{}, sessionNetworkCalls={}/{}, pauseCycles={}, reason={}",
+                        productiveBatchesCompleted, maxBatches,
+                        sessionProductiveBatchesCompleted, maxSessionProductiveBatchesConfigured,
+                        sessionNetworkCallsMade, maxSessionNetworkCallsConfigured,
+                        pauseCyclesCount, checkpoint.lastStopReason
                     )
                     break
                 }
@@ -586,11 +750,17 @@ class OvernightCohortCollectorRunner(
                     pauseCyclesCount++
                     consecutivePauseCycles++
                     logger.info(
-                        "[OvernightCollector] Paused without consuming productive batch budget (productiveBatches={}/{}, consecutivePause={}/{}, totalPauses={}, reason={})",
-                        productiveBatchesCompleted, maxBatches, consecutivePauseCycles, maxPauseCycles, pauseCyclesCount, checkpoint.lastStopReason
+                        "[OvernightCollector] Paused without consuming productive batch budget (productiveBatches={}/{}, sessionBatches={}/{}, consecutivePause={}/{}, totalPauses={}, reason={})",
+                        productiveBatchesCompleted, maxBatches,
+                        sessionProductiveBatchesCompleted, maxSessionProductiveBatchesConfigured,
+                        consecutivePauseCycles, maxPauseCycles, pauseCyclesCount, checkpoint.lastStopReason
                     )
                     if (consecutivePauseCycles >= maxPauseCycles) {
                         val cooldownCheckpoint = checkpoint.copy(
+                            sessionProductiveBatchesCompleted = sessionProductiveBatchesCompleted,
+                            maxSessionProductiveBatches = maxSessionProductiveBatchesConfigured,
+                            sessionNetworkCallsMade = sessionNetworkCallsMade,
+                            maxSessionNetworkCalls = maxSessionNetworkCallsConfigured,
                             lastStopReason = "PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE",
                             updatedAt = Instant.ofEpochMilli(timeProvider.now())
                         )
@@ -609,14 +779,47 @@ class OvernightCohortCollectorRunner(
                 }
                 else -> {
                     productiveBatchesCompleted++
+                    sessionProductiveBatchesCompleted++
                     consecutivePauseCycles = 0
                     logger.info(
-                        "[OvernightCollector] Completed productive batch {}/{}: region={}, patch={}, cellsPassing={}/{}, processedPuuids={}, pendingCandidates={}, networkCalls={}, stopReason={}",
-                        productiveBatchesCompleted, maxBatches, checkpoint.region, checkpoint.targetPatch ?: "NONE",
+                        "[OvernightCollector] Completed productive batch {}/{} (sessionBatches={}/{}, sessionNetworkCalls={}/{}): region={}, patch={}, cellsPassing={}/{}, processedPuuids={}, pendingCandidates={}, networkCalls={}, stopReason={}",
+                        productiveBatchesCompleted, maxBatches,
+                        sessionProductiveBatchesCompleted, maxSessionProductiveBatchesConfigured,
+                        sessionNetworkCallsMade, maxSessionNetworkCallsConfigured,
+                        checkpoint.region, checkpoint.targetPatch ?: "NONE",
                         checkpoint.cellsPassingQualityGate, checkpoint.targetCellsCount,
                         checkpoint.processedPuuids.size, checkpoint.pendingCandidatePuuids.size,
                         checkpoint.totalNetworkCallsMade, checkpoint.lastStopReason
                     )
+                    if (sessionProductiveBatchesCompleted >= maxSessionProductiveBatchesConfigured ||
+                        sessionNetworkCallsMade >= maxSessionNetworkCallsConfigured
+                    ) {
+                        overnightSessionArmed.set(false)
+                        val capReason = if (sessionNetworkCallsMade >= maxSessionNetworkCallsConfigured) {
+                            STOP_REASON_SESSION_NETWORK_CALL_CAP
+                        } else {
+                            STOP_REASON_SESSION_BATCH_CAP
+                        }
+                        if (checkpoint.lastStopReason != capReason) {
+                            val cappedCheckpoint = checkpoint.copy(
+                                sessionProductiveBatchesCompleted = sessionProductiveBatchesCompleted,
+                                maxSessionProductiveBatches = maxSessionProductiveBatchesConfigured,
+                                sessionNetworkCallsMade = sessionNetworkCallsMade,
+                                maxSessionNetworkCalls = maxSessionNetworkCallsConfigured,
+                                lastStopReason = capReason,
+                                updatedAt = Instant.ofEpochMilli(timeProvider.now())
+                            )
+                            cohortBenchmarkService.saveCollectorCheckpoint(cappedCheckpoint)
+                            lastCheckpoint = cappedCheckpoint
+                        }
+                        logger.info(
+                            "[OvernightCollector] Disarming and stopping after productive batch {}: session hard cap reached ({}, sessionBatches={}/{}, sessionNetworkCalls={}/{}).",
+                            productiveBatchesCompleted, capReason,
+                            sessionProductiveBatchesCompleted, maxSessionProductiveBatchesConfigured,
+                            sessionNetworkCallsMade, maxSessionNetworkCallsConfigured
+                        )
+                        break
+                    }
                 }
             }
         }
