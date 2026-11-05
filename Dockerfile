@@ -33,4 +33,4 @@ USER spring:spring
 COPY --from=build /app/build/libs/*.jar app.jar
 
 EXPOSE 8080
-ENTRYPOINT ["java", "-XX:+UseSerialGC", "-Xms32m", "-XX:MaxRAMPercentage=40.0", "-XX:MinHeapFreeRatio=10", "-XX:MaxHeapFreeRatio=25", "-XX:-ShrinkHeapInSteps", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=32m", "-XX:CICompilerCount=2", "-XX:MaxDirectMemorySize=32m", "-Dio.netty.noPreferDirect=true", "-Dio.netty.maxDirectMemory=0", "-Djdk.nio.maxCachedBufferSize=32768", "-Xss384k", "-jar", "app.jar"]
+ENTRYPOINT ["java", "-XX:NativeMemoryTracking=detail", "-XX:+UseSerialGC", "-Xms32m", "-XX:MaxRAMPercentage=40.0", "-XX:MinHeapFreeRatio=10", "-XX:MaxHeapFreeRatio=25", "-XX:-ShrinkHeapInSteps", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=32m", "-XX:CICompilerCount=2", "-XX:MaxDirectMemorySize=32m", "-Dio.netty.noPreferDirect=true", "-Dio.netty.maxDirectMemory=0", "-Djdk.nio.maxCachedBufferSize=32768", "-Xss384k", "-jar", "app.jar"]

@@ -16,6 +16,7 @@ jobs:
       with:
         java-version: '21'
         distribution: 'temurin'
+        cache: 'gradle'
     - name: Grant execute permission for gradlew and preflight script
       run: chmod +x gradlew scripts/preflight.sh
     - name: Run shared preflight (compileKotlin compileTestKotlin + full test)
@@ -26,7 +27,17 @@ jobs:
       run: |
         docker run -d --name ss-postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=summoner_searcher postgres:16-alpine
         docker run -d --name ss-redis -p 6379:6379 redis:7-alpine
-        docker build -t ss-backend:512m-proof .
+        ./gradlew bootJar --no-daemon -x test
+        cat << 'EOF' > Dockerfile.proof
+        FROM eclipse-temurin:21-jre-alpine
+        WORKDIR /app
+        RUN addgroup -S spring && adduser -S spring -G spring
+        USER spring:spring
+        COPY build/libs/*.jar app.jar
+        EXPOSE 8080
+        ENTRYPOINT ["java", "-XX:NativeMemoryTracking=detail", "-XX:+UseSerialGC", "-Xms32m", "-XX:MaxRAMPercentage=40.0", "-XX:MinHeapFreeRatio=10", "-XX:MaxHeapFreeRatio=25", "-XX:-ShrinkHeapInSteps", "-XX:MaxMetaspaceSize=128m", "-XX:ReservedCodeCacheSize=32m", "-XX:CICompilerCount=2", "-XX:MaxDirectMemorySize=32m", "-Dio.netty.noPreferDirect=true", "-Dio.netty.maxDirectMemory=0", "-Djdk.nio.maxCachedBufferSize=32768", "-Xss384k", "-jar", "app.jar"]
+        EOF
+        docker build -f Dockerfile.proof -t ss-backend:512m-proof .
         openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/mockriot.key -out /tmp/mockriot.crt -days 1 \
           -subj "/CN=api.riotgames.com" \
           -addext "subjectAltName=DNS:euw1.api.riotgames.com,DNS:na1.api.riotgames.com,DNS:kr.api.riotgames.com,DNS:europe.api.riotgames.com,DNS:americas.api.riotgames.com,DNS:asia.api.riotgames.com"

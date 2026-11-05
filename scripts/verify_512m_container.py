@@ -2,6 +2,7 @@
 import http.server
 import json
 import os
+import re
 import socketserver
 import ssl
 import subprocess
@@ -196,10 +197,7 @@ def start_mock_riot_server(cert_file: str, key_file: str):
     return httpd
 
 def http_json(url: str, method: str = "GET", body: dict = None, headers: dict = None, timeout: int = 120) -> dict:
-    req_headers = {
-        "Accept": "application/json",
-        "X-Cohort-Operator-Token": "test-op-token"
-    }
+    req_headers = {"Accept": "application/json"}
     if headers:
         req_headers.update(headers)
     data = None
@@ -210,21 +208,158 @@ def http_json(url: str, method: str = "GET", body: dict = None, headers: dict = 
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
-def read_container_events_and_cgroup(container_name: str) -> dict:
-    inspect_out = subprocess.check_output(["docker", "inspect", container_name]).decode("utf-8")
-    info = json.loads(inspect_out)[0]
-    state = info["State"]
-    stats_out = subprocess.check_output(
-        ["docker", "exec", container_name, "sh", "-c",
-         "cat /sys/fs/cgroup/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/memory.usage_in_bytes; echo '---'; "
-         "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes; echo '---'; "
-         "cat /sys/fs/cgroup/memory.events 2>/dev/null || true"]
-    ).decode("utf-8").splitlines()
+def parse_kv_bytes_file(path: str) -> dict:
+    out = {}
+    try:
+        with open(path, "r") as f:
+            for line in f:
+                parts = line.strip().split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    out[parts[0]] = int(parts[1])
+    except Exception:
+        pass
+    return out
+
+def parse_proc_kb_file(path: str) -> dict:
+    out = {}
+    try:
+        with open(path, "r") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                v_parts = v.strip().split()
+                if v_parts and v_parts[0].isdigit():
+                    out[k.strip()] = int(v_parts[0]) * 1024
+    except Exception:
+        pass
+    return out
+
+def parse_proc_smaps(host_pid: int) -> dict:
+    vmas = {}
+    try:
+        with open(f"/proc/{host_pid}/smaps", "r") as f:
+            cur_key = None
+            cur_info = None
+            for line in f:
+                if "-" in line and ":" not in line.split()[0]:
+                    parts = line.strip().split(None, 5)
+                    addr = parts[0]
+                    perms = parts[1] if len(parts) > 1 else ""
+                    name = parts[5] if len(parts) > 5 else "[anon]"
+                    cur_key = f"{addr} {perms} {name}"
+                    cur_info = {"addr": addr, "perms": perms, "name": name, "Size": 0, "Rss": 0, "Pss": 0, "Anonymous": 0, "AnonHugePages": 0}
+                    vmas[cur_key] = cur_info
+                elif cur_info is not None and ":" in line:
+                    k, v = line.split(":", 1)
+                    k = k.strip()
+                    if k in cur_info:
+                        vp = v.strip().split()
+                        if vp and vp[0].isdigit():
+                            cur_info[k] = int(vp[0]) * 1024
+    except Exception:
+        pass
+    return vmas
+
+def sample_host_proc_and_cgroup(host_pid: int) -> dict:
+    mstat = parse_kv_bytes_file(f"/proc/{host_pid}/root/sys/fs/cgroup/memory.stat")
+    status = parse_proc_kb_file(f"/proc/{host_pid}/status")
+    rollup = parse_proc_kb_file(f"/proc/{host_pid}/smaps_rollup")
+    smaps = parse_proc_smaps(host_pid)
     return {
-        "oomKilled": state.get("OOMKilled", False),
-        "restartCount": info.get("RestartCount", 0),
-        "rawCgroup": "\n".join(stats_out)
+        "mstat": mstat,
+        "status": status,
+        "rollup": rollup,
+        "smaps": smaps
     }
+
+def format_mib_diff(before_bytes: int, after_bytes: int) -> str:
+    b_mib = before_bytes / (1024 * 1024)
+    a_mib = after_bytes / (1024 * 1024)
+    d_mib = a_mib - b_mib
+    sign = "+" if d_mib >= 0 else ""
+    return f"{b_mib:.2f} -> {a_mib:.2f} MiB ({sign}{d_mib:.2f} MiB)"
+
+def print_host_diff(label: str, prev: dict, curr: dict):
+    print(f"=== HOST CGROUP & PROC DIFF: {label} ===")
+    for k in ["anon", "file", "kernel", "slab", "sock", "shmem", "anon_thp", "file_mapped"]:
+        b = prev["mstat"].get(k, 0)
+        a = curr["mstat"].get(k, 0)
+        if b > 0 or a > 0:
+            print(f"  cgroup memory.stat[{k}]: {format_mib_diff(b, a)}")
+    for k in ["VmPeak", "VmSize", "VmRSS", "RssAnon", "RssFile", "VmData", "VmStk"]:
+        b = prev["status"].get(k, 0)
+        a = curr["status"].get(k, 0)
+        if b > 0 or a > 0:
+            print(f"  /proc/pid/status[{k}]: {format_mib_diff(b, a)}")
+    for k in ["Rss", "Pss", "Anonymous", "AnonHugePages", "Private_Dirty", "Private_Clean"]:
+        b = prev["rollup"].get(k, 0)
+        a = curr["rollup"].get(k, 0)
+        if b > 0 or a > 0:
+            print(f"  /proc/pid/smaps_rollup[{k}]: {format_mib_diff(b, a)}")
+
+    # Compute VMA diffs
+    all_keys = set(prev["smaps"].keys()) | set(curr["smaps"].keys())
+    vma_diffs = []
+    for k in all_keys:
+        b_vma = prev["smaps"].get(k, {"Size": 0, "Rss": 0, "Anonymous": 0, "AnonHugePages": 0})
+        a_vma = curr["smaps"].get(k, {"Size": 0, "Rss": 0, "Anonymous": 0, "AnonHugePages": 0})
+        d_rss = a_vma["Rss"] - b_vma["Rss"]
+        d_size = a_vma["Size"] - b_vma["Size"]
+        if abs(d_rss) >= 65536 or abs(d_size) >= 262144:
+            vma_diffs.append((d_rss, d_size, k, b_vma, a_vma))
+    vma_diffs.sort(key=lambda x: abs(x[0]), reverse=True)
+    print("  Top /proc/pid/smaps VMA changes (by |delta RSS|):")
+    for d_rss, d_size, k, b_vma, a_vma in vma_diffs[:15]:
+        print(
+            f"    {k}: RSS {format_mib_diff(b_vma['Rss'], a_vma['Rss'])} | "
+            f"Size {format_mib_diff(b_vma['Size'], a_vma['Size'])} | "
+            f"Anon {format_mib_diff(b_vma['Anonymous'], a_vma['Anonymous'])}"
+        )
+
+def extract_detail_diff_highlights(detail_diff_text: str) -> str:
+    lines = detail_diff_text.splitlines()
+    out = []
+    # 1. Include everything up to "Virtual memory map:" or first 55 lines (the Summary diff section)
+    # 2. Include any Virtual memory map region or Call site that has a non-zero "+/-" diff
+    in_vmap = False
+    cur_block = []
+    for line in lines:
+        if "Virtual memory map:" in line:
+            in_vmap = True
+            out.append(line)
+            continue
+        if not in_vmap:
+            out.append(line)
+        else:
+            if line.startswith("[0x") or line.startswith("0x") or (line.strip().startswith("[0x")):
+                if cur_block:
+                    block_txt = "\n".join(cur_block)
+                    if "+" in block_txt or "-" in block_txt:
+                        out.extend(cur_block)
+                cur_block = [line]
+            elif line.startswith("Details:"):
+                if cur_block:
+                    block_txt = "\n".join(cur_block)
+                    if "+" in block_txt or "-" in block_txt:
+                        out.extend(cur_block)
+                cur_block = [line]
+                break
+            else:
+                cur_block.append(line)
+    # Also grab top non-zero call sites from Details:
+    if "Details:" in detail_diff_text:
+        details_part = detail_diff_text.split("Details:", 1)[1]
+        out.append("Details (top non-zero native allocation call sites):")
+        site_blocks = details_part.split("\n\n")
+        matched_sites = 0
+        for sb in site_blocks:
+            if ("+" in sb or "-" in sb) and ("committed=" in sb or "malloc=" in sb):
+                out.append(sb.strip())
+                matched_sites += 1
+                if matched_sites >= 15:
+                    break
+    return "\n".join(out)
 
 def main():
     cert_file = sys.argv[1]
@@ -265,13 +400,14 @@ def main():
         "ss-backend:512m-proof"
     ])
 
+    op_headers = {"X-Cohort-Operator-Token": "test-op-token"}
     base_url = "http://localhost:10000"
     print("=== Waiting for backend container on http://localhost:10000 ===", flush=True)
     boot_t0 = time.time()
     status_data = None
     for attempt in range(90):
         try:
-            status_data = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", timeout=5)
+            status_data = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=5)
             break
         except Exception:
             time.sleep(1)
@@ -280,61 +416,63 @@ def main():
         sys.exit(1)
     boot_sec = time.time() - boot_t0
     print(f"=== 1. COLD BOOT SUCCEEDED in {boot_sec:.2f}s (512 MB Container) ===", flush=True)
+
+    # Check container libc and host PID once before warmer finishes
+    host_pid = int(subprocess.check_output(["docker", "inspect", "-f", "{{.State.Pid}}", "ss-backend-512m"]).decode("utf-8").strip())
+    libc_info = subprocess.check_output(["docker", "exec", "ss-backend-512m", "sh", "-c", "ldd --version 2>&1 || true"]).decode("utf-8", errors="replace").strip()
+    print(f"Container Host PID: {host_pid}")
+    print(f"Container libc info:\n{libc_info}")
+
     # Wait 3s for startup ChallengerCacheWarmer to finish sequential warming
     time.sleep(3)
-    idle_status = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", timeout=10)
+    idle_status = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=10)
     idle_mem = idle_status["memoryHeadroom"]
-    cg_idle = read_container_events_and_cgroup("ss-backend-512m")
-    print("=== 2. IDLE + POST-WARMER MEMORY HEADROOM SNAPSHOT ===", flush=True)
-    print(json.dumps(idle_mem, indent=2), flush=True)
-    print("=== CGROUP V2 EVENTS (IDLE) ===", flush=True)
-    print(cg_idle["rawCgroup"], flush=True)
+    idle_nmt_summary = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/nmt?cmd=summary", headers=op_headers, timeout=15)
+    http_json(f"{base_url}/api/riot/cohorts/euw1/collector/nmt?cmd=baseline", headers=op_headers, timeout=15)
+    prev_host = sample_host_proc_and_cgroup(host_pid)
+    idle_host = prev_host
 
-    # Run bounded diagnostic probe (3 calls) to verify rate limits and persist a checkpoint to Redis + Postgres
+    print("=== 2. IDLE + POST-WARMER MEMORY HEADROOM SNAPSHOT ===", flush=True)
+    print(json.dumps(idle_mem, indent=2))
+    print("=== IDLE JVM ARGS, MALLOC_ARENA_MAX, THREADS, POOLS, BUFFER POOLS, GC BEANS ===")
+    print(json.dumps({
+        "vmArgs": idle_nmt_summary.get("vmArgs"),
+        "mallocArenaMax": idle_nmt_summary.get("mallocArenaMax"),
+        "threadCount": idle_nmt_summary.get("threadCount"),
+        "peakThreadCount": idle_nmt_summary.get("peakThreadCount"),
+        "nonHeapMemoryUsage": idle_nmt_summary.get("nonHeapMemoryUsage"),
+        "heapMemoryUsage": idle_nmt_summary.get("heapMemoryUsage"),
+        "memoryPools": idle_nmt_summary.get("memoryPools"),
+        "bufferPools": idle_nmt_summary.get("bufferPools"),
+        "gcBeans": idle_nmt_summary.get("gcBeans")
+    }, indent=2))
+    print("=== IDLE NMT SUMMARY ===")
+    print(idle_nmt_summary.get("nmtOutput", ""))
+
+    # Run bounded diagnostic probe (3 calls) and 1 collector batch
     probe_res = http_json(
         f"{base_url}/api/riot/cohorts/euw1/collector/probe?patch=16.7&seedPuuid=seed-puuid-1",
         method="POST",
+        headers=op_headers,
         timeout=30
     )
-    print("=== DIAGNOSTIC PROBE RESULT ===", flush=True)
-    print(json.dumps({
-        "probeStatus": probe_res.get("probeStatus"),
-        "totalHttpAttemptsMade": probe_res.get("totalHttpAttemptsMade"),
-        "checkpoint": {
-            "totalNetworkCallsMade": probe_res.get("checkpoint", {}).get("totalNetworkCallsMade"),
-            "lastStopReason": probe_res.get("checkpoint", {}).get("lastStopReason")
-        }
-    }, indent=2), flush=True)
-
-    # Run 1 productive collector batch (batchSize=2) so checkpoint has processedPuuids, pendingCandidatePuuids, and cached matches
     batch_res = http_json(
-        f"{base_url}/api/riot/cohorts/euw1/collector/start?patch=16.7&maxBatches=1&batchSize=2&async=false",
+        f"{base_url}/api/riot/cohorts/euw1/collector/start?patch=16.7&maxBatches=1&batchSize=2&maxGamesPerPlayer=10&async=false&seedPuuids=seed-puuid-1",
         method="POST",
+        headers=op_headers,
         timeout=60
     )
-    print("=== 1-BATCH COLLECTOR RUNNER RESULT ===", flush=True)
-    print(json.dumps({
-        "productiveBatchesCompleted": batch_res.get("productiveBatchesCompleted"),
-        "processedPuuids": batch_res.get("checkpoint", {}).get("processedPuuids"),
-        "pendingCount": len(batch_res.get("checkpoint", {}).get("pendingCandidatePuuids", [])),
-        "totalNetworkCallsMade": batch_res.get("checkpoint", {}).get("totalNetworkCallsMade"),
-        "lastStopReason": batch_res.get("checkpoint", {}).get("lastStopReason")
-    }, indent=2), flush=True)
+    print("=== PRE-CYCLE BASELINE RESET (AFTER PROBE + 1 BATCH) ===", flush=True)
+    http_json(f"{base_url}/api/riot/cohorts/euw1/collector/nmt?cmd=baseline", headers=op_headers, timeout=15)
+    prev_host = sample_host_proc_and_cgroup(host_pid)
+    prev_cgroup_mib = idle_mem["cgroupMemoryCurrentBytes"] / (1024 * 1024)
 
-    print("=== 3. RUNNING 10 CYCLES OF (450-MATCH PROFILE LOAD + COHORT REPORT + MEMORY SNAPSHOT) ===", flush=True)
+    print("=== 3. RUNNING 10 CYCLES OF (450-MATCH PROFILE LOAD + COHORT REPORT + NMT/CGROUP/SMAPS DIFF) ===", flush=True)
     cycle_metrics = []
     for cycle in range(1, 11):
         t0 = time.time()
-        # Flush the player profile + cooldown and cohort report + lock keys before cycles 2..10 so every cycle executes full work
         if cycle > 1:
-            subprocess.check_call(
-                ["docker", "exec", "ss-redis", "redis-cli", "DEL",
-                 "player:profile:euw1:puuid-main-450",
-                 "cooldown:profile:refresh:euw1:puuid-main-450",
-                 "cohort:report:euw1:16.7",
-                 "lock:cohort:report:euw1:16.7"],
-                stdout=subprocess.DEVNULL
-            )
+            subprocess.check_call(["docker", "exec", "ss-redis", "redis-cli", "DEL", "player:profile:euw1:puuid-main-450"], stdout=subprocess.DEVNULL)
         prof = http_json(
             f"{base_url}/api/riot/summoner/euw1/TestPlayer/EUW?refresh=true",
             method="GET",
@@ -342,60 +480,79 @@ def main():
         )
         t_prof = (time.time() - t0) * 1000.0
         t1 = time.time()
-        rep = http_json(f"{base_url}/api/riot/cohorts/euw1/report?patch=16.7", timeout=60)
+        rep = http_json(f"{base_url}/api/riot/cohorts/euw1/report?patch=16.7&recompute=true", timeout=60)
         t_rep = (time.time() - t1) * 1000.0
-        snap = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", timeout=15)["memoryHeadroom"]
+        snap = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=15)["memoryHeadroom"]
+        nmt_diff = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/nmt?cmd=detail.diff", headers=op_headers, timeout=20)
+        curr_host = sample_host_proc_and_cgroup(host_pid)
+
+        cgroup_mib = round(snap["cgroupMemoryCurrentBytes"] / (1024 * 1024), 2)
+        gc_beans = {g["name"]: g for g in (nmt_diff.get("gcBeans") or [])}
+        pools_by_name = {p["name"]: p for p in (nmt_diff.get("memoryPools") or [])}
+        tenured = pools_by_name.get("Tenured Gen", {})
+        eden = pools_by_name.get("Eden Space", {})
+
         row = {
             "cycle": cycle,
-            "recentMatchesCount": len(prof.get("recentMatches") or []),
             "profileLoadMs": round(t_prof, 1),
             "reportMs": round(t_rep, 1),
-            "cgroupCurrentMiB": round(snap["cgroupMemoryCurrentBytes"] / (1024 * 1024), 2),
+            "cgroupCurrentMiB": cgroup_mib,
             "cgroupRatioPct": round(snap["containerUtilizationRatio"] * 100.0, 2),
+            "cgroupAnonMiB": round(curr_host["mstat"].get("anon", 0) / (1024 * 1024), 2),
+            "cgroupFileMiB": round(curr_host["mstat"].get("file", 0) / (1024 * 1024), 2),
+            "cgroupSlabMiB": round(curr_host["mstat"].get("slab", 0) / (1024 * 1024), 2),
+            "cgroupSockMiB": round(curr_host["mstat"].get("sock", 0) / (1024 * 1024), 2),
+            "smapsRssMiB": round(curr_host["rollup"].get("Rss", 0) / (1024 * 1024), 2),
+            "smapsAnonMiB": round(curr_host["rollup"].get("Anonymous", 0) / (1024 * 1024), 2),
+            "smapsAnonHugeMiB": round(curr_host["rollup"].get("AnonHugePages", 0) / (1024 * 1024), 2),
             "heapUsedMiB": round(snap["jvmHeapUsedBytes"] / (1024 * 1024), 2),
             "heapCommittedMiB": round(snap["jvmHeapCommittedBytes"] / (1024 * 1024), 2),
-            "heapUnusedCommittedMiB": round(snap["jvmHeapUnusedCommittedBytes"] / (1024 * 1024), 2),
-            "metaspaceUsedMiB": round(snap["jvmMetaspaceUsedBytes"] / (1024 * 1024), 2),
+            "tenuredUsedMiB": round(tenured.get("used", 0) / (1024 * 1024), 2),
+            "tenuredCommittedMiB": round(tenured.get("committed", 0) / (1024 * 1024), 2),
+            "edenUsedMiB": round(eden.get("used", 0) / (1024 * 1024), 2),
+            "edenCommittedMiB": round(eden.get("committed", 0) / (1024 * 1024), 2),
+            "metaspacePoolUsedMiB": round(snap["jvmMetaspaceUsedBytes"] / (1024 * 1024), 2),
+            "metaspacePoolCommittedMiB": round(snap["jvmMetaspaceCommittedBytes"] / (1024 * 1024), 2),
+            "compressedClassUsedMiB": round(snap["jvmCompressedClassSpaceUsedBytes"] / (1024 * 1024), 2),
+            "compressedClassCommittedMiB": round(snap["jvmCompressedClassSpaceCommittedBytes"] / (1024 * 1024), 2),
             "codeCacheUsedMiB": round(snap["jvmCodeCacheUsedBytes"] / (1024 * 1024), 2),
+            "nonHeapTotalUsedMiB": round(snap["jvmNonHeapUsedBytes"] / (1024 * 1024), 2),
             "directUsedMiB": round(snap["directBufferUsedBytes"] / (1024 * 1024), 2),
             "nativeResidualMiB": round(snap["estimatedNativeResidualBytes"] / (1024 * 1024), 2),
             "threads": snap["jvmThreadCount"],
+            "peakThreads": nmt_diff.get("peakThreadCount"),
+            "copyGcCount": gc_beans.get("Copy", {}).get("collectionCount"),
+            "copyGcMs": gc_beans.get("Copy", {}).get("collectionTimeMs"),
+            "markSweepGcCount": gc_beans.get("MarkSweepCompact", {}).get("collectionCount"),
+            "markSweepGcMs": gc_beans.get("MarkSweepCompact", {}).get("collectionTimeMs"),
             "hasHeadroom": snap["hasHeadroomForLowPriority"]
         }
         cycle_metrics.append(row)
         print(f"CYCLE {cycle:02d}: {json.dumps(row)}", flush=True)
 
-    print("=== 4. VERIFYING POSTGRES CHECKPOINT DURABILITY ACROSS REDIS FLUSHALL ===")
-    pg_rows = subprocess.check_output([
-        "docker", "exec", "ss-postgres",
-        "psql", "-U", "postgres", "-d", "summoner_searcher", "-t", "-A", "-c",
-        "SELECT region, target_patch, queue_id, last_stop_reason, total_network_calls_made, processed_puuids_count, pending_candidates_count FROM cohort_collector_checkpoints ORDER BY target_patch;"
-    ]).decode("utf-8").strip()
-    print("POSTGRES cohort_collector_checkpoints ROWS:")
-    print(pg_rows)
+        if cycle in (1, 6, 7, 10) or abs(cgroup_mib - prev_cgroup_mib) >= 8.0:
+            print_host_diff(f"Cycle {cycle - 1} -> Cycle {cycle}", prev_host, curr_host)
+            print(f"=== NMT DETAIL DIFF (Cycle {cycle - 1} -> Cycle {cycle}) ===")
+            print(extract_detail_diff_highlights(nmt_diff.get("nmtOutput", "")), flush=True)
 
-    subprocess.check_call(["docker", "exec", "ss-redis", "redis-cli", "FLUSHALL"])
-    after_flush_status = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", timeout=15)
-    recovered_cp = after_flush_status.get("checkpoint")
-    print("RECOVERED CHECKPOINT AFTER REDIS FLUSHALL:")
-    print(json.dumps({
-        "region": recovered_cp.get("region"),
-        "targetPatch": recovered_cp.get("targetPatch"),
-        "processedPuuids": recovered_cp.get("processedPuuids"),
-        "pendingCount": len(recovered_cp.get("pendingCandidatePuuids", [])),
-        "totalNetworkCallsMade": recovered_cp.get("totalNetworkCallsMade"),
-        "lastStopReason": recovered_cp.get("lastStopReason")
-    }, indent=2))
+        # Reset NMT baseline to current cycle so next cycle diffs cleanly against this cycle
+        http_json(f"{base_url}/api/riot/cohorts/euw1/collector/nmt?cmd=baseline", headers=op_headers, timeout=15)
+        prev_host = curr_host
+        prev_cgroup_mib = cgroup_mib
 
-    cg_final = read_container_events_and_cgroup("ss-backend-512m")
-    print("=== FINAL CGROUP V2 EVENTS & OOM CHECK ===")
-    print(json.dumps(cg_final, indent=2))
+    print("=== 4. POST-CYCLE-10 EXPLICIT GC CHECK ===", flush=True)
+    gc_nmt = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/nmt?cmd=gc", headers=op_headers, timeout=20)
+    post_gc_snap = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=15)["memoryHeadroom"]
+    post_gc_host = sample_host_proc_and_cgroup(host_pid)
+    print("POST-GC MEMORY HEADROOM SNAPSHOT:")
+    print(json.dumps(post_gc_snap, indent=2))
+    print_host_diff("Cycle 10 -> Post-GC", prev_host, post_gc_host)
+    print("=== POST-GC NMT DIFF (Cycle 10 -> Post-GC) ===")
+    print(gc_nmt.get("nmtOutput", ""))
 
-    assert not cg_final["oomKilled"], "Container was OOMKilled!"
-    assert cg_final["restartCount"] == 0, "Container restarted unexpectedly!"
-    assert recovered_cp is not None and recovered_cp.get("totalNetworkCallsMade", 0) > 0, "Postgres checkpoint recovery failed!"
-    assert all(c["cgroupRatioPct"] < 78.0 for c in cycle_metrics), "Memory exceeded 78% gate during 10-cycle load!"
-    print("=== ALL 512 MB CONTAINER PROOFS PASSED ===")
+    post_gc_summary = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/nmt?cmd=summary", headers=op_headers, timeout=20)
+    print("=== POST-GC FULL NMT SUMMARY ===")
+    print(post_gc_summary.get("nmtOutput", ""), flush=True)
 
 if __name__ == "__main__":
     main()

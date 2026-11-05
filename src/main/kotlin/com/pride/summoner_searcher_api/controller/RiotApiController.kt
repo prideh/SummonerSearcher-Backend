@@ -267,6 +267,87 @@ class RiotApiController(
         return ResponseEntity.ok(runner.requestStop(region = region, targetPatch = patch))
     }
 
+    @GetMapping("/cohorts/{region}/collector/nmt")
+    fun getCollectorNmtDiagnostics(
+        @PathVariable region: String,
+        @org.springframework.web.bind.annotation.RequestParam(defaultValue = "summary") cmd: String
+    ): ResponseEntity<Map<String, Any?>> {
+        val nmtOutput = try {
+            val mbeanServer = java.lang.management.ManagementFactory.getPlatformMBeanServer()
+            val objName = javax.management.ObjectName("com.sun.management:type=DiagnosticCommand")
+            if (cmd == "gc") {
+                System.gc()
+                mbeanServer.invoke(
+                    objName,
+                    "vmNativeMemory",
+                    arrayOf(arrayOf("summary.diff")),
+                    arrayOf("[Ljava.lang.String;")
+                ) as? String ?: ""
+            } else {
+                mbeanServer.invoke(
+                    objName,
+                    "vmNativeMemory",
+                    arrayOf(arrayOf(cmd)),
+                    arrayOf("[Ljava.lang.String;")
+                ) as? String ?: ""
+            }
+        } catch (e: Exception) {
+            "ERR: ${e.javaClass.name}: ${e.message}"
+        }
+
+        val pools = java.lang.management.ManagementFactory.getMemoryPoolMXBeans().map { pool ->
+            val u = pool.usage
+            mapOf(
+                "name" to pool.name,
+                "type" to pool.type.name,
+                "used" to (u?.used ?: 0L),
+                "committed" to (u?.committed ?: 0L),
+                "max" to (u?.max ?: -1L)
+            )
+        }
+        val bufferPools = java.lang.management.ManagementFactory.getPlatformMXBeans(
+            java.lang.management.BufferPoolMXBean::class.java
+        ).map { bp ->
+            mapOf(
+                "name" to bp.name,
+                "count" to bp.count,
+                "memoryUsed" to bp.memoryUsed,
+                "totalCapacity" to bp.totalCapacity
+            )
+        }
+        val gcBeans = java.lang.management.ManagementFactory.getGarbageCollectorMXBeans().map { gc ->
+            mapOf(
+                "name" to gc.name,
+                "collectionCount" to gc.collectionCount,
+                "collectionTimeMs" to gc.collectionTime
+            )
+        }
+        val threadBean = java.lang.management.ManagementFactory.getThreadMXBean()
+        return ResponseEntity.ok(
+            mapOf(
+                "cmd" to cmd,
+                "nmtOutput" to nmtOutput,
+                "vmArgs" to java.lang.management.ManagementFactory.getRuntimeMXBean().inputArguments,
+                "mallocArenaMax" to System.getenv("MALLOC_ARENA_MAX"),
+                "threadCount" to threadBean.threadCount,
+                "peakThreadCount" to threadBean.peakThreadCount,
+                "daemonThreadCount" to threadBean.daemonThreadCount,
+                "nonHeapMemoryUsage" to mapOf(
+                    "used" to java.lang.management.ManagementFactory.getMemoryMXBean().nonHeapMemoryUsage.used,
+                    "committed" to java.lang.management.ManagementFactory.getMemoryMXBean().nonHeapMemoryUsage.committed
+                ),
+                "heapMemoryUsage" to mapOf(
+                    "used" to java.lang.management.ManagementFactory.getMemoryMXBean().heapMemoryUsage.used,
+                    "committed" to java.lang.management.ManagementFactory.getMemoryMXBean().heapMemoryUsage.committed,
+                    "max" to java.lang.management.ManagementFactory.getMemoryMXBean().heapMemoryUsage.max
+                ),
+                "memoryPools" to pools,
+                "bufferPools" to bufferPools,
+                "gcBeans" to gcBeans
+            )
+        )
+    }
+
     private fun isAuthorizedCollectorOperator(
         runner: com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner,
         httpRequest: jakarta.servlet.http.HttpServletRequest,
