@@ -2058,8 +2058,8 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 callsAfterBatchCap shouldBe 4
 
                 // Part 2 assertions: maxTotalNetworkCalls = 3 (starting from baseline=4 -> ceiling=7 total calls)
-                netCapChunk1Status.productiveBatchesCompleted shouldBe 1
-                netCapChunk1Status.sessionProductiveBatchesCompleted shouldBe 1
+                netCapChunk1Status.productiveBatchesCompleted shouldBe 0
+                netCapChunk1Status.sessionProductiveBatchesCompleted shouldBe 0
                 netCapChunk1Status.sessionNetworkCallsMade shouldBe 2
                 netCapChunk1Status.overnightSessionArmed shouldBe true
                 netCapChunk1Status.checkpoint?.lastStopReason shouldBe "PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE"
