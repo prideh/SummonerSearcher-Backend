@@ -261,33 +261,78 @@ def parse_proc_smaps(host_pid: int) -> dict:
         pass
     return vmas
 
+def read_int_file(path: str, default: int = 0) -> int:
+    try:
+        with open(path, "r") as f:
+            val = f.read().strip()
+            return int(val) if val.isdigit() else default
+    except Exception:
+        return default
+
+def read_host_cgroup_snapshot(host_pid: int) -> dict:
+    cg_dir = f"/proc/{host_pid}/root/sys/fs/cgroup"
+    current_bytes = read_int_file(f"{cg_dir}/memory.current", 0)
+    peak_bytes = read_int_file(f"{cg_dir}/memory.peak", 0)
+    max_bytes = read_int_file(f"{cg_dir}/memory.max", 536870912)
+    if max_bytes <= 0:
+        max_bytes = 536870912
+    if peak_bytes <= 0:
+        peak_bytes = current_bytes
+    return {
+        "cgroupCurrentBytes": current_bytes,
+        "cgroupCurrentMiB": round(current_bytes / (1024 * 1024), 2),
+        "cgroupRatioPct": round((current_bytes / max_bytes) * 100.0, 2),
+        "cgroupPeakBytes": peak_bytes,
+        "cgroupPeakMiB": round(peak_bytes / (1024 * 1024), 2),
+        "cgroupPeakRatioPct": round((peak_bytes / max_bytes) * 100.0, 2),
+        "cgroupMaxBytes": max_bytes
+    }
+
 def sample_host_proc_and_cgroup(host_pid: int) -> dict:
     mstat = parse_kv_bytes_file(f"/proc/{host_pid}/root/sys/fs/cgroup/memory.stat")
     status = parse_proc_kb_file(f"/proc/{host_pid}/status")
     rollup = parse_proc_kb_file(f"/proc/{host_pid}/smaps_rollup")
     smaps = parse_proc_smaps(host_pid)
+    cg = read_host_cgroup_snapshot(host_pid)
     return {
+        "cgroup": cg,
         "mstat": mstat,
         "status": status,
         "rollup": rollup,
         "smaps": smaps
     }
 
-def read_container_events_and_cgroup(container_name: str) -> dict:
+def read_container_events_and_cgroup(container_name: str, host_pid: int) -> dict:
     inspect_out = subprocess.check_output(["docker", "inspect", container_name]).decode("utf-8")
     info = json.loads(inspect_out)[0]
     state = info["State"]
-    stats_out = subprocess.check_output(
-        ["docker", "exec", container_name, "sh", "-c",
-         "cat /sys/fs/cgroup/memory.current 2>/dev/null || cat /sys/fs/cgroup/memory/memory.usage_in_bytes; echo '---'; "
-         "cat /sys/fs/cgroup/memory.max 2>/dev/null || cat /sys/fs/cgroup/memory/memory.limit_in_bytes; echo '---'; "
-         "cat /sys/fs/cgroup/memory.events 2>/dev/null || true"]
-    ).decode("utf-8").splitlines()
+    cg_dir = f"/proc/{host_pid}/root/sys/fs/cgroup"
+    cg_snap = read_host_cgroup_snapshot(host_pid)
+    events_raw = ""
+    try:
+        with open(f"{cg_dir}/memory.events", "r") as f:
+            events_raw = f.read().strip()
+    except Exception:
+        pass
+    raw_cgroup = (
+        f"current={cg_snap['cgroupCurrentBytes']} ({cg_snap['cgroupCurrentMiB']} MiB, {cg_snap['cgroupRatioPct']}%)\n"
+        f"peak={cg_snap['cgroupPeakBytes']} ({cg_snap['cgroupPeakMiB']} MiB, {cg_snap['cgroupPeakRatioPct']}%)\n"
+        f"max={cg_snap['cgroupMaxBytes']}\n"
+        f"---\n{events_raw}"
+    )
     return {
         "oomKilled": state.get("OOMKilled", False),
         "restartCount": info.get("RestartCount", 0),
-        "rawCgroup": "\n".join(stats_out)
+        "cgroupCurrentBytes": cg_snap["cgroupCurrentBytes"],
+        "cgroupCurrentMiB": cg_snap["cgroupCurrentMiB"],
+        "cgroupRatioPct": cg_snap["cgroupRatioPct"],
+        "cgroupPeakBytes": cg_snap["cgroupPeakBytes"],
+        "cgroupPeakMiB": cg_snap["cgroupPeakMiB"],
+        "cgroupPeakRatioPct": cg_snap["cgroupPeakRatioPct"],
+        "cgroupMaxBytes": cg_snap["cgroupMaxBytes"],
+        "rawCgroup": raw_cgroup
     }
+
 
 def main():
     cert_file = sys.argv[1]
@@ -347,12 +392,66 @@ def main():
 
     host_pid = int(subprocess.check_output(["docker", "inspect", "-f", "{{.State.Pid}}", "ss-backend-512m"]).decode("utf-8").strip())
 
+    sampler_samples = []
+    sampler_lock = threading.Lock()
+    sampler_stop = threading.Event()
+    sampler_t0 = time.time()
+
+    def record_5s_sample(tag: str = "timer") -> dict:
+        cg = read_host_cgroup_snapshot(host_pid)
+        with sampler_lock:
+            entry = {
+                "sampleIdx": len(sampler_samples) + 1,
+                "elapsedSec": round(time.time() - sampler_t0, 2),
+                "tag": tag,
+                "cgroupCurrentBytes": cg["cgroupCurrentBytes"],
+                "cgroupCurrentMiB": cg["cgroupCurrentMiB"],
+                "cgroupRatioPct": cg["cgroupRatioPct"],
+                "cgroupPeakBytes": cg["cgroupPeakBytes"],
+                "cgroupPeakMiB": cg["cgroupPeakMiB"],
+                "cgroupPeakRatioPct": cg["cgroupPeakRatioPct"]
+            }
+            sampler_samples.append(entry)
+            return entry
+
+    def get_5s_sampler_max() -> dict:
+        with sampler_lock:
+            if not sampler_samples:
+                cg = read_host_cgroup_snapshot(host_pid)
+                return {
+                    "sampleCount": 0,
+                    "maxCurrentBytes": cg["cgroupCurrentBytes"],
+                    "maxCurrentMiB": cg["cgroupCurrentMiB"],
+                    "maxCurrentRatioPct": cg["cgroupRatioPct"],
+                    "maxPeakBytes": cg["cgroupPeakBytes"],
+                    "maxPeakMiB": cg["cgroupPeakMiB"],
+                    "maxPeakRatioPct": cg["cgroupPeakRatioPct"]
+                }
+            return {
+                "sampleCount": len(sampler_samples),
+                "maxCurrentBytes": max(s["cgroupCurrentBytes"] for s in sampler_samples),
+                "maxCurrentMiB": max(s["cgroupCurrentMiB"] for s in sampler_samples),
+                "maxCurrentRatioPct": max(s["cgroupRatioPct"] for s in sampler_samples),
+                "maxPeakBytes": max(s["cgroupPeakBytes"] for s in sampler_samples),
+                "maxPeakMiB": max(s["cgroupPeakMiB"] for s in sampler_samples),
+                "maxPeakRatioPct": max(s["cgroupPeakRatioPct"] for s in sampler_samples)
+            }
+
+    def sampler_loop():
+        record_5s_sample("boot")
+        while not sampler_stop.wait(5.0):
+            record_5s_sample("5s_poll")
+
+    sampler_thread = threading.Thread(target=sampler_loop, daemon=True)
+    sampler_thread.start()
+
     # Wait 3s for startup ChallengerCacheWarmer to finish sequential warming
     time.sleep(3)
     idle_status = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=10)
     idle_mem = idle_status["memoryHeadroom"]
-    cg_idle = read_container_events_and_cgroup("ss-backend-512m")
+    cg_idle = read_container_events_and_cgroup("ss-backend-512m", host_pid)
     idle_host = sample_host_proc_and_cgroup(host_pid)
+    record_5s_sample("idle")
 
     print("=== 2. IDLE + POST-WARMER MEMORY HEADROOM SNAPSHOT ===", flush=True)
     print(json.dumps(idle_mem, indent=2), flush=True)
@@ -392,12 +491,14 @@ def main():
         "lastStopReason": batch_res.get("checkpoint", {}).get("lastStopReason")
     }, indent=2), flush=True)
 
-    # Set NMT baseline once before the 10-cycle loop so the separate non-gating step can diff against Pre-Cycle
-    try:
-        http_json(f"{base_url}/api/riot/cohorts/euw1/collector/nmt?cmd=baseline", headers=op_headers, timeout=15)
-    except Exception:
-        pass
+    # Only set NMT baseline if NMT is enabled in the container so we do not trigger unnecessary MBean overhead when NMT is off
+    if os.environ.get("ENABLE_NMT", "1") == "1":
+        try:
+            http_json(f"{base_url}/api/riot/cohorts/euw1/collector/nmt?cmd=baseline", headers=op_headers, timeout=15)
+        except Exception:
+            pass
     pre_cycle_host = sample_host_proc_and_cgroup(host_pid)
+    record_5s_sample("pre_cycle")
     host_samples_by_stage = {
         "idle": idle_host,
         "pre_cycle": pre_cycle_host,
@@ -407,11 +508,13 @@ def main():
     proof_mode = os.environ.get("PROOF_MODE", "10_CYCLE")
     cycle_metrics = []
     if proof_mode == "SUSTAINED_30M":
-        print("=== 3. RUNNING SUSTAINED 30-MINUTE (1800s) GATED LOAD (SAMPLED AT LEAST EVERY 30s, MOCK RIOT SERVER != LIVE INTERNET) ===", flush=True)
+        print("=== 3. RUNNING SUSTAINED 30-MINUTE (1800s) GATED LOAD (SAMPLED AT LEAST EVERY 30s + 5s BACKGROUND SAMPLER + memory.peak, MOCK RIOT SERVER != LIVE INTERNET) ===", flush=True)
         sustained_t0 = time.time()
         last_sample_ts = sustained_t0
         # Record initial sample 0 at t=0.0s before the ~13.5s cold 450-match load so sample interval is strictly <= 30s
         snap0 = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=15)["memoryHeadroom"]
+        cg0 = record_5s_sample("sustained_sample_0")
+        smax0 = get_5s_sampler_max()
         mstat0 = parse_kv_bytes_file(f"/proc/{host_pid}/root/sys/fs/cgroup/memory.stat")
         rollup0 = parse_proc_kb_file(f"/proc/{host_pid}/smaps_rollup")
         row0 = {
@@ -422,8 +525,14 @@ def main():
             "reportSource": "PRE_LOAD_BASELINE",
             "profileLoadMs": 0.0,
             "reportMs": 0.0,
+            "cgroupCurrentBytes": snap0["cgroupMemoryCurrentBytes"],
             "cgroupCurrentMiB": round(snap0["cgroupMemoryCurrentBytes"] / (1024 * 1024), 2),
             "cgroupRatioPct": round(snap0["containerUtilizationRatio"] * 100.0, 2),
+            "cgroupPeakBytes": cg0["cgroupPeakBytes"],
+            "cgroupPeakMiB": cg0["cgroupPeakMiB"],
+            "cgroupPeakRatioPct": cg0["cgroupPeakRatioPct"],
+            "sampler5sMaxCurrentMiB": smax0["maxCurrentMiB"],
+            "sampler5sMaxRatioPct": smax0["maxCurrentRatioPct"],
             "cgroupAnonMiB": round(mstat0.get("anon", 0) / (1024 * 1024), 2),
             "cgroupFileMiB": round(mstat0.get("file", 0) / (1024 * 1024), 2),
             "cgroupSlabMiB": round(mstat0.get("slab", 0) / (1024 * 1024), 2),
@@ -469,6 +578,8 @@ def main():
             rep = http_json(f"{base_url}/api/riot/cohorts/euw1/report?patch=16.7", timeout=60)
             t_rep = (time.time() - t1) * 1000.0
             snap = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=15)["memoryHeadroom"]
+            cg_now = record_5s_sample(f"sustained_sample_{sample_idx}")
+            smax_now = get_5s_sampler_max()
             now_ts = time.time()
             elapsed_sec = now_ts - sustained_t0
             delta_sec = now_ts - last_sample_ts
@@ -491,8 +602,14 @@ def main():
                 "reportSource": rep.get("reportSource"),
                 "profileLoadMs": round(t_prof, 1),
                 "reportMs": round(t_rep, 1),
+                "cgroupCurrentBytes": snap["cgroupMemoryCurrentBytes"],
                 "cgroupCurrentMiB": round(snap["cgroupMemoryCurrentBytes"] / (1024 * 1024), 2),
                 "cgroupRatioPct": round(snap["containerUtilizationRatio"] * 100.0, 2),
+                "cgroupPeakBytes": cg_now["cgroupPeakBytes"],
+                "cgroupPeakMiB": cg_now["cgroupPeakMiB"],
+                "cgroupPeakRatioPct": cg_now["cgroupPeakRatioPct"],
+                "sampler5sMaxCurrentMiB": smax_now["maxCurrentMiB"],
+                "sampler5sMaxRatioPct": smax_now["maxCurrentRatioPct"],
                 "cgroupAnonMiB": round(mstat.get("anon", 0) / (1024 * 1024), 2),
                 "cgroupFileMiB": round(mstat.get("file", 0) / (1024 * 1024), 2),
                 "cgroupSlabMiB": round(mstat.get("slab", 0) / (1024 * 1024), 2),
@@ -522,6 +639,7 @@ def main():
 
         warm_rows = [r for r in cycle_metrics if r.get("sample", 0) >= 2]
         max_delta_sec = max(r["deltaSec"] for r in cycle_metrics)
+        smax_end = get_5s_sampler_max()
         sustained_summary = {
             "proofMode": "SUSTAINED_30M",
             "totalDurationSec": cycle_metrics[-1]["elapsedSec"],
@@ -533,6 +651,16 @@ def main():
             "minCgroupRatioPct": min(r["cgroupRatioPct"] for r in cycle_metrics),
             "maxCgroupRatioPct": max(r["cgroupRatioPct"] for r in cycle_metrics),
             "finalCgroupRatioPct": cycle_metrics[-1]["cgroupRatioPct"],
+            "maxCgroupPeakBytes": max(r["cgroupPeakBytes"] for r in cycle_metrics),
+            "maxCgroupPeakMiB": max(r["cgroupPeakMiB"] for r in cycle_metrics),
+            "maxCgroupPeakRatioPct": max(r["cgroupPeakRatioPct"] for r in cycle_metrics),
+            "sampler5sSampleCount": smax_end["sampleCount"],
+            "sampler5sMaxCurrentBytes": smax_end["maxCurrentBytes"],
+            "sampler5sMaxCurrentMiB": smax_end["maxCurrentMiB"],
+            "sampler5sMaxCurrentRatioPct": smax_end["maxCurrentRatioPct"],
+            "sampler5sMaxPeakBytes": smax_end["maxPeakBytes"],
+            "sampler5sMaxPeakMiB": smax_end["maxPeakMiB"],
+            "sampler5sMaxPeakRatioPct": smax_end["maxPeakRatioPct"],
             "warmProfileLoadMsMin": min(r["profileLoadMs"] for r in warm_rows),
             "warmProfileLoadMsMax": max(r["profileLoadMs"] for r in warm_rows),
             "warmProfileLoadMsAvg": round(sum(r["profileLoadMs"] for r in warm_rows) / len(warm_rows), 1),
@@ -544,7 +672,7 @@ def main():
         print("=== SUSTAINED 30-MINUTE SUMMARY ===", flush=True)
         print(json.dumps(sustained_summary, indent=2), flush=True)
     else:
-        print("=== 3. RUNNING 10 CYCLES OF (450-MATCH PROFILE LOAD + COHORT REPORT + MEMORY SNAPSHOT) ===", flush=True)
+        print("=== 3. RUNNING 10 CYCLES OF (450-MATCH PROFILE LOAD + COHORT REPORT + MEMORY SNAPSHOT + 5s SAMPLER + memory.peak) ===", flush=True)
         for cycle in range(1, 11):
             t0 = time.time()
             # Flush the player profile + cooldown and cohort report + lock keys before cycles 2..10 so every cycle executes full work
@@ -567,6 +695,8 @@ def main():
             rep = http_json(f"{base_url}/api/riot/cohorts/euw1/report?patch=16.7", timeout=60)
             t_rep = (time.time() - t1) * 1000.0
             snap = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=15)["memoryHeadroom"]
+            cg_now = record_5s_sample(f"cycle_{cycle}")
+            smax_now = get_5s_sampler_max()
             curr_host = sample_host_proc_and_cgroup(host_pid)
             host_samples_by_stage["cycles"][str(cycle)] = curr_host
 
@@ -576,8 +706,14 @@ def main():
                 "reportSource": rep.get("reportSource"),
                 "profileLoadMs": round(t_prof, 1),
                 "reportMs": round(t_rep, 1),
+                "cgroupCurrentBytes": snap["cgroupMemoryCurrentBytes"],
                 "cgroupCurrentMiB": round(snap["cgroupMemoryCurrentBytes"] / (1024 * 1024), 2),
                 "cgroupRatioPct": round(snap["containerUtilizationRatio"] * 100.0, 2),
+                "cgroupPeakBytes": cg_now["cgroupPeakBytes"],
+                "cgroupPeakMiB": cg_now["cgroupPeakMiB"],
+                "cgroupPeakRatioPct": cg_now["cgroupPeakRatioPct"],
+                "sampler5sMaxCurrentMiB": smax_now["maxCurrentMiB"],
+                "sampler5sMaxRatioPct": smax_now["maxCurrentRatioPct"],
                 "heapUsedMiB": round(snap["jvmHeapUsedBytes"] / (1024 * 1024), 2),
                 "heapCommittedMiB": round(snap["jvmHeapCommittedBytes"] / (1024 * 1024), 2),
                 "heapUnusedCommittedMiB": round(snap["jvmHeapUnusedCommittedBytes"] / (1024 * 1024), 2),
@@ -595,14 +731,6 @@ def main():
             cycle_metrics.append(row)
             print(f"CYCLE {cycle:02d}: {json.dumps(row)}", flush=True)
 
-    # Persist passive host samples so the separate non-gating diagnostic step can inspect them even if an assert fails below
-    with open("/tmp/proof_host_samples.json", "w") as f:
-        json.dump({
-            "hostPid": host_pid,
-            "cycleMetrics": cycle_metrics,
-            "samples": host_samples_by_stage
-        }, f)
-
     print("=== 4. VERIFYING POSTGRES CHECKPOINT DURABILITY ACROSS REDIS FLUSHALL ===", flush=True)
     pg_rows = subprocess.check_output([
         "docker", "exec", "ss-postgres",
@@ -614,6 +742,8 @@ def main():
 
     subprocess.check_call(["docker", "exec", "ss-redis", "redis-cli", "FLUSHALL"])
     after_flush_status = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=15)
+    after_flush_mem = after_flush_status["memoryHeadroom"]
+    after_flush_cg = record_5s_sample("after_flush")
     recovered_cp = after_flush_status.get("checkpoint")
     print("RECOVERED CHECKPOINT AFTER REDIS FLUSHALL:")
     print(json.dumps({
@@ -625,9 +755,45 @@ def main():
         "lastStopReason": recovered_cp.get("lastStopReason")
     }, indent=2), flush=True)
 
-    cg_final = read_container_events_and_cgroup("ss-backend-512m")
+    after_flush_row = {
+        "stage": "AFTER_REDIS_FLUSHALL_AND_PG_CHECKPOINT_RECOVERY",
+        "cgroupCurrentBytes": after_flush_mem["cgroupMemoryCurrentBytes"],
+        "cgroupCurrentMiB": round(after_flush_mem["cgroupMemoryCurrentBytes"] / (1024 * 1024), 2),
+        "cgroupRatioPct": round(after_flush_mem["containerUtilizationRatio"] * 100.0, 2),
+        "hostCgroupCurrentBytes": after_flush_cg["cgroupCurrentBytes"],
+        "hostCgroupCurrentMiB": after_flush_cg["cgroupCurrentMiB"],
+        "hostCgroupRatioPct": after_flush_cg["cgroupRatioPct"],
+        "cgroupPeakBytes": after_flush_cg["cgroupPeakBytes"],
+        "cgroupPeakMiB": after_flush_cg["cgroupPeakMiB"],
+        "cgroupPeakRatioPct": after_flush_cg["cgroupPeakRatioPct"],
+        "heapUsedMiB": round(after_flush_mem["jvmHeapUsedBytes"] / (1024 * 1024), 2),
+        "heapCommittedMiB": round(after_flush_mem["jvmHeapCommittedBytes"] / (1024 * 1024), 2),
+        "nonHeapTotalUsedMiB": round(after_flush_mem["jvmNonHeapUsedBytes"] / (1024 * 1024), 2),
+        "nativeResidualMiB": round(after_flush_mem["estimatedNativeResidualBytes"] / (1024 * 1024), 2),
+        "hasHeadroom": after_flush_mem["hasHeadroomForLowPriority"]
+    }
+    print("=== AFTER-FLUSH CHECKPOINT RECOVERY MEMORY SNAPSHOT ===", flush=True)
+    print(json.dumps(after_flush_row, indent=2), flush=True)
+
+    cg_final = read_container_events_and_cgroup("ss-backend-512m", host_pid)
+    record_5s_sample("final")
+    sampler_stop.set()
+    sampler_summary = get_5s_sampler_max()
+    print("=== 5-SECOND BACKGROUND CGROUP SAMPLER SUMMARY ===", flush=True)
+    print(json.dumps(sampler_summary, indent=2), flush=True)
     print("=== FINAL CGROUP V2 EVENTS & OOM CHECK ===", flush=True)
     print(json.dumps(cg_final, indent=2), flush=True)
+
+    # Persist passive host samples so the separate non-gating diagnostic step can inspect them even if an assert fails below
+    with open("/tmp/proof_host_samples.json", "w") as f:
+        json.dump({
+            "hostPid": host_pid,
+            "cycleMetrics": cycle_metrics,
+            "afterFlush": after_flush_row,
+            "samplerSummary": sampler_summary,
+            "finalCgroup": cg_final,
+            "samples": host_samples_by_stage
+        }, f)
 
     assert not cg_final["oomKilled"], "Container was OOMKilled!"
     assert cg_final["restartCount"] == 0, "Container restarted unexpectedly!"
@@ -636,10 +802,35 @@ def main():
         assert cycle_metrics[-1]["elapsedSec"] >= 1800.0, f"Sustained run was shorter than 1800s ({cycle_metrics[-1]['elapsedSec']}s)!"
         assert max(r["deltaSec"] for r in cycle_metrics) <= 30.0, f"Sample interval exceeded 30s ({max(r['deltaSec'] for r in cycle_metrics)}s)!"
     assert all(c["cgroupRatioPct"] < 78.0 for c in cycle_metrics), (
-        f"Memory exceeded 78.0% gate! Max was {max(c['cgroupRatioPct'] for c in cycle_metrics):.2f}%"
+        f"Checkpoint cgroupRatioPct exceeded 78.0% gate! Max was {max(c['cgroupRatioPct'] for c in cycle_metrics):.2f}%"
     )
-    print("=== ALL 512 MB CONTAINER PROOFS PASSED ===", flush=True)
+    assert all(c["cgroupPeakRatioPct"] < 78.0 for c in cycle_metrics), (
+        f"Cycle cgroupPeakRatioPct (memory.peak) exceeded 78.0% gate! Max was {max(c['cgroupPeakRatioPct'] for c in cycle_metrics):.2f}%"
+    )
+    assert sampler_summary["maxCurrentRatioPct"] < 78.0, (
+        f"5s background sampler maxCurrentRatioPct exceeded 78.0% gate! Max was {sampler_summary['maxCurrentRatioPct']:.2f}%"
+    )
+    assert sampler_summary["maxPeakRatioPct"] < 78.0, (
+        f"5s background sampler maxPeakRatioPct (memory.peak) exceeded 78.0% gate! Max was {sampler_summary['maxPeakRatioPct']:.2f}%"
+    )
+    assert after_flush_row["cgroupRatioPct"] < 78.0, (
+        f"After-FLUSHALL checkpoint recovery cgroupRatioPct exceeded 78.0% gate! Was {after_flush_row['cgroupRatioPct']:.2f}%"
+    )
+    assert after_flush_row["hostCgroupRatioPct"] < 78.0, (
+        f"After-FLUSHALL hostCgroupRatioPct exceeded 78.0% gate! Was {after_flush_row['hostCgroupRatioPct']:.2f}%"
+    )
+    assert after_flush_row["cgroupPeakRatioPct"] < 78.0, (
+        f"After-FLUSHALL cgroupPeakRatioPct (memory.peak) exceeded 78.0% gate! Was {after_flush_row['cgroupPeakRatioPct']:.2f}%"
+    )
+    assert cg_final["cgroupRatioPct"] < 78.0, (
+        f"Final cgroupRatioPct exceeded 78.0% gate! Was {cg_final['cgroupRatioPct']:.2f}%"
+    )
+    assert cg_final["cgroupPeakRatioPct"] < 78.0, (
+        f"Final cgroupPeakRatioPct (memory.peak) exceeded 78.0% gate! Was {cg_final['cgroupPeakRatioPct']:.2f}%"
+    )
+    print("=== ALL 512 MB CONTAINER PROOFS PASSED (CHECKPOINTS, AFTER-WORK, 5s SAMPLER, AND memory.peak ALL < 78.0%) ===", flush=True)
 
 if __name__ == "__main__":
     main()
+
 
