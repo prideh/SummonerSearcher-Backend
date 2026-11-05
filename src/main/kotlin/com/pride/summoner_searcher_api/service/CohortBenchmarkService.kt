@@ -166,9 +166,9 @@ class CohortBenchmarkService(
         const val SOLO_QUEUE_ID = 420
         const val MIN_GAME_DURATION_SECONDS = 600L
         const val MAX_SCAN_KEYS_PER_NAMESPACE = 500
-        const val PROFILE_SCAN_CHUNK_SIZE = 20
-        const val SNAPSHOT_SCAN_CHUNK_SIZE = 50
-        const val MATCH_SCAN_CHUNK_SIZE = 25
+        const val PROFILE_SCAN_CHUNK_SIZE = 10
+        const val SNAPSHOT_SCAN_CHUNK_SIZE = 25
+        const val MATCH_SCAN_CHUNK_SIZE = 10
         const val MAX_IN_MEMORY_PARTICIPANT_SAMPLES = 6_000
         const val MAX_CHECKPOINT_PROCESSED_PUUIDS = 5_000
         const val MAX_CHECKPOINT_PROCESSED_MATCH_IDS = 10_000
@@ -1099,7 +1099,9 @@ class CohortBenchmarkService(
         val normalizedRegion = region.lowercase().trim()
         if (!patch.isNullOrBlank()) {
             val cacheKey = benchmarkCacheKey(normalizedRegion, patch.trim())
-            val cached = redisCacheService.get(cacheKey, Array<CohortBenchmarkCellDto>::class.java)
+            val cached = runCatching {
+                redisCacheService.get(cacheKey, Array<CohortBenchmarkCellDto>::class.java)
+            }.getOrNull()
             if (cached != null && cached.isNotEmpty()) {
                 return cached.toList()
             }
@@ -1279,21 +1281,17 @@ class CohortBenchmarkService(
             return pausedCheckpoint
         }
 
-        // 1. Run bounded streaming cache-only extraction when initializing a new checkpoint or when no cell progress exists yet
-        val initialReport = if (existingCheckpoint == null || existingCheckpoint.cellProgress.isEmpty()) {
-            extractCachedCohortsAndReport(
-                region = normalizedRegion,
-                targetPatch = cleanRequestedPatch,
-                maxGamesPerPlayer = effectiveCap
-            )
+        // 1. Initialize baseline cell progress from compact persisted cells (zero 500-key profile/match scans during batch runs)
+        val persistedCells = if (existingCheckpoint == null || existingCheckpoint.cellProgress.isEmpty()) {
+            getPersistedCohortCells(normalizedRegion, cleanRequestedPatch)
         } else {
-            null
+            emptyList()
         }
         var effectivePatch = cleanRequestedPatch
             ?: existingCheckpoint?.targetPatch
-            ?: initialReport?.inventory?.selectedTargetPatch
+            ?: persistedCells.firstOrNull()?.patch
         val patchSource = existingCheckpoint?.patchSelectionSource
-            ?: initialReport?.inventory?.patchSelectionSource
+            ?: persistedCells.firstOrNull()?.patchSelectionSource
             ?: if (cleanRequestedPatch != null) "EXPLICIT_TARGET_PATCH" else "NO_CACHED_PATCH_FOUND"
 
         val processedPuuids = existingCheckpoint?.processedPuuids?.take(MAX_CHECKPOINT_PROCESSED_PUUIDS)?.toMutableSet() ?: mutableSetOf()
@@ -1307,8 +1305,8 @@ class CohortBenchmarkService(
             if (pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) pendingQueue.add(it)
         }
 
-        // Seed additional candidates from cache only when pendingQueue needs replenishment
-        if (pendingQueue.size < effectiveBatchLimit * 2 && getMemoryHeadroomSnapshot().hasHeadroomForLowPriority) {
+        // Seed additional candidates from cache only when pendingQueue is completely empty
+        if (pendingQueue.isEmpty() && getMemoryHeadroomSnapshot().hasHeadroomForLowPriority) {
             val discoveredFromCache = discoverCandidatePuuidsFromCache(normalizedRegion, effectivePatch)
             for (candidate in discoveredFromCache) {
                 if (candidate !in processedPuuids && pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
@@ -1317,10 +1315,10 @@ class CohortBenchmarkService(
             }
         }
 
-        var cellProgress = if (initialReport != null) {
-            buildAllTargetCellProgress(initialReport.cells)
+        var cellProgress = if (existingCheckpoint != null && existingCheckpoint.cellProgress.isNotEmpty()) {
+            mergeCellProgressWithPlayerCounts(existingCheckpoint.cellProgress, playerCellGameCounts)
         } else {
-            existingCheckpoint?.cellProgress ?: buildAllTargetCellProgress(emptyList())
+            mergeCellProgressWithPlayerCounts(buildAllTargetCellProgress(persistedCells), playerCellGameCounts)
         }
         var cellsPassing = cellProgress.values.count { it.passesQualityGate }
         val startedAt = existingCheckpoint?.startedAt ?: nowInstant
@@ -1545,7 +1543,14 @@ class CohortBenchmarkService(
             }
 
             // Step D: Inspect/fetch matches on current patch, enforcing 10-game per-player cap
-            matchLoop@ for (matchId in matchIds.take(effectiveCap)) {
+            val ownMatchIdSet = matchIds.take(effectiveCap).toSet()
+            val candidateMatchIds = if (ownMatchIdSet.size < effectiveCap && processedMatchIds.isNotEmpty()) {
+                (ownMatchIdSet + processedMatchIds.filter { it !in ownMatchIdSet }.takeLast(effectiveCap)).take(effectiveCap)
+            } else {
+                ownMatchIdSet.toList()
+            }
+            matchLoop@ for (matchId in candidateMatchIds) {
+                val isOwnListedMatch = matchId in ownMatchIdSet
                 val allRolesCappedForPlayer = ELIGIBLE_ROLES.all { role ->
                     (playerCellGameCounts["$playerTier:$role:$puuid"] ?: 0) >= effectiveCap
                 }
@@ -1556,6 +1561,9 @@ class CohortBenchmarkService(
                 val matchKey = "match:$normalizedRegion:$matchId"
                 var match = redisCacheService.get(matchKey, MatchDto::class.java)
                 if (match == null) {
+                    if (!isOwnListedMatch) {
+                        continue@matchLoop
+                    }
                     val matchFetchPause = evaluateLivePauseReason("match-v5-match-by-id")
                     if (matchFetchPause != null) {
                         stopReason = matchFetchPause
@@ -1586,17 +1594,20 @@ class CohortBenchmarkService(
                         fetchedMatches++
                     }
                 }
-                if (processedMatchIds.size < MAX_CHECKPOINT_PROCESSED_MATCH_IDS) {
+                if (isOwnListedMatch && processedMatchIds.size < MAX_CHECKPOINT_PROCESSED_MATCH_IDS) {
                     processedMatchIds.add(matchId)
                 }
                 val info = match?.info ?: continue@matchLoop
+                if (!isOwnListedMatch && info.participants.none { it.puuid == puuid }) {
+                    continue@matchLoop
+                }
                 val matchPatch = extractMajorMinorPatch(info.gameVersion)
                 if (effectivePatch == null && matchPatch != null) {
                     effectivePatch = matchPatch
                 }
                 // Match IDs are ordered newest-first; stop inspecting older matches once we cross into an older patch
                 if (effectivePatch != null && matchPatch != null && patchComparator.compare(matchPatch, effectivePatch!!) < 0) {
-                    break@matchLoop
+                    if (isOwnListedMatch) break@matchLoop else continue@matchLoop
                 }
                 if (info.queueId != SOLO_QUEUE_ID || (info.gameDuration ?: 0L) < MIN_GAME_DURATION_SECONDS) {
                     continue@matchLoop
@@ -1627,29 +1638,30 @@ class CohortBenchmarkService(
             }
             pendingQueue.remove(puuid)
             playersProcessedThisBatch++
+            cellProgress = mergeCellProgressWithPlayerCounts(cellProgress, playerCellGameCounts)
+            cellsPassing = cellProgress.values.count { it.passesQualityGate }
             saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
         }
 
-        // 6. Re-extract from cache only when new players/matches were processed and memory headroom is healthy
-        if ((playersProcessedThisBatch > 0 || fetchedMatches > (existingCheckpoint?.fetchedMatches ?: 0)) &&
-            getMemoryHeadroomSnapshot().hasHeadroomForLowPriority
-        ) {
-            val updatedReport = extractCachedCohortsAndReport(
-                region = normalizedRegion,
-                targetPatch = effectivePatch,
-                maxGamesPerPlayer = effectiveCap
-            )
-            if (effectivePatch == null) {
-                effectivePatch = updatedReport.inventory.selectedTargetPatch
-            }
-            cellProgress = buildAllTargetCellProgress(updatedReport.cells)
+        // 6. Update cell progress incrementally in O(1) memory from playerCellGameCounts (zero full-cache profile/match scans)
+        if (playersProcessedThisBatch > 0 || fetchedMatches > (existingCheckpoint?.fetchedMatches ?: 0)) {
+            cellProgress = mergeCellProgressWithPlayerCounts(cellProgress, playerCellGameCounts)
             cellsPassing = cellProgress.values.count { it.passesQualityGate }
         }
 
         if (cellsPassing >= TIER_ORDER.size * ELIGIBLE_ROLES.size) {
             stopReason = "ALL_TARGET_CELLS_SATISFIED"
         } else if (stopReason == "BATCH_BUDGET_REACHED_RESUMABLE" && pendingQueue.none { it !in processedPuuids }) {
-            stopReason = "NO_CANDIDATES_REMAINING"
+            if (getMemoryHeadroomSnapshot(allowGcHintOnPressure = false).hasHeadroomForLowPriority) {
+                for (candidate in discoverCandidatePuuidsFromCache(normalizedRegion, effectivePatch)) {
+                    if (candidate !in processedPuuids && pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
+                        pendingQueue.add(candidate)
+                    }
+                }
+            }
+            if (pendingQueue.none { it !in processedPuuids }) {
+                stopReason = "NO_CANDIDATES_REMAINING"
+            }
         }
 
         val finalCheckpoint = buildCurrentCheckpoint(stopReason)
@@ -1775,22 +1787,20 @@ class CohortBenchmarkService(
             )
         }
 
-        // 1. Ensure cache-only baseline checkpoint is initialized so status is populated even while network=false
+        // 1. Initialize baseline checkpoint from compact persisted cells (zero full-cache profile/match scans during probe)
         var checkpoint = getCollectorCheckpoint(normalizedRegion, cleanPatch)
             ?: if (cleanPatch != null) getCollectorCheckpoint(normalizedRegion, null) else null
         if (checkpoint == null) {
-            val report = extractCachedCohortsAndReport(
-                region = normalizedRegion,
-                targetPatch = cleanPatch,
-                maxGamesPerPlayer = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
-            )
-            val effectivePatch = cleanPatch ?: report.inventory.selectedTargetPatch
+            val persistedCells = getPersistedCohortCells(normalizedRegion, cleanPatch)
+            val effectivePatch = cleanPatch ?: persistedCells.firstOrNull()?.patch
+            val patchSource = persistedCells.firstOrNull()?.patchSelectionSource
+                ?: if (cleanPatch != null) "EXPLICIT_TARGET_PATCH" else "PERSISTED_CELLS_OR_DEFERRED"
             val candidates = discoverCandidatePuuidsFromCache(normalizedRegion, effectivePatch).take(MAX_CHECKPOINT_PENDING_PUUIDS)
-            val cellProgress = buildAllTargetCellProgress(report.cells)
+            val cellProgress = buildAllTargetCellProgress(persistedCells)
             checkpoint = CohortCollectorCheckpointDto(
                 region = normalizedRegion,
                 targetPatch = effectivePatch,
-                patchSelectionSource = report.inventory.patchSelectionSource,
+                patchSelectionSource = patchSource,
                 queueId = SOLO_QUEUE_ID,
                 roles = listOf("TOP", "MIDDLE", "BOTTOM"),
                 maxGamesPerPlayerCap = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER,
@@ -2273,8 +2283,8 @@ class CohortBenchmarkService(
             val puuid = key.substringAfterLast(":").trim()
             if (puuid.isNotBlank() && discovered.size < MAX_CHECKPOINT_PENDING_PUUIDS) discovered.add(puuid)
         }
-        if (discovered.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
-            val matchKeys = redisCacheService.scanKeys("match:$region:*", maxKeys = MAX_SCAN_KEYS_PER_NAMESPACE)
+        if (discovered.isEmpty()) {
+            val matchKeys = redisCacheService.scanKeys("match:$region:*", maxKeys = 20)
             chunkLoop@ for (chunk in matchKeys.chunked(MATCH_SCAN_CHUNK_SIZE)) {
                 if (discovered.size >= MAX_CHECKPOINT_PENDING_PUUIDS || !getMemoryHeadroomSnapshot().hasHeadroomForLowPriority) {
                     break@chunkLoop
@@ -2326,6 +2336,45 @@ class CohortBenchmarkService(
             }
         }
         return result
+    }
+
+    private fun mergeCellProgressWithPlayerCounts(
+        base: Map<String, CohortCellProgressDto>,
+        playerCountsByCell: Map<String, Int>
+    ): Map<String, CohortCellProgressDto> {
+        if (playerCountsByCell.isEmpty()) return base
+        val playersPerCell = HashMap<String, Int>()
+        val gamesPerCell = HashMap<String, Int>()
+        for ((entryKey, games) in playerCountsByCell) {
+            if (games <= 0) continue
+            val firstColon = entryKey.indexOf(':')
+            if (firstColon <= 0) continue
+            val secondColon = entryKey.indexOf(':', firstColon + 1)
+            val cellKey = if (secondColon > firstColon) entryKey.substring(0, secondColon) else entryKey
+            playersPerCell[cellKey] = (playersPerCell[cellKey] ?: 0) + 1
+            gamesPerCell[cellKey] = (gamesPerCell[cellKey] ?: 0) + games
+        }
+        val merged = LinkedHashMap<String, CohortCellProgressDto>(base.size)
+        for ((key, progress) in base) {
+            val mapPlayers = playersPerCell[key] ?: 0
+            val mapGames = gamesPerCell[key] ?: 0
+            if (mapPlayers <= 0 && mapGames <= 0) {
+                merged[key] = progress
+            } else {
+                val newPlayers = maxOf(progress.distinctPlayers, mapPlayers)
+                val newGames = maxOf(progress.eligibleGames, mapGames)
+                val passes = progress.passesQualityGate ||
+                    (newPlayers >= progress.targetPlayers && newGames >= progress.targetGames)
+                merged[key] = progress.copy(
+                    distinctPlayers = newPlayers,
+                    eligibleGames = newGames,
+                    passesQualityGate = passes,
+                    deficitPlayers = (progress.targetPlayers - newPlayers).coerceAtLeast(0),
+                    deficitGames = (progress.targetGames - newGames).coerceAtLeast(0)
+                )
+            }
+        }
+        return merged
     }
 
     private fun collectorCheckpointKey(region: String, patch: String?): String =

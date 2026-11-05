@@ -29,24 +29,7 @@ class RedisCacheService(
      */
     fun <T> get(key: String, type: Class<T>): T? {
         val rawValue = redisTemplate.opsForValue().get(key) ?: return null
-
-        val json = if (rawValue.startsWith(COMPRESSION_PREFIX)) {
-            try {
-                decompress(rawValue.removePrefix(COMPRESSION_PREFIX))
-            } catch (e: Exception) {
-                // If decompression fails, log it and treat as cache miss or return null
-                return null
-            }
-        } else {
-            // Legacy: It's just plain JSON
-            rawValue
-        }
-
-        return try {
-            objectMapper.readValue(json, type)
-        } catch (e: Exception) {
-            null
-        }
+        return deserializeValue(rawValue, type)
     }
 
     /**
@@ -62,48 +45,20 @@ class RedisCacheService(
         val rawValues = redisTemplate.opsForValue().multiGet(keys) ?: return keys.associateWith { null }
 
         // rawValues matches the order of keys
-        val result = mutableMapOf<String, T?>()
-        
+        val result = LinkedHashMap<String, T?>(keys.size)
         for (i in keys.indices) {
             val key = keys[i]
             val rawValue = rawValues.getOrNull(i)
-            
-            if (rawValue == null) {
-                result[key] = null
-                continue
-            }
-
-            val json = if (rawValue.startsWith(COMPRESSION_PREFIX)) {
-                try {
-                    decompress(rawValue.removePrefix(COMPRESSION_PREFIX))
-                } catch (e: Exception) {
-                    null
-                }
-            } else {
-                rawValue
-            }
-
-            val obj = if (json != null) {
-                try {
-                    objectMapper.readValue(json, type)
-                } catch (e: Exception) {
-                    null
-                }
-            } else null
-            
-            result[key] = obj
+            result[key] = if (rawValue != null) deserializeValue(rawValue, type) else null
         }
-        
         return result
     }
 
     /**
-     * Serializes, compresses, and stores an object in the Redis cache.
+     * Serializes, compresses, and stores an object in the Redis cache using streaming GZIP + Base64.
      */
     fun <T> set(key: String, value: T, expiration: Duration) {
-        val json = objectMapper.writeValueAsString(value)
-        val compressed = COMPRESSION_PREFIX + compress(json)
-        
+        val compressed = serializeAndCompress(value)
         if (expiration.isZero || expiration.isNegative) {
             redisTemplate.opsForValue().set(key, compressed)
         } else {
@@ -116,8 +71,6 @@ class RedisCacheService(
      * @return true if the key was set, false if it already existed.
      */
     fun setIfAbsent(key: String, value: String, expiration: Duration): Boolean {
-        // We calculate value separately only if needed, but for locks usually value doesn't matter much.
-        // For simplicity, we just store the raw string provided (e.g., "LOCKED").
         return redisTemplate.opsForValue().setIfAbsent(key, value, expiration) == true
     }
 
@@ -131,7 +84,7 @@ class RedisCacheService(
     /**
      * Bounded cursor-based key scan matching [pattern] (e.g., `match:euw1:*` or `player:profile:euw1:*`).
      * Enforces [maxKeys] (capped at [HARD_MAX_SCAN_KEYS]) so Redis scans are never unbounded.
-     * Falls back to `redisTemplate.keys(pattern)` only when `scan` is unstubbed in unit tests.
+     * Falls back to `redisTemplate.keys(pattern)` only when `scan` is unstubbed (returns null/throws) in unit tests.
      */
     fun scanKeys(
         pattern: String,
@@ -145,12 +98,14 @@ class RedisCacheService(
                 .count(countHint)
                 .build()
             val found = mutableSetOf<String>()
-            redisTemplate.scan(options).use { cursor ->
+            var scanCursorOpened = false
+            redisTemplate.scan(options)?.use { cursor ->
+                scanCursorOpened = true
                 while (cursor.hasNext() && found.size < effectiveLimit) {
                     found.add(cursor.next())
                 }
             }
-            if (found.isNotEmpty()) {
+            if (scanCursorOpened) {
                 found.sorted().take(effectiveLimit)
             } else {
                 redisTemplate.keys(pattern)?.sorted()?.take(effectiveLimit) ?: emptyList()
@@ -164,20 +119,40 @@ class RedisCacheService(
         }
     }
 
-    private fun compress(data: String): String {
-        val bos = java.io.ByteArrayOutputStream()
-        java.util.zip.GZIPOutputStream(bos).bufferedWriter(java.nio.charset.StandardCharsets.UTF_8).use { it.write(data) }
-        return java.util.Base64.getEncoder().encodeToString(bos.toByteArray())
+    private fun <T> serializeAndCompress(value: T): String {
+        val bos = java.io.ByteArrayOutputStream(1024)
+        bos.write(COMPRESSION_PREFIX.toByteArray(java.nio.charset.StandardCharsets.ISO_8859_1))
+        java.util.Base64.getEncoder().wrap(bos).use { b64Out ->
+            java.util.zip.GZIPOutputStream(b64Out, GZIP_BUFFER_SIZE).use { gzipOut ->
+                objectMapper.writeValue(gzipOut, value)
+            }
+        }
+        return bos.toString(java.nio.charset.StandardCharsets.ISO_8859_1)
     }
 
-    private fun decompress(compressedData: String): String {
-        val bytes = java.util.Base64.getDecoder().decode(compressedData)
-        val bis = java.io.ByteArrayInputStream(bytes)
-        return java.util.zip.GZIPInputStream(bis).bufferedReader(java.nio.charset.StandardCharsets.UTF_8).use { it.readText() }
+    private fun <T> deserializeValue(rawValue: String, type: Class<T>): T? {
+        return try {
+            if (rawValue.startsWith(COMPRESSION_PREFIX)) {
+                val b64Bytes = rawValue.substring(COMPRESSION_PREFIX.length)
+                    .toByteArray(java.nio.charset.StandardCharsets.ISO_8859_1)
+                java.io.ByteArrayInputStream(b64Bytes).use { rawIn ->
+                    java.util.Base64.getDecoder().wrap(rawIn).use { b64In ->
+                        java.util.zip.GZIPInputStream(b64In, GZIP_BUFFER_SIZE).use { gzipIn ->
+                            objectMapper.readValue(gzipIn, type)
+                        }
+                    }
+                }
+            } else {
+                objectMapper.readValue(rawValue, type)
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
     companion object {
         private const val COMPRESSION_PREFIX = "GZIP_B64:"
+        private const val GZIP_BUFFER_SIZE = 2048
         const val DEFAULT_MAX_SCAN_KEYS = 2_000
         const val HARD_MAX_SCAN_KEYS = 5_000
     }

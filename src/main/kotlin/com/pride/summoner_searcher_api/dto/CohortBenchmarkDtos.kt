@@ -240,9 +240,9 @@ data class MemoryHeadroomSnapshotDto(
     val hasHeadroomForLowPriority: Boolean,
     val nearCapStopTriggered: Boolean = !hasHeadroomForLowPriority,
     val scanKeyCapPerNamespace: Int = 500,
-    val profileScanChunkSize: Int = 20,
-    val snapshotScanChunkSize: Int = 50,
-    val matchScanChunkSize: Int = 25,
+    val profileScanChunkSize: Int = 10,
+    val snapshotScanChunkSize: Int = 25,
+    val matchScanChunkSize: Int = 10,
     val maxInMemoryParticipantSamples: Int = 6_000
 )
 

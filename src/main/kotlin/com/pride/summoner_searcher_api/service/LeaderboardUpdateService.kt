@@ -47,20 +47,18 @@ class ChallengerCacheWarmer(
         logger.info("Scheduled task running: Checking if Challenger league cache needs refreshing for queue: {}", queue)
         val regions = listOf("euw1", "na1", "kr")
 
-        // Process regions in parallel - each region has independent rate limits
+        // Warm regions sequentially so 3x 300-player Challenger leaderboards are not deserialized/compressed concurrently
         runBlocking {
-            regions.map { region ->
-                async {
-                    try {
-                        logger.info("Starting cache refresh for region: {}", region)
-                        challengerLeagueService.warmChallengerLeagueCache(region, queue)
-                        logger.info("Completed cache refresh for region: {}", region)
-                    } catch (e: Exception) {
-                        // Catching a broad exception to ensure that a failure in one region does not stop the process for others.
-                        logger.error("Error during scheduled cache check for {} - {}: {}", region, queue, e.message, e)
-                    }
+            for (region in regions) {
+                try {
+                    logger.info("Starting cache refresh for region: {}", region)
+                    challengerLeagueService.warmChallengerLeagueCache(region, queue)
+                    logger.info("Completed cache refresh for region: {}", region)
+                } catch (e: Exception) {
+                    // Catching a broad exception to ensure that a failure in one region does not stop the process for others.
+                    logger.error("Error during scheduled cache check for {} - {}: {}", region, queue, e.message, e)
                 }
-            }.awaitAll()
+            }
         }
         logger.info("Scheduled cache check complete.")
     }
