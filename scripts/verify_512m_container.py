@@ -196,7 +196,10 @@ def start_mock_riot_server(cert_file: str, key_file: str):
     return httpd
 
 def http_json(url: str, method: str = "GET", body: dict = None, headers: dict = None, timeout: int = 120) -> dict:
-    req_headers = {"Accept": "application/json"}
+    req_headers = {
+        "Accept": "application/json",
+        "X-Cohort-Operator-Token": "test-op-token"
+    }
     if headers:
         req_headers.update(headers)
     data = None
@@ -226,11 +229,11 @@ def read_container_events_and_cgroup(container_name: str) -> dict:
 def main():
     cert_file = sys.argv[1]
     key_file = sys.argv[2]
-    print("=== Starting Mock Riot HTTPS API server on port 443 ===")
+    print("=== Starting Mock Riot HTTPS API server on port 443 ===", flush=True)
     httpd = start_mock_riot_server(cert_file, key_file)
     time.sleep(1)
 
-    print("=== Starting ss-backend-512m Docker container (--memory=512m --memory-swap=512m) ===")
+    print("=== Starting ss-backend-512m Docker container (--memory=512m --memory-swap=512m) ===", flush=True)
     subprocess.check_call([
         "docker", "run", "-d",
         "--name", "ss-backend-512m",
@@ -263,7 +266,7 @@ def main():
     ])
 
     base_url = "http://localhost:10000"
-    print("=== Waiting for backend container on http://localhost:10000 ===")
+    print("=== Waiting for backend container on http://localhost:10000 ===", flush=True)
     boot_t0 = time.time()
     status_data = None
     for attempt in range(90):
@@ -276,25 +279,24 @@ def main():
         subprocess.run(["docker", "logs", "ss-backend-512m"])
         sys.exit(1)
     boot_sec = time.time() - boot_t0
-    print(f"=== 1. COLD BOOT SUCCEEDED in {boot_sec:.2f}s (512 MB Container) ===")
+    print(f"=== 1. COLD BOOT SUCCEEDED in {boot_sec:.2f}s (512 MB Container) ===", flush=True)
     # Wait 3s for startup ChallengerCacheWarmer to finish sequential warming
     time.sleep(3)
     idle_status = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", timeout=10)
     idle_mem = idle_status["memoryHeadroom"]
     cg_idle = read_container_events_and_cgroup("ss-backend-512m")
-    print("=== 2. IDLE + POST-WARMER MEMORY HEADROOM SNAPSHOT ===")
-    print(json.dumps(idle_mem, indent=2))
-    print("=== CGROUP V2 EVENTS (IDLE) ===")
-    print(cg_idle["rawCgroup"])
+    print("=== 2. IDLE + POST-WARMER MEMORY HEADROOM SNAPSHOT ===", flush=True)
+    print(json.dumps(idle_mem, indent=2), flush=True)
+    print("=== CGROUP V2 EVENTS (IDLE) ===", flush=True)
+    print(cg_idle["rawCgroup"], flush=True)
 
     # Run bounded diagnostic probe (3 calls) to verify rate limits and persist a checkpoint to Redis + Postgres
     probe_res = http_json(
         f"{base_url}/api/riot/cohorts/euw1/collector/probe?patch=16.7&seedPuuid=seed-puuid-1",
         method="POST",
-        headers={"X-Cohort-Operator-Token": "test-op-token"},
         timeout=30
     )
-    print("=== DIAGNOSTIC PROBE RESULT ===")
+    print("=== DIAGNOSTIC PROBE RESULT ===", flush=True)
     print(json.dumps({
         "probeStatus": probe_res.get("probeStatus"),
         "totalHttpAttemptsMade": probe_res.get("totalHttpAttemptsMade"),
@@ -302,31 +304,37 @@ def main():
             "totalNetworkCallsMade": probe_res.get("checkpoint", {}).get("totalNetworkCallsMade"),
             "lastStopReason": probe_res.get("checkpoint", {}).get("lastStopReason")
         }
-    }, indent=2))
+    }, indent=2), flush=True)
 
     # Run 1 productive collector batch (batchSize=2) so checkpoint has processedPuuids, pendingCandidatePuuids, and cached matches
     batch_res = http_json(
-        f"{base_url}/api/riot/cohorts/euw1/collector/start?patch=16.7&maxBatches=1&batchSize=2&maxGamesPerPlayer=10&async=false&seedPuuids=seed-puuid-1",
+        f"{base_url}/api/riot/cohorts/euw1/collector/start?patch=16.7&maxBatches=1&batchSize=2&async=false",
         method="POST",
-        headers={"X-Cohort-Operator-Token": "test-op-token"},
         timeout=60
     )
-    print("=== 1-BATCH COLLECTOR RUNNER RESULT ===")
+    print("=== 1-BATCH COLLECTOR RUNNER RESULT ===", flush=True)
     print(json.dumps({
         "productiveBatchesCompleted": batch_res.get("productiveBatchesCompleted"),
         "processedPuuids": batch_res.get("checkpoint", {}).get("processedPuuids"),
         "pendingCount": len(batch_res.get("checkpoint", {}).get("pendingCandidatePuuids", [])),
         "totalNetworkCallsMade": batch_res.get("checkpoint", {}).get("totalNetworkCallsMade"),
         "lastStopReason": batch_res.get("checkpoint", {}).get("lastStopReason")
-    }, indent=2))
+    }, indent=2), flush=True)
 
-    print("=== 3. RUNNING 10 CYCLES OF (450-MATCH PROFILE LOAD + COHORT REPORT + MEMORY SNAPSHOT) ===")
+    print("=== 3. RUNNING 10 CYCLES OF (450-MATCH PROFILE LOAD + COHORT REPORT + MEMORY SNAPSHOT) ===", flush=True)
     cycle_metrics = []
     for cycle in range(1, 11):
         t0 = time.time()
-        # Flush only the player profile key before cycles 2..10 so every cycle executes a full 450-match aggregation
+        # Flush the player profile + cooldown and cohort report + lock keys before cycles 2..10 so every cycle executes full work
         if cycle > 1:
-            subprocess.check_call(["docker", "exec", "ss-redis", "redis-cli", "DEL", "player:profile:euw1:puuid-main-450"], stdout=subprocess.DEVNULL)
+            subprocess.check_call(
+                ["docker", "exec", "ss-redis", "redis-cli", "DEL",
+                 "player:profile:euw1:puuid-main-450",
+                 "cooldown:profile:refresh:euw1:puuid-main-450",
+                 "cohort:report:euw1:16.7",
+                 "lock:cohort:report:euw1:16.7"],
+                stdout=subprocess.DEVNULL
+            )
         prof = http_json(
             f"{base_url}/api/riot/summoner/euw1/TestPlayer/EUW?refresh=true",
             method="GET",
@@ -334,7 +342,7 @@ def main():
         )
         t_prof = (time.time() - t0) * 1000.0
         t1 = time.time()
-        rep = http_json(f"{base_url}/api/riot/cohorts/euw1/report?patch=16.7&recompute=true", timeout=60)
+        rep = http_json(f"{base_url}/api/riot/cohorts/euw1/report?patch=16.7", timeout=60)
         t_rep = (time.time() - t1) * 1000.0
         snap = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", timeout=15)["memoryHeadroom"]
         row = {
@@ -355,7 +363,7 @@ def main():
             "hasHeadroom": snap["hasHeadroomForLowPriority"]
         }
         cycle_metrics.append(row)
-        print(f"CYCLE {cycle:02d}: {json.dumps(row)}")
+        print(f"CYCLE {cycle:02d}: {json.dumps(row)}", flush=True)
 
     print("=== 4. VERIFYING POSTGRES CHECKPOINT DURABILITY ACROSS REDIS FLUSHALL ===")
     pg_rows = subprocess.check_output([
