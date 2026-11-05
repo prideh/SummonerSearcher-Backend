@@ -108,6 +108,7 @@ class OvernightCohortCollectorRunner(
         const val DEFAULT_MAX_SESSION_NETWORK_CALLS = 60
         const val STOP_REASON_SESSION_BATCH_CAP = "SESSION_BATCH_CAP_REACHED"
         const val STOP_REASON_SESSION_NETWORK_CALL_CAP = "SESSION_NETWORK_CALL_CAP_REACHED"
+        const val STOP_REASON_SESSION_ERROR_ABORT = "SESSION_ERROR_ABORT"
 
         private val LOOPBACK_ADDRESSES = setOf(
             "127.0.0.1",
@@ -122,7 +123,8 @@ class OvernightCohortCollectorRunner(
             "RATE_LIMIT_VERIFICATION_OR_HEADROOM_NOT_READY",
             "STOPPED_BY_OPERATOR",
             STOP_REASON_SESSION_BATCH_CAP,
-            STOP_REASON_SESSION_NETWORK_CALL_CAP
+            STOP_REASON_SESSION_NETWORK_CALL_CAP,
+            STOP_REASON_SESSION_ERROR_ABORT
         )
     }
 
@@ -371,6 +373,14 @@ class OvernightCohortCollectorRunner(
         val currentCheckpoint = cohortBenchmarkService.getCollectorCheckpoint(region, activeTargetPatch)
         if (currentCheckpoint != null) {
             sessionNetworkCallsMade = (currentCheckpoint.totalNetworkCallsMade - sessionBaselineNetworkCalls).coerceAtLeast(0)
+            if (currentCheckpoint.lastStopReason in TERMINAL_STOP_REASONS) {
+                overnightSessionArmed.set(false)
+                logger.info(
+                    "[OvernightCollector] Disarming auto-resume for region={} patch={}: checkpoint has terminal stopReason={}.",
+                    region, activeTargetPatch ?: "auto-cached", currentCheckpoint.lastStopReason
+                )
+                return null
+            }
         }
         if (sessionProductiveBatchesCompleted >= maxSessionProductiveBatchesConfigured ||
             sessionNetworkCallsMade >= maxSessionNetworkCallsConfigured
@@ -707,17 +717,42 @@ class OvernightCohortCollectorRunner(
                 ?: cohortBenchmarkService.getCollectorCheckpoint(region, targetPatch ?: activeTargetPatch)?.processedPuuids?.size
                 ?: 0
 
-            val checkpoint = cohortBenchmarkService.runResumableLowPriorityCollectorBatch(
-                region = region,
-                targetPatch = targetPatch ?: lastCheckpoint?.targetPatch,
-                maxPlayersPerBatch = batchSize,
-                maxGamesPerPlayer = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER,
-                maxSessionNetworkCalls = maxSessionNetworkCallsConfigured,
-                sessionBaselineNetworkCalls = sessionBaselineNetworkCalls,
-                sessionProductiveBatchesBeforeBatch = sessionProductiveBatchesCompleted,
-                maxSessionProductiveBatches = maxSessionProductiveBatchesConfigured,
-                shouldStop = { stopRequested.get() }
-            )
+            val checkpoint = try {
+                cohortBenchmarkService.runResumableLowPriorityCollectorBatch(
+                    region = region,
+                    targetPatch = targetPatch ?: lastCheckpoint?.targetPatch,
+                    maxPlayersPerBatch = batchSize,
+                    maxGamesPerPlayer = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER,
+                    maxSessionNetworkCalls = maxSessionNetworkCallsConfigured,
+                    sessionBaselineNetworkCalls = sessionBaselineNetworkCalls,
+                    sessionProductiveBatchesBeforeBatch = sessionProductiveBatchesCompleted,
+                    maxSessionProductiveBatches = maxSessionProductiveBatchesConfigured,
+                    shouldStop = { stopRequested.get() }
+                )
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                overnightSessionArmed.set(false)
+                val existing = lastCheckpoint ?: cohortBenchmarkService.getCollectorCheckpoint(region, targetPatch ?: activeTargetPatch)
+                if (existing != null) {
+                    sessionNetworkCallsMade = (existing.totalNetworkCallsMade - sessionBaselineNetworkCalls).coerceAtLeast(0)
+                    val aborted = existing.copy(
+                        sessionProductiveBatchesCompleted = sessionProductiveBatchesCompleted,
+                        maxSessionProductiveBatches = maxSessionProductiveBatchesConfigured,
+                        sessionNetworkCallsMade = sessionNetworkCallsMade,
+                        maxSessionNetworkCalls = maxSessionNetworkCallsConfigured,
+                        lastStopReason = STOP_REASON_SESSION_ERROR_ABORT,
+                        updatedAt = Instant.ofEpochMilli(timeProvider.now())
+                    )
+                    cohortBenchmarkService.saveCollectorCheckpoint(aborted)
+                    lastCheckpoint = aborted
+                }
+                logger.error(
+                    "[OvernightCollector] Aborting chunk and disarming auto-resume due to exception on batch {}: region={}, patch={}, error={}",
+                    productiveBatchesCompleted + 1, region, targetPatch ?: activeTargetPatch ?: "auto-cached", e.message
+                )
+                break
+            }
             lastCheckpoint = checkpoint
             sessionNetworkCallsMade = (checkpoint.totalNetworkCallsMade - sessionBaselineNetworkCalls).coerceAtLeast(0)
             if (activeTargetPatch == null && checkpoint.targetPatch != null) {

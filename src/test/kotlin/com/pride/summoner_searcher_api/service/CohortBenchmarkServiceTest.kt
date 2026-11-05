@@ -2076,6 +2076,225 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 callsAfterNetCap shouldBe 7
             }
         }
+
+        When("a low-priority Riot API call throws an exception (5xx or non-429 error) at any of the 3 call sites") {
+            val clockMs = java.util.concurrent.atomic.AtomicLong(nowInstant.toEpochMilli())
+            val testClock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            val errLimiter = RiotApiRateLimiter(testClock)
+            val errRedis = mockk<RedisCacheService>(relaxed = true)
+            val errRiotApi = mockk<RiotApiService>(relaxed = true)
+            val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
+            val savedSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
+            var lockHeld = false
+
+            every { errRedis.scanKeys(any(), any(), any()) } returns emptyList()
+            every { errRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
+                savedCheckpoints[firstArg()]
+            }
+            every { errRedis.get(any(), CohortRankSnapshotDto::class.java) } answers {
+                savedSnapshots[firstArg()]
+            }
+            every { errRedis.get(any(), SummonerProfileDto::class.java) } returns null
+            every { errRedis.get(any(), MatchDto::class.java) } returns null
+            every { errRedis.get(any(), CachedLeaderboardDto::class.java) } returns null
+            every { errRedis.setIfAbsent(match { it.startsWith("lock:cohort:collector:") }, any(), any()) } answers {
+                val key = firstArg<String>()
+                if (key.contains(":active:")) {
+                    if (lockHeld) false else {
+                        lockHeld = true
+                        true
+                    }
+                } else {
+                    true
+                }
+            }
+            every { errRedis.delete(match { it.startsWith("lock:cohort:collector:active:") }) } answers {
+                lockHeld = false
+            }
+            every { errRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                when (val value = secondArg<Any>()) {
+                    is CohortCollectorCheckpointDto -> savedCheckpoints[key] = value
+                    is CohortRankSnapshotDto -> savedSnapshots[key] = value
+                }
+            }
+
+            val errMemoryProvider = object : MemoryStatsProvider {
+                override fun sample(): RawMemorySample = RawMemorySample(
+                    jvmHeapUsedBytes = 180_000_000L,
+                    jvmHeapCommittedBytes = 220_000_000L,
+                    jvmHeapMaxBytes = 268_435_456L,
+                    jvmNonHeapUsedBytes = 95_000_000L,
+                    jvmMetaspaceUsedBytes = 68_000_000L,
+                    jvmMetaspaceCommittedBytes = 72_000_000L,
+                    jvmCompressedClassSpaceUsedBytes = 8_000_000L,
+                    jvmCompressedClassSpaceCommittedBytes = 10_000_000L,
+                    jvmCodeCacheUsedBytes = 19_000_000L,
+                    jvmCodeCacheCommittedBytes = 22_000_000L,
+                    directBufferUsedBytes = 5_000_000L,
+                    directBufferCapacityBytes = 8_000_000L,
+                    mappedBufferUsedBytes = 0L,
+                    jvmThreadCount = 24,
+                    cgroupMemoryCurrentBytes = 360_000_000L,
+                    cgroupMemoryMaxBytes = 536_870_912L
+                )
+            }
+
+            CohortBenchmarkService.REQUIRED_COLLECTOR_ENDPOINTS.forEach { ep ->
+                errLimiter.updateLimits(
+                    region = "euw1",
+                    limitHeader = "20:1,100:120",
+                    countHeader = "1:1,5:120",
+                    endpointKey = ep,
+                    methodLimitHeader = "500:10",
+                    methodCountHeader = "1:10"
+                )
+            }
+
+            val errService = CohortBenchmarkService(
+                redisCacheService = errRedis,
+                cohortBenchmarkCellRepository = cohortRepo,
+                riotApiRateLimiter = errLimiter,
+                riotApiService = errRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = testClock,
+                configuredContainerLimitBytes = 536_870_912L,
+                maxMemoryUtilizationRatio = 0.78,
+                minFreeMemoryBytes = 67_108_864L,
+                memoryStatsProvider = errMemoryProvider
+            )
+            val errRunner = com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner(
+                cohortBenchmarkService = errService,
+                configuredOperatorToken = "",
+                timeProvider = testClock
+            )
+
+            errService.saveCollectorCheckpoint(
+                CohortCollectorCheckpointDto(
+                    region = "euw1",
+                    targetPatch = "16.7",
+                    patchSelectionSource = "EXPLICIT_TARGET_PATCH",
+                    pendingCandidatePuuids = listOf("err-p-1", "err-p-2"),
+                    startedAt = nowInstant,
+                    updatedAt = nowInstant
+                )
+            )
+
+            val totalHttpAttempts = java.util.concurrent.atomic.AtomicInteger(0)
+
+            // Site 1: fetchLeagueRankLowPriority throws 502 Bad Gateway (with maxTotalNetworkCalls = 1)
+            coEvery { errRiotApi.fetchLeagueRankLowPriority(any(), "euw1", any(), any(), any()) } coAnswers {
+                arg<java.util.concurrent.atomic.AtomicInteger?>(3)?.incrementAndGet()
+                totalHttpAttempts.incrementAndGet()
+                throw RuntimeException("502 Bad Gateway from Riot league-v4")
+            }
+            val site1Status = errRunner.startOrResumeGuarded(
+                region = "euw1",
+                targetPatch = "16.7",
+                maxBatches = 2,
+                batchSize = 2,
+                pauseDelayMs = 0L,
+                maxPauseCycles = 2,
+                maxTotalProductiveBatches = 4,
+                maxTotalNetworkCalls = 1,
+                async = false
+            )
+            val site1AutoResume = errRunner.checkAndAutoResumeOvernightSession(async = false)
+            errRunner.scheduledAutoResumeTick()
+            val callsAfterSite1 = totalHttpAttempts.get()
+
+            // Site 2: fetchLeagueRankLowPriority succeeds (call 1), getMatchIdsByPuuidLowPriority throws 503 (call 2, maxTotalNetworkCalls = 2)
+            coEvery { errRiotApi.fetchLeagueRankLowPriority(any(), "euw1", any(), any(), any()) } coAnswers {
+                val pid = firstArg<String>()
+                arg<java.util.concurrent.atomic.AtomicInteger?>(3)?.incrementAndGet()
+                totalHttpAttempts.incrementAndGet()
+                LeagueEntryDto(
+                    leagueId = "l-$pid", queueType = "RANKED_SOLO_5x5", tier = "DIAMOND", rank = "I",
+                    summonerName = pid, puuid = pid, leaguePoints = 60, wins = 25, losses = 20,
+                    veteran = false, inactive = false, freshBlood = false, hotStreak = false
+                )
+            }
+            coEvery { errRiotApi.getMatchIdsByPuuidLowPriority(any(), "euw1", 420, any(), 0, any(), any(), any()) } coAnswers {
+                arg<java.util.concurrent.atomic.AtomicInteger?>(6)?.incrementAndGet()
+                totalHttpAttempts.incrementAndGet()
+                throw RuntimeException("503 Service Unavailable from Riot match-v5 ids")
+            }
+            val site2Status = errRunner.startOrResumeGuarded(
+                region = "euw1",
+                targetPatch = "16.7",
+                maxBatches = 2,
+                batchSize = 2,
+                pauseDelayMs = 0L,
+                maxPauseCycles = 2,
+                maxTotalProductiveBatches = 4,
+                maxTotalNetworkCalls = 2,
+                async = false
+            )
+            val site2AutoResume = errRunner.checkAndAutoResumeOvernightSession(async = false)
+            errRunner.scheduledAutoResumeTick()
+            val callsAfterSite2 = totalHttpAttempts.get()
+
+            // Site 3: rank is now cached for err-p-1; getMatchIdsByPuuidLowPriority returns 1 match (call 1), getMatchByIdLowPriority throws 500 (call 2, maxTotalNetworkCalls = 2)
+            coEvery { errRiotApi.getMatchIdsByPuuidLowPriority(any(), "euw1", 420, any(), 0, any(), any(), any()) } coAnswers {
+                arg<java.util.concurrent.atomic.AtomicInteger?>(6)?.incrementAndGet()
+                totalHttpAttempts.incrementAndGet()
+                listOf("EUW1_ERR_MATCH_1")
+            }
+            coEvery { errRiotApi.getMatchByIdLowPriority("EUW1_ERR_MATCH_1", "euw1", any(), any(), any()) } coAnswers {
+                arg<java.util.concurrent.atomic.AtomicInteger?>(3)?.incrementAndGet()
+                totalHttpAttempts.incrementAndGet()
+                throw RuntimeException("500 Internal Server Error from Riot match-v5 detail")
+            }
+            val site3Status = errRunner.startOrResumeGuarded(
+                region = "euw1",
+                targetPatch = "16.7",
+                maxBatches = 2,
+                batchSize = 2,
+                pauseDelayMs = 0L,
+                maxPauseCycles = 2,
+                maxTotalProductiveBatches = 4,
+                maxTotalNetworkCalls = 2,
+                async = false
+            )
+            val site3AutoResume = errRunner.checkAndAutoResumeOvernightSession(async = false)
+            errRunner.scheduledAutoResumeTick()
+            val callsAfterSite3 = totalHttpAttempts.get()
+
+            Then("it should count the failed attempt in finally at all 3 call sites, hit the session cap, persist SESSION_ERROR_ABORT, disarm, and make 0 calls on auto-resume ticks") {
+                // Site 1: rank fetch threw on attempt 1 -> counted in finally (1/1 cap hit), persisted SESSION_ERROR_ABORT, disarmed, tick made 0 calls
+                site1Status.overnightSessionArmed shouldBe false
+                site1Status.sessionNetworkCallsMade shouldBe 1
+                site1Status.maxSessionNetworkCallsConfigured shouldBe 1
+                site1Status.checkpoint?.totalNetworkCallsMade shouldBe 1
+                site1Status.checkpoint?.sessionNetworkCallsMade shouldBe 1
+                site1Status.checkpoint?.lastStopReason shouldBe "SESSION_ERROR_ABORT"
+                site1AutoResume shouldBe null
+                callsAfterSite1 shouldBe 1
+
+                // Site 2: rank fetch succeeded (1) + match IDs fetch threw (2) -> counted in finally (2/2 cap hit, total=3), persisted SESSION_ERROR_ABORT, disarmed, tick made 0 calls
+                site2Status.overnightSessionArmed shouldBe false
+                site2Status.sessionNetworkCallsMade shouldBe 2
+                site2Status.maxSessionNetworkCallsConfigured shouldBe 2
+                site2Status.checkpoint?.totalNetworkCallsMade shouldBe 3
+                site2Status.checkpoint?.sessionNetworkCallsMade shouldBe 2
+                site2Status.checkpoint?.lastStopReason shouldBe "SESSION_ERROR_ABORT"
+                site2AutoResume shouldBe null
+                callsAfterSite2 shouldBe 3
+
+                // Site 3: match IDs fetch succeeded (1) + match detail fetch threw (2) -> counted in finally (2/2 cap hit, total=5), persisted SESSION_ERROR_ABORT, disarmed, tick made 0 calls
+                site3Status.overnightSessionArmed shouldBe false
+                site3Status.sessionNetworkCallsMade shouldBe 2
+                site3Status.maxSessionNetworkCallsConfigured shouldBe 2
+                site3Status.checkpoint?.totalNetworkCallsMade shouldBe 5
+                site3Status.checkpoint?.sessionNetworkCallsMade shouldBe 2
+                site3Status.checkpoint?.lastStopReason shouldBe "SESSION_ERROR_ABORT"
+                site3AutoResume shouldBe null
+                callsAfterSite3 shouldBe 5
+            }
+        }
     }
 })
 

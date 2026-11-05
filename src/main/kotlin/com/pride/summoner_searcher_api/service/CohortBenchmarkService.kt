@@ -1486,14 +1486,26 @@ class CohortBenchmarkService(
                 }
                 val rankAttempts = java.util.concurrent.atomic.AtomicInteger(0)
                 val rankFailure = java.util.concurrent.atomic.AtomicReference<String?>(null)
-                val leagueEntry = riotApiService.fetchLeagueRankLowPriority(
-                    puuid = puuid,
-                    region = normalizedRegion,
-                    maxRetries = 0,
-                    httpAttemptCounter = rankAttempts,
-                    failureReasonHolder = rankFailure
-                )
-                totalNetworkCalls += rankAttempts.get().coerceAtLeast(1)
+                val leagueEntry = try {
+                    riotApiService.fetchLeagueRankLowPriority(
+                        puuid = puuid,
+                        region = normalizedRegion,
+                        maxRetries = 0,
+                        httpAttemptCounter = rankAttempts,
+                        failureReasonHolder = rankFailure
+                    )
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    logger.warn(
+                        "[CohortBenchmark] Exception during low-priority rank fetch for region={} puuid={}: {}",
+                        normalizedRegion, puuid, e.message
+                    )
+                    stopReason = "SESSION_ERROR_ABORT"
+                    break@outerLoop
+                } finally {
+                    totalNetworkCalls += rankAttempts.get().coerceAtLeast(1)
+                }
                 fetchedRankSnapshots++
                 val postRankSnap = getLiveRateLimitVerification(normalizedRegion)
                 if (rankFailure.get() == "HTTP_429_TOO_MANY_REQUESTS" || postRankSnap.serviceRateLimitActive || postRankSnap.retryAfterUntil != null) {
@@ -1550,17 +1562,29 @@ class CohortBenchmarkService(
             }
             val idsAttempts = java.util.concurrent.atomic.AtomicInteger(0)
             val idsFailure = java.util.concurrent.atomic.AtomicReference<String?>(null)
-            val matchIds = riotApiService.getMatchIdsByPuuidLowPriority(
-                puuid = puuid,
-                region = normalizedRegion,
-                queueId = SOLO_QUEUE_ID,
-                count = effectiveCap,
-                start = 0,
-                maxRetries = 0,
-                httpAttemptCounter = idsAttempts,
-                failureReasonHolder = idsFailure
-            ).orEmpty()
-            totalNetworkCalls += idsAttempts.get().coerceAtLeast(1)
+            val matchIds = try {
+                riotApiService.getMatchIdsByPuuidLowPriority(
+                    puuid = puuid,
+                    region = normalizedRegion,
+                    queueId = SOLO_QUEUE_ID,
+                    count = effectiveCap,
+                    start = 0,
+                    maxRetries = 0,
+                    httpAttemptCounter = idsAttempts,
+                    failureReasonHolder = idsFailure
+                ).orEmpty()
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn(
+                    "[CohortBenchmark] Exception during low-priority match IDs fetch for region={} puuid={}: {}",
+                    normalizedRegion, puuid, e.message
+                )
+                stopReason = "SESSION_ERROR_ABORT"
+                break@outerLoop
+            } finally {
+                totalNetworkCalls += idsAttempts.get().coerceAtLeast(1)
+            }
             fetchedMatchIdLists++
             val postIdsSnap = getLiveRateLimitVerification(normalizedRegion)
             if (idsFailure.get() == "HTTP_429_TOO_MANY_REQUESTS" || postIdsSnap.serviceRateLimitActive || postIdsSnap.retryAfterUntil != null) {
@@ -1602,14 +1626,26 @@ class CohortBenchmarkService(
                     }
                     val matchAttempts = java.util.concurrent.atomic.AtomicInteger(0)
                     val matchFailure = java.util.concurrent.atomic.AtomicReference<String?>(null)
-                    match = riotApiService.getMatchByIdLowPriority(
-                        matchId = matchId,
-                        region = normalizedRegion,
-                        maxRetries = 0,
-                        httpAttemptCounter = matchAttempts,
-                        failureReasonHolder = matchFailure
-                    )
-                    totalNetworkCalls += matchAttempts.get().coerceAtLeast(1)
+                    match = try {
+                        riotApiService.getMatchByIdLowPriority(
+                            matchId = matchId,
+                            region = normalizedRegion,
+                            maxRetries = 0,
+                            httpAttemptCounter = matchAttempts,
+                            failureReasonHolder = matchFailure
+                        )
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        logger.warn(
+                            "[CohortBenchmark] Exception during low-priority match detail fetch for region={} matchId={}: {}",
+                            normalizedRegion, matchId, e.message
+                        )
+                        stopReason = "SESSION_ERROR_ABORT"
+                        break@outerLoop
+                    } finally {
+                        totalNetworkCalls += matchAttempts.get().coerceAtLeast(1)
+                    }
                     val postMatchSnap = getLiveRateLimitVerification(normalizedRegion)
                     if (matchFailure.get() == "HTTP_429_TOO_MANY_REQUESTS" || postMatchSnap.serviceRateLimitActive || postMatchSnap.retryAfterUntil != null) {
                         pausedForRetryAfter++
@@ -1680,27 +1716,29 @@ class CohortBenchmarkService(
             cellsPassing = cellProgress.values.count { it.passesQualityGate }
         }
 
-        if (cellsPassing >= TIER_ORDER.size * ELIGIBLE_ROLES.size) {
-            stopReason = "ALL_TARGET_CELLS_SATISFIED"
-        } else if (maxSessionNetworkCalls != null && currentSessionNetworkCalls() >= maxSessionNetworkCalls &&
-            (stopReason == "BATCH_BUDGET_REACHED_RESUMABLE" || stopReason == "SESSION_NETWORK_CALL_CAP_REACHED")
-        ) {
-            stopReason = "SESSION_NETWORK_CALL_CAP_REACHED"
-        } else if (stopReason == "BATCH_BUDGET_REACHED_RESUMABLE" && pendingQueue.none { it !in processedPuuids }) {
-            if (getMemoryHeadroomSnapshot(allowGcHintOnPressure = false).hasHeadroomForLowPriority) {
-                for (candidate in discoverCandidatePuuidsFromCache(normalizedRegion, effectivePatch)) {
-                    if (candidate !in processedPuuids && pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
-                        pendingQueue.add(candidate)
+        if (stopReason != "SESSION_ERROR_ABORT") {
+            if (cellsPassing >= TIER_ORDER.size * ELIGIBLE_ROLES.size) {
+                stopReason = "ALL_TARGET_CELLS_SATISFIED"
+            } else if (maxSessionNetworkCalls != null && currentSessionNetworkCalls() >= maxSessionNetworkCalls &&
+                (stopReason == "BATCH_BUDGET_REACHED_RESUMABLE" || stopReason == "SESSION_NETWORK_CALL_CAP_REACHED")
+            ) {
+                stopReason = "SESSION_NETWORK_CALL_CAP_REACHED"
+            } else if (stopReason == "BATCH_BUDGET_REACHED_RESUMABLE" && pendingQueue.none { it !in processedPuuids }) {
+                if (getMemoryHeadroomSnapshot(allowGcHintOnPressure = false).hasHeadroomForLowPriority) {
+                    for (candidate in discoverCandidatePuuidsFromCache(normalizedRegion, effectivePatch)) {
+                        if (candidate !in processedPuuids && pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
+                            pendingQueue.add(candidate)
+                        }
                     }
                 }
-            }
-            if (pendingQueue.none { it !in processedPuuids }) {
-                stopReason = "NO_CANDIDATES_REMAINING"
-            } else if (maxSessionProductiveBatches > 0 && currentSessionProductiveBatches() >= maxSessionProductiveBatches) {
+                if (pendingQueue.none { it !in processedPuuids }) {
+                    stopReason = "NO_CANDIDATES_REMAINING"
+                } else if (maxSessionProductiveBatches > 0 && currentSessionProductiveBatches() >= maxSessionProductiveBatches) {
+                    stopReason = "SESSION_BATCH_CAP_REACHED"
+                }
+            } else if (stopReason == "BATCH_BUDGET_REACHED_RESUMABLE" && maxSessionProductiveBatches > 0 && currentSessionProductiveBatches() >= maxSessionProductiveBatches) {
                 stopReason = "SESSION_BATCH_CAP_REACHED"
             }
-        } else if (stopReason == "BATCH_BUDGET_REACHED_RESUMABLE" && maxSessionProductiveBatches > 0 && currentSessionProductiveBatches() >= maxSessionProductiveBatches) {
-            stopReason = "SESSION_BATCH_CAP_REACHED"
         }
 
         val finalCheckpoint = buildCurrentCheckpoint(stopReason)
