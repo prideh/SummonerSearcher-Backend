@@ -256,6 +256,7 @@ def main():
         "-e", "JWT_SECRET_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "-e", "TWOFA_SECRET_KEY=0123456789abcdef0123456789abcdef",
         "-e", "RESEND_API_KEY=re_test_123456789",
+        "-e", "GEMINI_API_KEY=disabled",
         "-e", "COHORT_NETWORK_COLLECTION_ENABLED=true",
         "-e", "COHORT_OPERATOR_TOKEN=test-op-token",
         "ss-backend:512m-proof"
