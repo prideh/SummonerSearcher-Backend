@@ -346,6 +346,10 @@ def read_container_events_and_cgroup(container_name: str, host_pid: int) -> dict
 
 
 def main():
+    db_pass = os.environ.get("DB_PASS", "").strip()
+    if not db_pass:
+        raise RuntimeError("Missing required DB_PASS environment variable; refusing hardcoded fallback.")
+
     cert_file = sys.argv[1]
     key_file = sys.argv[2]
     print("=== Starting Mock Riot HTTPS API server on port 443 ===", flush=True)
@@ -373,7 +377,7 @@ def main():
         "-e", "DB_PORT=5432",
         "-e", "DB_NAME=summoner_searcher",
         "-e", "DB_USER=postgres",
-        "-e", "DB_PASS=postgres",
+        "-e", "DB_PASS",
         "-e", "REDIS_URL=redis://host.docker.internal:6379",
         "-e", "RIOT_API_KEY=RGAPI-test-512m-proof",
         "-e", "JWT_SECRET_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -383,7 +387,7 @@ def main():
         "-e", "COHORT_NETWORK_COLLECTION_ENABLED=true",
         "-e", "COHORT_OPERATOR_TOKEN=test-op-token",
         "ss-backend:512m-proof"
-    ])
+    ], env={**os.environ, "DB_PASS": db_pass})
 
     op_headers = {"X-Cohort-Operator-Token": "test-op-token"}
     base_url = "http://localhost:10000"

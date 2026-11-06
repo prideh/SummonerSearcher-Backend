@@ -24,6 +24,7 @@ Guarantees enforced by this script:
 
 import json
 import os
+import secrets
 import socket
 import subprocess
 import sys
@@ -466,6 +467,11 @@ class Cgroup2sWatcher:
 
 
 def run_arm(arm_label: str, image_tag: str) -> dict:
+    ephemeral_db_pass = secrets.token_hex(24)
+    if not ephemeral_db_pass:
+        raise RuntimeError("Failed to generate ephemeral Postgres password")
+    pg_docker_env = {**os.environ, "POSTGRES_PASSWORD": ephemeral_db_pass, "DB_PASS": ephemeral_db_pass}
+
     setup_isolated_network()
 
     # 1. Start fresh isolated Postgres & Redis on ab-isolated-net
@@ -474,10 +480,10 @@ def run_arm(arm_label: str, image_tag: str) -> dict:
         "--name", "ss-postgres",
         "--network", NETWORK_NAME,
         "--ip", POSTGRES_IP,
-        "-e", "POSTGRES_PASSWORD=postgres",
+        "-e", "POSTGRES_PASSWORD",
         "-e", "POSTGRES_DB=summoner_searcher",
         "postgres:16-alpine"
-    ], stdout=subprocess.DEVNULL)
+    ], stdout=subprocess.DEVNULL, env=pg_docker_env)
 
     subprocess.check_call([
         "docker", "run", "-d",
@@ -509,7 +515,7 @@ def run_arm(arm_label: str, image_tag: str) -> dict:
         "-e", "DB_PORT=5432",
         "-e", "DB_NAME=summoner_searcher",
         "-e", "DB_USER=postgres",
-        "-e", "DB_PASS=postgres",
+        "-e", "DB_PASS",
         "-e", f"REDIS_URL=redis://{REDIS_IP}:6379",
         "-e", "RIOT_API_KEY=RGAPI-test-512m-proof",
         "-e", "JWT_SECRET_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
@@ -519,7 +525,7 @@ def run_arm(arm_label: str, image_tag: str) -> dict:
         "-e", "COHORT_NETWORK_COLLECTION_ENABLED=true",
         "-e", "COHORT_OPERATOR_TOKEN=test-op-token",
         image_tag
-    ], stdout=subprocess.DEVNULL)
+    ], stdout=subprocess.DEVNULL, env=pg_docker_env)
 
     # 3. Wait for readiness on GET /api/riot/cohorts/euw1/collector/status?patch=16.7
     boot_status = None
