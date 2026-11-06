@@ -3141,13 +3141,13 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             every { memRedis.delete(any()) } answers {
                 locks.remove(firstArg<String>())
             }
-            every { memRedis.set(any(), any(), any()) } answers {
+            every { memRedis.set<Any>(any(), any(), any()) } answers {
                 redisStore[firstArg<String>()] = secondArg<Any>()
             }
             every { memRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
                 redisStore[firstArg<String>()] as? CohortCollectorCheckpointDto
             }
-            every { memRedis.scanKeys(any(), any()) } returns emptySet()
+            every { memRedis.scanKeys(any(), any()) } returns emptyList()
 
             val memLimiter = RiotApiRateLimiter(timeProvider)
             val memRiotApi = mockk<RiotApiService>(relaxed = true)
@@ -3158,7 +3158,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 cohortBenchmarkCellRepository = mockk(relaxed = true),
                 riotApiRateLimiter = memLimiter,
                 riotApiService = memRiotApi,
-                objectMapper = jacksonObjectMapper().findAndRegisterModules(),
+                objectMapper = objectMapper,
                 networkCollectionEnabled = false,
                 timeProvider = timeProvider,
                 memoryStatsProvider = memProvider
