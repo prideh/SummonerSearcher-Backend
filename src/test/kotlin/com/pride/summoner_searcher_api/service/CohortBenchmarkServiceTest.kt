@@ -3374,7 +3374,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             every { scalarRedis.get(any(), any<Class<Any>>()) } returns null
             every { scalarRedis.scanKeys(any(), any()) } returns emptyList()
 
-            val service = CohortBenchmarkService(
+            fun newColdService() = CohortBenchmarkService(
                 redisCacheService = scalarRedis,
                 cohortBenchmarkCellRepository = scalarCellRepo,
                 riotApiRateLimiter = scalarLimiter,
@@ -3390,9 +3390,9 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             every { scalarRiotApi.fetchDataDragonVersions(any()) } returns listOf("16.22.1", "16.21.1")
             every { scalarSampleRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") } returns listOf("16.21", "16.22", "16.99")
             every { scalarCellRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") } returns listOf("16.20", "16.99")
-            val groundedWithDdragon = service.resolveGroundedCurrentPatch("euw1")
+            val groundedWithDdragon = newColdService().resolveGroundedCurrentPatch("euw1")
 
-            // 2. DataDragon unavailable after TTL expiry: selects highest verified store patch (16.22 over 16.21)
+            // 2. DataDragon unavailable on cold start: selects highest verified store patch (16.22 over 16.21)
             //    and ignores unbacked higher checkpoint patch (16.99)
             nowMs += 31 * 60 * 1_000L
             every { scalarRiotApi.fetchDataDragonVersions(any()) } throws RuntimeException("DataDragon unreachable")
@@ -3413,7 +3413,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 startedAt = Instant.ofEpochMilli(nowMs),
                 updatedAt = Instant.ofEpochMilli(nowMs)
             )
-            val groundedStoreFallback = service.resolveGroundedCurrentPatch("euw1")
+            val groundedStoreFallback = newColdService().resolveGroundedCurrentPatch("euw1")
 
             // 3. Empty verified stores + DataDragon unavailable: falls back to latest Postgres checkpoint row with targetPatch="latest"
             //    by parsing checkpointJson.targetPatch ("16.21")
@@ -3435,13 +3435,13 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 startedAt = Instant.ofEpochMilli(nowMs),
                 updatedAt = Instant.ofEpochMilli(nowMs)
             )
-            val groundedFromCheckpointJson = service.resolveGroundedCurrentPatch("euw1")
+            val groundedFromCheckpointJson = newColdService().resolveGroundedCurrentPatch("euw1")
 
             // 4. Repository exceptions are safely caught by runCatching and fall back to observed/in-memory patch
             every { scalarSampleRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") } throws RuntimeException("DB timeout")
             every { scalarCellRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") } throws RuntimeException("DB timeout")
             every { scalarCheckpointRepo.findFirstByRegionAndQueueIdOrderByUpdatedAtDesc("euw1", 420) } throws RuntimeException("DB timeout")
-            val groundedOnRepoError = service.resolveGroundedCurrentPatch("euw1", observedCandidatePatch = "16.23")
+            val groundedOnRepoError = newColdService().resolveGroundedCurrentPatch("euw1", observedCandidatePatch = "16.23")
 
             Then("it should preserve all grounding and fallback semantics while making zero full-entity findByRegionOrderByPatchDescTierAscRoleAsc calls") {
                 groundedWithDdragon shouldBe "16.22"
