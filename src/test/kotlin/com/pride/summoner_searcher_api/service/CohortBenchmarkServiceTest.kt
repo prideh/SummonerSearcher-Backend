@@ -3051,24 +3051,38 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             )
             val versions = serviceWithSeparateClients.fetchDataDragonVersions(maxEntries = 2)
 
-            // Also verify defense-in-depth: even if a RestClient with a default X-Riot-Token header were passed,
-            // fetchDataDragonVersions strips X-Riot-Token before the request is sent
-            val capturedStrippedHeaders = mutableListOf<org.springframework.http.HttpHeaders>()
-            val clientWithDefaultToken = org.springframework.web.client.RestClient.builder()
-                .defaultHeader("X-Riot-Token", "RGAPI-secret-token-must-never-leak-to-ddragon")
+            // Also instantiate the real RestClientConfig beans (riotRestClient vs dataDragonRestClient)
+            // and verify that riotRestClient has the default X-Riot-Token header while dataDragonRestClient has none!
+            val restClientConfig = com.pride.summoner_searcher_api.config.RestClientConfig()
+            org.springframework.test.util.ReflectionTestUtils.setField(
+                restClientConfig,
+                "riotApiKey",
+                "RGAPI-secret-token-must-never-leak-to-ddragon"
+            )
+            val realConfigDdragonHeaders = mutableListOf<org.springframework.http.HttpHeaders>()
+            val realConfigRiotHeaders = mutableListOf<org.springframework.http.HttpHeaders>()
+            val realConfigRiotClient = restClientConfig.riotRestClient().mutate()
                 .requestInterceptor { request, _, _ ->
                     val headersSnapshot = org.springframework.http.HttpHeaders()
                     headersSnapshot.putAll(request.headers)
-                    capturedStrippedHeaders.add(headersSnapshot)
+                    realConfigRiotHeaders.add(headersSnapshot)
+                    buildMockJsonResponse("""["should-not-be-called"]""")
+                }
+                .build()
+            val realConfigDdragonClient = restClientConfig.dataDragonRestClient().mutate()
+                .requestInterceptor { request, _, _ ->
+                    val headersSnapshot = org.springframework.http.HttpHeaders()
+                    headersSnapshot.putAll(request.headers)
+                    realConfigDdragonHeaders.add(headersSnapshot)
                     buildMockJsonResponse("""["16.22.1"]""")
                 }
                 .build()
-            val defenseInDepthService = RiotApiService(
-                riotRestClient = authenticatedRiotRestClient,
+            val realConfigService = RiotApiService(
+                riotRestClient = realConfigRiotClient,
                 rateLimiter = RiotApiRateLimiter(SystemTimeProvider()),
-                dataDragonRestClient = clientWithDefaultToken
+                dataDragonRestClient = realConfigDdragonClient
             )
-            val defenseVersions = defenseInDepthService.fetchDataDragonVersions(maxEntries = 1)
+            val realConfigVersions = realConfigService.fetchDataDragonVersions(maxEntries = 1)
 
             Then("it should use the separate dataDragonRestClient, make zero calls on riotRestClient, and send no X-Riot-Token header to ddragon.leagueoflegends.com") {
                 versions shouldBe listOf("16.22.1", "16.21.1")
@@ -3081,11 +3095,14 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 sentHeaders["X-Riot-Token"] shouldBe null
                 sentHeaders.keys.none { it.equals("X-Riot-Token", ignoreCase = true) } shouldBe true
 
-                // Defense-in-depth header removal also guarantees no X-Riot-Token header on outgoing request
-                defenseVersions shouldBe listOf("16.22.1")
-                val strippedHeaders = capturedStrippedHeaders.single()
-                strippedHeaders.containsKey("X-Riot-Token") shouldBe false
-                strippedHeaders["X-Riot-Token"] shouldBe null
+                // Verify real RestClientConfig.dataDragonRestClient bean sends zero X-Riot-Token headers
+                // and zero requests through RestClientConfig.riotRestClient
+                realConfigVersions shouldBe listOf("16.22.1")
+                realConfigRiotHeaders shouldBe emptyList()
+                val configDdragonSentHeaders = realConfigDdragonHeaders.single()
+                configDdragonSentHeaders.containsKey("X-Riot-Token") shouldBe false
+                configDdragonSentHeaders["X-Riot-Token"] shouldBe null
+                configDdragonSentHeaders.keys.none { it.equals("X-Riot-Token", ignoreCase = true) } shouldBe true
             }
         }
     }

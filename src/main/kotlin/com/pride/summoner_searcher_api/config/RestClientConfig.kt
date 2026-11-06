@@ -77,6 +77,10 @@ class RestClientConfig {
 
         return RestClient.builder()
             .requestFactory(requestFactory)
+            .requestInterceptor { request, body, execution ->
+                request.headers.remove("X-Riot-Token")
+                execution.execute(request, body)
+            }
             .build()
     }
 }
