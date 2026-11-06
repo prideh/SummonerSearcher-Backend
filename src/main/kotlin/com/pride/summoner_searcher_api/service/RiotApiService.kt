@@ -23,8 +23,11 @@ import org.springframework.web.client.RestClient
  */
 @Service
 class RiotApiService(
+    @org.springframework.beans.factory.annotation.Qualifier("riotRestClient")
     private val riotRestClient: RestClient,
-    private val rateLimiter: RiotApiRateLimiter
+    private val rateLimiter: RiotApiRateLimiter,
+    @org.springframework.beans.factory.annotation.Qualifier("dataDragonRestClient")
+    private val dataDragonRestClient: RestClient = RestClient.builder().build()
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
@@ -621,6 +624,38 @@ class RiotApiService(
                     )
                 }
             )
+        }
+    }
+
+    @org.springframework.beans.factory.annotation.Value("\${cohort.patch.ddragon-versions-url:https://ddragon.leagueoflegends.com/api/versions.json}")
+    private var dataDragonVersionsUrl: String = "https://ddragon.leagueoflegends.com/api/versions.json"
+
+    /**
+     * Bounded lookup of Riot Data Dragon `versions.json` (e.g. `["16.22.1", "16.21.1", ...]`)
+     * used to ground the current League of Legends `major.minor` patch without counting against
+     * regional Riot API rate limits.
+     * Uses the separate unauthenticated [dataDragonRestClient] (never [riotRestClient]) so the
+     * `X-Riot-Token` header is never sent to `ddragon.leagueoflegends.com`.
+     * Returns an empty list on any network/parse error (safe fallback: never crashes and never
+     * advances to an unverified patch).
+     */
+    fun fetchDataDragonVersions(maxEntries: Int = 5): List<String> {
+        val safeMax = maxEntries.coerceIn(1, 20)
+        return try {
+            val body = dataDragonRestClient.get()
+                .uri(dataDragonVersionsUrl)
+                .headers { it.remove("X-Riot-Token") }
+                .retrieve()
+                .body(Array<String>::class.java)
+            body?.asSequence()
+                ?.map { it.trim() }
+                ?.filter { it.isNotBlank() }
+                ?.take(safeMax)
+                ?.toList()
+                .orEmpty()
+        } catch (e: Exception) {
+            logger.debug("Data Dragon versions.json lookup failed (safe fallback): {}", e.message)
+            emptyList()
         }
     }
 

@@ -3,13 +3,16 @@ package com.pride.summoner_searcher_api.service
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.pride.summoner_searcher_api.dto.*
 import com.pride.summoner_searcher_api.model.CohortBenchmarkCellEntity
+import com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity
 import com.pride.summoner_searcher_api.model.CohortCollectorCheckpointEntity
 import com.pride.summoner_searcher_api.repository.CohortBenchmarkCellRepository
+import com.pride.summoner_searcher_api.repository.CohortCellSampleStateRepository
 import com.pride.summoner_searcher_api.repository.CohortCollectorCheckpointRepository
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
+import java.security.MessageDigest
 import java.time.Duration
 import java.time.Instant
 import kotlin.math.ceil
@@ -162,10 +165,28 @@ class CohortBenchmarkService(
     private val minFreeMemoryBytes: Long = DEFAULT_MIN_FREE_MEMORY_BYTES,
     private val memoryStatsProvider: MemoryStatsProvider = SystemMemoryStatsProvider(),
     @Autowired(required = false)
-    private val cohortCollectorCheckpointRepository: CohortCollectorCheckpointRepository? = null
+    private val cohortCollectorCheckpointRepository: CohortCollectorCheckpointRepository? = null,
+    @Autowired(required = false)
+    private val cohortCellSampleStateRepository: CohortCellSampleStateRepository? = null
 ) {
     private val logger = LoggerFactory.getLogger(javaClass)
     private val lastGcHintAtMs = java.util.concurrent.atomic.AtomicLong(0L)
+    private val inMemoryDurableCellStates = java.util.concurrent.ConcurrentHashMap<String, DurableCellSampleStateDto>()
+    private val inMemoryGroundedPatchByRegion = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val freshRankedSoloMatchPatchByRegion = java.util.concurrent.ConcurrentHashMap<String, String>()
+    @Volatile private var cachedDataDragonPatch: String? = null
+    @Volatile private var cachedDataDragonPatchExpiresAtMs: Long = 0L
+    @Volatile private var lastDataDragonLookupFailureAtMs: Long = 0L
+
+    private val durableSampleStateDbWriteCount = java.util.concurrent.atomic.AtomicLong(0L)
+    private val benchmarkCellDbWriteCount = java.util.concurrent.atomic.AtomicLong(0L)
+    private val checkpointDbWriteCount = java.util.concurrent.atomic.AtomicLong(0L)
+
+    fun getDurableDbWriteCounts(): Map<String, Long> = mapOf(
+        "cohortCellSampleStatesWrites" to durableSampleStateDbWriteCount.get(),
+        "cohortBenchmarkCellsWrites" to benchmarkCellDbWriteCount.get(),
+        "cohortCollectorCheckpointsWrites" to checkpointDbWriteCount.get()
+    )
 
     companion object {
         const val SOLO_QUEUE_ID = 420
@@ -175,6 +196,28 @@ class CohortBenchmarkService(
         const val SNAPSHOT_SCAN_CHUNK_SIZE = 25
         const val MATCH_SCAN_CHUNK_SIZE = 10
         const val MAX_IN_MEMORY_PARTICIPANT_SAMPLES = 6_000
+        /**
+         * Per-cell distinct player cap (`250` players = 5x the `50`-player quality gate, and up to
+         * `2,500` games = 12.5x the `200`-game quality gate).
+         * Bounds `samples_json` to <= 2,500 de-identified sample records (~820 KB max per cell) and
+         * bounds 30-cell memory footprint inside the 512 MB container while achieving nonparametric
+         * median standard error ~1.253*sigma/sqrt(250) ~= 0.079*sigma. Existing players among the 250
+         * continue to refresh their 10 newest games on the patch.
+         */
+        const val MAX_PLAYERS_PER_DURABLE_CELL_STATE = 250
+        const val MAX_SEEN_MATCH_HASHES_PER_CELL = 2_500
+        /**
+         * Batches Postgres `cohort_cell_sample_states`, `cohort_benchmark_cells`, and checkpoint writes
+         * to flush at most once every N = 10 processed players or once at the end of a productive batch,
+         * eliminating per-player `samples_json` write amplification.
+         */
+        const val DURABLE_CELL_FLUSH_PLAYER_INTERVAL = 10
+        const val EXTERNAL_PATCH_CACHE_TTL_MS = 30L * 60L * 1000L
+        const val EXTERNAL_PATCH_FAILURE_COOLDOWN_MS = 60_000L
+        private val EXTERNAL_PATCH_REDIS_TTL = Duration.ofMinutes(30)
+        private const val EXTERNAL_PATCH_REDIS_KEY = "cohort:patch:external:ddragon"
+        const val STOP_REASON_NON_CURRENT_PATCH_REFUSED = "NON_CURRENT_PATCH_REFUSED"
+        const val GROUNDED_PATCH_SOURCE_LABEL = "GROUNDED_CURRENT_PATCH_STORE"
         const val MAX_CHECKPOINT_PROCESSED_PUUIDS = 5_000
         const val MAX_CHECKPOINT_PROCESSED_MATCH_IDS = 10_000
         const val MAX_CHECKPOINT_PENDING_PUUIDS = 500
@@ -347,10 +390,44 @@ class CohortBenchmarkService(
         val timeSpentDeadShare: Double?
     )
 
+    @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
+    data class DeidentifiedMetricSampleDto(
+        val matchIdHash: String = "",
+        val playerHash: String = "",
+        val gameCreation: Long = 0L,
+        val rankSnapshotEpochMilli: Long = 0L,
+        val laneCsAt10: Double? = null,
+        val laneOnlyCsPerMin: Double? = null,
+        val totalCsPerMinWithCamps: Double? = null,
+        val timelineTotalCsAt10WithCamps: Double? = null,
+        val goldPerMin: Double? = null,
+        val damagePerMin: Double? = null,
+        val visionScorePerMin: Double? = null,
+        val killParticipation: Double? = null,
+        val deathsPerGame: Double? = null,
+        val timeSpentDeadShare: Double? = null
+    )
+
+    @com.fasterxml.jackson.annotation.JsonIgnoreProperties(ignoreUnknown = true)
+    data class DurableCellSampleStateDto(
+        val region: String = "euw1",
+        val patch: String = "",
+        val queueId: Int = SOLO_QUEUE_ID,
+        val tier: String = "",
+        val role: String = "",
+        val maxGamesPerPlayerCap: Int = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER,
+        val excludedOverPlayerCapGames: Int = 0,
+        val seenMatchIdHashes: Set<String> = emptySet(),
+        val samplesByPlayerHash: Map<String, List<DeidentifiedMetricSampleDto>> = emptyMap(),
+        val updatedAtEpochMilli: Long = 0L
+    )
+
     /**
      * Public-safe, cached and recompute-guarded report endpoint entrypoint.
      * - Validates [region] and optional [targetPatch] before touching Redis.
-     * - Serves cached report (`cohort:report:{region}:{patch}`) with zero Redis scans and zero DB writes.
+     * - Enforces the single grounded current patch source: refuses non-current [targetPatch] requests.
+     * - Serves cached report (`cohort:report:{region}:{patch}`) with zero Redis scans and zero DB writes
+     *   while hydrating cells from the durable Postgres store if empty.
      * - Guards cache-miss recomputation with a cooldown lock (`lock:cohort:report:{region}:{patch}`) so
      *   public `GET` requests can never trigger unbounded or repeated scans/persistence.
      */
@@ -379,6 +456,16 @@ class CohortBenchmarkService(
             )
         }
 
+        val groundedPatch = resolveGroundedCurrentPatch(normalizedRegion, allowLightRedisMatchProbe = false)
+        if (cleanPatch != null && groundedPatch != null && cleanPatch != groundedPatch) {
+            return buildEmptyGuardedReport(
+                region = normalizedRegion,
+                now = now,
+                reportSource = STOP_REASON_NON_CURRENT_PATCH_REFUSED,
+                note = "Refused non-current patch '$cleanPatch' for region '$normalizedRegion': grounded current patch is '$groundedPatch' (source=$GROUNDED_PATCH_SOURCE_LABEL)."
+            )
+        }
+
         val rKey = reportCacheKey(normalizedRegion, cleanPatch)
         val cachedReport = redisCacheService.get(rKey, CohortExtractionReportDto::class.java)
         if (cachedReport != null) {
@@ -397,7 +484,7 @@ class CohortBenchmarkService(
         val acquiredGuard = redisCacheService.setIfAbsent(guardKey, "LOCKED", RECOMPUTE_GUARD_TTL)
         if (!acquiredGuard) {
             val persistedCells = getPersistedCohortCells(normalizedRegion, cleanPatch)
-            val fallbackPatch = cleanPatch ?: persistedCells.firstOrNull()?.patch
+            val fallbackPatch = cleanPatch ?: groundedPatch ?: persistedCells.firstOrNull()?.patch
             return CohortExtractionReportDto(
                 reportSource = "GUARDED_COOLDOWN_FALLBACK",
                 inventory = CohortCacheInventoryDto(
@@ -428,7 +515,7 @@ class CohortBenchmarkService(
                     participantsWithRankSnapshot = 0,
                     participantsWithoutRankSnapshot = 0,
                     deduplicatedParticipantEntries = 0,
-                    excludedOverPlayerCapSamples = 0,
+                    excludedOverPlayerCapSamples = persistedCells.sumOf { it.excludedOverPlayerCapGames },
                     eligibleCohortSamples = persistedCells.sumOf { it.eligibleGames },
                     distinctEligibleCohortPlayers = persistedCells.sumOf { it.distinctPlayers },
                     cellsTotal = persistedCells.size,
@@ -862,166 +949,176 @@ class CohortBenchmarkService(
 
         val latestCachedPatch = soloQueueMatchesByPatch.keys.maxWithOrNull(patchComparator)
             ?: matchesByPatchCounts.keys.maxWithOrNull(patchComparator)
-        val resolvedPatch = cleanTargetPatch ?: latestCachedPatch
+        val groundedStorePatch = resolveGroundedCurrentPatch(
+            region = normalizedRegion,
+            observedCandidatePatch = latestCachedPatch,
+            allowLightRedisMatchProbe = false
+        )
+        if (cleanTargetPatch != null && groundedStorePatch != null && cleanTargetPatch != groundedStorePatch) {
+            return buildEmptyGuardedReport(
+                region = normalizedRegion,
+                now = scannedAt,
+                reportSource = STOP_REASON_NON_CURRENT_PATCH_REFUSED,
+                note = "Refused non-current patch '$cleanTargetPatch' for region '$normalizedRegion': grounded current patch is '$groundedStorePatch' (source=$GROUNDED_PATCH_SOURCE_LABEL)."
+            )
+        }
+        val resolvedPatch = cleanTargetPatch ?: groundedStorePatch ?: latestCachedPatch
         val patchSelectionSource = when {
             cleanTargetPatch != null -> "EXPLICIT_TARGET_PATCH"
             latestCachedPatch != null -> "LATEST_CACHED_PATCH_IN_REDIS"
+            groundedStorePatch != null -> GROUNDED_PATCH_SOURCE_LABEL
             else -> "NO_CACHED_PATCH_FOUND"
         }
 
-        // 3. Group by (tier, role), enforce per-player game cap (newest games first), and compute P25/Median/P75/IQR
+        // 3. Group by (tier, role), merge with durable Postgres cell states, enforce per-player game cap (newest games first), and compute P25/Median/P75/IQR
         val groupedByCell = candidateSamples.groupBy { it.tier to it.role }
         var totalExcludedOverPlayerCap = 0
         var totalEligibleSamples = 0
-        val distinctEligiblePlayers = mutableSetOf<String>()
+        var totalDistinctEligiblePlayers = 0
+        val distinctEligiblePlayersInScan = mutableSetOf<String>()
         val computedCells = mutableListOf<CohortBenchmarkCellDto>()
         val effectivePatchLabel = resolvedPatch ?: "UNKNOWN"
 
-        val sortedCellKeys = groupedByCell.keys.sortedWith(
-            compareBy<Pair<String, String>> { tierIndex(it.first) }.thenBy { roleIndex(it.second) }
-        )
+        val existingDurableStatesByCell = if (resolvedPatch != null && effectiveCap == CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER) {
+            loadDurableCellSampleStatesForPatch(normalizedRegion, resolvedPatch)
+        } else {
+            emptyMap()
+        }
+        val existingLegacyCellsByKey = if (resolvedPatch != null && effectiveCap == CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER) {
+            runCatching {
+                cohortBenchmarkCellRepository.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(
+                    region = normalizedRegion,
+                    patch = resolvedPatch,
+                    queueId = SOLO_QUEUE_ID
+                ).mapNotNull { entityToDto(it) }
+                    .associateBy { it.tier.uppercase() to it.role.uppercase() }
+            }.getOrNull().orEmpty()
+        } else {
+            emptyMap()
+        }
 
-        for (cellKey in sortedCellKeys) {
+        val allCellKeys = (groupedByCell.keys + existingDurableStatesByCell.keys + existingLegacyCellsByKey.keys)
+            .distinct()
+            .sortedWith(
+                compareBy<Pair<String, String>> { tierIndex(it.first) }.thenBy { roleIndex(it.second) }
+            )
+        val cellsToWriteToDb = mutableListOf<CohortBenchmarkCellDto>()
+
+        for (cellKey in allCellKeys) {
             val (tier, role) = cellKey
             val cellCandidates = groupedByCell[cellKey].orEmpty()
-            val byPlayer = cellCandidates.groupBy { it.puuid }
 
-            val retainedSamples = mutableListOf<ParticipantSample>()
-            var cellExcludedOverCap = 0
-
-            for ((_, playerSamples) in byPlayer) {
-                val sortedNewestFirst = playerSamples.sortedWith(
-                    compareByDescending<ParticipantSample> { it.gameCreation }.thenByDescending { it.matchId }
-                )
-                val kept = sortedNewestFirst.take(effectiveCap)
-                val dropped = (sortedNewestFirst.size - kept.size).coerceAtLeast(0)
-                cellExcludedOverCap += dropped
-                retainedSamples.addAll(kept)
-            }
-
-            totalExcludedOverPlayerCap += cellExcludedOverCap
-            totalEligibleSamples += retainedSamples.size
-            retainedSamples.forEach { distinctEligiblePlayers.add(it.puuid) }
-
-            val distinctPlayersCount = byPlayer.keys.size
-            val eligibleGamesCount = retainedSamples.size
-            val passesGate = distinctPlayersCount >= CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE &&
-                eligibleGamesCount >= CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE
-
-            val gateStatus = if (passesGate) {
-                "READY_FOR_COLOR_BANDS"
-            } else {
-                "INSUFFICIENT_SAMPLE (players=$distinctPlayersCount/${CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE}, games=$eligibleGamesCount/${CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE})"
-            }
-
-            val earliestSnapshot = retainedSamples.minOfOrNull { it.rankSnapshotAt }
-            val latestSnapshot = retainedSamples.maxOfOrNull { it.rankSnapshotAt }
-            val roleLaneCeiling = theoreticalLaneMinionSupplyAt10(resolvedPatch, role)
-
-            val metricsBundle = CohortMetricsBundleDto(
-                laneCsAt10 = buildDistribution(
-                    metricKey = "laneCsAt10",
-                    unit = "lane_cs",
-                    includesJungleCamps = false,
-                    theoreticalSupplyCeiling = roleLaneCeiling,
-                    samples = retainedSamples,
-                    extractor = { it.laneCsAt10 }
-                ),
-                laneOnlyCsPerMin = buildDistribution(
-                    metricKey = "laneOnlyCsPerMin",
-                    unit = "lane_cs_per_min",
-                    includesJungleCamps = false,
-                    theoreticalSupplyCeiling = null,
-                    samples = retainedSamples,
-                    extractor = { it.laneOnlyCsPerMin }
-                ),
-                totalCsPerMinWithCamps = buildDistribution(
-                    metricKey = "totalCsPerMinWithCamps",
-                    unit = "total_cs_per_min",
-                    includesJungleCamps = true,
-                    theoreticalSupplyCeiling = null,
-                    samples = retainedSamples,
-                    extractor = { it.totalCsPerMinWithCamps }
-                ),
-                timelineTotalCsAt10WithCamps = buildDistribution(
-                    metricKey = "timelineTotalCsAt10WithCamps",
-                    unit = "total_cs",
-                    includesJungleCamps = true,
-                    theoreticalSupplyCeiling = null,
-                    samples = retainedSamples,
-                    extractor = { it.timelineTotalCsAt10WithCamps }
-                ),
-                goldPerMin = buildDistribution(
-                    metricKey = "goldPerMin",
-                    unit = "gold_per_min",
-                    includesJungleCamps = false,
-                    theoreticalSupplyCeiling = null,
-                    samples = retainedSamples,
-                    extractor = { it.goldPerMin }
-                ),
-                damagePerMin = buildDistribution(
-                    metricKey = "damagePerMin",
-                    unit = "damage_per_min",
-                    includesJungleCamps = false,
-                    theoreticalSupplyCeiling = null,
-                    samples = retainedSamples,
-                    extractor = { it.damagePerMin }
-                ),
-                visionScorePerMin = buildDistribution(
-                    metricKey = "visionScorePerMin",
-                    unit = "vision_score_per_min",
-                    includesJungleCamps = false,
-                    theoreticalSupplyCeiling = null,
-                    samples = retainedSamples,
-                    extractor = { it.visionScorePerMin }
-                ),
-                killParticipation = buildDistribution(
-                    metricKey = "killParticipation",
-                    unit = "ratio_0_to_1",
-                    includesJungleCamps = false,
-                    theoreticalSupplyCeiling = null,
-                    samples = retainedSamples,
-                    extractor = { it.killParticipation }
-                ),
-                deathsPerGame = buildDistribution(
-                    metricKey = "deathsPerGame",
-                    unit = "deaths",
-                    includesJungleCamps = false,
-                    theoreticalSupplyCeiling = null,
-                    samples = retainedSamples,
-                    extractor = { it.deathsPerGame }
-                ),
-                timeSpentDeadShare = buildDistribution(
-                    metricKey = "timeSpentDeadShare",
-                    unit = "ratio_0_to_1",
-                    includesJungleCamps = false,
-                    theoreticalSupplyCeiling = null,
-                    samples = retainedSamples,
-                    extractor = { it.timeSpentDeadShare }
-                )
-            )
-
-            computedCells.add(
-                CohortBenchmarkCellDto(
+            if (resolvedPatch != null && effectiveCap == CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER) {
+                val existingState = existingDurableStatesByCell[cellKey]
+                val legacyCell = existingLegacyCellsByKey[cellKey]
+                if (existingState == null && cellCandidates.isEmpty() && legacyCell != null) {
+                    totalExcludedOverPlayerCap += legacyCell.excludedOverPlayerCapGames
+                    totalEligibleSamples += legacyCell.eligibleGames
+                    totalDistinctEligiblePlayers += legacyCell.distinctPlayers
+                    computedCells.add(legacyCell)
+                    continue
+                }
+                val baseState = existingState ?: DurableCellSampleStateDto(
                     region = normalizedRegion,
-                    patch = effectivePatchLabel,
-                    patchSelectionSource = patchSelectionSource,
+                    patch = resolvedPatch,
                     queueId = SOLO_QUEUE_ID,
                     tier = tier,
                     role = role,
-                    distinctPlayers = distinctPlayersCount,
-                    eligibleGames = eligibleGamesCount,
                     maxGamesPerPlayerCap = effectiveCap,
-                    excludedOverPlayerCapGames = cellExcludedOverCap,
-                    passesQualityGate = passesGate,
-                    colorBandsEnabled = passesGate,
-                    qualityGateStatus = gateStatus,
-                    earliestRankSnapshotAt = earliestSnapshot,
-                    latestRankSnapshotAt = latestSnapshot,
-                    computedAt = scannedAt,
-                    metrics = metricsBundle
+                    updatedAtEpochMilli = scannedAt.toEpochMilli()
                 )
-            )
+                val mergedState = if (cellCandidates.isNotEmpty()) {
+                    val updated = foldParticipantSamplesIntoDurableState(
+                        state = baseState,
+                        samples = cellCandidates,
+                        effectiveCap = effectiveCap,
+                        nowEpochMilli = scannedAt.toEpochMilli()
+                    )
+                    if (updated != baseState || existingState == null) {
+                        saveDurableCellSampleState(updated)
+                    }
+                    updated
+                } else {
+                    baseState
+                }
+                val durableCellDto = buildCellDtoFromDurableState(
+                    state = mergedState,
+                    patchSelectionSource = patchSelectionSource,
+                    computedAt = scannedAt
+                )
+                val chosenCell = if (legacyCell != null && legacyCell.eligibleGames > durableCellDto.eligibleGames) {
+                    legacyCell
+                } else {
+                    if (mergedState != baseState || legacyCell == null || durableCellDto.eligibleGames > legacyCell.eligibleGames) {
+                        cellsToWriteToDb.add(durableCellDto)
+                    }
+                    durableCellDto
+                }
+                totalExcludedOverPlayerCap += chosenCell.excludedOverPlayerCapGames
+                totalEligibleSamples += chosenCell.eligibleGames
+                totalDistinctEligiblePlayers += chosenCell.distinctPlayers
+                computedCells.add(chosenCell)
+            } else {
+                val byPlayer = cellCandidates.groupBy { it.puuid }
+                val retainedSamples = mutableListOf<ParticipantSample>()
+                var cellExcludedOverCap = 0
+
+                for ((_, playerSamples) in byPlayer) {
+                    val sortedNewestFirst = playerSamples.sortedWith(
+                        compareByDescending<ParticipantSample> { it.gameCreation }.thenByDescending { it.matchId }
+                    )
+                    val kept = sortedNewestFirst.take(effectiveCap)
+                    val dropped = (sortedNewestFirst.size - kept.size).coerceAtLeast(0)
+                    cellExcludedOverCap += dropped
+                    retainedSamples.addAll(kept)
+                }
+
+                totalExcludedOverPlayerCap += cellExcludedOverCap
+                totalEligibleSamples += retainedSamples.size
+                retainedSamples.forEach { distinctEligiblePlayersInScan.add(it.puuid) }
+
+                val distinctPlayersCount = byPlayer.keys.size
+                val eligibleGamesCount = retainedSamples.size
+                val passesGate = distinctPlayersCount >= CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE &&
+                    eligibleGamesCount >= CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE
+
+                val gateStatus = if (passesGate) {
+                    "READY_FOR_COLOR_BANDS"
+                } else {
+                    "INSUFFICIENT_SAMPLE (players=$distinctPlayersCount/${CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE}, games=$eligibleGamesCount/${CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE})"
+                }
+
+                val earliestSnapshot = retainedSamples.minOfOrNull { it.rankSnapshotAt }
+                val latestSnapshot = retainedSamples.maxOfOrNull { it.rankSnapshotAt }
+                val roleLaneCeiling = theoreticalLaneMinionSupplyAt10(resolvedPatch, role)
+
+                val metricsBundle = buildMetricsBundleFromSamples(
+                    samples = retainedSamples,
+                    roleLaneCeiling = roleLaneCeiling
+                )
+
+                computedCells.add(
+                    CohortBenchmarkCellDto(
+                        region = normalizedRegion,
+                        patch = effectivePatchLabel,
+                        patchSelectionSource = patchSelectionSource,
+                        queueId = SOLO_QUEUE_ID,
+                        tier = tier,
+                        role = role,
+                        distinctPlayers = distinctPlayersCount,
+                        eligibleGames = eligibleGamesCount,
+                        maxGamesPerPlayerCap = effectiveCap,
+                        excludedOverPlayerCapGames = cellExcludedOverCap,
+                        passesQualityGate = passesGate,
+                        colorBandsEnabled = passesGate,
+                        qualityGateStatus = gateStatus,
+                        earliestRankSnapshotAt = earliestSnapshot,
+                        latestRankSnapshotAt = latestSnapshot,
+                        computedAt = scannedAt,
+                        metrics = metricsBundle
+                    )
+                )
+            }
         }
 
         // 4. Persist compact de-identified cells to PostgreSQL/JPA and Redis only when using canonical game cap
@@ -1029,7 +1126,18 @@ class CohortBenchmarkService(
             computedCells.isNotEmpty() &&
             effectiveCap == CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
         ) {
-            persistDeidentifiedCells(normalizedRegion, resolvedPatch, computedCells)
+            persistDeidentifiedCells(
+                region = normalizedRegion,
+                patch = resolvedPatch,
+                cellsToSaveInDb = cellsToWriteToDb,
+                allCellsForCache = computedCells
+            )
+        }
+
+        val finalDistinctPlayers = if (distinctEligiblePlayersInScan.isNotEmpty()) {
+            maxOf(distinctEligiblePlayersInScan.size, totalDistinctEligiblePlayers)
+        } else {
+            totalDistinctEligiblePlayers
         }
 
         val inventory = CohortCacheInventoryDto(
@@ -1048,7 +1156,7 @@ class CohortBenchmarkService(
             cachedMatchCount = cachedMatchCount,
             cachedTimelineCount = timelineKeys.size,
             matchesByPatch = matchesByPatchCounts.toSortedMap(patchComparator.reversed()),
-            latestCachedPatch = latestCachedPatch,
+            latestCachedPatch = latestCachedPatch ?: resolvedPatch,
             selectedTargetPatch = resolvedPatch,
             patchSelectionSource = patchSelectionSource,
             soloQueue420MatchesOnTargetPatch = soloQueue420MatchesOnTargetPatch,
@@ -1065,7 +1173,7 @@ class CohortBenchmarkService(
             deduplicatedParticipantEntries = deduplicatedParticipantEntries,
             excludedOverPlayerCapSamples = totalExcludedOverPlayerCap,
             eligibleCohortSamples = totalEligibleSamples,
-            distinctEligibleCohortPlayers = distinctEligiblePlayers.size,
+            distinctEligibleCohortPlayers = finalDistinctPlayers,
             cellsTotal = computedCells.size,
             cellsPassingQualityGate = computedCells.count { it.passesQualityGate }
         )
@@ -1078,10 +1186,10 @@ class CohortBenchmarkService(
 
         val midCeilingForPatch = theoreticalLaneMinionSupplyAt10(resolvedPatch, "MIDDLE")
         val methodologyNotes = listOf(
-            "Bounded streaming cache-only extraction scans at most $MAX_SCAN_KEYS_PER_NAMESPACE Redis keys per namespace in small chunks (profiles=$PROFILE_SCAN_CHUNK_SIZE, snapshots=$SNAPSHOT_SCAN_CHUNK_SIZE, matches=$MATCH_SCAN_CHUNK_SIZE) for region '$normalizedRegion' with zero Riot API requests and zero full-list DTO accumulation.",
-            "Only Ranked Solo (queueId=420) matches on selected patch '${resolvedPatch ?: "NONE"}' (source=$patchSelectionSource, latestCachedPatch=${latestCachedPatch ?: "NONE"}) with duration >= 600s and roles TOP, MIDDLE, BOTTOM are included; when inferred from cache, this reflects the latest cached patch in Redis rather than an unverified live Riot patch.",
+            "Bounded streaming cache-only extraction scans at most $MAX_SCAN_KEYS_PER_NAMESPACE Redis keys per namespace in small chunks (profiles=$PROFILE_SCAN_CHUNK_SIZE, snapshots=$SNAPSHOT_SCAN_CHUNK_SIZE, matches=$MATCH_SCAN_CHUNK_SIZE) for region '$normalizedRegion' with zero Riot API requests and zero full-list DTO accumulation, and folds samples into durable Postgres cell state (`cohort_cell_sample_states` + `cohort_benchmark_cells`).",
+            "Only Ranked Solo (queueId=420) matches on grounded current patch '${resolvedPatch ?: "NONE"}' (source=$patchSelectionSource, latestCachedPatch=${latestCachedPatch ?: "NONE"}) with duration >= 600s and roles TOP, MIDDLE, BOTTOM are included; non-current patches (older or ahead of Data Dragon / live Ranked Solo source) are refused.",
             "Rank assignment strictly requires a fresh timestamped current-rank snapshot (age <= ${MAX_RANK_SNAPSHOT_AGE.toHours()}h) and recent match timestamp within ${MAX_MATCH_TO_SNAPSHOT_SKEW.toHours()}h of the snapshot (match age <= ${MAX_MATCH_AGE.toHours()}h); historical rank is never invented or projected onto distant games.",
-            "Samples are deduplicated by (matchId, puuid) and capped at maxGamesPerPlayer=$effectiveCap newest games per player per (tier, role) cell.",
+            "Samples are deduplicated by match ID (`matchIdHash`) and capped at maxGamesPerPlayer=$effectiveCap newest games per player (`playerHash`) and maxPlayersPerCell=$MAX_PLAYERS_PER_DURABLE_CELL_STATE (5x the 50-player quality gate, <= 2,500 games/cell) in durable Postgres storage, batched per productive batch or per $DURABLE_CELL_FLUSH_PLAYER_INTERVAL players, independent of Redis eviction.",
             "RAW lane CS@10 (laneCsAt10, unit='lane_cs') is the primary CS@10 metric — never percentages and never hardcoded guesses (e.g. 95/100/105). Bands (P25/median/P75) are derived strictly from sufficient actual (tier, role) data.",
             "Per-role lane-only CS@10 theoretical supply ceiling (TOP=114, BOTTOM=114, MIDDLE=$midCeilingForPatch for patch ${resolvedPatch ?: "default"}) is kept strictly separate from pro-compatible total CS reference metrics (timelineTotalCsAt10WithCamps, totalCsPerMinWithCamps where includesJungleCamps=true and missing jungle counters stay null).",
             "Quality gate requires >= ${CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE} distinct players AND >= ${CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE} games per cell before passesQualityGate / colorBandsEnabled becomes true."
@@ -1098,12 +1206,23 @@ class CohortBenchmarkService(
     }
 
     /**
-     * Retrieves persisted de-identified cohort benchmark cells for [region] and optional [patch].
+     * Retrieves persisted de-identified cohort benchmark cells for [region] and optional [patch]
+     * from the durable Postgres store (`cohort_benchmark_cells` / `cohort_cell_sample_states`).
+     * Refuses non-current [patch] when a grounded current patch is established for [region].
      */
     fun getPersistedCohortCells(region: String, patch: String? = null): List<CohortBenchmarkCellDto> {
         val normalizedRegion = region.lowercase().trim()
-        if (!patch.isNullOrBlank()) {
-            val cacheKey = benchmarkCacheKey(normalizedRegion, patch.trim())
+        val cleanPatch = patch?.trim()?.takeIf { it.isNotBlank() }
+        if (cleanPatch != null && !PATCH_REGEX.matches(cleanPatch)) {
+            return emptyList()
+        }
+        val groundedPatch = resolveGroundedCurrentPatch(normalizedRegion, allowLightRedisMatchProbe = false)
+        if (cleanPatch != null && groundedPatch != null && cleanPatch != groundedPatch) {
+            return emptyList()
+        }
+        val effectivePatch = cleanPatch ?: groundedPatch
+        if (!effectivePatch.isNullOrBlank()) {
+            val cacheKey = benchmarkCacheKey(normalizedRegion, effectivePatch)
             val cached = runCatching {
                 redisCacheService.get(cacheKey, Array<CohortBenchmarkCellDto>::class.java)
             }.getOrNull()
@@ -1112,16 +1231,62 @@ class CohortBenchmarkService(
             }
             val entities = cohortBenchmarkCellRepository.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(
                 region = normalizedRegion,
-                patch = patch.trim(),
+                patch = effectivePatch,
                 queueId = SOLO_QUEUE_ID
             )
-            return entities.mapNotNull { entityToDto(it) }
+            val fromBenchmarkTableByKey = entities.mapNotNull { entityToDto(it) }
+                .associateBy { it.tier.uppercase() to it.role.uppercase() }
+            val durableStates = loadDurableCellSampleStatesForPatch(normalizedRegion, effectivePatch)
+            if (fromBenchmarkTableByKey.isEmpty() && durableStates.isEmpty()) {
+                return emptyList()
+            }
+            val now = Instant.ofEpochMilli(timeProvider.now())
+            val allKeys = (fromBenchmarkTableByKey.keys + durableStates.keys)
+                .distinct()
+                .sortedWith(compareBy<Pair<String, String>> { tierIndex(it.first) }.thenBy { roleIndex(it.second) })
+            val mergedCells = mutableListOf<CohortBenchmarkCellDto>()
+            val missingFromBenchmarkTable = mutableListOf<CohortBenchmarkCellDto>()
+            for (k in allKeys) {
+                val legacy = fromBenchmarkTableByKey[k]
+                val st = durableStates[k]
+                if (st != null && st.samplesByPlayerHash.isNotEmpty()) {
+                    val rebuilt = buildCellDtoFromDurableState(
+                        state = st,
+                        patchSelectionSource = GROUNDED_PATCH_SOURCE_LABEL,
+                        computedAt = now
+                    )
+                    if (legacy == null || rebuilt.eligibleGames >= legacy.eligibleGames) {
+                        mergedCells.add(rebuilt)
+                        if (legacy == null || rebuilt.eligibleGames > legacy.eligibleGames) {
+                            missingFromBenchmarkTable.add(rebuilt)
+                        }
+                    } else {
+                        mergedCells.add(legacy)
+                    }
+                } else if (legacy != null) {
+                    mergedCells.add(legacy)
+                }
+            }
+            if (missingFromBenchmarkTable.isNotEmpty()) {
+                persistDeidentifiedCells(
+                    region = normalizedRegion,
+                    patch = effectivePatch,
+                    cellsToSaveInDb = missingFromBenchmarkTable,
+                    allCellsForCache = mergedCells
+                )
+            } else if (mergedCells.isNotEmpty()) {
+                runCatching { redisCacheService.set(cacheKey, mergedCells, BENCHMARK_CACHE_TTL) }
+            }
+            return mergedCells
         }
 
         val allForRegion = cohortBenchmarkCellRepository.findByRegionOrderByPatchDescTierAscRoleAsc(normalizedRegion)
         if (allForRegion.isEmpty()) return emptyList()
         val latestPatch = allForRegion.map { it.patch }.maxWithOrNull(patchComparator) ?: allForRegion.first().patch
-        return allForRegion.filter { it.patch == latestPatch }.mapNotNull { entityToDto(it) }
+        return allForRegion
+            .filter { it.patch == latestPatch }
+            .sortedWith(compareBy<CohortBenchmarkCellEntity> { tierIndex(it.tier) }.thenBy { roleIndex(it.role) })
+            .mapNotNull { entityToDto(it) }
     }
 
     /**
@@ -1294,29 +1459,89 @@ class CohortBenchmarkService(
             return pausedCheckpoint
         }
 
-        // 1. Initialize baseline cell progress from compact persisted cells (zero 500-key profile/match scans during batch runs)
-        val persistedCells = if (existingCheckpoint == null || existingCheckpoint.cellProgress.isEmpty()) {
-            getPersistedCohortCells(normalizedRegion, cleanRequestedPatch)
-        } else {
-            emptyList()
+        // 1. Resolve single grounded current patch and refuse non-current explicit targetPatch
+        val initialGroundedPatch = resolveGroundedCurrentPatch(
+            region = normalizedRegion,
+            allowLightRedisMatchProbe = true
+        )
+        if (cleanRequestedPatch != null && initialGroundedPatch != null && cleanRequestedPatch != initialGroundedPatch) {
+            val refusedCheckpoint = (existingCheckpoint ?: CohortCollectorCheckpointDto(
+                region = normalizedRegion,
+                targetPatch = initialGroundedPatch,
+                patchSelectionSource = GROUNDED_PATCH_SOURCE_LABEL,
+                maxGamesPerPlayerCap = effectiveCap,
+                cellProgress = buildAllTargetCellProgress(getPersistedCohortCells(normalizedRegion, initialGroundedPatch)),
+                startedAt = nowInstant,
+                updatedAt = nowInstant
+            )).let { base ->
+                base.copy(
+                    targetPatch = initialGroundedPatch,
+                    patchSelectionSource = GROUNDED_PATCH_SOURCE_LABEL,
+                    sessionProductiveBatchesCompleted = sessionProductiveBatchesBeforeBatch,
+                    maxSessionProductiveBatches = maxSessionProductiveBatches,
+                    sessionNetworkCallsMade = (base.totalNetworkCallsMade - sessionBaselineNetworkCalls).coerceAtLeast(0),
+                    maxSessionNetworkCalls = maxSessionNetworkCalls ?: 0,
+                    lastStopReason = STOP_REASON_NON_CURRENT_PATCH_REFUSED,
+                    updatedAt = Instant.ofEpochMilli(timeProvider.now())
+                )
+            }
+            saveCollectorCheckpoint(refusedCheckpoint)
+            return refusedCheckpoint
         }
-        var effectivePatch = cleanRequestedPatch
-            ?: existingCheckpoint?.targetPatch
-            ?: persistedCells.firstOrNull()?.patch
-        val patchSource = existingCheckpoint?.patchSelectionSource
-            ?: persistedCells.firstOrNull()?.patchSelectionSource
-            ?: if (cleanRequestedPatch != null) "EXPLICIT_TARGET_PATCH" else "NO_CACHED_PATCH_FOUND"
 
-        val processedPuuids = existingCheckpoint?.processedPuuids?.take(MAX_CHECKPOINT_PROCESSED_PUUIDS)?.toMutableSet() ?: mutableSetOf()
+        // If an existing checkpoint was pinned to an older patch (e.g., 16.21) while the grounded current patch is newer (e.g., 16.22),
+        // advance the collector to the grounded current patch and reset per-patch player game counts so collector and persisted cells never diverge.
+        val checkpointStalePatchAdvance = existingCheckpoint?.targetPatch != null &&
+            initialGroundedPatch != null &&
+            patchComparator.compare(initialGroundedPatch, existingCheckpoint.targetPatch) > 0
+
+        var effectivePatch = when {
+            cleanRequestedPatch != null -> cleanRequestedPatch
+            initialGroundedPatch != null -> initialGroundedPatch
+            else -> existingCheckpoint?.targetPatch
+        }
+        val persistedCells = getPersistedCohortCells(normalizedRegion, effectivePatch)
+        if (effectivePatch == null && persistedCells.isNotEmpty()) {
+            effectivePatch = persistedCells.first().patch
+        }
+        if (effectivePatch != null) {
+            inMemoryGroundedPatchByRegion[normalizedRegion] = effectivePatch!!
+        }
+        var patchSource = when {
+            cleanRequestedPatch != null -> "EXPLICIT_TARGET_PATCH"
+            initialGroundedPatch != null -> GROUNDED_PATCH_SOURCE_LABEL
+            existingCheckpoint?.patchSelectionSource != null -> existingCheckpoint.patchSelectionSource
+            persistedCells.isNotEmpty() -> persistedCells.first().patchSelectionSource
+            else -> "NO_CACHED_PATCH_FOUND"
+        }
+
+        val processedPuuids = if (checkpointStalePatchAdvance) {
+            mutableSetOf()
+        } else {
+            existingCheckpoint?.processedPuuids?.take(MAX_CHECKPOINT_PROCESSED_PUUIDS)?.toMutableSet() ?: mutableSetOf()
+        }
         val initialProcessedPuuidCount = processedPuuids.size
-        val processedMatchIds = existingCheckpoint?.processedMatchIds?.take(MAX_CHECKPOINT_PROCESSED_MATCH_IDS)?.toMutableSet() ?: mutableSetOf()
-        val playerCellGameCounts = existingCheckpoint?.playerCellGameCounts?.toMutableMap() ?: mutableMapOf()
+        val processedMatchIds = if (checkpointStalePatchAdvance) {
+            mutableSetOf()
+        } else {
+            existingCheckpoint?.processedMatchIds?.take(MAX_CHECKPOINT_PROCESSED_MATCH_IDS)?.toMutableSet() ?: mutableSetOf()
+        }
+        val playerCellGameCounts = if (checkpointStalePatchAdvance) {
+            mutableMapOf()
+        } else {
+            existingCheckpoint?.playerCellGameCounts?.toMutableMap() ?: mutableMapOf()
+        }
         val pendingQueue = LinkedHashSet<String>()
         seedPuuids.map { it.trim() }.filter { it.isNotBlank() && it !in processedPuuids }.forEach {
             if (pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) pendingQueue.add(it)
         }
         existingCheckpoint?.pendingCandidatePuuids?.filter { it !in processedPuuids }?.forEach {
             if (pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) pendingQueue.add(it)
+        }
+        if (checkpointStalePatchAdvance) {
+            existingCheckpoint?.processedPuuids?.forEach {
+                if (pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) pendingQueue.add(it)
+            }
         }
 
         // Seed additional candidates from cache only when pendingQueue is completely empty
@@ -1329,11 +1554,47 @@ class CohortBenchmarkService(
             }
         }
 
-        var cellProgress = if (existingCheckpoint != null && existingCheckpoint.cellProgress.isNotEmpty()) {
-            mergeCellProgressWithPlayerCounts(existingCheckpoint.cellProgress, playerCellGameCounts)
+        val persistedCellsByKey = persistedCells
+            .associateBy { it.tier.uppercase() to it.role.uppercase() }
+            .toMutableMap()
+        val durableStatesByCell = if (effectivePatch != null) {
+            loadDurableCellSampleStatesForPatch(normalizedRegion, effectivePatch!!).toMutableMap()
         } else {
-            mergeCellProgressWithPlayerCounts(buildAllTargetCellProgress(persistedCells), playerCellGameCounts)
+            mutableMapOf()
         }
+
+        fun rebuildCellProgressFromDurableStore(): Map<String, CohortCellProgressDto> {
+            val result = LinkedHashMap<String, CohortCellProgressDto>()
+            for (tier in TIER_ORDER) {
+                for (role in listOf("TOP", "MIDDLE", "BOTTOM")) {
+                    val pairKey = tier to role
+                    val key = "$tier:$role"
+                    val st = durableStatesByCell[pairKey]
+                    val legacy = persistedCellsByKey[pairKey]
+                    val durablePlayers = st?.samplesByPlayerHash?.count { (_, list) -> list.isNotEmpty() } ?: 0
+                    val durableGames = st?.samplesByPlayerHash?.values?.sumOf { it.size.coerceAtMost(st.maxGamesPerPlayerCap) } ?: 0
+                    val players = maxOf(durablePlayers, legacy?.distinctPlayers ?: 0)
+                    val games = maxOf(durableGames, legacy?.eligibleGames ?: 0)
+                    val passes = (legacy?.passesQualityGate == true) ||
+                        (players >= CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE &&
+                            games >= CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE)
+                    result[key] = CohortCellProgressDto(
+                        tier = tier,
+                        role = role,
+                        distinctPlayers = players,
+                        eligibleGames = games,
+                        targetPlayers = CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE,
+                        targetGames = CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE,
+                        passesQualityGate = passes,
+                        deficitPlayers = (CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE - players).coerceAtLeast(0),
+                        deficitGames = (CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE - games).coerceAtLeast(0)
+                    )
+                }
+            }
+            return mergeCellProgressWithPlayerCounts(result, playerCellGameCounts)
+        }
+
+        var cellProgress = rebuildCellProgressFromDurableStore()
         var cellsPassing = cellProgress.values.count { it.passesQualityGate }
         val startedAt = existingCheckpoint?.startedAt ?: nowInstant
         var totalNetworkCalls = existingCheckpoint?.totalNetworkCallsMade ?: 0
@@ -1463,10 +1724,45 @@ class CohortBenchmarkService(
             return emptyCheckpoint
         }
 
-        // 5. Process up to maxPlayersPerBatch candidates at LOW priority, checkpointing after each player
+        // 5. Process up to maxPlayersPerBatch candidates at LOW priority, batching Postgres cell & checkpoint writes
+        //    per productive batch or per DURABLE_CELL_FLUSH_PLAYER_INTERVAL (10) players to avoid per-player write amplification.
         var playersProcessedThisBatch = 0
         var stopReason = "BATCH_BUDGET_REACHED_RESUMABLE"
         val minSnapshotInstant = Instant.ofEpochMilli(timeProvider.now()).minus(MAX_RANK_SNAPSHOT_AGE)
+        val dirtyCellsInBatch = LinkedHashSet<Pair<String, String>>()
+
+        fun flushDirtyCellsToPostgres() {
+            val currentPatch = effectivePatch ?: return
+            if (dirtyCellsInBatch.isEmpty()) return
+            val nowPersist = Instant.ofEpochMilli(timeProvider.now())
+            val cellsToSaveInDb = mutableListOf<CohortBenchmarkCellDto>()
+            for (dirtyKey in dirtyCellsInBatch) {
+                val st = durableStatesByCell[dirtyKey] ?: continue
+                saveDurableCellSampleState(st)
+                val cellDto = buildCellDtoFromDurableState(
+                    state = st,
+                    patchSelectionSource = patchSource,
+                    computedAt = nowPersist
+                )
+                val existingLegacy = persistedCellsByKey[dirtyKey]
+                if (existingLegacy == null || cellDto.eligibleGames >= existingLegacy.eligibleGames) {
+                    persistedCellsByKey[dirtyKey] = cellDto
+                    cellsToSaveInDb.add(cellDto)
+                }
+            }
+            dirtyCellsInBatch.clear()
+            if (cellsToSaveInDb.isNotEmpty() && effectiveCap == CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER) {
+                val allSortedCells = persistedCellsByKey.values.sortedWith(
+                    compareBy<CohortBenchmarkCellDto> { tierIndex(it.tier) }.thenBy { roleIndex(it.role) }
+                )
+                persistDeidentifiedCells(
+                    region = normalizedRegion,
+                    patch = currentPatch,
+                    cellsToSaveInDb = cellsToSaveInDb,
+                    allCellsForCache = allSortedCells
+                )
+            }
+        }
 
         val candidatesThisBatch = pendingQueue.filter { it !in processedPuuids }.take(effectiveBatchLimit)
         outerLoop@ for (puuid in candidatesThisBatch) {
@@ -1478,6 +1774,7 @@ class CohortBenchmarkService(
 
             // Step A: Resolve or fetch fresh Solo Queue rank snapshot
             var playerTier = getFreshCachedTierForPuuid(normalizedRegion, puuid, minSnapshotInstant)
+            var playerSnapshotAt = Instant.ofEpochMilli(timeProvider.now())
             if (playerTier == null) {
                 val rankPause = evaluateLivePauseReason("league-v4-entries-by-puuid")
                 if (rankPause != null) {
@@ -1519,21 +1816,29 @@ class CohortBenchmarkService(
                 }
                 val fetchedTier = leagueEntry?.tier?.uppercase()?.trim()?.takeIf { it in TIER_ORDER }
                 if (fetchedTier != null && leagueEntry.queueType == "RANKED_SOLO_5x5") {
+                    playerSnapshotAt = Instant.ofEpochMilli(timeProvider.now())
                     cacheRankSnapshot(
                         region = normalizedRegion,
                         puuid = puuid,
                         tier = fetchedTier,
                         rank = leagueEntry.rank,
                         leaguePoints = leagueEntry.leaguePoints,
-                        snapshotAt = Instant.ofEpochMilli(timeProvider.now())
+                        snapshotAt = playerSnapshotAt
                     )
                     playerTier = fetchedTier
                 } else {
-                    // Unranked in Solo Queue; mark processed and checkpoint
+                    // Unranked in Solo Queue; mark processed and batch checkpoint flush
                     if (processedPuuids.size < MAX_CHECKPOINT_PROCESSED_PUUIDS) processedPuuids.add(puuid)
                     pendingQueue.remove(puuid)
                     playersProcessedThisBatch++
-                    saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
+                    if (playersProcessedThisBatch % DURABLE_CELL_FLUSH_PLAYER_INTERVAL == 0 &&
+                        playersProcessedThisBatch < candidatesThisBatch.size
+                    ) {
+                        flushDirtyCellsToPostgres()
+                        cellProgress = rebuildCellProgressFromDurableStore()
+                        cellsPassing = cellProgress.values.count { it.passesQualityGate }
+                        saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
+                    }
                     continue@outerLoop
                 }
             }
@@ -1550,7 +1855,14 @@ class CohortBenchmarkService(
                 if (processedPuuids.size < MAX_CHECKPOINT_PROCESSED_PUUIDS) processedPuuids.add(puuid)
                 pendingQueue.remove(puuid)
                 playersProcessedThisBatch++
-                saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
+                if (playersProcessedThisBatch % DURABLE_CELL_FLUSH_PLAYER_INTERVAL == 0 &&
+                    playersProcessedThisBatch < candidatesThisBatch.size
+                ) {
+                    flushDirtyCellsToPostgres()
+                    cellProgress = rebuildCellProgressFromDurableStore()
+                    cellsPassing = cellProgress.values.count { it.passesQualityGate }
+                    saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
+                }
                 continue@outerLoop
             }
 
@@ -1597,7 +1909,7 @@ class CohortBenchmarkService(
                 break@outerLoop
             }
 
-            // Step D: Inspect/fetch matches on current patch, enforcing 10-game per-player cap
+            // Step D: Inspect/fetch matches on current patch, enforcing 10-game per-player cap and accumulating in batch state
             val ownMatchIdSet = matchIds.take(effectiveCap).toSet()
             val candidateMatchIds = if (ownMatchIdSet.size < effectiveCap && processedMatchIds.isNotEmpty()) {
                 (ownMatchIdSet + processedMatchIds.filter { it !in ownMatchIdSet }.takeLast(effectiveCap)).take(effectiveCap)
@@ -1615,6 +1927,7 @@ class CohortBenchmarkService(
 
                 val matchKey = "match:$normalizedRegion:$matchId"
                 var match = redisCacheService.get(matchKey, MatchDto::class.java)
+                var freshlyFetchedFromRiot = false
                 if (match == null) {
                     if (!isOwnListedMatch) {
                         continue@matchLoop
@@ -1659,6 +1972,7 @@ class CohortBenchmarkService(
                     if (match != null) {
                         redisCacheService.set(matchKey, match, MATCH_CACHE_TTL)
                         fetchedMatches++
+                        freshlyFetchedFromRiot = true
                     }
                 }
                 if (isOwnListedMatch && processedMatchIds.size < MAX_CHECKPOINT_PROCESSED_MATCH_IDS) {
@@ -1669,19 +1983,55 @@ class CohortBenchmarkService(
                     continue@matchLoop
                 }
                 val matchPatch = extractMajorMinorPatch(info.gameVersion)
-                if (effectivePatch == null && matchPatch != null) {
-                    effectivePatch = matchPatch
+                if (info.queueId == SOLO_QUEUE_ID && matchPatch != null) {
+                    if (freshlyFetchedFromRiot) {
+                        recordFreshRankedSoloMatchPatch(normalizedRegion, matchPatch)
+                    }
+                    val liveGrounded = resolveGroundedCurrentPatch(
+                        region = normalizedRegion,
+                        observedCandidatePatch = matchPatch,
+                        allowLightRedisMatchProbe = false
+                    ) ?: matchPatch
+                    if (cleanRequestedPatch != null && liveGrounded != cleanRequestedPatch) {
+                        // Explicit targetPatch is either older than or ahead of the grounded current patch -> refuse non-current patch!
+                        effectivePatch = liveGrounded
+                        patchSource = GROUNDED_PATCH_SOURCE_LABEL
+                        stopReason = STOP_REASON_NON_CURRENT_PATCH_REFUSED
+                        break@outerLoop
+                    }
+                    if (effectivePatch == null || (cleanRequestedPatch == null && patchComparator.compare(liveGrounded, effectivePatch!!) > 0)) {
+                        // Advance auto-patch collector to the newly grounded current patch so collector and persisted cells never diverge (e.g. 16.21 -> 16.22)
+                        effectivePatch = liveGrounded
+                        patchSource = GROUNDED_PATCH_SOURCE_LABEL
+                        dirtyCellsInBatch.clear()
+                        durableStatesByCell.clear()
+                        durableStatesByCell.putAll(loadDurableCellSampleStatesForPatch(normalizedRegion, liveGrounded))
+                        persistedCellsByKey.clear()
+                        getPersistedCohortCells(normalizedRegion, liveGrounded).forEach {
+                            persistedCellsByKey[it.tier.uppercase() to it.role.uppercase()] = it
+                        }
+                        playerCellGameCounts.clear()
+                    }
                 }
                 // Match IDs are ordered newest-first; stop inspecting older matches once we cross into an older patch
                 if (effectivePatch != null && matchPatch != null && patchComparator.compare(matchPatch, effectivePatch!!) < 0) {
                     if (isOwnListedMatch) break@matchLoop else continue@matchLoop
                 }
-                if (info.queueId != SOLO_QUEUE_ID || (info.gameDuration ?: 0L) < MIN_GAME_DURATION_SECONDS) {
+                val durationSeconds = info.gameDuration ?: 0L
+                val isRemakeOrEarlySurrender = durationSeconds < MIN_GAME_DURATION_SECONDS ||
+                    info.participants.any { it.gameEndedInEarlySurrender == true || it.teamEarlySurrendered == true }
+                if (info.queueId != SOLO_QUEUE_ID || isRemakeOrEarlySurrender) {
                     continue@matchLoop
                 }
                 if (effectivePatch != null && matchPatch != effectivePatch) {
                     continue@matchLoop
                 }
+
+                val durationMinutes = durationSeconds.toDouble() / 60.0
+                val gameCreation = info.gameCreation ?: timeProvider.now()
+                val teamKillsByTeamId = info.participants
+                    .groupBy { it.teamId ?: 0 }
+                    .mapValues { (_, plist) -> plist.sumOf { it.kills ?: 0 } }
 
                 for (participant in info.participants) {
                     val role = resolveNormalizedRole(participant)
@@ -1690,12 +2040,51 @@ class CohortBenchmarkService(
                     if (pPuuid !in processedPuuids && pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
                         pendingQueue.add(pPuuid)
                     }
-                    if (pPuuid == puuid) {
-                        val countKey = "$playerTier:$role:$puuid"
-                        val currentCount = playerCellGameCounts[countKey] ?: 0
-                        if (currentCount < effectiveCap) {
-                            playerCellGameCounts[countKey] = currentCount + 1
-                        }
+                    val participantTier = if (pPuuid == puuid) {
+                        playerTier
+                    } else {
+                        getFreshCachedTierForPuuid(normalizedRegion, pPuuid, minSnapshotInstant)
+                    } ?: continue
+
+                    val cellKeyPair = participantTier to role
+                    val currentPatchNonNull = effectivePatch ?: continue
+                    val baseCellState = durableStatesByCell[cellKeyPair] ?: DurableCellSampleStateDto(
+                        region = normalizedRegion,
+                        patch = currentPatchNonNull,
+                        queueId = SOLO_QUEUE_ID,
+                        tier = participantTier,
+                        role = role,
+                        maxGamesPerPlayerCap = effectiveCap,
+                        updatedAtEpochMilli = timeProvider.now()
+                    )
+
+                    val sample = extractParticipantSampleFromMatch(
+                        matchId = matchId,
+                        puuid = pPuuid,
+                        tier = participantTier,
+                        role = role,
+                        gameCreation = gameCreation,
+                        rankSnapshotAt = playerSnapshotAt,
+                        participant = participant,
+                        durationSeconds = durationSeconds,
+                        durationMinutes = durationMinutes,
+                        teamKillsByTeamId = teamKillsByTeamId
+                    )
+                    val updatedCellState = foldParticipantSamplesIntoDurableState(
+                        state = baseCellState,
+                        samples = listOf(sample),
+                        effectiveCap = effectiveCap,
+                        nowEpochMilli = timeProvider.now()
+                    )
+                    if (updatedCellState != baseCellState) {
+                        durableStatesByCell[cellKeyPair] = updatedCellState
+                        dirtyCellsInBatch.add(cellKeyPair)
+                    }
+                    val pHash = hashIdentifier("player:$normalizedRegion:$pPuuid")
+                    val retainedForParticipant = updatedCellState.samplesByPlayerHash[pHash]?.size ?: 0
+                    val countKey = "$participantTier:$role:$pPuuid"
+                    if (retainedForParticipant > 0) {
+                        playerCellGameCounts[countKey] = retainedForParticipant.coerceAtMost(effectiveCap)
                     }
                 }
             }
@@ -1705,14 +2094,21 @@ class CohortBenchmarkService(
             }
             pendingQueue.remove(puuid)
             playersProcessedThisBatch++
-            cellProgress = mergeCellProgressWithPlayerCounts(cellProgress, playerCellGameCounts)
+            cellProgress = rebuildCellProgressFromDurableStore()
             cellsPassing = cellProgress.values.count { it.passesQualityGate }
-            saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
+
+            if (playersProcessedThisBatch % DURABLE_CELL_FLUSH_PLAYER_INTERVAL == 0 &&
+                playersProcessedThisBatch < candidatesThisBatch.size
+            ) {
+                flushDirtyCellsToPostgres()
+                saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
+            }
         }
 
-        // 6. Update cell progress incrementally in O(1) memory from playerCellGameCounts (zero full-cache profile/match scans)
+        // 6. Flush batched dirty cell states & benchmark cells once at the end of the productive batch
+        flushDirtyCellsToPostgres()
         if (playersProcessedThisBatch > 0 || fetchedMatches > (existingCheckpoint?.fetchedMatches ?: 0)) {
-            cellProgress = mergeCellProgressWithPlayerCounts(cellProgress, playerCellGameCounts)
+            cellProgress = rebuildCellProgressFromDurableStore()
             cellsPassing = cellProgress.values.count { it.passesQualityGate }
         }
 
@@ -2337,6 +2733,7 @@ class CohortBenchmarkService(
                 entity.updatedAt = checkpoint.updatedAt
                 repo.save(entity)
             }
+            checkpointDbWriteCount.incrementAndGet()
         } catch (e: Exception) {
             logger.warn("Failed to persist collector checkpoint to Postgres for {} {}: {}", normalizedRegion, cleanPatch ?: "latest", e.message)
         }
@@ -2521,17 +2918,22 @@ class CohortBenchmarkService(
     private fun persistDeidentifiedCells(
         region: String,
         patch: String,
-        cells: List<CohortBenchmarkCellDto>
+        cellsToSaveInDb: List<CohortBenchmarkCellDto>,
+        allCellsForCache: List<CohortBenchmarkCellDto> = cellsToSaveInDb
     ) {
-        try {
-            val cacheKey = benchmarkCacheKey(region, patch)
-            redisCacheService.set(cacheKey, cells, BENCHMARK_CACHE_TTL)
-        } catch (e: Exception) {
-            logger.warn("Failed to cache cohort benchmark cells in Redis for {} {}: {}", region, patch, e.message)
+        if (allCellsForCache.isNotEmpty()) {
+            try {
+                val cacheKey = benchmarkCacheKey(region, patch)
+                redisCacheService.set(cacheKey, allCellsForCache, BENCHMARK_CACHE_TTL)
+            } catch (e: Exception) {
+                logger.warn("Failed to cache cohort benchmark cells in Redis for {} {}: {}", region, patch, e.message)
+            }
         }
 
+        if (cellsToSaveInDb.isEmpty()) return
+
         try {
-            for (cell in cells) {
+            for (cell in cellsToSaveInDb) {
                 val metricsJson = objectMapper.writeValueAsString(cell.metrics)
                 val existing = cohortBenchmarkCellRepository.findByRegionAndPatchAndQueueIdAndTierAndRole(
                     region = cell.region,
@@ -2573,6 +2975,7 @@ class CohortBenchmarkService(
                         )
                     )
                 }
+                benchmarkCellDbWriteCount.incrementAndGet()
             }
         } catch (e: Exception) {
             logger.warn("Failed to persist cohort benchmark cells in DB for {} {}: {}", region, patch, e.message)
@@ -2609,6 +3012,653 @@ class CohortBenchmarkService(
             logger.warn("Failed to deserialize CohortBenchmarkCellEntity {}: {}", entity.id, e.message)
             null
         }
+    }
+
+    private fun cleanPatchCandidate(raw: String?): String? =
+        raw?.trim()?.takeIf { it.isNotBlank() && it != "latest" && it != "UNKNOWN" && PATCH_REGEX.matches(it) }
+
+    internal fun recordFreshRankedSoloMatchPatch(region: String, patch: String?) {
+        val normalizedRegion = region.lowercase().trim()
+        val clean = cleanPatchCandidate(patch) ?: return
+        val ddPatch = resolveDataDragonLatestPatch()
+        if (ddPatch != null && patchComparator.compare(clean, ddPatch) > 0) {
+            // Refuse to record a patch ahead of Data Dragon versions.json
+            return
+        }
+        freshRankedSoloMatchPatchByRegion.compute(normalizedRegion) { _, prev ->
+            if (prev == null || patchComparator.compare(clean, prev) >= 0) clean else prev
+        }
+    }
+
+    /**
+     * Bounded cached lookup of Riot Data Dragon `versions.json` (e.g. `16.22.1` -> `16.22`).
+     * - Cached in process memory and Redis (`cohort:patch:external:ddragon`) for 30 minutes.
+     * - Uses a 60-second failure cooldown on network/parse failure.
+     * - Safe fallback: returns `null` (or last valid cached patch) on failure without throwing or advancing.
+     */
+    internal fun resolveDataDragonLatestPatch(): String? {
+        val nowMs = timeProvider.now()
+        val localCached = cachedDataDragonPatch
+        if (localCached != null && nowMs < cachedDataDragonPatchExpiresAtMs) {
+            return localCached
+        }
+        val redisCached = runCatching {
+            redisCacheService.get(EXTERNAL_PATCH_REDIS_KEY, String::class.java)
+        }.getOrNull()?.let { cleanPatchCandidate(it) }
+        if (redisCached != null) {
+            cachedDataDragonPatch = redisCached
+            cachedDataDragonPatchExpiresAtMs = nowMs + EXTERNAL_PATCH_CACHE_TTL_MS
+            return redisCached
+        }
+        if (lastDataDragonLookupFailureAtMs > 0L && nowMs - lastDataDragonLookupFailureAtMs < EXTERNAL_PATCH_FAILURE_COOLDOWN_MS) {
+            return localCached
+        }
+        val fetchedVersions = try {
+            riotApiService.fetchDataDragonVersions(maxEntries = 5)
+        } catch (e: Exception) {
+            logger.debug("External Data Dragon patch lookup failed (safe fallback): {}", e.message)
+            emptyList()
+        }
+        val latestFromDdragon = fetchedVersions
+            .asSequence()
+            .mapNotNull { extractMajorMinorPatch(it) }
+            .mapNotNull { cleanPatchCandidate(it) }
+            .firstOrNull()
+        return if (latestFromDdragon != null) {
+            cachedDataDragonPatch = latestFromDdragon
+            cachedDataDragonPatchExpiresAtMs = nowMs + EXTERNAL_PATCH_CACHE_TTL_MS
+            lastDataDragonLookupFailureAtMs = 0L
+            runCatching {
+                redisCacheService.set(EXTERNAL_PATCH_REDIS_KEY, latestFromDdragon, EXTERNAL_PATCH_REDIS_TTL)
+            }
+            latestFromDdragon
+        } else {
+            lastDataDragonLookupFailureAtMs = nowMs
+            localCached
+        }
+    }
+
+    /**
+     * Single canonical grounded current-patch resolver for [region].
+     *
+     * Combines:
+     * 1. External grounding source: bounded cached Riot Data Dragon `versions.json` (`resolveDataDragonLatestPatch`,
+     *    e.g. `16.22.1` -> `16.22`) or the `gameVersion` of freshly fetched Ranked Solo (`420`) matches
+     *    (`freshRankedSoloMatchPatchByRegion` / [observedCandidatePatch]).
+     *    - Allows advancing to the current patch (e.g. `16.21` -> `16.22`) even before a `16.22` match is stored in Postgres.
+     *    - Rejects any internal store or checkpoint candidate ahead of the external source so a stray high value
+     *      (e.g. `16.99`) can never stick forever, and refuses any caller-requested patch ahead of (or behind) that source.
+     *    - Safe fallback: if the external lookup fails, does not crash and does not advance to an unverified patch.
+     * 2. Verified match/cell stores (`cohort_cell_sample_states`, `cohort_benchmark_cells`, and optional bounded Redis
+     *    Ranked Solo match probe), which take precedence over unbacked checkpoint `targetPatch` entries during fallback.
+     */
+    fun resolveGroundedCurrentPatch(
+        region: String,
+        observedCandidatePatch: String? = null,
+        allowLightRedisMatchProbe: Boolean = false
+    ): String? {
+        val normalizedRegion = region.lowercase().trim()
+        val dataDragonPatch = resolveDataDragonLatestPatch()
+        val cleanObserved = cleanPatchCandidate(observedCandidatePatch)
+        val freshMatchPatch = cleanPatchCandidate(freshRankedSoloMatchPatchByRegion[normalizedRegion]) ?: cleanObserved
+
+        val externalGroundedPatch: String? = when {
+            dataDragonPatch != null -> dataDragonPatch
+            freshMatchPatch != null -> freshMatchPatch
+            else -> null
+        }
+
+        val verifiedStoreCandidates = mutableSetOf<String>()
+        val checkpointCandidates = mutableSetOf<String>()
+
+        fun addVerifiedCandidate(raw: String?) {
+            val clean = cleanPatchCandidate(raw) ?: return
+            if (externalGroundedPatch != null && patchComparator.compare(clean, externalGroundedPatch) > 0) {
+                // Reject stray high value ahead of external grounded source
+                return
+            }
+            verifiedStoreCandidates.add(clean)
+        }
+
+        fun addCheckpointCandidate(raw: String?) {
+            val clean = cleanPatchCandidate(raw) ?: return
+            if (externalGroundedPatch != null && patchComparator.compare(clean, externalGroundedPatch) > 0) {
+                // Reject stray high checkpoint value ahead of external grounded source
+                return
+            }
+            checkpointCandidates.add(clean)
+        }
+
+        if (cleanObserved != null) {
+            addVerifiedCandidate(cleanObserved)
+        }
+
+        inMemoryDurableCellStates.values
+            .asSequence()
+            .filter { it.region == normalizedRegion && it.samplesByPlayerHash.isNotEmpty() }
+            .forEach { addVerifiedCandidate(it.patch) }
+
+        val sampleRepo = cohortCellSampleStateRepository
+        if (sampleRepo != null) {
+            runCatching {
+                sampleRepo.findByRegionOrderByPatchDescTierAscRoleAsc(normalizedRegion)
+            }.getOrNull().orEmpty()
+                .filter { it.eligibleGames > 0 }
+                .forEach { addVerifiedCandidate(it.patch) }
+        }
+
+        runCatching {
+            cohortBenchmarkCellRepository.findByRegionOrderByPatchDescTierAscRoleAsc(normalizedRegion)
+        }.getOrNull().orEmpty()
+            .filter { it.eligibleGames > 0 }
+            .forEach { addVerifiedCandidate(it.patch) }
+
+        val cpRepo = cohortCollectorCheckpointRepository
+        if (cpRepo != null) {
+            runCatching {
+                cpRepo.findFirstByRegionAndQueueIdOrderByUpdatedAtDesc(normalizedRegion, SOLO_QUEUE_ID)
+            }.getOrNull()?.let { ent ->
+                addCheckpointCandidate(ent.targetPatch)
+                runCatching {
+                    objectMapper.readValue(ent.checkpointJson, CohortCollectorCheckpointDto::class.java)
+                }.getOrNull()?.let { addCheckpointCandidate(it.targetPatch) }
+            }
+        }
+
+        runCatching {
+            redisCacheService.get(collectorCheckpointKey(normalizedRegion, null), CohortCollectorCheckpointDto::class.java)
+        }.getOrNull()?.let { addCheckpointCandidate(it.targetPatch) }
+
+        if (allowLightRedisMatchProbe && getMemoryHeadroomSnapshot(allowGcHintOnPressure = false).hasHeadroomForLowPriority) {
+            val matchKeys = runCatching {
+                redisCacheService.scanKeys("match:$normalizedRegion:*", maxKeys = 10)
+            }.getOrNull().orEmpty()
+            if (matchKeys.isNotEmpty()) {
+                val matches = runCatching {
+                    redisCacheService.multiGet(matchKeys.take(10), MatchDto::class.java).values.filterNotNull()
+                }.getOrNull().orEmpty()
+                for (m in matches) {
+                    val info = m.info ?: continue
+                    if (info.queueId == SOLO_QUEUE_ID) {
+                        addVerifiedCandidate(extractMajorMinorPatch(info.gameVersion))
+                    }
+                }
+            }
+        }
+
+        val grounded: String? = when {
+            externalGroundedPatch != null -> {
+                (verifiedStoreCandidates + externalGroundedPatch).maxWithOrNull(patchComparator)
+            }
+            verifiedStoreCandidates.isNotEmpty() -> {
+                // Safe fallback when external lookup is unavailable: use verified match/cell store patches,
+                // ignoring unbacked checkpoint targetPatch entries so stray high checkpoint values cannot stick.
+                verifiedStoreCandidates.maxWithOrNull(patchComparator)
+            }
+            checkpointCandidates.isNotEmpty() -> {
+                checkpointCandidates.maxWithOrNull(patchComparator)
+            }
+            else -> {
+                cleanPatchCandidate(inMemoryGroundedPatchByRegion[normalizedRegion])
+            }
+        }
+
+        if (grounded != null) {
+            inMemoryGroundedPatchByRegion[normalizedRegion] = grounded
+        } else {
+            inMemoryGroundedPatchByRegion.remove(normalizedRegion)
+        }
+        return grounded
+    }
+
+    private fun durableCellMapKey(region: String, patch: String, tier: String, role: String): String =
+        "${region.lowercase().trim()}:${patch.trim()}:$SOLO_QUEUE_ID:${tier.uppercase().trim()}:${role.uppercase().trim()}"
+
+    internal fun hashIdentifier(raw: String): String {
+        val digest = MessageDigest.getInstance("SHA-256").digest(raw.toByteArray(Charsets.UTF_8))
+        val sb = StringBuilder(16)
+        for (i in 0 until 8) {
+            sb.append(String.format("%02x", digest[i]))
+        }
+        return sb.toString()
+    }
+
+    private fun loadDurableCellSampleStatesForPatch(
+        region: String,
+        patch: String
+    ): Map<Pair<String, String>, DurableCellSampleStateDto> {
+        val normalizedRegion = region.lowercase().trim()
+        val cleanPatch = patch.trim()
+        val result = LinkedHashMap<Pair<String, String>, DurableCellSampleStateDto>()
+
+        for ((_, st) in inMemoryDurableCellStates) {
+            if (st.region == normalizedRegion && st.patch == cleanPatch && st.queueId == SOLO_QUEUE_ID) {
+                result[st.tier.uppercase() to st.role.uppercase()] = st
+            }
+        }
+
+        val repo = cohortCellSampleStateRepository
+        if (repo != null) {
+            val entities = runCatching {
+                repo.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(normalizedRegion, cleanPatch, SOLO_QUEUE_ID)
+            }.getOrNull().orEmpty()
+            for (entity in entities) {
+                val parsed = runCatching {
+                    objectMapper.readValue(entity.samplesJson, DurableCellSampleStateDto::class.java)
+                }.getOrNull() ?: continue
+                val cellKey = parsed.tier.uppercase() to parsed.role.uppercase()
+                val existingInMem = result[cellKey]
+                if (existingInMem == null || parsed.updatedAtEpochMilli >= existingInMem.updatedAtEpochMilli) {
+                    result[cellKey] = parsed
+                    inMemoryDurableCellStates[durableCellMapKey(normalizedRegion, cleanPatch, parsed.tier, parsed.role)] = parsed
+                }
+            }
+        }
+        return result
+    }
+
+    private fun saveDurableCellSampleState(state: DurableCellSampleStateDto) {
+        val normalizedRegion = state.region.lowercase().trim()
+        val cleanPatch = state.patch.trim()
+        val cleanTier = state.tier.uppercase().trim()
+        val cleanRole = state.role.uppercase().trim()
+        val mapKey = durableCellMapKey(normalizedRegion, cleanPatch, cleanTier, cleanRole)
+        inMemoryDurableCellStates[mapKey] = state
+
+        val repo = cohortCellSampleStateRepository ?: return
+        try {
+            val distinctPlayersCount = state.samplesByPlayerHash.count { (_, list) -> list.isNotEmpty() }
+            val eligibleGamesCount = state.samplesByPlayerHash.values.sumOf { it.size.coerceAtMost(state.maxGamesPerPlayerCap) }
+            val passesGate = distinctPlayersCount >= CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE &&
+                eligibleGamesCount >= CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE
+            val json = objectMapper.writeValueAsString(state)
+            val updatedAtInstant = Instant.ofEpochMilli(state.updatedAtEpochMilli.takeIf { it > 0L } ?: timeProvider.now())
+
+            val existing = repo.findByRegionAndPatchAndQueueIdAndTierAndRole(
+                region = normalizedRegion,
+                patch = cleanPatch,
+                queueId = state.queueId,
+                tier = cleanTier,
+                role = cleanRole
+            )
+            if (existing != null) {
+                existing.distinctPlayers = distinctPlayersCount
+                existing.eligibleGames = eligibleGamesCount
+                existing.excludedOverPlayerCapGames = state.excludedOverPlayerCapGames
+                existing.passesQualityGate = passesGate
+                existing.samplesJson = json
+                existing.updatedAt = updatedAtInstant
+                repo.save(existing)
+            } else {
+                repo.save(
+                    CohortCellSampleStateEntity(
+                        region = normalizedRegion,
+                        patch = cleanPatch,
+                        queueId = state.queueId,
+                        tier = cleanTier,
+                        role = cleanRole,
+                        distinctPlayers = distinctPlayersCount,
+                        eligibleGames = eligibleGamesCount,
+                        excludedOverPlayerCapGames = state.excludedOverPlayerCapGames,
+                        passesQualityGate = passesGate,
+                        samplesJson = json,
+                        updatedAt = updatedAtInstant
+                    )
+                )
+            }
+            durableSampleStateDbWriteCount.incrementAndGet()
+        } catch (e: Exception) {
+            logger.warn("Failed to persist durable cell sample state in Postgres for {} {} {} {}: {}", normalizedRegion, cleanPatch, cleanTier, cleanRole, e.message)
+        }
+    }
+
+    private fun extractParticipantSampleFromMatch(
+        matchId: String,
+        puuid: String,
+        tier: String,
+        role: String,
+        gameCreation: Long,
+        rankSnapshotAt: Instant,
+        participant: ParticipantDto,
+        durationSeconds: Long,
+        durationMinutes: Double,
+        teamKillsByTeamId: Map<Int, Int>
+    ): ParticipantSample {
+        var lazyFrameAt10m: TimelineFrameDto? = null
+        var lazyTimeline: MatchTimelineDto? = null
+        val normalizedRegionFromMatch = matchId.substringBefore("_").lowercase().trim()
+        val needsTimelineFallback =
+            participant.challenges?.laneMinionsFirst10Minutes == null ||
+                participant.challenges.jungleCsBefore10Minutes == null
+        if (needsTimelineFallback && normalizedRegionFromMatch.isNotBlank()) {
+            val tKey = "timeline:$normalizedRegionFromMatch:$matchId"
+            lazyTimeline = runCatching { redisCacheService.get(tKey, MatchTimelineDto::class.java) }.getOrNull()
+            lazyFrameAt10m = findFrameAt10Minutes(lazyTimeline)
+        }
+        val participantFrame10m = if (lazyFrameAt10m != null) {
+            findParticipantFrame(lazyFrameAt10m, participant, lazyTimeline)
+        } else {
+            null
+        }
+
+        val laneCs10 = participant.challenges?.laneMinionsFirst10Minutes?.toDouble()
+            ?: participantFrame10m?.minionsKilled?.toDouble()
+
+        val laneOnlyCsPerMin = participant.totalMinionsKilled?.let {
+            if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null
+        }
+
+        val totalCsPerMinWithCamps = if (
+            participant.totalMinionsKilled != null &&
+            participant.neutralMinionsKilled != null &&
+            durationMinutes > 0.0
+        ) {
+            (participant.totalMinionsKilled + participant.neutralMinionsKilled).toDouble() / durationMinutes
+        } else {
+            null
+        }
+
+        val timelineTotalCs10WithCamps = if (
+            participantFrame10m?.minionsKilled != null &&
+            participantFrame10m.jungleMinionsKilled != null
+        ) {
+            (participantFrame10m.minionsKilled + participantFrame10m.jungleMinionsKilled).toDouble()
+        } else if (
+            participant.challenges?.laneMinionsFirst10Minutes != null &&
+            participant.challenges.jungleCsBefore10Minutes != null
+        ) {
+            participant.challenges.laneMinionsFirst10Minutes.toDouble() +
+                participant.challenges.jungleCsBefore10Minutes.toDouble()
+        } else {
+            null
+        }
+
+        val goldPerMin = participant.challenges?.goldPerMinute?.toDouble()
+            ?: participant.goldEarned?.let { if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null }
+
+        val damagePerMin = participant.challenges?.damagePerMinute?.toDouble()
+            ?: participant.totalDamageDealtToChampions?.let {
+                if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null
+            }
+
+        val visionScorePerMin = participant.challenges?.visionScorePerMinute?.toDouble()
+            ?: participant.visionScore?.let {
+                if (durationMinutes > 0.0) it.toDouble() / durationMinutes else null
+            }
+
+        val kp = participant.challenges?.killParticipation?.toDouble() ?: run {
+            val teamKills = teamKillsByTeamId[participant.teamId ?: 0] ?: 0
+            if (teamKills > 0 && participant.kills != null && participant.assists != null) {
+                ((participant.kills + participant.assists).toDouble() / teamKills.toDouble()).coerceIn(0.0, 1.0)
+            } else {
+                null
+            }
+        }
+
+        val deathsPerGame = participant.deaths?.toDouble()
+        val timeSpentDeadShare = participant.totalTimeSpentDead?.let { deadSec ->
+            if (durationSeconds > 0L) (deadSec.toDouble() / durationSeconds.toDouble()).coerceIn(0.0, 1.0) else null
+        }
+
+        return ParticipantSample(
+            matchId = matchId,
+            puuid = puuid,
+            tier = tier,
+            role = role,
+            gameCreation = gameCreation,
+            rankSnapshotAt = rankSnapshotAt,
+            laneCsAt10 = laneCs10,
+            laneOnlyCsPerMin = laneOnlyCsPerMin,
+            totalCsPerMinWithCamps = totalCsPerMinWithCamps,
+            timelineTotalCsAt10WithCamps = timelineTotalCs10WithCamps,
+            goldPerMin = goldPerMin,
+            damagePerMin = damagePerMin,
+            visionScorePerMin = visionScorePerMin,
+            killParticipation = kp,
+            deathsPerGame = deathsPerGame,
+            timeSpentDeadShare = timeSpentDeadShare
+        )
+    }
+
+    private fun foldParticipantSamplesIntoDurableState(
+        state: DurableCellSampleStateDto,
+        samples: List<ParticipantSample>,
+        effectiveCap: Int,
+        nowEpochMilli: Long
+    ): DurableCellSampleStateDto {
+        if (samples.isEmpty()) return state
+        val normalizedRegion = state.region.lowercase().trim()
+        val mutableByPlayer = LinkedHashMap<String, MutableList<DeidentifiedMetricSampleDto>>()
+        for ((pHash, list) in state.samplesByPlayerHash) {
+            mutableByPlayer[pHash] = list.toMutableList()
+        }
+        val seenMatches = LinkedHashSet<String>(state.seenMatchIdHashes)
+        var excludedOverCap = state.excludedOverPlayerCapGames
+        var changed = false
+
+        val sortedIncoming = samples.sortedWith(
+            compareByDescending<ParticipantSample> { it.gameCreation }.thenByDescending { it.matchId }
+        )
+
+        for (s in sortedIncoming) {
+            val pHash = hashIdentifier("player:$normalizedRegion:${s.puuid}")
+            val mHash = hashIdentifier("match:$normalizedRegion:${s.matchId}")
+            val existingPlayerSamples = mutableByPlayer[pHash]
+            if (existingPlayerSamples != null && existingPlayerSamples.any { it.matchIdHash == mHash }) {
+                // Already recorded this (matchId, player) in this cell -> deduplicate!
+                continue
+            }
+            // Also if this player already has effectiveCap games and this match was already seen in this cell for this player
+            val dedupeToken = "$mHash:$pHash"
+            if (dedupeToken in seenMatches) {
+                continue
+            }
+            // Cap distinct players per cell at MAX_PLAYERS_PER_DURABLE_CELL_STATE (250 = 5x the 50-player quality gate,
+            // <= 2,500 games/cell) to bound samples_json payload (~820 KB max) and 512 MB container heap.
+            // Existing players among the 250 continue to refresh their 10 newest games.
+            if (existingPlayerSamples == null && mutableByPlayer.size >= MAX_PLAYERS_PER_DURABLE_CELL_STATE) {
+                continue
+            }
+
+            if (seenMatches.size < MAX_SEEN_MATCH_HASHES_PER_CELL) {
+                seenMatches.add(dedupeToken)
+            }
+            val playerList = mutableByPlayer.getOrPut(pHash) { mutableListOf() }
+            playerList.add(
+                DeidentifiedMetricSampleDto(
+                    matchIdHash = mHash,
+                    playerHash = pHash,
+                    gameCreation = s.gameCreation,
+                    rankSnapshotEpochMilli = s.rankSnapshotAt.toEpochMilli(),
+                    laneCsAt10 = s.laneCsAt10,
+                    laneOnlyCsPerMin = s.laneOnlyCsPerMin,
+                    totalCsPerMinWithCamps = s.totalCsPerMinWithCamps,
+                    timelineTotalCsAt10WithCamps = s.timelineTotalCsAt10WithCamps,
+                    goldPerMin = s.goldPerMin,
+                    damagePerMin = s.damagePerMin,
+                    visionScorePerMin = s.visionScorePerMin,
+                    killParticipation = s.killParticipation,
+                    deathsPerGame = s.deathsPerGame,
+                    timeSpentDeadShare = s.timeSpentDeadShare
+                )
+            )
+            playerList.sortWith(
+                compareByDescending<DeidentifiedMetricSampleDto> { it.gameCreation }.thenByDescending { it.matchIdHash }
+            )
+            if (playerList.size > effectiveCap) {
+                val droppedCount = playerList.size - effectiveCap
+                while (playerList.size > effectiveCap) {
+                    playerList.removeAt(playerList.lastIndex)
+                }
+                excludedOverCap += droppedCount
+            }
+            changed = true
+        }
+
+        if (!changed) return state
+        return state.copy(
+            maxGamesPerPlayerCap = effectiveCap,
+            excludedOverPlayerCapGames = excludedOverCap,
+            seenMatchIdHashes = seenMatches,
+            samplesByPlayerHash = mutableByPlayer.mapValues { it.value.toList() },
+            updatedAtEpochMilli = nowEpochMilli
+        )
+    }
+
+    private fun buildCellDtoFromDurableState(
+        state: DurableCellSampleStateDto,
+        patchSelectionSource: String,
+        computedAt: Instant
+    ): CohortBenchmarkCellDto {
+        val retainedSamples = mutableListOf<ParticipantSample>()
+        for ((pHash, list) in state.samplesByPlayerHash) {
+            for (s in list.take(state.maxGamesPerPlayerCap)) {
+                retainedSamples.add(
+                    ParticipantSample(
+                        matchId = s.matchIdHash,
+                        puuid = pHash,
+                        tier = state.tier,
+                        role = state.role,
+                        gameCreation = s.gameCreation,
+                        rankSnapshotAt = Instant.ofEpochMilli(s.rankSnapshotEpochMilli.takeIf { it > 0L } ?: computedAt.toEpochMilli()),
+                        laneCsAt10 = s.laneCsAt10,
+                        laneOnlyCsPerMin = s.laneOnlyCsPerMin,
+                        totalCsPerMinWithCamps = s.totalCsPerMinWithCamps,
+                        timelineTotalCsAt10WithCamps = s.timelineTotalCsAt10WithCamps,
+                        goldPerMin = s.goldPerMin,
+                        damagePerMin = s.damagePerMin,
+                        visionScorePerMin = s.visionScorePerMin,
+                        killParticipation = s.killParticipation,
+                        deathsPerGame = s.deathsPerGame,
+                        timeSpentDeadShare = s.timeSpentDeadShare
+                    )
+                )
+            }
+        }
+        val distinctPlayersCount = state.samplesByPlayerHash.count { (_, list) -> list.isNotEmpty() }
+        val eligibleGamesCount = retainedSamples.size
+        val passesGate = distinctPlayersCount >= CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE &&
+            eligibleGamesCount >= CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE
+        val gateStatus = if (passesGate) {
+            "READY_FOR_COLOR_BANDS"
+        } else {
+            "INSUFFICIENT_SAMPLE (players=$distinctPlayersCount/${CohortBenchmarkCellDto.MIN_PLAYERS_FOR_QUALITY_GATE}, games=$eligibleGamesCount/${CohortBenchmarkCellDto.MIN_GAMES_FOR_QUALITY_GATE})"
+        }
+        val earliestSnapshot = retainedSamples.minOfOrNull { it.rankSnapshotAt }
+        val latestSnapshot = retainedSamples.maxOfOrNull { it.rankSnapshotAt }
+        val roleLaneCeiling = theoreticalLaneMinionSupplyAt10(state.patch, state.role)
+        val metricsBundle = buildMetricsBundleFromSamples(
+            samples = retainedSamples,
+            roleLaneCeiling = roleLaneCeiling
+        )
+
+        return CohortBenchmarkCellDto(
+            region = state.region,
+            patch = state.patch,
+            patchSelectionSource = patchSelectionSource,
+            queueId = state.queueId,
+            tier = state.tier,
+            role = state.role,
+            distinctPlayers = distinctPlayersCount,
+            eligibleGames = eligibleGamesCount,
+            maxGamesPerPlayerCap = state.maxGamesPerPlayerCap,
+            excludedOverPlayerCapGames = state.excludedOverPlayerCapGames,
+            passesQualityGate = passesGate,
+            colorBandsEnabled = passesGate,
+            qualityGateStatus = gateStatus,
+            earliestRankSnapshotAt = earliestSnapshot,
+            latestRankSnapshotAt = latestSnapshot,
+            computedAt = computedAt,
+            metrics = metricsBundle
+        )
+    }
+
+    private fun buildMetricsBundleFromSamples(
+        samples: List<ParticipantSample>,
+        roleLaneCeiling: Int
+    ): CohortMetricsBundleDto {
+        return CohortMetricsBundleDto(
+            laneCsAt10 = buildDistribution(
+                metricKey = "laneCsAt10",
+                unit = "lane_cs",
+                includesJungleCamps = false,
+                theoreticalSupplyCeiling = roleLaneCeiling,
+                samples = samples,
+                extractor = { it.laneCsAt10 }
+            ),
+            laneOnlyCsPerMin = buildDistribution(
+                metricKey = "laneOnlyCsPerMin",
+                unit = "lane_cs_per_min",
+                includesJungleCamps = false,
+                theoreticalSupplyCeiling = null,
+                samples = samples,
+                extractor = { it.laneOnlyCsPerMin }
+            ),
+            totalCsPerMinWithCamps = buildDistribution(
+                metricKey = "totalCsPerMinWithCamps",
+                unit = "total_cs_per_min",
+                includesJungleCamps = true,
+                theoreticalSupplyCeiling = null,
+                samples = samples,
+                extractor = { it.totalCsPerMinWithCamps }
+            ),
+            timelineTotalCsAt10WithCamps = buildDistribution(
+                metricKey = "timelineTotalCsAt10WithCamps",
+                unit = "total_cs",
+                includesJungleCamps = true,
+                theoreticalSupplyCeiling = null,
+                samples = samples,
+                extractor = { it.timelineTotalCsAt10WithCamps }
+            ),
+            goldPerMin = buildDistribution(
+                metricKey = "goldPerMin",
+                unit = "gold_per_min",
+                includesJungleCamps = false,
+                theoreticalSupplyCeiling = null,
+                samples = samples,
+                extractor = { it.goldPerMin }
+            ),
+            damagePerMin = buildDistribution(
+                metricKey = "damagePerMin",
+                unit = "damage_per_min",
+                includesJungleCamps = false,
+                theoreticalSupplyCeiling = null,
+                samples = samples,
+                extractor = { it.damagePerMin }
+            ),
+            visionScorePerMin = buildDistribution(
+                metricKey = "visionScorePerMin",
+                unit = "vision_score_per_min",
+                includesJungleCamps = false,
+                theoreticalSupplyCeiling = null,
+                samples = samples,
+                extractor = { it.visionScorePerMin }
+            ),
+            killParticipation = buildDistribution(
+                metricKey = "killParticipation",
+                unit = "ratio_0_to_1",
+                includesJungleCamps = false,
+                theoreticalSupplyCeiling = null,
+                samples = samples,
+                extractor = { it.killParticipation }
+            ),
+            deathsPerGame = buildDistribution(
+                metricKey = "deathsPerGame",
+                unit = "deaths",
+                includesJungleCamps = false,
+                theoreticalSupplyCeiling = null,
+                samples = samples,
+                extractor = { it.deathsPerGame }
+            ),
+            timeSpentDeadShare = buildDistribution(
+                metricKey = "timeSpentDeadShare",
+                unit = "ratio_0_to_1",
+                includesJungleCamps = false,
+                theoreticalSupplyCeiling = null,
+                samples = samples,
+                extractor = { it.timeSpentDeadShare }
+            )
+        )
     }
 
     private fun buildDistribution(

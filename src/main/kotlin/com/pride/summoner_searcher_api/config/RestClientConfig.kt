@@ -3,6 +3,7 @@ package com.pride.summoner_searcher_api.config
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
+import org.springframework.context.annotation.Primary
 import org.springframework.web.client.RestClient
 
 /**
@@ -24,10 +25,9 @@ class RestClientConfig {
      *
      * @return A configured RestClient instance for the Riot API.
      */
-    @Bean
+    @Bean("riotRestClient")
+    @Primary
     fun riotRestClient(): RestClient {
-        val logger = org.slf4j.LoggerFactory.getLogger(RestClientConfig::class.java)
-
         val provider = reactor.netty.resources.ConnectionProvider.builder("riot-api-pool")
             .maxConnections(24)
             .pendingAcquireMaxCount(64)
@@ -50,4 +50,38 @@ class RestClientConfig {
             .defaultHeader("X-Riot-Token", riotApiKey)
             .build()
     }
+
+    /**
+     * Separate unauthenticated RestClient for public Riot Data Dragon static endpoints
+     * (`ddragon.leagueoflegends.com`). Never attaches `X-Riot-Token` so the Riot API key
+     * is never sent to Data Dragon CDNs.
+     */
+    @Bean("dataDragonRestClient")
+    fun dataDragonRestClient(): RestClient {
+        val provider = reactor.netty.resources.ConnectionProvider.builder("ddragon-pool")
+            .maxConnections(4)
+            .pendingAcquireMaxCount(8)
+            .maxIdleTime(java.time.Duration.ofSeconds(10))
+            .maxLifeTime(java.time.Duration.ofSeconds(50))
+            .pendingAcquireTimeout(java.time.Duration.ofSeconds(15))
+            .evictInBackground(java.time.Duration.ofSeconds(30))
+            .build()
+
+        val httpClient = reactor.netty.http.client.HttpClient.create(provider)
+            .responseTimeout(java.time.Duration.ofSeconds(10))
+            .option(io.netty.channel.ChannelOption.CONNECT_TIMEOUT_MILLIS, 10000)
+            .protocol(reactor.netty.http.HttpProtocol.HTTP11)
+            .headers { it.set(org.springframework.http.HttpHeaders.USER_AGENT, "SummonerSearcher/1.0") }
+
+        val requestFactory = org.springframework.http.client.ReactorNettyClientRequestFactory(httpClient)
+
+        return RestClient.builder()
+            .requestFactory(requestFactory)
+            .requestInterceptor { request, body, execution ->
+                request.headers.remove("X-Riot-Token")
+                execution.execute(request, body)
+            }
+            .build()
+    }
 }
+
