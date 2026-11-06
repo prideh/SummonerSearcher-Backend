@@ -1,0 +1,76 @@
+name: Collector Checkpoint Single-Encode A/B (Manual Dispatch Only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      batch_size:
+        description: "Players per collector batch (5 uses 15/session across 47 fixture PUUIDs; 3 uses 9/session across all 5 sessions)"
+        required: false
+        default: "5"
+      max_batches:
+        description: "Max productive batches per session"
+        required: false
+        default: "3"
+      post_gc_wait_sec:
+        description: "Passive post-session wait seconds before reading post-wait status"
+        required: false
+        default: "30"
+
+permissions:
+  contents: read
+
+jobs:
+  ab-checkpoint-single-encode:
+    # Standard public GitHub-hosted runner (free on public repositories).
+    # Guarded below to fail closed if repository is not public.
+    if: github.event.repository.private == false && github.event.repository.visibility == 'public'
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout repository with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify public repo free-runner invariant and exact base/candidate commit SHAs
+        run: |
+          test "${{ github.event.repository.private }}" = "false"
+          test "${{ github.event.repository.visibility }}" = "public"
+          git cat-file -e 176f67f5ba59abb22099d2ac1bdc3c2ada77c420^{commit}
+          git cat-file -e 92617ddca063e317abe401a0e7d44d36d419943e^{commit}
+
+      - name: Build Base (176f67f) and Candidate (92617dd) Docker images from exact repo Dockerfile
+        run: |
+          git worktree add --detach /tmp/wt-base 176f67f5ba59abb22099d2ac1bdc3c2ada77c420
+          docker build -f /tmp/wt-base/Dockerfile -t ss-backend:ab-base-176f67f /tmp/wt-base
+          git worktree remove --force /tmp/wt-base
+
+          git worktree add --detach /tmp/wt-cand 92617ddca063e317abe401a0e7d44d36d419943e
+          docker build -f /tmp/wt-cand/Dockerfile -t ss-backend:ab-cand-92617dd /tmp/wt-cand
+          git worktree remove --force /tmp/wt-cand
+
+      - name: Prepare local Mock Riot TLS certificate and container truststore
+        run: |
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/mockriot.key -out /tmp/mockriot.crt -days 1 \
+            -subj "/CN=api.riotgames.com" \
+            -addext "subjectAltName=DNS:euw1.api.riotgames.com,DNS:na1.api.riotgames.com,DNS:kr.api.riotgames.com,DNS:europe.api.riotgames.com,DNS:americas.api.riotgames.com,DNS:asia.api.riotgames.com,DNS:ddragon.leagueoflegends.com"
+          cid=$(docker create ss-backend:ab-base-176f67f)
+          docker cp "$cid:/opt/java/openjdk/lib/security/cacerts" /tmp/cacerts
+          docker rm "$cid"
+          keytool -importcert -noprompt -trustcacerts -alias mockriot -file /tmp/mockriot.crt -keystore /tmp/cacerts -storepass changeit
+          chmod 644 /tmp/cacerts
+
+      - name: Execute isolated same-fixture A/B harness (176f67f vs 92617dd)
+        env:
+          AB_BASE_IMAGE: "ss-backend:ab-base-176f67f"
+          AB_CAND_IMAGE: "ss-backend:ab-cand-92617dd"
+          AB_MAX_SESSIONS: "5"
+          AB_MAX_BATCHES: ${{ inputs.max_batches || '3' }}
+          AB_BATCH_SIZE: ${{ inputs.batch_size || '5' }}
+          AB_MAX_TOTAL_PRODUCTIVE_BATCHES: ${{ inputs.max_batches || '3' }}
+          AB_MAX_TOTAL_NETWORK_CALLS: "60"
+          AB_POST_GC_WAIT_SEC: ${{ inputs.post_gc_wait_sec || '30' }}
+        run: |
+          chmod +x ./scripts/ab_checkpoint_single_encode.py
+          sudo --preserve-env=AB_BASE_IMAGE,AB_CAND_IMAGE,AB_MAX_SESSIONS,AB_MAX_BATCHES,AB_BATCH_SIZE,AB_MAX_TOTAL_PRODUCTIVE_BATCHES,AB_MAX_TOTAL_NETWORK_CALLS,AB_POST_GC_WAIT_SEC \
+            python3 ./scripts/ab_checkpoint_single_encode.py /tmp/mockriot.crt /tmp/mockriot.key
