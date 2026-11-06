@@ -2492,6 +2492,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             // - Players 2..50 ("dia-top-2".."dia-top-50") play 4 matches each (49 * 4 = 196 games).
             // Total eligible games in DIAMOND:TOP = 10 + 196 = 206 (>= 200) across 50 distinct players (>= 50) -> passes quality gate!
             val allPlayers = (1..50).map { "dia-top-$it" }
+            every { evictRiotApi.fetchDataDragonVersions(any()) } returns listOf("16.22.1", "16.21.1")
             coEvery { evictRiotApi.fetchLeagueRankLowPriority(any(), "euw1", any(), any(), any()) } coAnswers {
                 val pid = firstArg<String>()
                 arg<java.util.concurrent.atomic.AtomicInteger?>(3)?.incrementAndGet()
@@ -2541,8 +2542,8 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 )
             }
 
-            // Pre-seed an older checkpoint pinned to stale patch "16.21" while a 16.22 Solo Queue match is in Redis
-            // to reproduce and verify the fix for the prod 16.21 vs 16.22 divergence!
+            // Pre-seed an older checkpoint pinned to stale patch "16.21" while Redis has 0 matches initially:
+            // Data Dragon versions.json ("16.22.1") grounds the current patch to "16.22" before any 16.22 match is stored!
             durableService.saveCollectorCheckpoint(
                 CohortCollectorCheckpointDto(
                     region = "euw1",
@@ -2551,20 +2552,6 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                     pendingCandidatePuuids = allPlayers,
                     startedAt = nowInstant,
                     updatedAt = nowInstant
-                )
-            )
-            redisMatches["match:euw1:EUW1_D_1_1"] = MatchDto(
-                metadata = MatchMetadata("EUW1_D_1_1", listOf("dia-top-1")),
-                info = MatchInfo(
-                    gameCreation = clockMs.get() - 101_000L,
-                    gameDuration = 1800L,
-                    gameId = 1001L,
-                    queueId = 420,
-                    gameMode = "CLASSIC",
-                    gameVersion = "16.22.615.9999",
-                    participants = listOf(
-                        buildParticipant(puuid = "dia-top-1", role = "TOP", laneCs10 = 81, totalMinions = 211, neutralMinions = 8)
-                    )
                 )
             )
 
@@ -2588,6 +2575,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 maxPlayersPerBatch = 25,
                 maxGamesPerPlayer = 10
             )
+            val dbWriteCountsAfter50Players = durableService.getDurableDbWriteCounts()
 
             // Also test feeding duplicate match EUW1_D_1_1 and extra over-cap matches EUW1_D_1_11 and EUW1_D_1_12 for dia-top-1
             // before clearing Redis completely again
@@ -2649,25 +2637,39 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             val restartedCohortsAfterEviction = restartedController.getCohortBenchmarks("euw1", null).body!!
             val restartedReportAfterEviction = restartedController.getCohortExtractionReport("euw1", null).body!!
 
-            // Test non-current patch refusal ("16.21" when grounded current patch is "16.22") on collector, report, and /cohorts
-            val refusedCollectorCp = restartedService.runResumableLowPriorityCollectorBatch(
+            // Test non-current patch refusal: both older ("16.21") and ahead-of-source ("16.23") when grounded patch is "16.22"
+            val refusedOlderCollectorCp = restartedService.runResumableLowPriorityCollectorBatch(
                 region = "euw1",
                 targetPatch = "16.21",
                 maxPlayersPerBatch = 5,
                 maxGamesPerPlayer = 10
             )
-            val refusedReport = restartedController.getCohortExtractionReport("euw1", "16.21").body!!
-            val refusedCohorts = restartedController.getCohortBenchmarks("euw1", "16.21").body!!
+            val refusedAheadCollectorCp = restartedService.runResumableLowPriorityCollectorBatch(
+                region = "euw1",
+                targetPatch = "16.23",
+                maxPlayersPerBatch = 5,
+                maxGamesPerPlayer = 10
+            )
+            val refusedOlderReport = restartedController.getCohortExtractionReport("euw1", "16.21").body!!
+            val refusedAheadReport = restartedController.getCohortExtractionReport("euw1", "16.23").body!!
+            val refusedOlderCohorts = restartedController.getCohortBenchmarks("euw1", "16.21").body!!
+            val refusedAheadCohorts = restartedController.getCohortBenchmarks("euw1", "16.23").body!!
 
             val memHeadroom = restartedService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
 
-            Then("it should advance from stale patch 16.21 to grounded 16.22, persist de-identified cell aggregates in Postgres across Redis evictions, enforce dedupe and 10-game cap, pass the 50-player/200-game quality gate, refuse non-current patch 16.21, and keep the 78%/64MiB guard unchanged") {
+            Then("it should advance from stale patch 16.21 to grounded 16.22, batch Postgres writes, persist de-identified cell aggregates across Redis evictions, enforce dedupe and 10-game cap, pass the 50-player/200-game quality gate, refuse both older and ahead-of-source patches, and keep the 78%/64MiB guard unchanged") {
                 // 1. Grounded patch aligned both collector checkpoint and persisted cells to 16.22 (never 16.21 vs 16.22)
                 cpBatch1.targetPatch shouldBe "16.22"
                 cpBatch2.targetPatch shouldBe "16.22"
                 restartedService.resolveGroundedCurrentPatch("euw1") shouldBe "16.22"
 
-                // 2. Checkpoint cellsPassingQualityGate matches persisted cohort_benchmark_cells and reportAfterEviction
+                // 2. Write amplification eliminated: across 50 players (2 batches of 25 with flush interval N=10),
+                // each 25-player batch flushes at player 10, player 20, and end-of-batch (player 25) = 3 flushes/batch = 6 total writes
+                // instead of 50 per-player rewrites of samples_json and cohort_benchmark_cells!
+                dbWriteCountsAfter50Players["cohortCellSampleStatesWrites"] shouldBe 6L
+                dbWriteCountsAfter50Players["cohortBenchmarkCellsWrites"] shouldBe 6L
+
+                // 3. Checkpoint cellsPassingQualityGate matches persisted cohort_benchmark_cells and reportAfterEviction
                 cpBatch2.cellsPassingQualityGate shouldBe 1
                 cpBatch2.targetCellsCount shouldBe 30
                 val cpDiaTop = cpBatch2.cellProgress["DIAMOND:TOP"]!!
@@ -2675,7 +2677,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 cpDiaTop.eligibleGames shouldBe 206
                 cpDiaTop.passesQualityGate shouldBe true
 
-                // 3. Even after complete Redis eviction (0 match:* keys in Redis) and JVM restart, /cohorts and /report read the durable Postgres store
+                // 4. Even after complete Redis eviction (0 match:* keys in Redis) and JVM restart, /cohorts and /report read the durable Postgres store
                 cohortsAfterEviction shouldHaveSize 1
                 restartedCohortsAfterEviction shouldHaveSize 1
                 val persistedDiaTop = restartedCohortsAfterEviction.first()
@@ -2699,7 +2701,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 restartedReportAfterEviction.inventory.eligibleCohortSamples shouldBe 206
                 restartedReportAfterEviction.inventory.cellsPassingQualityGate shouldBe 1
 
-                // 4. Verify durable Postgres tables contain zero raw PUUIDs or raw match IDs (de-identified hashes only)
+                // 5. Verify durable Postgres tables contain zero raw PUUIDs or raw match IDs (de-identified hashes only)
                 val sampleEntity = pgSampleStates["euw1:16.22:420:DIAMOND:TOP"]!!
                 sampleEntity.distinctPlayers shouldBe 50
                 sampleEntity.eligibleGames shouldBe 206
@@ -2707,16 +2709,315 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 sampleEntity.samplesJson.contains("dia-top-") shouldBe false
                 sampleEntity.samplesJson.contains("EUW1_D_") shouldBe false
 
-                // 5. Non-current patch "16.21" is refused across collector, /report, and /cohorts
-                refusedCollectorCp.lastStopReason shouldBe "NON_CURRENT_PATCH_REFUSED"
-                refusedCollectorCp.targetPatch shouldBe "16.22"
-                refusedReport.reportSource shouldBe "NON_CURRENT_PATCH_REFUSED"
-                refusedReport.cells shouldBe emptyList()
-                refusedCohorts shouldBe emptyList()
+                // 6. Both older ("16.21") and ahead-of-source ("16.23") patches are refused across collector, /report, and /cohorts
+                refusedOlderCollectorCp.lastStopReason shouldBe "NON_CURRENT_PATCH_REFUSED"
+                refusedOlderCollectorCp.targetPatch shouldBe "16.22"
+                refusedAheadCollectorCp.lastStopReason shouldBe "NON_CURRENT_PATCH_REFUSED"
+                refusedAheadCollectorCp.targetPatch shouldBe "16.22"
+                refusedOlderReport.reportSource shouldBe "NON_CURRENT_PATCH_REFUSED"
+                refusedOlderReport.cells shouldBe emptyList()
+                refusedAheadReport.reportSource shouldBe "NON_CURRENT_PATCH_REFUSED"
+                refusedAheadReport.cells shouldBe emptyList()
+                refusedOlderCohorts shouldBe emptyList()
+                refusedAheadCohorts shouldBe emptyList()
 
-                // 6. 78% / 64 MiB memory guard remains unchanged
+                // 7. 78% / 64 MiB memory guard remains unchanged
                 memHeadroom.maxAllowedUtilizationRatio shouldBe 0.78
                 memHeadroom.minRequiredFreeBytes shouldBe 67_108_864L
+            }
+        }
+
+        When("starting with production legacy rows (14 cells on 16.22 with 341 games/218 players/0 passing, checkpoint pinned to 16.21 with 7/30 passing, empty cohort_cell_sample_states) and testing external grounding fallback and stray high patch rejection") {
+            val clockMs = java.util.concurrent.atomic.AtomicLong(nowInstant.toEpochMilli())
+            val testClock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            val legacyLimiter = RiotApiRateLimiter(testClock)
+            val legacyRedis = mockk<RedisCacheService>(relaxed = true)
+            val legacyRiotApi = mockk<RiotApiService>(relaxed = true)
+            val pgCellRepo = mockk<CohortBenchmarkCellRepository>(relaxed = true)
+            val pgSampleRepo = mockk<com.pride.summoner_searcher_api.repository.CohortCellSampleStateRepository>(relaxed = true)
+            val pgCheckpointRepo = mockk<CohortCollectorCheckpointRepository>(relaxed = true)
+
+            val pgBenchmarkCells = mutableMapOf<String, CohortBenchmarkCellEntity>()
+            val pgSampleStates = mutableMapOf<String, com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity>()
+            val pgCheckpoints = mutableMapOf<String, CohortCollectorCheckpointEntity>()
+            var lockHeld = false
+
+            every { legacyRedis.scanKeys(any(), any(), any()) } returns emptyList()
+            every { legacyRedis.get(any(), any<Class<Any>>()) } returns null
+            every { legacyRedis.setIfAbsent(any(), any(), any()) } answers {
+                val key = firstArg<String>()
+                if (key.startsWith("lock:cohort:collector:active:")) {
+                    if (lockHeld) false else {
+                        lockHeld = true
+                        true
+                    }
+                } else {
+                    true
+                }
+            }
+            every { legacyRedis.delete(match { it.startsWith("lock:cohort:collector:active:") }) } answers {
+                lockHeld = false
+            }
+
+            every { pgCellRepo.findByRegionAndPatchAndQueueIdAndTierAndRole(any(), any(), any(), any(), any()) } answers {
+                pgBenchmarkCells["${firstArg<String>()}:${secondArg<String>()}:${thirdArg<Int>()}:${arg<String>(3)}:${arg<String>(4)}"]
+            }
+            every { pgCellRepo.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(any(), any(), any()) } answers {
+                val r = firstArg<String>()
+                val p = secondArg<String>()
+                val q = thirdArg<Int>()
+                pgBenchmarkCells.values.filter { it.region == r && it.patch == p && it.queueId == q }
+            }
+            every { pgCellRepo.findByRegionOrderByPatchDescTierAscRoleAsc(any()) } answers {
+                val r = firstArg<String>()
+                pgBenchmarkCells.values.filter { it.region == r }
+            }
+            every { pgCellRepo.save(any<CohortBenchmarkCellEntity>()) } answers {
+                val ent = firstArg<CohortBenchmarkCellEntity>()
+                pgBenchmarkCells["${ent.region}:${ent.patch}:${ent.queueId}:${ent.tier}:${ent.role}"] = ent
+                ent
+            }
+
+            every { pgSampleRepo.findByRegionAndPatchAndQueueIdAndTierAndRole(any(), any(), any(), any(), any()) } answers {
+                pgSampleStates["${firstArg<String>()}:${secondArg<String>()}:${thirdArg<Int>()}:${arg<String>(3)}:${arg<String>(4)}"]
+            }
+            every { pgSampleRepo.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(any(), any(), any()) } answers {
+                val r = firstArg<String>()
+                val p = secondArg<String>()
+                val q = thirdArg<Int>()
+                pgSampleStates.values.filter { it.region == r && it.patch == p && it.queueId == q }
+            }
+            every { pgSampleRepo.findByRegionOrderByPatchDescTierAscRoleAsc(any()) } answers {
+                val r = firstArg<String>()
+                pgSampleStates.values.filter { it.region == r }
+            }
+            every { pgSampleRepo.save(any<com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity>()) } answers {
+                val ent = firstArg<com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity>()
+                pgSampleStates["${ent.region}:${ent.patch}:${ent.queueId}:${ent.tier}:${ent.role}"] = ent
+                ent
+            }
+
+            every { pgCheckpointRepo.findByRegionAndTargetPatchAndQueueId(any(), any(), any()) } answers {
+                pgCheckpoints["${firstArg<String>()}:${secondArg<String>()}:${thirdArg<Int>()}"]
+            }
+            every { pgCheckpointRepo.findFirstByRegionAndQueueIdOrderByUpdatedAtDesc(any(), any()) } answers {
+                val r = firstArg<String>()
+                val q = secondArg<Int>()
+                pgCheckpoints.values.filter { it.region == r && it.queueId == q }.maxByOrNull { it.updatedAt }
+            }
+            every { pgCheckpointRepo.save(any<CohortCollectorCheckpointEntity>()) } answers {
+                val ent = firstArg<CohortCollectorCheckpointEntity>()
+                pgCheckpoints["${ent.region}:${ent.targetPatch}:${ent.queueId}"] = ent
+                ent
+            }
+
+            for (ep in CohortBenchmarkService.REQUIRED_COLLECTOR_ENDPOINTS) {
+                legacyLimiter.updateLimits(
+                    region = "euw1",
+                    limitHeader = "20:1,100:120",
+                    countHeader = "1:1,2:120",
+                    endpointKey = ep,
+                    methodLimitHeader = "500:10",
+                    methodCountHeader = "1:10"
+                )
+            }
+
+            // Seed exact production legacy state:
+            // - 14 cells on patch 16.22 in cohort_benchmark_cells totaling 341 games and 218 players (0 passing quality gate)
+            //   (13 cells with 24 games / 15 players = 312 games / 195 players, plus 1 cell MASTER:MID with 29 games / 23 players = 341 games / 218 players)
+            // - 0 rows in cohort_cell_sample_states (brand new table created by ddl-auto=update)
+            // - Legacy checkpoint row pinned to targetPatch = "16.21" with cellsPassingQualityGate = 7 and 2 processed PUUIDs
+            val legacyCellPairs = listOf(
+                "IRON" to "TOP", "IRON" to "JUNGLE",
+                "BRONZE" to "TOP", "BRONZE" to "JUNGLE",
+                "SILVER" to "TOP", "SILVER" to "JUNGLE",
+                "GOLD" to "TOP", "GOLD" to "JUNGLE",
+                "PLATINUM" to "TOP", "PLATINUM" to "JUNGLE",
+                "EMERALD" to "TOP", "EMERALD" to "JUNGLE",
+                "DIAMOND" to "TOP", "MASTER" to "MID"
+            )
+            val emptyQuantilesJson = objectMapper.writeValueAsString(
+                CohortCellMetricsDto(
+                    laneCsAt10 = MetricQuantilesDto("laneCsAt10", false, 24, 15, 70.0, 60.0, 65.0, 70.0, 75.0, 80.0),
+                    csPerMinute = MetricQuantilesDto("csPerMinute", false, 24, 15, 7.0, 6.0, 6.5, 7.0, 7.5, 8.0),
+                    deathsAt10 = MetricQuantilesDto("deathsAt10", true, 24, 15, 1.0, 0.0, 0.0, 1.0, 1.0, 2.0),
+                    soloDeaths = MetricQuantilesDto("soloDeaths", true, 24, 15, 1.0, 0.0, 0.0, 1.0, 1.0, 2.0),
+                    firstRecallTimeSeconds = MetricQuantilesDto("firstRecallTimeSeconds", true, 24, 15, 330.0, 270.0, 300.0, 330.0, 360.0, 400.0),
+                    teamfightParticipation = MetricQuantilesDto("teamfightParticipation", false, 24, 15, 0.55, 0.40, 0.48, 0.55, 0.62, 0.70)
+                )
+            )
+            legacyCellPairs.forEachIndexed { idx, (tier, role) ->
+                val games = if (idx == 13) 29 else 24
+                val players = if (idx == 13) 23 else 15
+                pgBenchmarkCells["euw1:16.22:420:$tier:$role"] = CohortBenchmarkCellEntity(
+                    id = (idx + 1).toLong(),
+                    region = "euw1",
+                    patch = "16.22",
+                    queueId = 420,
+                    tier = tier,
+                    role = role,
+                    eligibleGames = games,
+                    distinctPlayers = players,
+                    excludedOverPlayerCapGames = 0,
+                    minPlayersRequired = 50,
+                    minGamesRequired = 200,
+                    passesQualityGate = false,
+                    colorBandsEnabled = false,
+                    metricsJson = emptyQuantilesJson,
+                    computedAt = nowInstant,
+                    updatedAt = nowInstant
+                )
+            }
+            val legacyCp1621 = CohortCollectorCheckpointDto(
+                region = "euw1",
+                targetPatch = "16.21",
+                patchSelectionSource = "AUTO_LATEST_EXACT_PATCH",
+                processedPuuids = setOf("legacy-p1", "legacy-p2"),
+                pendingCandidatePuuids = emptyList(),
+                cellsPassingQualityGate = 7,
+                targetCellsCount = 30,
+                startedAt = nowInstant.minusSeconds(3600),
+                updatedAt = nowInstant.minusSeconds(60)
+            )
+            pgCheckpoints["euw1:16.21:420"] = CohortCollectorCheckpointEntity(
+                region = "euw1",
+                targetPatch = "16.21",
+                queueId = 420,
+                processedPuuidsCount = 2,
+                pendingCandidatesCount = 0,
+                cellsPassingQualityGate = 7,
+                allTargetCellsPassing = false,
+                batchesCompleted = 10,
+                totalNetworkCalls = 150,
+                lastStopReason = "BATCH_COMPLETED",
+                checkpointJson = objectMapper.writeValueAsString(legacyCp1621),
+                startedAt = legacyCp1621.startedAt,
+                updatedAt = legacyCp1621.updatedAt
+            )
+            pgCheckpoints["euw1:latest:420"] = CohortCollectorCheckpointEntity(
+                region = "euw1",
+                targetPatch = "latest",
+                queueId = 420,
+                processedPuuidsCount = 2,
+                pendingCandidatesCount = 0,
+                cellsPassingQualityGate = 7,
+                allTargetCellsPassing = false,
+                batchesCompleted = 10,
+                totalNetworkCalls = 150,
+                lastStopReason = "BATCH_COMPLETED",
+                checkpointJson = objectMapper.writeValueAsString(legacyCp1621),
+                startedAt = legacyCp1621.startedAt,
+                updatedAt = legacyCp1621.updatedAt
+            )
+
+            // Also seed a stray poisoned checkpoint with patch "99.1" to verify external grounding rejects it
+            val strayHighCp = legacyCp1621.copy(targetPatch = "99.1", updatedAt = nowInstant)
+            pgCheckpoints["euw1:99.1:420"] = CohortCollectorCheckpointEntity(
+                region = "euw1",
+                targetPatch = "99.1",
+                queueId = 420,
+                processedPuuidsCount = 0,
+                pendingCandidatesCount = 0,
+                cellsPassingQualityGate = 0,
+                allTargetCellsPassing = false,
+                batchesCompleted = 0,
+                totalNetworkCalls = 0,
+                lastStopReason = "IDLE",
+                checkpointJson = objectMapper.writeValueAsString(strayHighCp),
+                startedAt = nowInstant,
+                updatedAt = nowInstant
+            )
+
+            every { legacyRiotApi.fetchDataDragonVersions(any()) } returns listOf("16.22.1", "16.21.1")
+
+            val legacyStartupService = CohortBenchmarkService(
+                redisCacheService = legacyRedis,
+                cohortBenchmarkCellRepository = pgCellRepo,
+                riotApiRateLimiter = legacyLimiter,
+                riotApiService = legacyRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = testClock,
+                configuredContainerLimitBytes = 536_870_912L,
+                maxMemoryUtilizationRatio = 0.78,
+                minFreeMemoryBytes = 67_108_864L,
+                cohortCollectorCheckpointRepository = pgCheckpointRepo,
+                cohortCellSampleStateRepository = pgSampleRepo
+            )
+
+            // 1. Immediately on first start (before collector runs, with 0 rows in cohort_cell_sample_states):
+            val groundedOnStart = legacyStartupService.resolveGroundedCurrentPatch("euw1")
+            val cellsOnStart = legacyStartupService.getPersistedCohortCells("euw1", null)
+            val reportOnStart = legacyStartupService.getPublicCohortReport("euw1", null)
+
+            // 2. Test safe fallback when Data Dragon lookup fails (throws exception) after cache TTL expires:
+            clockMs.addAndGet(31 * 60 * 1_000L) // advance past 30m Data Dragon cache TTL
+            every { legacyRiotApi.fetchDataDragonVersions(any()) } throws RuntimeException("Data Dragon timeout")
+            val groundedDuringOutage = legacyStartupService.resolveGroundedCurrentPatch("euw1")
+
+            // 3. Restore Data Dragon and run 1 collector batch: verify legacy 16.21 checkpoint advances to 16.22,
+            // resets stale 7/30 passing count to 0/30, re-queues legacy-p1 & legacy-p2, and preserves all 14 legacy 16.22 cells!
+            clockMs.addAndGet(31 * 60 * 1_000L)
+            every { legacyRiotApi.fetchDataDragonVersions(any()) } returns listOf("16.22.1", "16.21.1")
+            // Restore latest pointer to legacyCp1621 so we test advancing from the 16.21 prod checkpoint
+            pgCheckpoints["euw1:latest:420"] = pgCheckpoints["euw1:16.21:420"]!!
+
+            coEvery { legacyRiotApi.fetchLeagueRankLowPriority(any(), "euw1", any(), any(), any()) } returns LeagueEntryDto(
+                leagueId = "l-1", queueType = "RANKED_SOLO_5x5", tier = "GOLD", rank = "II",
+                summonerName = "legacy-p1", puuid = "legacy-p1", leaguePoints = 50, wins = 20, losses = 20,
+                veteran = false, inactive = false, freshBlood = false, hotStreak = false
+            )
+            coEvery { legacyRiotApi.getMatchIdsByPuuidLowPriority(any(), "euw1", 420, any(), 0, any(), any(), any()) } returns listOf("EUW1_LEGACY_1")
+            coEvery { legacyRiotApi.getMatchByIdLowPriority("EUW1_LEGACY_1", "euw1", any(), any(), any()) } returns MatchDto(
+                metadata = MatchMetadata("EUW1_LEGACY_1", listOf("legacy-p1")),
+                info = MatchInfo(
+                    gameCreation = clockMs.get() - 10_000L,
+                    gameDuration = 1800L,
+                    gameId = 999001L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.22.615.9999",
+                    participants = listOf(
+                        buildParticipant(puuid = "legacy-p1", role = "MID", laneCs10 = 76, totalMinions = 195, neutralMinions = 4)
+                    )
+                )
+            )
+
+            val cpAfterLegacyAdvance = legacyStartupService.runResumableLowPriorityCollectorBatch(
+                region = "euw1",
+                targetPatch = null,
+                maxPlayersPerBatch = 1,
+                maxGamesPerPlayer = 10
+            )
+            val cellsAfterFirstBatch = legacyStartupService.getPersistedCohortCells("euw1", null)
+
+            Then("it should preserve all 14 legacy 16.22 cells (341 games, 218 players) on first start, reject stray patch 99.1, survive Data Dragon outage without crashing or advancing to 99.1, and advance the 16.21 checkpoint to 16.22 on the first batch") {
+                // Grounded patch on start is 16.22 (stray "99.1" checkpoint rejected!)
+                groundedOnStart shouldBe "16.22"
+
+                // All 14 legacy 16.22 cells (341 games, 218 players, 0 passing) are preserved on first start even with 0 cohort_cell_sample_states rows
+                cellsOnStart shouldHaveSize 14
+                cellsOnStart.sumOf { it.eligibleGames } shouldBe 341
+                cellsOnStart.sumOf { it.distinctPlayers } shouldBe 218
+                cellsOnStart.count { it.passesQualityGate } shouldBe 0
+                reportOnStart.inventory.selectedTargetPatch shouldBe "16.22"
+                reportOnStart.inventory.eligibleCohortSamples shouldBe 341
+                reportOnStart.inventory.distinctEligibleCohortPlayers shouldBe 218
+                reportOnStart.inventory.cellsPassingQualityGate shouldBe 0
+
+                // Safe fallback when Data Dragon throws: does not crash and does not advance to unbacked "99.1" checkpoint
+                groundedDuringOutage shouldBe "16.22"
+
+                // First collector batch advances from legacy 16.21 checkpoint to 16.22, resets stale 7/30 passing count to 0/30,
+                // processes legacy-p1 into GOLD:MID (a 15th cell on 16.22), and preserves all 14 existing 16.22 cells!
+                cpAfterLegacyAdvance.targetPatch shouldBe "16.22"
+                cpAfterLegacyAdvance.cellsPassingQualityGate shouldBe 0
+                cpAfterLegacyAdvance.processedPuuids shouldBe setOf("legacy-p1")
+                cpAfterLegacyAdvance.pendingCandidatePuuids shouldBe listOf("legacy-p2")
+                pgSampleStates.containsKey("euw1:16.22:420:GOLD:MID") shouldBe true
+                cellsAfterFirstBatch shouldHaveSize 15
             }
         }
     }

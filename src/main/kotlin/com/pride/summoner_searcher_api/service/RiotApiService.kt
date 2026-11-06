@@ -624,6 +624,34 @@ class RiotApiService(
         }
     }
 
+    @org.springframework.beans.factory.annotation.Value("\${cohort.patch.ddragon-versions-url:https://ddragon.leagueoflegends.com/api/versions.json}")
+    private var dataDragonVersionsUrl: String = "https://ddragon.leagueoflegends.com/api/versions.json"
+
+    /**
+     * Bounded lookup of Riot Data Dragon `versions.json` (e.g. `["16.22.1", "16.21.1", ...]`)
+     * used to ground the current League of Legends `major.minor` patch without counting against
+     * regional Riot API rate limits. Returns an empty list on any network/parse error (safe fallback:
+     * never crashes and never advances to an unverified patch).
+     */
+    fun fetchDataDragonVersions(maxEntries: Int = 5): List<String> {
+        val safeMax = maxEntries.coerceIn(1, 20)
+        return try {
+            val body = riotRestClient.get()
+                .uri(dataDragonVersionsUrl)
+                .retrieve()
+                .body(Array<String>::class.java)
+            body?.asSequence()
+                ?.map { it.trim() }
+                ?.filter { it.isNotBlank() }
+                ?.take(safeMax)
+                ?.toList()
+                .orEmpty()
+        } catch (e: Exception) {
+            logger.debug("Data Dragon versions.json lookup failed (safe fallback): {}", e.message)
+            emptyList()
+        }
+    }
+
     suspend fun getActiveGameByPuuid(puuid: String, region: String): CurrentGameInfo? = coroutineScope {
         val platformBaseUrl = "https://${region}.api.riotgames.com"
         val uri = "$platformBaseUrl/lol/spectator/v5/active-games/by-summoner/{puuid}"

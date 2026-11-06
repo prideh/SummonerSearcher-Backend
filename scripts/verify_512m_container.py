@@ -355,6 +355,7 @@ def main():
         "--add-host=europe.api.riotgames.com:host-gateway",
         "--add-host=americas.api.riotgames.com:host-gateway",
         "--add-host=asia.api.riotgames.com:host-gateway",
+        "--add-host=ddragon.leagueoflegends.com:host-gateway",
         "-v", "/tmp/cacerts:/opt/java/openjdk/lib/security/cacerts:ro",
         "-e", "PORT=10000",
         "-e", "DB_HOST=host.docker.internal",
