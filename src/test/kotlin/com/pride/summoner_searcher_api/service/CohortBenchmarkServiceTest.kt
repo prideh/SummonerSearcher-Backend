@@ -2838,21 +2838,11 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 "EMERALD" to "TOP", "EMERALD" to "JUNGLE",
                 "DIAMOND" to "TOP", "MASTER" to "MID"
             )
-            val emptyQuantilesJson = objectMapper.writeValueAsString(
-                CohortCellMetricsDto(
-                    laneCsAt10 = MetricQuantilesDto("laneCsAt10", false, 24, 15, 70.0, 60.0, 65.0, 70.0, 75.0, 80.0),
-                    csPerMinute = MetricQuantilesDto("csPerMinute", false, 24, 15, 7.0, 6.0, 6.5, 7.0, 7.5, 8.0),
-                    deathsAt10 = MetricQuantilesDto("deathsAt10", true, 24, 15, 1.0, 0.0, 0.0, 1.0, 1.0, 2.0),
-                    soloDeaths = MetricQuantilesDto("soloDeaths", true, 24, 15, 1.0, 0.0, 0.0, 1.0, 1.0, 2.0),
-                    firstRecallTimeSeconds = MetricQuantilesDto("firstRecallTimeSeconds", true, 24, 15, 330.0, 270.0, 300.0, 330.0, 360.0, 400.0),
-                    teamfightParticipation = MetricQuantilesDto("teamfightParticipation", false, 24, 15, 0.55, 0.40, 0.48, 0.55, 0.62, 0.70)
-                )
-            )
+            val emptyQuantilesJson = objectMapper.writeValueAsString(CohortMetricsBundleDto())
             legacyCellPairs.forEachIndexed { idx, (tier, role) ->
                 val games = if (idx == 13) 29 else 24
                 val players = if (idx == 13) 23 else 15
                 pgBenchmarkCells["euw1:16.22:420:$tier:$role"] = CohortBenchmarkCellEntity(
-                    id = (idx + 1).toLong(),
                     region = "euw1",
                     patch = "16.22",
                     queueId = 420,
@@ -2861,13 +2851,10 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                     eligibleGames = games,
                     distinctPlayers = players,
                     excludedOverPlayerCapGames = 0,
-                    minPlayersRequired = 50,
-                    minGamesRequired = 200,
                     passesQualityGate = false,
                     colorBandsEnabled = false,
                     metricsJson = emptyQuantilesJson,
-                    computedAt = nowInstant,
-                    updatedAt = nowInstant
+                    computedAt = nowInstant
                 )
             }
             val legacyCp1621 = CohortCollectorCheckpointDto(
