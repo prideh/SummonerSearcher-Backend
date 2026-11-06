@@ -2295,7 +2295,432 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 callsAfterSite3 shouldBe 5
             }
         }
+
+        When("collector accumulates de-identified per-cell aggregates durably in Postgres across simulated Redis evictions, deduplicates matches, enforces the 10-game cap, and refuses non-current patches") {
+            val clockMs = java.util.concurrent.atomic.AtomicLong(nowInstant.toEpochMilli())
+            val testClock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            val evictLimiter = RiotApiRateLimiter(testClock)
+            val evictRedis = mockk<RedisCacheService>(relaxed = true)
+            val evictRiotApi = mockk<RiotApiService>(relaxed = true)
+            val pgCellRepo = mockk<CohortBenchmarkCellRepository>(relaxed = true)
+            val pgSampleRepo = mockk<com.pride.summoner_searcher_api.repository.CohortCellSampleStateRepository>(relaxed = true)
+            val pgCheckpointRepo = mockk<CohortCollectorCheckpointRepository>(relaxed = true)
+
+            // Volatile Redis store (simulated 25 MB allkeys-lru where matches/snapshots/checkpoints can be evicted at any time)
+            val redisCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
+            val redisSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
+            val redisMatches = mutableMapOf<String, MatchDto>()
+            val redisBenchmarkCells = mutableMapOf<String, Array<CohortBenchmarkCellDto>>()
+            val redisReports = mutableMapOf<String, CohortExtractionReportDto>()
+
+            // Durable Postgres stores (cohort_benchmark_cells, cohort_cell_sample_states, cohort_collector_checkpoints)
+            val pgBenchmarkCells = mutableMapOf<String, CohortBenchmarkCellEntity>()
+            val pgSampleStates = mutableMapOf<String, com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity>()
+            val pgCheckpoints = mutableMapOf<String, CohortCollectorCheckpointEntity>()
+            var lockHeld = false
+
+            every { evictRedis.scanKeys(any(), any(), any()) } answers {
+                val pattern = firstArg<String>()
+                when {
+                    pattern.startsWith("cohort:rank:snapshot:euw1:") -> redisSnapshots.keys.toList()
+                    pattern.startsWith("match:euw1:") -> redisMatches.keys.toList()
+                    else -> emptyList()
+                }
+            }
+            every { evictRedis.multiGet(any(), CohortRankSnapshotDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                keys.associateWith { redisSnapshots[it] }
+            }
+            every { evictRedis.multiGet(any(), MatchDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                keys.associateWith { redisMatches[it] }
+            }
+            every { evictRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
+                redisCheckpoints[firstArg()]
+            }
+            every { evictRedis.get(any(), CohortRankSnapshotDto::class.java) } answers {
+                redisSnapshots[firstArg()]
+            }
+            every { evictRedis.get(any(), MatchDto::class.java) } answers {
+                redisMatches[firstArg()]
+            }
+            every { evictRedis.get(any(), Array<CohortBenchmarkCellDto>::class.java) } answers {
+                redisBenchmarkCells[firstArg()]
+            }
+            every { evictRedis.get(any(), CohortExtractionReportDto::class.java) } answers {
+                redisReports[firstArg()]
+            }
+            every { evictRedis.get(any(), SummonerProfileDto::class.java) } returns null
+            every { evictRedis.get(any(), CachedLeaderboardDto::class.java) } returns null
+            every { evictRedis.setIfAbsent(any(), any(), any()) } answers {
+                val key = firstArg<String>()
+                if (key.startsWith("lock:cohort:collector:active:")) {
+                    if (lockHeld) false else {
+                        lockHeld = true
+                        true
+                    }
+                } else {
+                    true
+                }
+            }
+            every { evictRedis.delete(match { it.startsWith("lock:cohort:collector:active:") }) } answers {
+                lockHeld = false
+            }
+            @Suppress("UNCHECKED_CAST")
+            every { evictRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                when (val value = secondArg<Any>()) {
+                    is CohortCollectorCheckpointDto -> redisCheckpoints[key] = value
+                    is CohortRankSnapshotDto -> redisSnapshots[key] = value
+                    is MatchDto -> redisMatches[key] = value
+                    is List<*> -> {
+                        val list = value.filterIsInstance<CohortBenchmarkCellDto>()
+                        if (list.isNotEmpty()) {
+                            redisBenchmarkCells[key] = list.toTypedArray()
+                        }
+                    }
+                    is CohortExtractionReportDto -> redisReports[key] = value
+                }
+            }
+
+            // Wire durable Postgres repositories
+            every { pgCellRepo.findByRegionAndPatchAndQueueIdAndTierAndRole(any(), any(), any(), any(), any()) } answers {
+                val r = firstArg<String>()
+                val p = secondArg<String>()
+                val q = thirdArg<Int>()
+                val t = arg<String>(3)
+                val rl = arg<String>(4)
+                pgBenchmarkCells["$r:$p:$q:$t:$rl"]
+            }
+            every { pgCellRepo.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(any(), any(), any()) } answers {
+                val r = firstArg<String>()
+                val p = secondArg<String>()
+                val q = thirdArg<Int>()
+                pgBenchmarkCells.values.filter { it.region == r && it.patch == p && it.queueId == q }
+            }
+            every { pgCellRepo.findByRegionOrderByPatchDescTierAscRoleAsc(any()) } answers {
+                val r = firstArg<String>()
+                pgBenchmarkCells.values.filter { it.region == r }
+            }
+            every { pgCellRepo.save(any<CohortBenchmarkCellEntity>()) } answers {
+                val ent = firstArg<CohortBenchmarkCellEntity>()
+                pgBenchmarkCells["${ent.region}:${ent.patch}:${ent.queueId}:${ent.tier}:${ent.role}"] = ent
+                ent
+            }
+
+            every { pgSampleRepo.findByRegionAndPatchAndQueueIdAndTierAndRole(any(), any(), any(), any(), any()) } answers {
+                val r = firstArg<String>()
+                val p = secondArg<String>()
+                val q = thirdArg<Int>()
+                val t = arg<String>(3)
+                val rl = arg<String>(4)
+                pgSampleStates["$r:$p:$q:$t:$rl"]
+            }
+            every { pgSampleRepo.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(any(), any(), any()) } answers {
+                val r = firstArg<String>()
+                val p = secondArg<String>()
+                val q = thirdArg<Int>()
+                pgSampleStates.values.filter { it.region == r && it.patch == p && it.queueId == q }
+            }
+            every { pgSampleRepo.findByRegionOrderByPatchDescTierAscRoleAsc(any()) } answers {
+                val r = firstArg<String>()
+                pgSampleStates.values.filter { it.region == r }
+            }
+            every { pgSampleRepo.save(any<com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity>()) } answers {
+                val ent = firstArg<com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity>()
+                pgSampleStates["${ent.region}:${ent.patch}:${ent.queueId}:${ent.tier}:${ent.role}"] = ent
+                ent
+            }
+
+            every { pgCheckpointRepo.findByRegionAndTargetPatchAndQueueId(any(), any(), any()) } answers {
+                val r = firstArg<String>()
+                val p = secondArg<String>()
+                val q = thirdArg<Int>()
+                pgCheckpoints["$r:$p:$q"]
+            }
+            every { pgCheckpointRepo.findFirstByRegionAndQueueIdOrderByUpdatedAtDesc(any(), any()) } answers {
+                val r = firstArg<String>()
+                val q = secondArg<Int>()
+                pgCheckpoints.values.filter { it.region == r && it.queueId == q }.maxByOrNull { it.updatedAt }
+            }
+            every { pgCheckpointRepo.save(any<CohortCollectorCheckpointEntity>()) } answers {
+                val ent = firstArg<CohortCollectorCheckpointEntity>()
+                pgCheckpoints["${ent.region}:${ent.targetPatch}:${ent.queueId}"] = ent
+                ent
+            }
+
+            for (ep in CohortBenchmarkService.REQUIRED_COLLECTOR_ENDPOINTS) {
+                evictLimiter.updateLimits(
+                    region = "euw1",
+                    limitHeader = "20:1,100:120",
+                    countHeader = "1:1,2:120",
+                    endpointKey = ep,
+                    methodLimitHeader = "500:10",
+                    methodCountHeader = "1:10"
+                )
+            }
+
+            val durableService = CohortBenchmarkService(
+                redisCacheService = evictRedis,
+                cohortBenchmarkCellRepository = pgCellRepo,
+                riotApiRateLimiter = evictLimiter,
+                riotApiService = evictRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = testClock,
+                configuredContainerLimitBytes = 536_870_912L,
+                maxMemoryUtilizationRatio = 0.78,
+                minFreeMemoryBytes = 67_108_864L,
+                cohortCollectorCheckpointRepository = pgCheckpointRepo,
+                cohortCellSampleStateRepository = pgSampleRepo
+            )
+            val controller = com.pride.summoner_searcher_api.controller.RiotApiController(
+                riotApiService = evictRiotApi,
+                challengerLeagueService = mockk(relaxed = true),
+                userService = mockk(relaxed = true),
+                summonerProfileService = mockk(relaxed = true),
+                redisCacheService = evictRedis,
+                cohortBenchmarkService = durableService,
+                overnightCohortCollectorRunner = null
+            )
+
+            // 50 distinct DIAMOND TOP players:
+            // - Player 1 ("dia-top-1") plays 12 matches (EUW1_D_1_1..EUW1_D_1_12) + 1 duplicate match ID ("EUW1_D_1_1")
+            //   to prove match deduplication and the 10-game per-player cap (10 kept, 2 excludedOverPlayerCapGames).
+            // - Players 2..50 ("dia-top-2".."dia-top-50") play 4 matches each (49 * 4 = 196 games).
+            // Total eligible games in DIAMOND:TOP = 10 + 196 = 206 (>= 200) across 50 distinct players (>= 50) -> passes quality gate!
+            val allPlayers = (1..50).map { "dia-top-$it" }
+            coEvery { evictRiotApi.fetchLeagueRankLowPriority(any(), "euw1", any(), any(), any()) } coAnswers {
+                val pid = firstArg<String>()
+                arg<java.util.concurrent.atomic.AtomicInteger?>(3)?.incrementAndGet()
+                LeagueEntryDto(
+                    leagueId = "l-$pid", queueType = "RANKED_SOLO_5x5", tier = "DIAMOND", rank = "I",
+                    summonerName = pid, puuid = pid, leaguePoints = 75, wins = 40, losses = 30,
+                    veteran = false, inactive = false, freshBlood = false, hotStreak = false
+                )
+            }
+            coEvery { evictRiotApi.getMatchIdsByPuuidLowPriority(any(), "euw1", 420, any(), 0, any(), any(), any()) } coAnswers {
+                val pid = firstArg<String>()
+                arg<java.util.concurrent.atomic.AtomicInteger?>(6)?.incrementAndGet()
+                val pIdx = pid.substringAfter("dia-top-").toInt()
+                if (pIdx == 1) {
+                    // Return 10 matches in collector list (plus we will also feed 2 more via extractCachedCohortsAndReport + duplicate)
+                    (1..10).map { "EUW1_D_1_$it" }
+                } else {
+                    (1..4).map { "EUW1_D_${pIdx}_$it" }
+                }
+            }
+            coEvery { evictRiotApi.getMatchByIdLowPriority(any(), "euw1", any(), any(), any()) } coAnswers {
+                val mId = firstArg<String>()
+                arg<java.util.concurrent.atomic.AtomicInteger?>(3)?.incrementAndGet()
+                val parts = mId.removePrefix("EUW1_D_").split("_")
+                val pIdx = parts[0].toInt()
+                val gIdx = parts[1].toInt()
+                val pid = "dia-top-$pIdx"
+                MatchDto(
+                    metadata = MatchMetadata(mId, listOf(pid)),
+                    info = MatchInfo(
+                        gameCreation = clockMs.get() - (pIdx * 100 + gIdx) * 1_000L,
+                        gameDuration = 1800L,
+                        gameId = (pIdx * 1000 + gIdx).toLong(),
+                        queueId = 420,
+                        gameMode = "CLASSIC",
+                        gameVersion = "16.22.615.9999",
+                        participants = listOf(
+                            buildParticipant(
+                                puuid = pid,
+                                role = "TOP",
+                                laneCs10 = 80 + (gIdx % 5),
+                                totalMinions = 210 + gIdx,
+                                neutralMinions = 8
+                            )
+                        )
+                    )
+                )
+            }
+
+            // Pre-seed an older checkpoint pinned to stale patch "16.21" while a 16.22 Solo Queue match is in Redis
+            // to reproduce and verify the fix for the prod 16.21 vs 16.22 divergence!
+            durableService.saveCollectorCheckpoint(
+                CohortCollectorCheckpointDto(
+                    region = "euw1",
+                    targetPatch = "16.21",
+                    patchSelectionSource = "EXPLICIT_TARGET_PATCH",
+                    pendingCandidatePuuids = allPlayers,
+                    startedAt = nowInstant,
+                    updatedAt = nowInstant
+                )
+            )
+            redisMatches["match:euw1:EUW1_D_1_1"] = MatchDto(
+                metadata = MatchMetadata("EUW1_D_1_1", listOf("dia-top-1")),
+                info = MatchInfo(
+                    gameCreation = clockMs.get() - 101_000L,
+                    gameDuration = 1800L,
+                    gameId = 1001L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.22.615.9999",
+                    participants = listOf(
+                        buildParticipant(puuid = "dia-top-1", role = "TOP", laneCs10 = 81, totalMinions = 211, neutralMinions = 8)
+                    )
+                )
+            )
+
+            // Batch 1 (processes players 1..25 on auto-grounded patch 16.22), then simulate complete Redis allkeys-lru eviction!
+            val cpBatch1 = durableService.runResumableLowPriorityCollectorBatch(
+                region = "euw1",
+                targetPatch = null,
+                maxPlayersPerBatch = 25,
+                maxGamesPerPlayer = 10
+            )
+            // Simulate Free 25 MB Redis allkeys-lru evicting all matches, rank snapshots, benchmark cache, and reports!
+            redisMatches.clear()
+            redisSnapshots.clear()
+            redisBenchmarkCells.clear()
+            redisReports.clear()
+
+            // Batch 2 (processes remaining players 26..50), then simulate another complete Redis eviction!
+            val cpBatch2 = durableService.runResumableLowPriorityCollectorBatch(
+                region = "euw1",
+                targetPatch = null,
+                maxPlayersPerBatch = 25,
+                maxGamesPerPlayer = 10
+            )
+
+            // Also test feeding duplicate match EUW1_D_1_1 and extra over-cap matches EUW1_D_1_11 and EUW1_D_1_12 for dia-top-1
+            // before clearing Redis completely again
+            durableService.cacheRankSnapshot("euw1", "dia-top-1", "DIAMOND", "I", 75, Instant.ofEpochMilli(clockMs.get()))
+            for (extraIdx in listOf(1, 11, 12)) {
+                val mId = "EUW1_D_1_$extraIdx"
+                redisMatches["match:euw1:$mId"] = MatchDto(
+                    metadata = MatchMetadata(mId, listOf("dia-top-1")),
+                    info = MatchInfo(
+                        gameCreation = clockMs.get() - (100 + extraIdx) * 1_000L,
+                        gameDuration = 1800L,
+                        gameId = (1000 + extraIdx).toLong(),
+                        queueId = 420,
+                        gameMode = "CLASSIC",
+                        gameVersion = "16.22.615.9999",
+                        participants = listOf(
+                            buildParticipant(puuid = "dia-top-1", role = "TOP", laneCs10 = 75, totalMinions = 200, neutralMinions = 4)
+                        )
+                    )
+                )
+            }
+            durableService.extractCachedCohortsAndReport(region = "euw1", targetPatch = null)
+
+            // Now wipe ALL Redis keys (0 matches, 0 snapshots, 0 cached reports, 0 cached benchmarks in Redis!)
+            redisMatches.clear()
+            redisSnapshots.clear()
+            redisBenchmarkCells.clear()
+            redisReports.clear()
+            redisCheckpoints.clear()
+
+            // Create a fresh service instance (simulating a container restart with empty in-memory maps and empty Redis, backed only by Postgres)
+            val restartedService = CohortBenchmarkService(
+                redisCacheService = evictRedis,
+                cohortBenchmarkCellRepository = pgCellRepo,
+                riotApiRateLimiter = evictLimiter,
+                riotApiService = evictRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = testClock,
+                configuredContainerLimitBytes = 536_870_912L,
+                maxMemoryUtilizationRatio = 0.78,
+                minFreeMemoryBytes = 67_108_864L,
+                cohortCollectorCheckpointRepository = pgCheckpointRepo,
+                cohortCellSampleStateRepository = pgSampleRepo
+            )
+            val restartedController = com.pride.summoner_searcher_api.controller.RiotApiController(
+                riotApiService = evictRiotApi,
+                challengerLeagueService = mockk(relaxed = true),
+                userService = mockk(relaxed = true),
+                summonerProfileService = mockk(relaxed = true),
+                redisCacheService = evictRedis,
+                cohortBenchmarkService = restartedService,
+                overnightCohortCollectorRunner = null
+            )
+
+            // Query /cohorts/euw1 and /cohorts/euw1/report when Redis has 0 matches!
+            val cohortsAfterEviction = controller.getCohortBenchmarks("euw1", null).body!!
+            val reportAfterEviction = controller.getCohortExtractionReport("euw1", null).body!!
+            val restartedCohortsAfterEviction = restartedController.getCohortBenchmarks("euw1", null).body!!
+            val restartedReportAfterEviction = restartedController.getCohortExtractionReport("euw1", null).body!!
+
+            // Test non-current patch refusal ("16.21" when grounded current patch is "16.22") on collector, report, and /cohorts
+            val refusedCollectorCp = restartedService.runResumableLowPriorityCollectorBatch(
+                region = "euw1",
+                targetPatch = "16.21",
+                maxPlayersPerBatch = 5,
+                maxGamesPerPlayer = 10
+            )
+            val refusedReport = restartedController.getCohortExtractionReport("euw1", "16.21").body!!
+            val refusedCohorts = restartedController.getCohortBenchmarks("euw1", "16.21").body!!
+
+            val memHeadroom = restartedService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
+
+            Then("it should advance from stale patch 16.21 to grounded 16.22, persist de-identified cell aggregates in Postgres across Redis evictions, enforce dedupe and 10-game cap, pass the 50-player/200-game quality gate, refuse non-current patch 16.21, and keep the 78%/64MiB guard unchanged") {
+                // 1. Grounded patch aligned both collector checkpoint and persisted cells to 16.22 (never 16.21 vs 16.22)
+                cpBatch1.targetPatch shouldBe "16.22"
+                cpBatch2.targetPatch shouldBe "16.22"
+                restartedService.resolveGroundedCurrentPatch("euw1") shouldBe "16.22"
+
+                // 2. Checkpoint cellsPassingQualityGate matches persisted cohort_benchmark_cells and reportAfterEviction
+                cpBatch2.cellsPassingQualityGate shouldBe 1
+                cpBatch2.targetCellsCount shouldBe 30
+                val cpDiaTop = cpBatch2.cellProgress["DIAMOND:TOP"]!!
+                cpDiaTop.distinctPlayers shouldBe 50
+                cpDiaTop.eligibleGames shouldBe 206
+                cpDiaTop.passesQualityGate shouldBe true
+
+                // 3. Even after complete Redis eviction (0 match:* keys in Redis) and JVM restart, /cohorts and /report read the durable Postgres store
+                cohortsAfterEviction shouldHaveSize 1
+                restartedCohortsAfterEviction shouldHaveSize 1
+                val persistedDiaTop = restartedCohortsAfterEviction.first()
+                persistedDiaTop.patch shouldBe "16.22"
+                persistedDiaTop.tier shouldBe "DIAMOND"
+                persistedDiaTop.role shouldBe "TOP"
+                persistedDiaTop.distinctPlayers shouldBe 50
+                persistedDiaTop.eligibleGames shouldBe 206
+                // dia-top-1 had 12 unique matches + 1 duplicate match EUW1_D_1_1: duplicate was deduped, 10 kept, 2 excludedOverPlayerCapGames!
+                persistedDiaTop.excludedOverPlayerCapGames shouldBe 2
+                persistedDiaTop.passesQualityGate shouldBe true
+                persistedDiaTop.colorBandsEnabled shouldBe true
+                persistedDiaTop.metrics.laneCsAt10.sampleGames shouldBe 206
+                persistedDiaTop.metrics.laneCsAt10.distinctPlayers shouldBe 50
+                persistedDiaTop.metrics.laneCsAt10.median shouldNotBe null
+
+                reportAfterEviction.inventory.selectedTargetPatch shouldBe "16.22"
+                reportAfterEviction.inventory.eligibleCohortSamples shouldBe 206
+                reportAfterEviction.inventory.distinctEligibleCohortPlayers shouldBe 50
+                reportAfterEviction.inventory.cellsPassingQualityGate shouldBe 1
+                restartedReportAfterEviction.inventory.eligibleCohortSamples shouldBe 206
+                restartedReportAfterEviction.inventory.cellsPassingQualityGate shouldBe 1
+
+                // 4. Verify durable Postgres tables contain zero raw PUUIDs or raw match IDs (de-identified hashes only)
+                val sampleEntity = pgSampleStates["euw1:16.22:420:DIAMOND:TOP"]!!
+                sampleEntity.distinctPlayers shouldBe 50
+                sampleEntity.eligibleGames shouldBe 206
+                sampleEntity.passesQualityGate shouldBe true
+                sampleEntity.samplesJson.contains("dia-top-") shouldBe false
+                sampleEntity.samplesJson.contains("EUW1_D_") shouldBe false
+
+                // 5. Non-current patch "16.21" is refused across collector, /report, and /cohorts
+                refusedCollectorCp.lastStopReason shouldBe "NON_CURRENT_PATCH_REFUSED"
+                refusedCollectorCp.targetPatch shouldBe "16.22"
+                refusedReport.reportSource shouldBe "NON_CURRENT_PATCH_REFUSED"
+                refusedReport.cells shouldBe emptyList()
+                refusedCohorts shouldBe emptyList()
+
+                // 6. 78% / 64 MiB memory guard remains unchanged
+                memHeadroom.maxAllowedUtilizationRatio shouldBe 0.78
+                memHeadroom.minRequiredFreeBytes shouldBe 67_108_864L
+            }
+        }
     }
 })
+
 
 

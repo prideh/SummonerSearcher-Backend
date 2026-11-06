@@ -774,7 +774,7 @@ def main():
         print("=== 10-CYCLE SUMMARY ===", flush=True)
         print(json.dumps(ten_cycle_summary, indent=2), flush=True)
 
-    print("=== 4. VERIFYING POSTGRES CHECKPOINT DURABILITY ACROSS REDIS FLUSHALL ===", flush=True)
+    print("=== 4. VERIFYING POSTGRES CHECKPOINT & COHORT CELL DURABILITY ACROSS REDIS FLUSHALL ===", flush=True)
     pg_rows = subprocess.check_output([
         "docker", "exec", "ss-postgres",
         "psql", "-U", "postgres", "-d", "summoner_searcher", "-t", "-A", "-c",
@@ -783,19 +783,40 @@ def main():
     print("POSTGRES cohort_collector_checkpoints ROWS:")
     print(pg_rows, flush=True)
 
+    pg_sample_rows = subprocess.check_output([
+        "docker", "exec", "ss-postgres",
+        "psql", "-U", "postgres", "-d", "summoner_searcher", "-t", "-A", "-c",
+        "SELECT region, patch, queue_id, tier, role, distinct_players, eligible_games, passes_quality_gate FROM cohort_cell_sample_states ORDER BY tier, role;"
+    ]).decode("utf-8").strip()
+    print("POSTGRES cohort_cell_sample_states ROWS:")
+    print(pg_sample_rows, flush=True)
+
+    pg_cell_rows = subprocess.check_output([
+        "docker", "exec", "ss-postgres",
+        "psql", "-U", "postgres", "-d", "summoner_searcher", "-t", "-A", "-c",
+        "SELECT region, patch, queue_id, tier, role, distinct_players, eligible_games, passes_quality_gate FROM cohort_benchmark_cells ORDER BY tier, role;"
+    ]).decode("utf-8").strip()
+    print("POSTGRES cohort_benchmark_cells ROWS:")
+    print(pg_cell_rows, flush=True)
+
     subprocess.check_call(["docker", "exec", "ss-redis", "redis-cli", "FLUSHALL"])
     after_flush_status = http_json(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=15)
+    after_flush_cells = http_json(f"{base_url}/api/riot/cohorts/euw1?patch=16.7", timeout=15)
+    after_flush_report = http_json(f"{base_url}/api/riot/cohorts/euw1/report?patch=16.7", timeout=30)
     after_flush_mem = after_flush_status["memoryHeadroom"]
     after_flush_cg = record_5s_sample("after_flush")
     recovered_cp = after_flush_status.get("checkpoint")
-    print("RECOVERED CHECKPOINT AFTER REDIS FLUSHALL:")
+    print("RECOVERED CHECKPOINT & CELLS AFTER REDIS FLUSHALL:")
     print(json.dumps({
         "region": recovered_cp.get("region"),
         "targetPatch": recovered_cp.get("targetPatch"),
         "processedPuuids": recovered_cp.get("processedPuuids"),
         "pendingCount": len(recovered_cp.get("pendingCandidatePuuids", [])),
         "totalNetworkCallsMade": recovered_cp.get("totalNetworkCallsMade"),
-        "lastStopReason": recovered_cp.get("lastStopReason")
+        "lastStopReason": recovered_cp.get("lastStopReason"),
+        "persistedCellsCountAfterFlush": len(after_flush_cells),
+        "reportCellsCountAfterFlush": len(after_flush_report.get("cells", [])),
+        "reportEligibleSamplesAfterFlush": after_flush_report.get("inventory", {}).get("eligibleCohortSamples", 0)
     }, indent=2), flush=True)
 
     after_flush_row = {
@@ -841,6 +862,9 @@ def main():
     assert not cg_final["oomKilled"], "Container was OOMKilled!"
     assert cg_final["restartCount"] == 0, "Container restarted unexpectedly!"
     assert recovered_cp is not None and recovered_cp.get("totalNetworkCallsMade", 0) > 0, "Postgres checkpoint recovery failed!"
+    assert len(after_flush_cells) > 0 and after_flush_report.get("inventory", {}).get("eligibleCohortSamples", 0) > 0, (
+        "Durable Postgres cohort cells recovery after Redis FLUSHALL failed!"
+    )
     if proof_mode == "SUSTAINED_30M":
         assert cycle_metrics[-1]["elapsedSec"] >= 1800.0, f"Sustained run was shorter than 1800s ({cycle_metrics[-1]['elapsedSec']}s)!"
         assert max(r["deltaSec"] for r in cycle_metrics) <= 30.0, f"Sample interval exceeded 30s ({max(r['deltaSec'] for r in cycle_metrics)}s)!"
