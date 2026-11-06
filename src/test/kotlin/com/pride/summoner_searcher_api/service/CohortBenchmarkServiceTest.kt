@@ -3401,6 +3401,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             val strayCpDto = CohortCollectorCheckpointDto(
                 region = "euw1",
                 targetPatch = "16.99",
+                patchSelectionSource = "AUTO_LATEST_EXACT_PATCH",
                 startedAt = Instant.ofEpochMilli(nowMs),
                 updatedAt = Instant.ofEpochMilli(nowMs)
             )
@@ -3422,6 +3423,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             val validCpDto = CohortCollectorCheckpointDto(
                 region = "euw1",
                 targetPatch = "16.21",
+                patchSelectionSource = "AUTO_LATEST_EXACT_PATCH",
                 startedAt = Instant.ofEpochMilli(nowMs),
                 updatedAt = Instant.ofEpochMilli(nowMs)
             )

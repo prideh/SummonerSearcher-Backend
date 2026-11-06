@@ -176,6 +176,7 @@ class CohortPatchMetadataSqlShapeTest {
         val cpDto = CohortCollectorCheckpointDto(
             region = "euw1",
             targetPatch = "16.21",
+            patchSelectionSource = "AUTO_LATEST_EXACT_PATCH",
             startedAt = now,
             updatedAt = now
         )
