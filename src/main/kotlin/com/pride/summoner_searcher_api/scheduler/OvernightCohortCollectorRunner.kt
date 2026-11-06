@@ -4,8 +4,11 @@ import com.pride.summoner_searcher_api.dto.CohortBenchmarkCellDto
 import com.pride.summoner_searcher_api.dto.CohortCollectorCheckpointDto
 import com.pride.summoner_searcher_api.dto.CohortCollectorStatusDto
 import com.pride.summoner_searcher_api.dto.CohortRateLimitProbeResultDto
+import com.pride.summoner_searcher_api.dto.CollectorSessionMemoryDeltaDto
+import com.pride.summoner_searcher_api.dto.CollectorSessionMemoryPointDto
 import com.pride.summoner_searcher_api.dto.RateLimitVerificationSnapshotDto
 import com.pride.summoner_searcher_api.service.CohortBenchmarkService
+import com.pride.summoner_searcher_api.service.RawMemorySample
 import com.pride.summoner_searcher_api.service.SystemTimeProvider
 import com.pride.summoner_searcher_api.service.TimeProvider
 import kotlinx.coroutines.CoroutineScope
@@ -22,6 +25,7 @@ import org.springframework.stereotype.Component
 import java.security.MessageDigest
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.roundToLong
 
 /**
  * Same-process, guarded, resumable LOW-priority cohort collector coordinator.
@@ -101,11 +105,26 @@ class OvernightCohortCollectorRunner(
     @Volatile
     private var lastRunCompletedAt: Instant? = null
 
+    private val sessionMemoryLock = Any()
+    private var sessionStartMemoryPoint: CollectorSessionMemoryPointDto? = null
+    private val sessionBatchEndMemoryPoints = ArrayDeque<CollectorSessionMemoryPointDto>()
+    private var sessionPeakMemoryPoint: CollectorSessionMemoryPointDto? = null
+    private var sessionEndPreGcMemoryPoint: CollectorSessionMemoryPointDto? = null
+    private var sessionEndPostGcMemoryPoint: CollectorSessionMemoryPointDto? = null
+    private var oldGenGcCountAtSessionEndPreGc: Long? = null
+
     companion object {
         const val DEFAULT_MAX_BATCHES_PER_CHUNK = 2
         const val DEFAULT_BATCH_SIZE = 5
         const val DEFAULT_MAX_SESSION_PRODUCTIVE_BATCHES = 4
         const val DEFAULT_MAX_SESSION_NETWORK_CALLS = 60
+        const val MAX_SESSION_MEMORY_POINTS = 32
+        const val MEMORY_PHASE_SESSION_START = "SESSION_START"
+        const val MEMORY_PHASE_BATCH_END = "BATCH_END"
+        const val MEMORY_PHASE_SESSION_PEAK = "SESSION_PEAK"
+        const val MEMORY_PHASE_SESSION_END_PRE_GC = "SESSION_END_PRE_GC"
+        const val MEMORY_PHASE_SESSION_END_POST_GC = "SESSION_END_POST_GC"
+        private const val BYTES_PER_MIB = 1_048_576.0
         const val STOP_REASON_SESSION_BATCH_CAP = "SESSION_BATCH_CAP_REACHED"
         const val STOP_REASON_SESSION_NETWORK_CALL_CAP = "SESSION_NETWORK_CALL_CAP_REACHED"
         const val STOP_REASON_SESSION_ERROR_ABORT = "SESSION_ERROR_ABORT"
@@ -293,6 +312,7 @@ class OvernightCohortCollectorRunner(
             sessionBaselineNetworkCalls = existingCheckpoint?.totalNetworkCallsMade ?: 0
             sessionNetworkCallsMade = 0
             maxSessionNetworkCallsConfigured = coercedMaxSessionNetworkCalls
+            resetAndRecordSessionStartMemorySample()
         } else if (existingCheckpoint != null) {
             sessionNetworkCallsMade = (existingCheckpoint.totalNetworkCallsMade - sessionBaselineNetworkCalls).coerceAtLeast(0)
         }
@@ -364,11 +384,13 @@ class OvernightCohortCollectorRunner(
         initialDelayString = "\${cohort.collector.auto-resume-initial-delay-ms:30000}"
     )
     fun scheduledAutoResumeTick() {
+        observePassivePostGcMemorySampleIfEligible()
         checkAndAutoResumeOvernightSession(async = true)
     }
 
     fun checkAndAutoResumeOvernightSession(async: Boolean = true): CohortCollectorStatusDto? {
         if (!overnightSessionArmed.get() || running.get() || stopRequested.get()) {
+            observePassivePostGcMemorySampleIfEligible()
             return null
         }
         val region = activeRegion
@@ -377,6 +399,7 @@ class OvernightCohortCollectorRunner(
             sessionNetworkCallsMade = (currentCheckpoint.totalNetworkCallsMade - sessionBaselineNetworkCalls).coerceAtLeast(0)
             if (currentCheckpoint.lastStopReason in TERMINAL_STOP_REASONS) {
                 overnightSessionArmed.set(false)
+                recordSessionEndPreGcMemorySampleIfNeeded(sessionProductiveBatchesCompleted, sessionNetworkCallsMade)
                 logger.info(
                     "[OvernightCollector] Disarming auto-resume for region={} patch={}: checkpoint has terminal stopReason={}.",
                     region, activeTargetPatch ?: "auto-cached", currentCheckpoint.lastStopReason
@@ -405,6 +428,7 @@ class OvernightCohortCollectorRunner(
                     )
                 )
             }
+            recordSessionEndPreGcMemorySampleIfNeeded(sessionProductiveBatchesCompleted, sessionNetworkCallsMade)
             logger.info(
                 "[OvernightCollector] Disarming auto-resume for region={} patch={}: session hard cap reached ({}, sessionBatches={}/{}, sessionNetworkCalls={}/{}).",
                 region, activeTargetPatch ?: "auto-cached", capReason,
@@ -471,6 +495,7 @@ class OvernightCohortCollectorRunner(
                     )
                 )
             }
+            recordSessionEndPreGcMemorySampleIfNeeded(sessionProductiveBatchesCompleted, sessionNetworkCallsMade)
         }
 
         return getStatus(
@@ -505,6 +530,8 @@ class OvernightCohortCollectorRunner(
             return buildInvalidParamStatus(normalizedRegion, cleanPatch, "Invalid patch format '$cleanPatch' (expected major.minor).")
         }
 
+        observePassivePostGcMemorySampleIfEligible()
+        val (sessionSeries, sessionDelta) = getSessionMemorySeriesAndDeltaSnapshot()
         val verification = cohortBenchmarkService.getLiveRateLimitVerification(normalizedRegion)
         val memoryHeadroom = cohortBenchmarkService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
         val checkpoint = cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch)
@@ -548,7 +575,9 @@ class OvernightCohortCollectorRunner(
             lastRunCompletedAt = lastRunCompletedAt,
             rateLimitVerification = verification,
             memoryHeadroom = memoryHeadroom,
-            checkpoint = checkpoint
+            checkpoint = checkpoint,
+            sessionMemorySeries = sessionSeries,
+            sessionMemoryDelta = sessionDelta
         )
     }
 
@@ -749,6 +778,10 @@ class OvernightCohortCollectorRunner(
                     cohortBenchmarkService.saveCollectorCheckpoint(aborted)
                     lastCheckpoint = aborted
                 }
+                recordBatchEndMemorySample(
+                    batchIndex = sessionProductiveBatchesCompleted + 1,
+                    totalRiotNetworkCalls = sessionNetworkCallsMade
+                )
                 logger.error(
                     "[OvernightCollector] Aborting chunk and disarming auto-resume due to exception on batch {}: region={}, patch={}, error={}",
                     productiveBatchesCompleted + 1, region, targetPatch ?: activeTargetPatch ?: "auto-cached", e.message
@@ -768,6 +801,10 @@ class OvernightCohortCollectorRunner(
                         sessionProductiveBatchesCompleted++
                         consecutivePauseCycles = 0
                     }
+                    recordBatchEndMemorySample(
+                        batchIndex = sessionProductiveBatchesCompleted.coerceAtLeast(1),
+                        totalRiotNetworkCalls = sessionNetworkCallsMade
+                    )
                     overnightSessionArmed.set(false)
                     logger.info(
                         "[OvernightCollector] Stopping cleanly (terminal): productiveBatches={}/{}, sessionBatches={}/{}, sessionNetworkCalls={}/{}, pauseCycles={}, reason={}",
@@ -818,6 +855,10 @@ class OvernightCohortCollectorRunner(
                     productiveBatchesCompleted++
                     sessionProductiveBatchesCompleted++
                     consecutivePauseCycles = 0
+                    recordBatchEndMemorySample(
+                        batchIndex = sessionProductiveBatchesCompleted,
+                        totalRiotNetworkCalls = sessionNetworkCallsMade
+                    )
                     logger.info(
                         "[OvernightCollector] Completed productive batch {}/{} (sessionBatches={}/{}, sessionNetworkCalls={}/{}): region={}, patch={}, cellsPassing={}/{}, processedPuuids={}, pendingCandidates={}, networkCalls={}, stopReason={}",
                         productiveBatchesCompleted, maxBatches,
@@ -860,8 +901,230 @@ class OvernightCohortCollectorRunner(
                 }
             }
         }
+        if (!overnightSessionArmed.get()) {
+            recordSessionEndPreGcMemorySampleIfNeeded(
+                batchIndex = sessionProductiveBatchesCompleted,
+                totalRiotNetworkCalls = sessionNetworkCallsMade
+            )
+        }
         return lastCheckpoint
     }
+
+    private fun resetAndRecordSessionStartMemorySample() {
+        val raw = cohortBenchmarkService.sampleRawMemoryStats()
+        val nowMs = timeProvider.now()
+        synchronized(sessionMemoryLock) {
+            sessionBatchEndMemoryPoints.clear()
+            sessionEndPreGcMemoryPoint = null
+            sessionEndPostGcMemoryPoint = null
+            oldGenGcCountAtSessionEndPreGc = null
+            val startPt = buildSessionMemoryPoint(
+                raw = raw,
+                phase = MEMORY_PHASE_SESSION_START,
+                batchIndex = 0,
+                totalRiotNetworkCalls = 0,
+                timestampEpochMs = nowMs
+            )
+            sessionStartMemoryPoint = startPt
+            sessionPeakMemoryPoint = startPt.copy(phase = MEMORY_PHASE_SESSION_PEAK)
+        }
+    }
+
+    internal fun recordBatchEndMemorySample(batchIndex: Int, totalRiotNetworkCalls: Int) {
+        val raw = cohortBenchmarkService.sampleRawMemoryStats()
+        val nowMs = timeProvider.now()
+        synchronized(sessionMemoryLock) {
+            if (sessionStartMemoryPoint == null) return
+            val batchPt = buildSessionMemoryPoint(
+                raw = raw,
+                phase = MEMORY_PHASE_BATCH_END,
+                batchIndex = batchIndex,
+                totalRiotNetworkCalls = totalRiotNetworkCalls,
+                timestampEpochMs = nowMs
+            )
+            sessionBatchEndMemoryPoints.addLast(batchPt)
+            if (isHigherOrEqualPeak(batchPt, sessionPeakMemoryPoint)) {
+                sessionPeakMemoryPoint = batchPt.copy(phase = MEMORY_PHASE_SESSION_PEAK)
+            }
+            trimBatchEndRingBufferLocked()
+        }
+    }
+
+    internal fun recordSessionEndPreGcMemorySampleIfNeeded(batchIndex: Int, totalRiotNetworkCalls: Int) {
+        synchronized(sessionMemoryLock) {
+            if (sessionStartMemoryPoint == null || sessionEndPreGcMemoryPoint != null) return
+            val raw = cohortBenchmarkService.sampleRawMemoryStats()
+            val nowMs = timeProvider.now()
+            val endPreGcPt = buildSessionMemoryPoint(
+                raw = raw,
+                phase = MEMORY_PHASE_SESSION_END_PRE_GC,
+                batchIndex = batchIndex,
+                totalRiotNetworkCalls = totalRiotNetworkCalls,
+                timestampEpochMs = nowMs
+            )
+            sessionEndPreGcMemoryPoint = endPreGcPt
+            oldGenGcCountAtSessionEndPreGc = raw.oldGenGcCount
+            if (isHigherOrEqualPeak(endPreGcPt, sessionPeakMemoryPoint)) {
+                sessionPeakMemoryPoint = endPreGcPt.copy(phase = MEMORY_PHASE_SESSION_PEAK)
+            }
+            trimBatchEndRingBufferLocked()
+        }
+    }
+
+    internal fun observePassivePostGcMemorySampleIfEligible() {
+        synchronized(sessionMemoryLock) {
+            val preGcPt = sessionEndPreGcMemoryPoint ?: return
+            if (sessionEndPostGcMemoryPoint != null) return
+            val baselineOldGenGc = oldGenGcCountAtSessionEndPreGc ?: return
+            val raw = cohortBenchmarkService.sampleRawMemoryStats()
+            if (raw.oldGenGcCount > baselineOldGenGc) {
+                val nowMs = timeProvider.now()
+                val endPostGcPt = buildSessionMemoryPoint(
+                    raw = raw,
+                    phase = MEMORY_PHASE_SESSION_END_POST_GC,
+                    batchIndex = preGcPt.batchIndex,
+                    totalRiotNetworkCalls = preGcPt.totalRiotNetworkCalls,
+                    timestampEpochMs = nowMs
+                )
+                sessionEndPostGcMemoryPoint = endPostGcPt
+                if (isHigherOrEqualPeak(endPostGcPt, sessionPeakMemoryPoint)) {
+                    sessionPeakMemoryPoint = endPostGcPt.copy(phase = MEMORY_PHASE_SESSION_PEAK)
+                }
+                trimBatchEndRingBufferLocked()
+            }
+        }
+    }
+
+    private fun trimBatchEndRingBufferLocked() {
+        val reservedNonBatchPoints = (if (sessionStartMemoryPoint != null) 1 else 0) +
+            (if (sessionPeakMemoryPoint != null) 1 else 0) +
+            (if (sessionEndPreGcMemoryPoint != null) 1 else 0) +
+            (if (sessionEndPostGcMemoryPoint != null) 1 else 0)
+        val maxBatchEndPoints = (MAX_SESSION_MEMORY_POINTS - reservedNonBatchPoints).coerceAtLeast(0)
+        while (sessionBatchEndMemoryPoints.size > maxBatchEndPoints) {
+            sessionBatchEndMemoryPoints.removeFirst()
+        }
+    }
+
+    private fun isHigherOrEqualPeak(
+        candidate: CollectorSessionMemoryPointDto,
+        currentPeak: CollectorSessionMemoryPointDto?
+    ): Boolean {
+        if (currentPeak == null) return true
+        return if (candidate.cgroupCurrentMiB > 0.0 || currentPeak.cgroupCurrentMiB > 0.0) {
+            if (candidate.cgroupCurrentMiB != currentPeak.cgroupCurrentMiB) {
+                candidate.cgroupCurrentMiB > currentPeak.cgroupCurrentMiB
+            } else {
+                candidate.heapUsedMiB >= currentPeak.heapUsedMiB
+            }
+        } else {
+            candidate.heapUsedMiB >= currentPeak.heapUsedMiB
+        }
+    }
+
+    private fun getSessionMemorySeriesAndDeltaSnapshot(): Pair<List<CollectorSessionMemoryPointDto>, CollectorSessionMemoryDeltaDto?> {
+        synchronized(sessionMemoryLock) {
+            val startPt = sessionStartMemoryPoint ?: return emptyList<CollectorSessionMemoryPointDto>() to null
+            val peakPt = sessionPeakMemoryPoint ?: startPt.copy(phase = MEMORY_PHASE_SESSION_PEAK)
+            val preGcPt = sessionEndPreGcMemoryPoint
+            val postGcPt = sessionEndPostGcMemoryPoint
+
+            val series = buildList {
+                add(startPt)
+                addAll(sessionBatchEndMemoryPoints)
+                add(peakPt)
+                if (preGcPt != null) add(preGcPt)
+                if (postGcPt != null) add(postGcPt)
+            }.take(MAX_SESSION_MEMORY_POINTS)
+
+            val delta = CollectorSessionMemoryDeltaDto(
+                postGcCaptured = postGcPt != null,
+                startAnonMiB = startPt.cgroupAnonMiB,
+                peakCurrentMiB = peakPt.cgroupCurrentMiB,
+                endPreGcAnonMiB = preGcPt?.cgroupAnonMiB,
+                endPostGcAnonMiB = postGcPt?.cgroupAnonMiB,
+                totalRetainedAnonPreGcMiB = preGcPt?.let { round2(it.cgroupAnonMiB - startPt.cgroupAnonMiB) },
+                totalRetainedAnonPostGcMiB = postGcPt?.let { round2(it.cgroupAnonMiB - startPt.cgroupAnonMiB) },
+                reclaimedByEndFullGcMiB = if (preGcPt != null && postGcPt != null) {
+                    round2(preGcPt.heapCommittedMiB - postGcPt.heapCommittedMiB)
+                } else {
+                    null
+                },
+                deltaHeapUsedPreGcMiB = preGcPt?.let { round2(it.heapUsedMiB - startPt.heapUsedMiB) },
+                deltaHeapCommittedPreGcMiB = preGcPt?.let { round2(it.heapCommittedMiB - startPt.heapCommittedMiB) },
+                deltaNativeAnonResidualPreGcMiB = preGcPt?.let { round2(it.nativeAnonResidualMiB - startPt.nativeAnonResidualMiB) },
+                deltaHeapUsedPostGcMiB = postGcPt?.let { round2(it.heapUsedMiB - startPt.heapUsedMiB) },
+                deltaHeapCommittedPostGcMiB = postGcPt?.let { round2(it.heapCommittedMiB - startPt.heapCommittedMiB) },
+                deltaMetaspaceCommittedMiB = postGcPt?.let { round2(it.metaspaceCommittedMiB - startPt.metaspaceCommittedMiB) },
+                deltaNativeAnonResidualPostGcMiB = postGcPt?.let { round2(it.nativeAnonResidualMiB - startPt.nativeAnonResidualMiB) }
+            )
+            return series to delta
+        }
+    }
+
+    private fun buildSessionMemoryPoint(
+        raw: RawMemorySample,
+        phase: String,
+        batchIndex: Int,
+        totalRiotNetworkCalls: Int,
+        timestampEpochMs: Long
+    ): CollectorSessionMemoryPointDto {
+        val safeHeapUsed = raw.jvmHeapUsedBytes.coerceAtLeast(0L)
+        val safeHeapCommitted = raw.jvmHeapCommittedBytes.coerceAtLeast(safeHeapUsed)
+        val safeHeapUnusedCommitted = (safeHeapCommitted - safeHeapUsed).coerceAtLeast(0L)
+        val safeMetaspaceUsed = raw.jvmMetaspaceUsedBytes.coerceAtLeast(0L)
+        val safeMetaspaceCommitted = raw.jvmMetaspaceCommittedBytes.coerceAtLeast(safeMetaspaceUsed)
+        val safeDirectUsed = raw.directBufferUsedBytes.coerceAtLeast(0L)
+        val safeCgroupCurrent = raw.cgroupMemoryCurrentBytes?.coerceAtLeast(0L) ?: 0L
+        val safeCgroupPeak = raw.cgroupMemoryPeakBytes?.takeIf { it > 0L }
+        val safeCgroupAnon = raw.cgroupAnonBytes?.coerceAtLeast(0L) ?: 0L
+        val safeCgroupFile = raw.cgroupFileCacheBytes?.coerceAtLeast(0L) ?: 0L
+
+        val cgroupCurrentMiB = bytesToMiB(safeCgroupCurrent)
+        val cgroupPeakMiB = safeCgroupPeak?.let { bytesToMiB(it) }
+        val cgroupAnonMiB = bytesToMiB(safeCgroupAnon)
+        val cgroupFileCacheMiB = bytesToMiB(safeCgroupFile)
+        val heapUsedMiB = bytesToMiB(safeHeapUsed)
+        val heapCommittedMiB = bytesToMiB(safeHeapCommitted)
+        val heapUnusedCommittedMiB = bytesToMiB(safeHeapUnusedCommitted)
+        val metaspaceUsedMiB = bytesToMiB(safeMetaspaceUsed)
+        val metaspaceCommittedMiB = bytesToMiB(safeMetaspaceCommitted)
+        val directBuffersUsedMiB = bytesToMiB(safeDirectUsed)
+
+        val nativeResidualMiB = if (safeCgroupCurrent > 0L) {
+            round2((cgroupCurrentMiB - heapCommittedMiB - metaspaceCommittedMiB - directBuffersUsedMiB).coerceAtLeast(0.0))
+        } else {
+            0.0
+        }
+        val nativeAnonResidualMiB = if (safeCgroupAnon > 0L) {
+            round2((cgroupAnonMiB - heapCommittedMiB - metaspaceCommittedMiB - directBuffersUsedMiB).coerceAtLeast(0.0))
+        } else {
+            0.0
+        }
+
+        return CollectorSessionMemoryPointDto(
+            phase = phase,
+            batchIndex = batchIndex,
+            totalRiotNetworkCalls = totalRiotNetworkCalls,
+            timestampEpochMs = timestampEpochMs,
+            cgroupCurrentMiB = cgroupCurrentMiB,
+            cgroupPeakMiB = cgroupPeakMiB,
+            cgroupAnonMiB = cgroupAnonMiB,
+            cgroupFileCacheMiB = cgroupFileCacheMiB,
+            heapUsedMiB = heapUsedMiB,
+            heapCommittedMiB = heapCommittedMiB,
+            heapUnusedCommittedMiB = heapUnusedCommittedMiB,
+            metaspaceUsedMiB = metaspaceUsedMiB,
+            metaspaceCommittedMiB = metaspaceCommittedMiB,
+            directBuffersUsedMiB = directBuffersUsedMiB,
+            nativeResidualMiB = nativeResidualMiB,
+            nativeAnonResidualMiB = nativeAnonResidualMiB
+        )
+    }
+
+    private fun bytesToMiB(bytes: Long): Double = round2(bytes.toDouble() / BYTES_PER_MIB)
+
+    private fun round2(value: Double): Double = (value * 100.0).roundToLong() / 100.0
 
     private fun computeEffectivePauseWaitMs(
         region: String,

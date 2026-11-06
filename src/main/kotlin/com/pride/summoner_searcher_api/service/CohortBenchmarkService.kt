@@ -35,7 +35,11 @@ data class RawMemorySample(
     val mappedBufferUsedBytes: Long = 0L,
     val jvmThreadCount: Int = 0,
     val cgroupMemoryCurrentBytes: Long? = null,
-    val cgroupMemoryMaxBytes: Long? = null
+    val cgroupMemoryMaxBytes: Long? = null,
+    val cgroupMemoryPeakBytes: Long? = null,
+    val cgroupAnonBytes: Long? = null,
+    val cgroupFileCacheBytes: Long? = null,
+    val oldGenGcCount: Long = 0L
 )
 
 interface MemoryStatsProvider {
@@ -109,10 +113,29 @@ class SystemMemoryStatsProvider : MemoryStatsProvider {
             0
         }
 
+        var oldGenGcCount = 0L
+        try {
+            for (gc in java.lang.management.ManagementFactory.getGarbageCollectorMXBeans()) {
+                val gcName = gc.name ?: ""
+                val pools = gc.memoryPoolNames ?: emptyArray()
+                val isOldOrFullCollector = gcName.contains("MarkSweep", ignoreCase = true) ||
+                    gcName.contains("Old", ignoreCase = true) ||
+                    gcName.contains("Major", ignoreCase = true) ||
+                    pools.any { it.contains("Tenured", ignoreCase = true) || it.contains("Old", ignoreCase = true) }
+                if (isOldOrFullCollector && gc.collectionCount > 0L) {
+                    oldGenGcCount += gc.collectionCount
+                }
+            }
+        } catch (_: Exception) {
+        }
+
         val cgroupCurrent = readLongFromFile("/sys/fs/cgroup/memory.current")
             ?: readLongFromFile("/sys/fs/cgroup/memory/memory.usage_in_bytes")
         val cgroupMax = readLongFromFile("/sys/fs/cgroup/memory.max")
             ?: readLongFromFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")?.takeIf { it in 1L..68_719_476_736L }
+        val cgroupPeak = readLongFromFile("/sys/fs/cgroup/memory.peak")
+            ?: readLongFromFile("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")
+        val (cgroupAnon, cgroupFileCache) = readCgroupAnonAndFileBytes()
 
         return RawMemorySample(
             jvmHeapUsedBytes = used,
@@ -130,7 +153,11 @@ class SystemMemoryStatsProvider : MemoryStatsProvider {
             mappedBufferUsedBytes = mappedUsed,
             jvmThreadCount = threadCount,
             cgroupMemoryCurrentBytes = cgroupCurrent,
-            cgroupMemoryMaxBytes = cgroupMax
+            cgroupMemoryMaxBytes = cgroupMax,
+            cgroupMemoryPeakBytes = cgroupPeak,
+            cgroupAnonBytes = cgroupAnon,
+            cgroupFileCacheBytes = cgroupFileCache,
+            oldGenGcCount = oldGenGcCount
         )
     }
 
@@ -143,6 +170,38 @@ class SystemMemoryStatsProvider : MemoryStatsProvider {
             raw.toLongOrNull()?.takeIf { it > 0L }
         } catch (_: Exception) {
             null
+        }
+    }
+
+    private fun readCgroupAnonAndFileBytes(): Pair<Long?, Long?> {
+        val statFile = sequenceOf(
+            java.io.File("/sys/fs/cgroup/memory.stat"),
+            java.io.File("/sys/fs/cgroup/memory/memory.stat")
+        ).firstOrNull { it.exists() && it.canRead() } ?: return null to null
+
+        return try {
+            var anon: Long? = null
+            var fileCache: Long? = null
+            var rssFallback: Long? = null
+            var cacheFallback: Long? = null
+            statFile.forEachLine { line ->
+                val parts = line.trim().split(' ', '\t')
+                if (parts.size >= 2) {
+                    val key = parts[0]
+                    val value = parts[1].toLongOrNull()?.coerceAtLeast(0L)
+                    if (value != null) {
+                        when (key) {
+                            "anon" -> anon = value
+                            "file" -> fileCache = value
+                            "rss" -> rssFallback = value
+                            "cache" -> cacheFallback = value
+                        }
+                    }
+                }
+            }
+            (anon ?: rssFallback) to (fileCache ?: cacheFallback)
+        } catch (_: Exception) {
+            null to null
         }
     }
 }
@@ -249,6 +308,12 @@ class CohortBenchmarkService(
             "match-v5-match-by-id"
         )
     }
+
+    /**
+     * Read-only raw memory sample used by per-session memory series instrumentation.
+     * Never calls System.gc() and never alters GC hint cooldown state.
+     */
+    fun sampleRawMemoryStats(): RawMemorySample = memoryStatsProvider.sample()
 
     /**
      * Evaluates live JVM heap + Linux container cgroup memory headroom against the 512MB container cap.

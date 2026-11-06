@@ -3105,6 +3105,243 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 configDdragonSentHeaders.keys.none { it.equals("X-Riot-Token", ignoreCase = true) } shouldBe true
             }
         }
+
+        When("capturing collector session memory series and delta across start, batches, peak, pre-GC end, passive post-GC, and >32-point ring buffer overflow") {
+            val mib = 1_048_576L
+            var currentSample = RawMemorySample(
+                jvmHeapUsedBytes = 60L * mib,
+                jvmHeapCommittedBytes = 90L * mib,
+                jvmHeapMaxBytes = 204L * mib,
+                jvmNonHeapUsedBytes = 115L * mib,
+                jvmMetaspaceUsedBytes = 110L * mib,
+                jvmMetaspaceCommittedBytes = 112L * mib,
+                directBufferUsedBytes = 2L * mib,
+                cgroupMemoryCurrentBytes = 327L * mib,
+                cgroupMemoryMaxBytes = 512L * mib,
+                cgroupMemoryPeakBytes = 330L * mib,
+                cgroupAnonBytes = 304L * mib,
+                cgroupFileCacheBytes = 23L * mib,
+                oldGenGcCount = 5L
+            )
+            val memProvider = object : MemoryStatsProvider {
+                override fun sample(): RawMemorySample = currentSample
+            }
+            var nowEpochMs = 1_760_000_000_000L
+            val timeProvider = object : TimeProvider {
+                override fun now(): Long = nowEpochMs
+            }
+
+            val redisStore = java.util.concurrent.ConcurrentHashMap<String, Any>()
+            val locks = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
+            val memRedis = mockk<RedisCacheService>(relaxed = true)
+            every { memRedis.setIfAbsent(any(), any(), any()) } answers {
+                val key = firstArg<String>()
+                locks.putIfAbsent(key, true) == null
+            }
+            every { memRedis.delete(any()) } answers {
+                locks.remove(firstArg<String>())
+            }
+            every { memRedis.set(any(), any(), any()) } answers {
+                redisStore[firstArg<String>()] = secondArg<Any>()
+            }
+            every { memRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
+                redisStore[firstArg<String>()] as? CohortCollectorCheckpointDto
+            }
+            every { memRedis.scanKeys(any(), any()) } returns emptySet()
+
+            val memLimiter = RiotApiRateLimiter(timeProvider)
+            val memRiotApi = mockk<RiotApiService>(relaxed = true)
+            every { memRiotApi.fetchDataDragonVersions(any()) } returns listOf("16.22.1")
+
+            val memService = CohortBenchmarkService(
+                redisCacheService = memRedis,
+                cohortBenchmarkCellRepository = mockk(relaxed = true),
+                riotApiRateLimiter = memLimiter,
+                riotApiService = memRiotApi,
+                objectMapper = jacksonObjectMapper().findAndRegisterModules(),
+                networkCollectionEnabled = false,
+                timeProvider = timeProvider,
+                memoryStatsProvider = memProvider
+            )
+            val runner = com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner(
+                cohortBenchmarkService = memService,
+                configuredOperatorToken = "test-op-token",
+                timeProvider = timeProvider
+            )
+
+            // 1. Start session 1 (networkCollectionEnabled=false causes immediate terminal stop after batch 1)
+            // Start sample (T0): cgroupCurrent=327, anon=304, file=23, heapUsed=60, heapCommitted=90, metaspaceCommitted=112, direct=2
+            // -> nativeResidual = 327 - 90 - 112 - 2 = 123.0 MiB
+            // -> nativeAnonResidual = 304 - 90 - 112 - 2 = 100.0 MiB
+            runner.startOrResumeGuarded(
+                region = "euw1",
+                targetPatch = "16.22",
+                maxBatches = 1,
+                batchSize = 5,
+                maxTotalProductiveBatches = 3,
+                maxTotalNetworkCalls = 38,
+                async = false
+            )
+
+            // Simulate additional batches and peak (356 MiB current, 333 MiB anon) followed by pre-GC end (351 MiB current, 328 MiB anon)
+            nowEpochMs += 10_000L
+            currentSample = currentSample.copy(
+                jvmHeapUsedBytes = 88L * mib,
+                jvmHeapCommittedBytes = 115L * mib,
+                cgroupMemoryCurrentBytes = 356L * mib,
+                cgroupMemoryPeakBytes = 356L * mib,
+                cgroupAnonBytes = 333L * mib
+            )
+            runner.recordBatchEndMemorySample(batchIndex = 2, totalRiotNetworkCalls = 25)
+
+            // Simulate pre-GC end state: heapUsed dropped to 72 MiB after minor GC, heapCommitted stayed at 115 MiB (43 MiB unused),
+            // cgroupCurrent=351 MiB, cgroupAnon=328 MiB, oldGenGcCount still 5L (no natural Full GC happened)
+            nowEpochMs += 10_000L
+            currentSample = currentSample.copy(
+                jvmHeapUsedBytes = 72L * mib,
+                jvmHeapCommittedBytes = 115L * mib,
+                cgroupMemoryCurrentBytes = 351L * mib,
+                cgroupMemoryPeakBytes = 356L * mib,
+                cgroupAnonBytes = 328L * mib,
+                oldGenGcCount = 5L
+            )
+            // Force overwrite pre-GC end sample at this state to test exact T0 -> T2 -> T3 math
+            val preGcField = runner.javaClass.getDeclaredField("sessionEndPreGcMemoryPoint").apply { isAccessible = true }
+            preGcField.set(runner, null)
+            runner.recordSessionEndPreGcMemorySampleIfNeeded(batchIndex = 3, totalRiotNetworkCalls = 38)
+
+            val statusBeforeFullGc = runner.getStatus(region = "euw1", targetPatch = "16.22")
+
+            // 2. Now simulate a natural Old-Gen / Full GC occurring (oldGenGcCount advances 5 -> 6):
+            // SerialGC shrinks heapCommitted from 115 -> 85 MiB and heapUsed from 72 -> 64 MiB;
+            // cgroupAnon drops from 328 -> 298 MiB, cgroupCurrent drops from 351 -> 321 MiB
+            nowEpochMs += 15_000L
+            currentSample = currentSample.copy(
+                jvmHeapUsedBytes = 64L * mib,
+                jvmHeapCommittedBytes = 85L * mib,
+                cgroupMemoryCurrentBytes = 321L * mib,
+                cgroupMemoryPeakBytes = 356L * mib,
+                cgroupAnonBytes = 298L * mib,
+                oldGenGcCount = 6L
+            )
+            val statusAfterNaturalFullGc = runner.getStatus(region = "euw1", targetPatch = "16.22")
+
+            // 3. Now push 40 batch-end samples in the session to test the 32-point ring buffer bound
+            // Including a mid-session spike of 390 MiB at batch 10 (which will be evicted from the rolling BATCH_END window
+            // as batches 11..40 arrive, but MUST remain captured in SESSION_PEAK!)
+            for (b in 4..40) {
+                nowEpochMs += 1_000L
+                val isSpikeBatch = (b == 10)
+                currentSample = currentSample.copy(
+                    jvmHeapUsedBytes = (if (isSpikeBatch) 110L else 70L) * mib,
+                    jvmHeapCommittedBytes = (if (isSpikeBatch) 130L else 95L) * mib,
+                    cgroupMemoryCurrentBytes = (if (isSpikeBatch) 390L else 335L) * mib,
+                    cgroupMemoryPeakBytes = 390L * mib,
+                    cgroupAnonBytes = (if (isSpikeBatch) 367L else 312L) * mib
+                )
+                runner.recordBatchEndMemorySample(batchIndex = b, totalRiotNetworkCalls = b * 5)
+            }
+            val statusAfterOverflow = runner.getStatus(region = "euw1", targetPatch = "16.22")
+
+            // 4. Start a brand-new session (isAutoResume=false) and verify the ring buffer resets cleanly
+            nowEpochMs += 5_000L
+            currentSample = currentSample.copy(
+                jvmHeapUsedBytes = 58L * mib,
+                jvmHeapCommittedBytes = 80L * mib,
+                cgroupMemoryCurrentBytes = 318L * mib,
+                cgroupMemoryPeakBytes = 390L * mib,
+                cgroupAnonBytes = 295L * mib,
+                oldGenGcCount = 6L
+            )
+            val statusAfterNewSessionStart = runner.startOrResumeGuarded(
+                region = "euw1",
+                targetPatch = "16.22",
+                maxBatches = 1,
+                batchSize = 5,
+                maxTotalProductiveBatches = 2,
+                maxTotalNetworkCalls = 20,
+                async = false
+            )
+
+            Then("it should enforce the 32-point bound, compute exact pre/post-GC MiB deltas, leave post-GC null until a natural Old-Gen GC occurs, and reset on new session start") {
+                // Verify pre-Full-GC status: postGcCaptured is false and all post-GC delta fields are null
+                val deltaPre = statusBeforeFullGc.sessionMemoryDelta!!
+                deltaPre.postGcCaptured shouldBe false
+                deltaPre.startAnonMiB shouldBe 304.0
+                deltaPre.peakCurrentMiB shouldBe 356.0
+                deltaPre.endPreGcAnonMiB shouldBe 328.0
+                deltaPre.totalRetainedAnonPreGcMiB shouldBe 24.0
+                deltaPre.deltaHeapUsedPreGcMiB shouldBe 12.0      // 72 - 60
+                deltaPre.deltaHeapCommittedPreGcMiB shouldBe 25.0 // 115 - 90
+                // Start nativeAnonResidual = 304 - 90 - 112 - 2 = 100.0
+                // EndPreGc nativeAnonResidual = 328 - 115 - 112 - 2 = 99.0 -> delta = -1.0
+                deltaPre.deltaNativeAnonResidualPreGcMiB shouldBe -1.0
+                deltaPre.endPostGcAnonMiB shouldBe null
+                deltaPre.totalRetainedAnonPostGcMiB shouldBe null
+                deltaPre.reclaimedByEndFullGcMiB shouldBe null
+                deltaPre.deltaHeapUsedPostGcMiB shouldBe null
+                deltaPre.deltaHeapCommittedPostGcMiB shouldBe null
+                deltaPre.deltaMetaspaceCommittedMiB shouldBe null
+                deltaPre.deltaNativeAnonResidualPostGcMiB shouldBe null
+                statusBeforeFullGc.sessionMemorySeries.none { it.phase == "SESSION_END_POST_GC" } shouldBe true
+
+                val startPt = statusBeforeFullGc.sessionMemorySeries.first { it.phase == "SESSION_START" }
+                startPt.cgroupCurrentMiB shouldBe 327.0
+                startPt.cgroupPeakMiB shouldBe 330.0
+                startPt.cgroupAnonMiB shouldBe 304.0
+                startPt.cgroupFileCacheMiB shouldBe 23.0
+                startPt.heapUsedMiB shouldBe 60.0
+                startPt.heapCommittedMiB shouldBe 90.0
+                startPt.heapUnusedCommittedMiB shouldBe 30.0
+                startPt.metaspaceUsedMiB shouldBe 110.0
+                startPt.metaspaceCommittedMiB shouldBe 112.0
+                startPt.directBuffersUsedMiB shouldBe 2.0
+                startPt.nativeResidualMiB shouldBe 123.0
+                startPt.nativeAnonResidualMiB shouldBe 100.0
+
+                // Verify passive post-Full-GC capture: once oldGenGcCount increments, SESSION_END_POST_GC is captured
+                val deltaPost = statusAfterNaturalFullGc.sessionMemoryDelta!!
+                deltaPost.postGcCaptured shouldBe true
+                deltaPost.endPostGcAnonMiB shouldBe 298.0
+                deltaPost.totalRetainedAnonPostGcMiB shouldBe -6.0   // 298 - 304
+                deltaPost.reclaimedByEndFullGcMiB shouldBe 30.0      // 115 - 85
+                deltaPost.deltaHeapUsedPostGcMiB shouldBe 4.0        // 64 - 60
+                deltaPost.deltaHeapCommittedPostGcMiB shouldBe -5.0  // 85 - 90
+                deltaPost.deltaMetaspaceCommittedMiB shouldBe 0.0    // 112 - 112
+                // EndPostGc nativeAnonResidual = 298 - 85 - 112 - 2 = 99.0 -> delta vs 100.0 = -1.0
+                deltaPost.deltaNativeAnonResidualPostGcMiB shouldBe -1.0
+                statusAfterNaturalFullGc.sessionMemorySeries.any { it.phase == "SESSION_END_POST_GC" } shouldBe true
+
+                // Verify 32-point ring buffer bound after 40 batches
+                val overflowSeries = statusAfterOverflow.sessionMemorySeries
+                overflowSeries.size shouldBe 32
+                overflowSeries.first().phase shouldBe "SESSION_START"
+                val peakAfterOverflow = overflowSeries.single { it.phase == "SESSION_PEAK" }
+                peakAfterOverflow.cgroupCurrentMiB shouldBe 390.0
+                peakAfterOverflow.batchIndex shouldBe 10
+                statusAfterOverflow.sessionMemoryDelta!!.peakCurrentMiB shouldBe 390.0
+                val batchEndPoints = overflowSeries.filter { it.phase == "BATCH_END" }
+                batchEndPoints.size shouldBe 28 // 32 total - 4 (START, PEAK, END_PRE_GC, END_POST_GC)
+                batchEndPoints.first().batchIndex shouldBe 13
+                batchEndPoints.last().batchIndex shouldBe 40
+
+                // Verify only allowed enum phase strings exist in sessionMemorySeries (zero identifiers)
+                val allowedPhases = setOf(
+                    "SESSION_START",
+                    "BATCH_END",
+                    "SESSION_PEAK",
+                    "SESSION_END_PRE_GC",
+                    "SESSION_END_POST_GC"
+                )
+                overflowSeries.all { it.phase in allowedPhases } shouldBe true
+
+                // Verify starting a new session resets the ring buffer cleanly
+                statusAfterNewSessionStart.sessionMemorySeries.size shouldBe 4 // SESSION_START, BATCH_END(1), SESSION_PEAK, SESSION_END_PRE_GC
+                statusAfterNewSessionStart.sessionMemoryDelta!!.startAnonMiB shouldBe 295.0
+                statusAfterNewSessionStart.sessionMemoryDelta!!.peakCurrentMiB shouldBe 318.0
+                statusAfterNewSessionStart.sessionMemoryDelta!!.postGcCaptured shouldBe false
+            }
+        }
     }
 })
 

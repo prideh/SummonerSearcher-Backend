@@ -315,6 +315,45 @@ data class CohortCollectorCheckpointDto(
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
+data class CollectorSessionMemoryPointDto(
+    val phase: String,
+    val batchIndex: Int,
+    val totalRiotNetworkCalls: Int,
+    val timestampEpochMs: Long,
+    val cgroupCurrentMiB: Double,
+    val cgroupPeakMiB: Double? = null,
+    val cgroupAnonMiB: Double,
+    val cgroupFileCacheMiB: Double,
+    val heapUsedMiB: Double,
+    val heapCommittedMiB: Double,
+    val heapUnusedCommittedMiB: Double,
+    val metaspaceUsedMiB: Double,
+    val metaspaceCommittedMiB: Double,
+    val directBuffersUsedMiB: Double,
+    val nativeResidualMiB: Double,
+    val nativeAnonResidualMiB: Double
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class CollectorSessionMemoryDeltaDto(
+    val postGcCaptured: Boolean = false,
+    val startAnonMiB: Double,
+    val peakCurrentMiB: Double,
+    val endPreGcAnonMiB: Double? = null,
+    val endPostGcAnonMiB: Double? = null,
+    val totalRetainedAnonPreGcMiB: Double? = null,
+    val totalRetainedAnonPostGcMiB: Double? = null,
+    val reclaimedByEndFullGcMiB: Double? = null,
+    val deltaHeapUsedPreGcMiB: Double? = null,
+    val deltaHeapCommittedPreGcMiB: Double? = null,
+    val deltaNativeAnonResidualPreGcMiB: Double? = null,
+    val deltaHeapUsedPostGcMiB: Double? = null,
+    val deltaHeapCommittedPostGcMiB: Double? = null,
+    val deltaMetaspaceCommittedMiB: Double? = null,
+    val deltaNativeAnonResidualPostGcMiB: Double? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class CohortCollectorStatusDto(
     val region: String,
     val targetPatch: String?,
@@ -340,7 +379,9 @@ data class CohortCollectorStatusDto(
     val lastRunCompletedAt: Instant? = null,
     val rateLimitVerification: RateLimitVerificationSnapshotDto,
     val memoryHeadroom: MemoryHeadroomSnapshotDto? = null,
-    val checkpoint: CohortCollectorCheckpointDto? = null
+    val checkpoint: CohortCollectorCheckpointDto? = null,
+    val sessionMemorySeries: List<CollectorSessionMemoryPointDto> = emptyList(),
+    val sessionMemoryDelta: CollectorSessionMemoryDeltaDto? = null
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
