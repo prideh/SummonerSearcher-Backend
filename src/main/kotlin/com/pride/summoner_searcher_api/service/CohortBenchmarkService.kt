@@ -2764,10 +2764,8 @@ class CohortBenchmarkService(
         val normalizedRegion = checkpoint.region.lowercase().trim()
         val cleanPatch = checkpoint.targetPatch?.trim()?.takeIf { it.isNotBlank() }
         val primaryKey = collectorCheckpointKey(normalizedRegion, cleanPatch)
-        redisCacheService.set(primaryKey, checkpoint, MAX_RANK_SNAPSHOT_AGE)
-        if (cleanPatch != null) {
-            redisCacheService.set(collectorCheckpointKey(normalizedRegion, null), checkpoint, MAX_RANK_SNAPSHOT_AGE)
-        }
+        val secondaryKey = if (cleanPatch != null) collectorCheckpointKey(normalizedRegion, null) else null
+        redisCacheService.setReplicated(primaryKey, secondaryKey, checkpoint, MAX_RANK_SNAPSHOT_AGE)
         persistCollectorCheckpointToPostgres(normalizedRegion, cleanPatch, checkpoint)
     }
 

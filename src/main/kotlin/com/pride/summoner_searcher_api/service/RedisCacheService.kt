@@ -59,6 +59,27 @@ class RedisCacheService(
      */
     fun <T> set(key: String, value: T, expiration: Duration) {
         val compressed = serializeAndCompress(value)
+        writeCompressed(key, compressed, expiration)
+    }
+
+    /**
+     * Serializes and compresses [value] once, then stores the identical compressed payload
+     * under [primaryKey] and (when non-null) [secondaryKey] in order with [expiration].
+     */
+    fun <T> setReplicated(
+        primaryKey: String,
+        secondaryKey: String?,
+        value: T,
+        expiration: Duration
+    ) {
+        val compressed = serializeAndCompress(value)
+        writeCompressed(primaryKey, compressed, expiration)
+        if (secondaryKey != null) {
+            writeCompressed(secondaryKey, compressed, expiration)
+        }
+    }
+
+    private fun writeCompressed(key: String, compressed: String, expiration: Duration) {
         if (expiration.isZero || expiration.isNegative) {
             redisTemplate.opsForValue().set(key, compressed)
         } else {

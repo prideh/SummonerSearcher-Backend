@@ -15,7 +15,20 @@ import java.time.Instant
 
 class CohortBenchmarkServiceTest : BehaviorSpec({
     val objectMapper = ObjectMapper().findAndRegisterModules()
-    val redisCacheService = mockk<RedisCacheService>(relaxed = true)
+    fun mockRedisWithReplicatedForwarding(): RedisCacheService =
+        mockk<RedisCacheService>(relaxed = true).also { mockRedis ->
+            every { mockRedis.setReplicated<Any>(any(), any(), any(), any()) } answers {
+                val primaryKey = firstArg<String>()
+                val secondaryKey = secondArg<String?>()
+                val value = thirdArg<Any>()
+                val expiration = arg<java.time.Duration>(3)
+                mockRedis.set(primaryKey, value, expiration)
+                if (secondaryKey != null) {
+                    mockRedis.set(secondaryKey, value, expiration)
+                }
+            }
+        }
+    val redisCacheService = mockRedisWithReplicatedForwarding()
     val cohortRepo = mockk<CohortBenchmarkCellRepository>(relaxed = true)
     val riotApiService = mockk<RiotApiService>(relaxed = true)
 
@@ -568,7 +581,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 override fun now(): Long = clockMs.get()
             }
             val rateLimiter = RiotApiRateLimiter(testClock)
-            val localRedis = mockk<RedisCacheService>(relaxed = true)
+            val localRedis = mockRedisWithReplicatedForwarding()
 
             val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
             val savedRankSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
@@ -792,7 +805,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             }
             // Shared in-process rate limiter (same instance used by foreground traffic and collector)
             val sharedRateLimiter = RiotApiRateLimiter(testClock)
-            val localRedis = mockk<RedisCacheService>(relaxed = true)
+            val localRedis = mockRedisWithReplicatedForwarding()
             val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
             var lockHeld = false
 
@@ -945,7 +958,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 override fun now(): Long = clockMs.get()
             }
             val probeRateLimiter = RiotApiRateLimiter(testClock)
-            val probeRedis = mockk<RedisCacheService>(relaxed = true)
+            val probeRedis = mockRedisWithReplicatedForwarding()
             val probeRiotApi = mockk<RiotApiService>(relaxed = true)
             val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
             val savedRankSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
@@ -1221,7 +1234,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
 
             // Real RiotApiService instance (exercises executeRateLimitedCall directly!)
             val realRiotApiService = RiotApiService(mockRestClient, realLimiter)
-            val probeRedis = mockk<RedisCacheService>(relaxed = true)
+            val probeRedis = mockRedisWithReplicatedForwarding()
             val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
             every { probeRedis.scanKeys(any(), any(), any()) } returns emptyList()
             every { probeRedis.get(any(), CachedLeaderboardDto::class.java) } returns null
@@ -1316,7 +1329,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 override fun now(): Long = clockMs.get()
             }
             val durableLimiter = RiotApiRateLimiter(testClock)
-            val durableRedis = mockk<RedisCacheService>(relaxed = true)
+            val durableRedis = mockRedisWithReplicatedForwarding()
             val durableRiotApi = mockk<RiotApiService>(relaxed = true)
             val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
             val savedSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
@@ -1491,7 +1504,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 override fun now(): Long = clockMs.get()
             }
             val memLimiter = RiotApiRateLimiter(testClock)
-            val memRedis = mockk<RedisCacheService>(relaxed = true)
+            val memRedis = mockRedisWithReplicatedForwarding()
             val memRiotApi = mockk<RiotApiService>(relaxed = true)
             val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
             val savedSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
@@ -1782,7 +1795,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
         }
 
         When("persisting collector checkpoints to Postgres and recovering after a Redis flush") {
-            val pgRedis = mockk<RedisCacheService>(relaxed = true)
+            val pgRedis = mockRedisWithReplicatedForwarding()
             val pgCheckpointRepo = mockk<CohortCollectorCheckpointRepository>(relaxed = true)
             val redisStore = mutableMapOf<String, CohortCollectorCheckpointDto>()
             val pgStore = mutableMapOf<String, CohortCollectorCheckpointEntity>()
@@ -1877,7 +1890,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 override fun now(): Long = clockMs.get()
             }
             val capLimiter = RiotApiRateLimiter(testClock)
-            val capRedis = mockk<RedisCacheService>(relaxed = true)
+            val capRedis = mockRedisWithReplicatedForwarding()
             val capRiotApi = mockk<RiotApiService>(relaxed = true)
             val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
             val savedSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
@@ -2083,7 +2096,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 override fun now(): Long = clockMs.get()
             }
             val errLimiter = RiotApiRateLimiter(testClock)
-            val errRedis = mockk<RedisCacheService>(relaxed = true)
+            val errRedis = mockRedisWithReplicatedForwarding()
             val errRiotApi = mockk<RiotApiService>(relaxed = true)
             val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
             val savedSnapshots = mutableMapOf<String, CohortRankSnapshotDto>()
@@ -2302,7 +2315,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 override fun now(): Long = clockMs.get()
             }
             val evictLimiter = RiotApiRateLimiter(testClock)
-            val evictRedis = mockk<RedisCacheService>(relaxed = true)
+            val evictRedis = mockRedisWithReplicatedForwarding()
             val evictRiotApi = mockk<RiotApiService>(relaxed = true)
             val pgCellRepo = mockk<CohortBenchmarkCellRepository>(relaxed = true)
             val pgSampleRepo = mockk<com.pride.summoner_searcher_api.repository.CohortCellSampleStateRepository>(relaxed = true)
@@ -2733,7 +2746,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 override fun now(): Long = clockMs.get()
             }
             val legacyLimiter = RiotApiRateLimiter(testClock)
-            val legacyRedis = mockk<RedisCacheService>(relaxed = true)
+            val legacyRedis = mockRedisWithReplicatedForwarding()
             val legacyRiotApi = mockk<RiotApiService>(relaxed = true)
             val pgCellRepo = mockk<CohortBenchmarkCellRepository>(relaxed = true)
             val pgSampleRepo = mockk<com.pride.summoner_searcher_api.repository.CohortCellSampleStateRepository>(relaxed = true)
@@ -3133,7 +3146,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
 
             val redisStore = java.util.concurrent.ConcurrentHashMap<String, Any>()
             val locks = java.util.concurrent.ConcurrentHashMap<String, Boolean>()
-            val memRedis = mockk<RedisCacheService>(relaxed = true)
+            val memRedis = mockRedisWithReplicatedForwarding()
             every { memRedis.setIfAbsent(any(), any(), any()) } answers {
                 val key = firstArg<String>()
                 locks.putIfAbsent(key, true) == null
@@ -3340,6 +3353,188 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 statusAfterNewSessionStart.sessionMemoryDelta!!.startAnonMiB shouldBe 295.0
                 statusAfterNewSessionStart.sessionMemoryDelta!!.peakCurrentMiB shouldBe 318.0
                 statusAfterNewSessionStart.sessionMemoryDelta!!.postGcCaptured shouldBe false
+            }
+        }
+
+        When("saving collector checkpoints with single Redis GZIP+Base64 encoding reused across patch and latest keys") {
+            val streamEncodeCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val failOnStreamEncode = java.util.concurrent.atomic.AtomicBoolean(false)
+            val countingMapper = object : ObjectMapper() {
+                override fun writeValue(out: java.io.OutputStream, value: Any?) {
+                    if (failOnStreamEncode.get()) {
+                        throw java.io.IOException("Simulated Jackson GZIP stream serialization failure")
+                    }
+                    streamEncodeCount.incrementAndGet()
+                    super.writeValue(out, value)
+                }
+            }.findAndRegisterModules()
+
+            val rawRedisMap = LinkedHashMap<String, String>()
+            val writeOrder = mutableListOf<Pair<String, java.time.Duration>>()
+            var failOnKey: String? = null
+
+            val valueOps = mockk<org.springframework.data.redis.core.ValueOperations<String, String>>(relaxed = true)
+            every { valueOps.set(any(), any(), any<java.time.Duration>()) } answers {
+                val key = firstArg<String>()
+                val payload = secondArg<String>()
+                val ttl = thirdArg<java.time.Duration>()
+                if (failOnKey == key) {
+                    throw RuntimeException("Simulated Redis SET failure on $key")
+                }
+                rawRedisMap[key] = payload
+                writeOrder.add(key to ttl)
+            }
+            every { valueOps.get(any()) } answers {
+                rawRedisMap[firstArg<String>()]
+            }
+
+            val stringRedisTemplate = mockk<org.springframework.data.redis.core.StringRedisTemplate>(relaxed = true)
+            every { stringRedisTemplate.opsForValue() } returns valueOps
+
+            val realRedisCacheService = RedisCacheService(
+                redisTemplate = stringRedisTemplate,
+                objectMapper = countingMapper
+            )
+
+            val pgCheckpointSaves = mutableListOf<CohortCollectorCheckpointEntity>()
+            val pgCheckpointRepo = mockk<CohortCollectorCheckpointRepository>(relaxed = true)
+            every { pgCheckpointRepo.findByRegionAndTargetPatchAndQueueId(any(), any(), any()) } returns null
+            every { pgCheckpointRepo.save(any<CohortCollectorCheckpointEntity>()) } answers {
+                val ent = firstArg<CohortCollectorCheckpointEntity>()
+                pgCheckpointSaves.add(ent)
+                ent
+            }
+
+            val realEncodeService = CohortBenchmarkService(
+                redisCacheService = realRedisCacheService,
+                cohortBenchmarkCellRepository = cohortRepo,
+                riotApiRateLimiter = RiotApiRateLimiter(fixedTimeProvider),
+                riotApiService = riotApiService,
+                objectMapper = countingMapper,
+                networkCollectionEnabled = false,
+                timeProvider = fixedTimeProvider,
+                cohortCollectorCheckpointRepository = pgCheckpointRepo
+            )
+
+            // 1. Non-null patch ("16.22"): must encode ONCE and write identical payload to both patch and latest keys in order
+            val cpPatch = CohortCollectorCheckpointDto(
+                region = "EUW1",
+                targetPatch = " 16.22 ",
+                patchSelectionSource = "GROUNDED_CURRENT_PATCH_STORE",
+                processedPuuids = setOf("puuid-1", "puuid-2"),
+                pendingCandidatePuuids = listOf("puuid-3"),
+                processedMatchIds = setOf("EUW1_9001"),
+                playerCellGameCounts = mapOf("GOLD:MIDDLE:puuid-1" to 3),
+                totalNetworkCallsMade = 19,
+                lastStopReason = "BATCH_BUDGET_REACHED_RESUMABLE",
+                startedAt = nowInstant,
+                updatedAt = nowInstant
+            )
+            realEncodeService.saveCollectorCheckpoint(cpPatch)
+
+            val encodesAfterPatchSave = streamEncodeCount.get()
+            val writesAfterPatchSave = writeOrder.toList()
+            val pgSavesAfterPatchSave = pgCheckpointSaves.map { "${it.region}:${it.targetPatch}:${it.queueId}" }
+            val rawPatchPayload = rawRedisMap["cohort:collector:checkpoint:euw1:16.22"]
+            val rawLatestPayload = rawRedisMap["cohort:collector:checkpoint:euw1:latest"]
+            val decodedFromPatchKey = realRedisCacheService.get("cohort:collector:checkpoint:euw1:16.22", CohortCollectorCheckpointDto::class.java)
+            val decodedFromLatestKey = realRedisCacheService.get("cohort:collector:checkpoint:euw1:latest", CohortCollectorCheckpointDto::class.java)
+
+            // 2. Null targetPatch (and blank targetPatch): must encode ONCE and write ONLY the latest key
+            streamEncodeCount.set(0)
+            writeOrder.clear()
+            pgCheckpointSaves.clear()
+            val cpNullPatch = cpPatch.copy(targetPatch = null, totalNetworkCallsMade = 25)
+            realEncodeService.saveCollectorCheckpoint(cpNullPatch)
+            val encodesAfterNullPatchSave = streamEncodeCount.get()
+            val writesAfterNullPatchSave = writeOrder.toList()
+            val pgSavesAfterNullPatchSave = pgCheckpointSaves.map { "${it.region}:${it.targetPatch}:${it.queueId}" }
+            val decodedAfterNullPatch = realRedisCacheService.get("cohort:collector:checkpoint:euw1:latest", CohortCollectorCheckpointDto::class.java)
+
+            streamEncodeCount.set(0)
+            writeOrder.clear()
+            pgCheckpointSaves.clear()
+            val cpBlankPatch = cpPatch.copy(targetPatch = "   ", totalNetworkCallsMade = 27)
+            realEncodeService.saveCollectorCheckpoint(cpBlankPatch)
+            val encodesAfterBlankPatchSave = streamEncodeCount.get()
+            val writesAfterBlankPatchSave = writeOrder.toList()
+
+            // 3. Error behavior:
+            // (a) Serialization failure -> 0 Redis writes, 0 Postgres writes, exception propagates
+            writeOrder.clear()
+            pgCheckpointSaves.clear()
+            failOnStreamEncode.set(true)
+            val encodeFailureThrown = runCatching {
+                realEncodeService.saveCollectorCheckpoint(cpPatch)
+            }.exceptionOrNull()
+            failOnStreamEncode.set(false)
+            val writesOnEncodeFailure = writeOrder.size
+            val pgSavesOnEncodeFailure = pgCheckpointSaves.size
+
+            // (b) Primary key Redis write failure -> 0 secondary key writes, 0 Postgres writes, exception propagates
+            writeOrder.clear()
+            pgCheckpointSaves.clear()
+            failOnKey = "cohort:collector:checkpoint:euw1:16.22"
+            val primaryKeyFailureThrown = runCatching {
+                realEncodeService.saveCollectorCheckpoint(cpPatch)
+            }.exceptionOrNull()
+            val writesOnPrimaryFailure = writeOrder.toList()
+            val pgSavesOnPrimaryFailure = pgCheckpointSaves.size
+
+            // (c) Secondary (latest) key Redis write failure -> primary key written first, 0 Postgres writes, exception propagates
+            writeOrder.clear()
+            pgCheckpointSaves.clear()
+            failOnKey = "cohort:collector:checkpoint:euw1:latest"
+            val secondaryKeyFailureThrown = runCatching {
+                realEncodeService.saveCollectorCheckpoint(cpPatch)
+            }.exceptionOrNull()
+            failOnKey = null
+            val writesOnSecondaryFailure = writeOrder.toList()
+            val pgSavesOnSecondaryFailure = pgCheckpointSaves.size
+
+            Then("it should serialize and compress once, write identical payloads with unchanged TTLs and order, decode identically at both keys, and preserve null-patch and error semantics") {
+                // 1. Single encoding and identical payload at both keys
+                encodesAfterPatchSave shouldBe 1
+                writesAfterPatchSave shouldBe listOf(
+                    "cohort:collector:checkpoint:euw1:16.22" to CohortBenchmarkService.MAX_RANK_SNAPSHOT_AGE,
+                    "cohort:collector:checkpoint:euw1:latest" to CohortBenchmarkService.MAX_RANK_SNAPSHOT_AGE
+                )
+                rawPatchPayload shouldNotBe null
+                rawPatchPayload!!.startsWith("GZIP_B64:") shouldBe true
+                (rawPatchPayload === rawLatestPayload) shouldBe true
+                rawPatchPayload shouldBe rawLatestPayload
+                decodedFromPatchKey shouldBe cpPatch
+                decodedFromLatestKey shouldBe cpPatch
+                decodedFromPatchKey shouldBe decodedFromLatestKey
+                pgSavesAfterPatchSave shouldBe listOf("euw1:16.22:420", "euw1:latest:420")
+
+                // 2. Null and blank targetPatch write only the latest key once
+                encodesAfterNullPatchSave shouldBe 1
+                writesAfterNullPatchSave shouldBe listOf(
+                    "cohort:collector:checkpoint:euw1:latest" to CohortBenchmarkService.MAX_RANK_SNAPSHOT_AGE
+                )
+                decodedAfterNullPatch shouldBe cpNullPatch
+                pgSavesAfterNullPatchSave shouldBe listOf("euw1:latest:420")
+
+                encodesAfterBlankPatchSave shouldBe 1
+                writesAfterBlankPatchSave shouldBe listOf(
+                    "cohort:collector:checkpoint:euw1:latest" to CohortBenchmarkService.MAX_RANK_SNAPSHOT_AGE
+                )
+
+                // 3. Error behavior and write order preserved
+                encodeFailureThrown shouldNotBe null
+                writesOnEncodeFailure shouldBe 0
+                pgSavesOnEncodeFailure shouldBe 0
+
+                primaryKeyFailureThrown shouldNotBe null
+                writesOnPrimaryFailure shouldBe emptyList()
+                pgSavesOnPrimaryFailure shouldBe 0
+
+                secondaryKeyFailureThrown shouldNotBe null
+                writesOnSecondaryFailure shouldBe listOf(
+                    "cohort:collector:checkpoint:euw1:16.22" to CohortBenchmarkService.MAX_RANK_SNAPSHOT_AGE
+                )
+                pgSavesOnSecondaryFailure shouldBe 0
             }
         }
     }
