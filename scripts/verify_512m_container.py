@@ -133,7 +133,18 @@ class MockRiotHandler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = self.path.split("?")[0]
-        if "/challengerleagues/by-queue/" in path:
+        if path == "/api/versions.json":
+            if self.headers.get("X-Riot-Token") is not None:
+                self.send_response(400)
+                self.end_headers()
+                return
+            body = json.dumps(["16.7.1", "16.6.1"]).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif "/challengerleagues/by-queue/" in path:
             self._send_riot_json(CHALLENGER_JSON, "500:10,30000:600")
         elif "/riot/account/v1/accounts/by-riot-id/" in path:
             body = json.dumps({"puuid": "puuid-main-450", "gameName": "TestPlayer", "tagLine": "EUW"}).encode("utf-8")

@@ -3001,6 +3001,93 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 cellsAfterFirstBatch shouldHaveSize 15
             }
         }
+
+        When("fetching Data Dragon versions.json via RiotApiService.fetchDataDragonVersions") {
+            val riotClientCalls = java.util.concurrent.atomic.AtomicInteger(0)
+            val ddragonClientCalls = java.util.concurrent.atomic.AtomicInteger(0)
+            val capturedDdragonUris = mutableListOf<String>()
+            val capturedDdragonHeaders = mutableListOf<org.springframework.http.HttpHeaders>()
+
+            fun buildMockJsonResponse(jsonBody: String): org.springframework.http.client.ClientHttpResponse {
+                val bytes = jsonBody.toByteArray(Charsets.UTF_8)
+                return object : org.springframework.http.client.ClientHttpResponse {
+                    override fun getStatusCode(): org.springframework.http.HttpStatusCode = org.springframework.http.HttpStatus.OK
+                    override fun getStatusText(): String = "OK"
+                    override fun close() {}
+                    override fun getBody(): java.io.InputStream = java.io.ByteArrayInputStream(bytes)
+                    override fun getHeaders(): org.springframework.http.HttpHeaders = org.springframework.http.HttpHeaders().apply {
+                        contentType = org.springframework.http.MediaType.APPLICATION_JSON
+                        contentLength = bytes.size.toLong()
+                    }
+                }
+            }
+
+            // Authenticated riotRestClient with defaultHeader("X-Riot-Token", ...)
+            val authenticatedRiotRestClient = org.springframework.web.client.RestClient.builder()
+                .defaultHeader("X-Riot-Token", "RGAPI-secret-token-must-never-leak-to-ddragon")
+                .requestInterceptor { _, _, _ ->
+                    riotClientCalls.incrementAndGet()
+                    buildMockJsonResponse("""["should-not-be-called"]""")
+                }
+                .build()
+
+            // Separate unauthenticated dataDragonRestClient (matching RestClientConfig.dataDragonRestClient)
+            val unauthenticatedDdragonRestClient = org.springframework.web.client.RestClient.builder()
+                .defaultHeader(org.springframework.http.HttpHeaders.USER_AGENT, "SummonerSearcher/1.0")
+                .requestInterceptor { request, _, _ ->
+                    ddragonClientCalls.incrementAndGet()
+                    capturedDdragonUris.add(request.uri.toString())
+                    val headersSnapshot = org.springframework.http.HttpHeaders()
+                    headersSnapshot.putAll(request.headers)
+                    capturedDdragonHeaders.add(headersSnapshot)
+                    buildMockJsonResponse("""["16.22.1", "16.21.1", "16.20.1"]""")
+                }
+                .build()
+
+            val serviceWithSeparateClients = RiotApiService(
+                riotRestClient = authenticatedRiotRestClient,
+                rateLimiter = RiotApiRateLimiter(),
+                dataDragonRestClient = unauthenticatedDdragonRestClient
+            )
+            val versions = serviceWithSeparateClients.fetchDataDragonVersions(maxEntries = 2)
+
+            // Also verify defense-in-depth: even if a RestClient with a default X-Riot-Token header were passed,
+            // fetchDataDragonVersions strips X-Riot-Token before the request is sent
+            val capturedStrippedHeaders = mutableListOf<org.springframework.http.HttpHeaders>()
+            val clientWithDefaultToken = org.springframework.web.client.RestClient.builder()
+                .defaultHeader("X-Riot-Token", "RGAPI-secret-token-must-never-leak-to-ddragon")
+                .requestInterceptor { request, _, _ ->
+                    val headersSnapshot = org.springframework.http.HttpHeaders()
+                    headersSnapshot.putAll(request.headers)
+                    capturedStrippedHeaders.add(headersSnapshot)
+                    buildMockJsonResponse("""["16.22.1"]""")
+                }
+                .build()
+            val defenseInDepthService = RiotApiService(
+                riotRestClient = authenticatedRiotRestClient,
+                rateLimiter = RiotApiRateLimiter(),
+                dataDragonRestClient = clientWithDefaultToken
+            )
+            val defenseVersions = defenseInDepthService.fetchDataDragonVersions(maxEntries = 1)
+
+            Then("it should use the separate dataDragonRestClient, make zero calls on riotRestClient, and send no X-Riot-Token header to ddragon.leagueoflegends.com") {
+                versions shouldBe listOf("16.22.1", "16.21.1")
+                riotClientCalls.get() shouldBe 0
+                ddragonClientCalls.get() shouldBe 1
+                capturedDdragonUris.single() shouldBe "https://ddragon.leagueoflegends.com/api/versions.json"
+
+                val sentHeaders = capturedDdragonHeaders.single()
+                sentHeaders.containsKey("X-Riot-Token") shouldBe false
+                sentHeaders["X-Riot-Token"] shouldBe null
+                sentHeaders.keys.none { it.equals("X-Riot-Token", ignoreCase = true) } shouldBe true
+
+                // Defense-in-depth header removal also guarantees no X-Riot-Token header on outgoing request
+                defenseVersions shouldBe listOf("16.22.1")
+                val strippedHeaders = capturedStrippedHeaders.single()
+                strippedHeaders.containsKey("X-Riot-Token") shouldBe false
+                strippedHeaders["X-Riot-Token"] shouldBe null
+            }
+        }
     }
 })
 
