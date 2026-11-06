@@ -526,6 +526,7 @@ def main():
     print(pre_jfr_check, flush=True)
     print("=== PRE-START JFR.configure (BOUNDED stackdepth=32, memorysize=2m) ===", flush=True)
     print(pre_jfr_cfg, flush=True)
+    assert "[warning][cds]" not in pre_jfr_check, f"Unexpected CDS mismatch warning: {pre_jfr_check}"
     assert "No available recordings" in pre_jfr_check, f"Unexpected auto-started JFR recording: {pre_jfr_check}"
     assert "Stack depth: 32" in pre_jfr_cfg and "Memory size: 2.0 MB" in pre_jfr_cfg, (
         f"Expected Stack depth: 32 and Memory size: 2.0 MB in JFR.configure: {pre_jfr_cfg}"
@@ -623,12 +624,10 @@ END {
         "afterJfrPeakMiB": cg_after_jfr_cleanup["cgroupPeakMiB"]
     }, indent=2), flush=True)
     assert "jdk.ObjectAllocationSample" in jfr_summary_out, "Expected jdk.ObjectAllocationSample in jfr summary!"
-    assert "jdk.InitialEnvironmentVariable                   0" in jfr_summary_out, (
-        "Expected jdk.InitialEnvironmentVariable count to be 0!"
-    )
-    assert "jdk.InitialSystemProperty                        0" in jfr_summary_out, (
-        "Expected jdk.InitialSystemProperty count to be 0!"
-    )
+    for disabled_ev in ("jdk.InitialEnvironmentVariable", "jdk.InitialSystemProperty", "jdk.SystemProcess", "jdk.JVMInformation"):
+        assert re.search(rf"^\s*{re.escape(disabled_ev)}\s+0\s+0\s*$", jfr_summary_out, re.MULTILINE), (
+            f"Expected {disabled_ev} count to be 0 in jfr summary!"
+        )
 
     print("=== 1-BATCH COLLECTOR RUNNER RESULT ===", flush=True)
     print(json.dumps({

@@ -49,8 +49,9 @@ COPY --from=build /opt/jre-with-jcmd/lib/libattach.so /opt/java/openjdk/lib/liba
 COPY --from=build /opt/jre-with-jcmd/lib/modules /opt/java/openjdk/lib/modules
 COPY --from=build /opt/jre-with-jcmd/release /opt/java/openjdk/release
 
-# Create a non-root user (Security Best Practice)
-RUN addgroup -S spring && adduser -S spring -G spring
+# Regenerate default CDS archive (classes.jsa) for the updated lib/modules and create non-root user
+RUN /opt/java/openjdk/bin/java -Xshare:dump && \
+    addgroup -S spring && adduser -S spring -G spring
 USER spring:spring
 
 # Copy jar from build stage
