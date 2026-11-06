@@ -2,7 +2,7 @@ name: Backend CI
 
 on:
   push:
-    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates, feat/collector-session-memory-series ]
+    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates, feat/collector-session-memory-series, feat/scalar-patch-metadata-queries ]
   pull_request:
     branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates ]
 

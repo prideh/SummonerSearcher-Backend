@@ -2404,6 +2404,10 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 val r = firstArg<String>()
                 pgBenchmarkCells.values.filter { it.region == r }
             }
+            every { pgCellRepo.findDistinctPatchesByRegionWithEligibleGames(any()) } answers {
+                val r = firstArg<String>()
+                pgBenchmarkCells.values.filter { it.region == r && it.eligibleGames > 0 }.map { it.patch }.distinct()
+            }
             every { pgCellRepo.save(any<CohortBenchmarkCellEntity>()) } answers {
                 val ent = firstArg<CohortBenchmarkCellEntity>()
                 pgBenchmarkCells["${ent.region}:${ent.patch}:${ent.queueId}:${ent.tier}:${ent.role}"] = ent
@@ -2427,6 +2431,10 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             every { pgSampleRepo.findByRegionOrderByPatchDescTierAscRoleAsc(any()) } answers {
                 val r = firstArg<String>()
                 pgSampleStates.values.filter { it.region == r }
+            }
+            every { pgSampleRepo.findDistinctPatchesByRegionWithEligibleGames(any()) } answers {
+                val r = firstArg<String>()
+                pgSampleStates.values.filter { it.region == r && it.eligibleGames > 0 }.map { it.patch }.distinct()
             }
             every { pgSampleRepo.save(any<com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity>()) } answers {
                 val ent = firstArg<com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity>()
@@ -2774,6 +2782,10 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 val r = firstArg<String>()
                 pgBenchmarkCells.values.filter { it.region == r }
             }
+            every { pgCellRepo.findDistinctPatchesByRegionWithEligibleGames(any()) } answers {
+                val r = firstArg<String>()
+                pgBenchmarkCells.values.filter { it.region == r && it.eligibleGames > 0 }.map { it.patch }.distinct()
+            }
             every { pgCellRepo.save(any<CohortBenchmarkCellEntity>()) } answers {
                 val ent = firstArg<CohortBenchmarkCellEntity>()
                 pgBenchmarkCells["${ent.region}:${ent.patch}:${ent.queueId}:${ent.tier}:${ent.role}"] = ent
@@ -2792,6 +2804,10 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             every { pgSampleRepo.findByRegionOrderByPatchDescTierAscRoleAsc(any()) } answers {
                 val r = firstArg<String>()
                 pgSampleStates.values.filter { it.region == r }
+            }
+            every { pgSampleRepo.findDistinctPatchesByRegionWithEligibleGames(any()) } answers {
+                val r = firstArg<String>()
+                pgSampleStates.values.filter { it.region == r && it.eligibleGames > 0 }.map { it.patch }.distinct()
             }
             every { pgSampleRepo.save(any<com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity>()) } answers {
                 val ent = firstArg<com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity>()
@@ -3342,8 +3358,106 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 statusAfterNewSessionStart.sessionMemoryDelta!!.postGcCaptured shouldBe false
             }
         }
+
+        When("resolving grounded current patch using scalar metadata queries without hydrating full sample or benchmark entities") {
+            var nowMs = 1_760_000_000_000L
+            val timeProvider = object : TimeProvider {
+                override fun now(): Long = nowMs
+            }
+            val scalarRedis = mockk<RedisCacheService>(relaxed = true)
+            val scalarCellRepo = mockk<CohortBenchmarkCellRepository>(relaxed = true)
+            val scalarSampleRepo = mockk<com.pride.summoner_searcher_api.repository.CohortCellSampleStateRepository>(relaxed = true)
+            val scalarCheckpointRepo = mockk<CohortCollectorCheckpointRepository>(relaxed = true)
+            val scalarRiotApi = mockk<RiotApiService>(relaxed = true)
+            val scalarLimiter = RiotApiRateLimiter(timeProvider)
+
+            every { scalarRedis.get(any(), any<Class<Any>>()) } returns null
+            every { scalarRedis.scanKeys(any(), any()) } returns emptyList()
+
+            fun newColdService() = CohortBenchmarkService(
+                redisCacheService = scalarRedis,
+                cohortBenchmarkCellRepository = scalarCellRepo,
+                riotApiRateLimiter = scalarLimiter,
+                riotApiService = scalarRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = timeProvider,
+                cohortCollectorCheckpointRepository = scalarCheckpointRepo,
+                cohortCellSampleStateRepository = scalarSampleRepo
+            )
+
+            // 1. DataDragon upper bound (16.22) caps stray high store patches (16.99) while using scalar queries
+            every { scalarRiotApi.fetchDataDragonVersions(any()) } returns listOf("16.22.1", "16.21.1")
+            every { scalarSampleRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") } returns listOf("16.21", "16.22", "16.99")
+            every { scalarCellRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") } returns listOf("16.20", "16.99")
+            val groundedWithDdragon = newColdService().resolveGroundedCurrentPatch("euw1")
+
+            // 2. DataDragon unavailable on cold start: selects highest verified store patch (16.22 over 16.21)
+            //    and ignores unbacked higher checkpoint patch (16.99)
+            nowMs += 31 * 60 * 1_000L
+            every { scalarRiotApi.fetchDataDragonVersions(any()) } throws RuntimeException("DataDragon unreachable")
+            every { scalarSampleRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") } returns listOf("16.21")
+            every { scalarCellRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") } returns listOf("16.22")
+            val strayCpDto = CohortCollectorCheckpointDto(
+                region = "euw1",
+                targetPatch = "16.99",
+                patchSelectionSource = "AUTO_LATEST_EXACT_PATCH",
+                startedAt = Instant.ofEpochMilli(nowMs),
+                updatedAt = Instant.ofEpochMilli(nowMs)
+            )
+            every { scalarCheckpointRepo.findFirstByRegionAndQueueIdOrderByUpdatedAtDesc("euw1", 420) } returns CohortCollectorCheckpointEntity(
+                region = "euw1",
+                targetPatch = "latest",
+                queueId = 420,
+                checkpointJson = objectMapper.writeValueAsString(strayCpDto),
+                startedAt = Instant.ofEpochMilli(nowMs),
+                updatedAt = Instant.ofEpochMilli(nowMs)
+            )
+            val groundedStoreFallback = newColdService().resolveGroundedCurrentPatch("euw1")
+
+            // 3. Empty verified stores + DataDragon unavailable: falls back to latest Postgres checkpoint row with targetPatch="latest"
+            //    by parsing checkpointJson.targetPatch ("16.21")
+            nowMs += 31 * 60 * 1_000L
+            every { scalarSampleRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") } returns emptyList()
+            every { scalarCellRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") } returns emptyList()
+            val validCpDto = CohortCollectorCheckpointDto(
+                region = "euw1",
+                targetPatch = "16.21",
+                patchSelectionSource = "AUTO_LATEST_EXACT_PATCH",
+                startedAt = Instant.ofEpochMilli(nowMs),
+                updatedAt = Instant.ofEpochMilli(nowMs)
+            )
+            every { scalarCheckpointRepo.findFirstByRegionAndQueueIdOrderByUpdatedAtDesc("euw1", 420) } returns CohortCollectorCheckpointEntity(
+                region = "euw1",
+                targetPatch = "latest",
+                queueId = 420,
+                checkpointJson = objectMapper.writeValueAsString(validCpDto),
+                startedAt = Instant.ofEpochMilli(nowMs),
+                updatedAt = Instant.ofEpochMilli(nowMs)
+            )
+            val groundedFromCheckpointJson = newColdService().resolveGroundedCurrentPatch("euw1")
+
+            // 4. Repository exceptions are safely caught by runCatching and fall back to observed/in-memory patch
+            every { scalarSampleRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") } throws RuntimeException("DB timeout")
+            every { scalarCellRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") } throws RuntimeException("DB timeout")
+            every { scalarCheckpointRepo.findFirstByRegionAndQueueIdOrderByUpdatedAtDesc("euw1", 420) } throws RuntimeException("DB timeout")
+            val groundedOnRepoError = newColdService().resolveGroundedCurrentPatch("euw1", observedCandidatePatch = "16.23")
+
+            Then("it should preserve all grounding and fallback semantics while making zero full-entity findByRegionOrderByPatchDescTierAscRoleAsc calls") {
+                groundedWithDdragon shouldBe "16.22"
+                groundedStoreFallback shouldBe "16.22"
+                groundedFromCheckpointJson shouldBe "16.21"
+                groundedOnRepoError shouldBe "16.23"
+
+                verify(exactly = 0) { scalarSampleRepo.findByRegionOrderByPatchDescTierAscRoleAsc(any()) }
+                verify(exactly = 0) { scalarCellRepo.findByRegionOrderByPatchDescTierAscRoleAsc(any()) }
+                verify(atLeast = 4) { scalarSampleRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") }
+                verify(atLeast = 4) { scalarCellRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") }
+            }
+        }
     }
 })
+
 
 
 

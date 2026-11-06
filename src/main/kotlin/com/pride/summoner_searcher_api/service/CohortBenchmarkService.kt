@@ -3206,17 +3206,15 @@ class CohortBenchmarkService(
         val sampleRepo = cohortCellSampleStateRepository
         if (sampleRepo != null) {
             runCatching {
-                sampleRepo.findByRegionOrderByPatchDescTierAscRoleAsc(normalizedRegion)
+                sampleRepo.findDistinctPatchesByRegionWithEligibleGames(normalizedRegion)
             }.getOrNull().orEmpty()
-                .filter { it.eligibleGames > 0 }
-                .forEach { addVerifiedCandidate(it.patch) }
+                .forEach { addVerifiedCandidate(it) }
         }
 
         runCatching {
-            cohortBenchmarkCellRepository.findByRegionOrderByPatchDescTierAscRoleAsc(normalizedRegion)
+            cohortBenchmarkCellRepository.findDistinctPatchesByRegionWithEligibleGames(normalizedRegion)
         }.getOrNull().orEmpty()
-            .filter { it.eligibleGames > 0 }
-            .forEach { addVerifiedCandidate(it.patch) }
+            .forEach { addVerifiedCandidate(it) }
 
         val cpRepo = cohortCollectorCheckpointRepository
         if (cpRepo != null) {
