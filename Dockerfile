@@ -1,24 +1,36 @@
 # --- Stage 0: Runtime JRE Base ---
 FROM eclipse-temurin:21-jre-alpine AS jre-base
 
+# Probe actual runtime JRE modules via java --list-modules (do not trust release MODULES)
+FROM jre-base AS jre-probe
+RUN /opt/java/openjdk/bin/java --version > /tmp/jre-java-version.txt && \
+    /opt/java/openjdk/bin/java --list-modules | sed 's/@.*//' | sort > /tmp/jre-list-modules.txt
+
 # --- Stage 1: Build ---
 FROM eclipse-temurin:21-jdk-alpine AS build
 WORKDIR /app
 
 # Verify exact JDK/JRE version parity and link ONLY jdk.jcmd (+ jdk.attach, jdk.internal.jvmstat)
-# onto the existing JRE module set so runtime stays JRE-sized without full JDK packages.
-COPY --from=jre-base /opt/java/openjdk/release /tmp/jre-release
-RUN grep '^FULL_VERSION=' /tmp/jre-release && \
-    grep '^FULL_VERSION=' /opt/java/openjdk/release && \
-    test "$(grep '^FULL_VERSION=' /tmp/jre-release)" = "$(grep '^FULL_VERSION=' /opt/java/openjdk/release)" && \
-    JRE_MODS=$(grep '^MODULES=' /tmp/jre-release | cut -d'"' -f2 | tr ' ' ',') && \
+# onto the actual runtime JRE module set from java --list-modules.
+COPY --from=jre-probe /tmp/jre-java-version.txt /tmp/jre-java-version.txt
+COPY --from=jre-probe /tmp/jre-list-modules.txt /tmp/jre-list-modules.txt
+RUN /opt/java/openjdk/bin/java --version > /tmp/jdk-java-version.txt && \
+    diff -u /tmp/jre-java-version.txt /tmp/jdk-java-version.txt && \
+    JRE_MODS=$(paste -sd, /tmp/jre-list-modules.txt) && \
     /opt/java/openjdk/bin/jlink \
       --add-modules "${JRE_MODS},jdk.jcmd" \
       --strip-debug \
       --no-man-pages \
       --no-header-files \
       --compress=zip-6 \
-      --output /opt/jre-with-jcmd
+      --output /opt/jre-with-jcmd && \
+    /opt/jre-with-jcmd/bin/java --list-modules | sed 's/@.*//' | sort > /tmp/new-list-modules.txt && \
+    REMOVED_MODS=$(comm -23 /tmp/jre-list-modules.txt /tmp/new-list-modules.txt | paste -sd, -) && \
+    ADDED_MODS=$(comm -13 /tmp/jre-list-modules.txt /tmp/new-list-modules.txt | paste -sd, -) && \
+    echo "Removed modules vs runtime JRE: '${REMOVED_MODS}'" && \
+    echo "Added modules vs runtime JRE: '${ADDED_MODS}'" && \
+    test -z "${REMOVED_MODS}" && \
+    test "${ADDED_MODS}" = "jdk.attach,jdk.internal.jvmstat,jdk.jcmd"
 
 # Copy Gradle wrapper and config first (Caching layer)
 COPY gradlew .
