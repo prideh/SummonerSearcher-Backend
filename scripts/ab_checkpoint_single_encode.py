@@ -135,15 +135,92 @@ def teardown_isolated_network():
     subprocess.run(["docker", "network", "rm", NETWORK_NAME], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def verify_egress_deny_from_container_netns(host_pid: int) -> dict:
+EXPECTED_EXTRA_HOSTS = tuple(
+    f"{h}:{GATEWAY_IP}"
+    for h in (
+        "euw1.api.riotgames.com",
+        "na1.api.riotgames.com",
+        "kr.api.riotgames.com",
+        "europe.api.riotgames.com",
+        "americas.api.riotgames.com",
+        "asia.api.riotgames.com",
+        "ddragon.leagueoflegends.com",
+    )
+)
+
+
+def request_collector_stop_best_effort():
+    try:
+        fixture.http_json(
+            f"{BASE_URL}/api/riot/cohorts/{REGION}/collector/stop?patch={PATCH}",
+            method="POST",
+            headers=OP_HEADERS,
+            timeout=5
+        )
+    except Exception:
+        pass
+
+
+def verify_container_hosts_mapping_fail_closed(container_name: str, host_pid: int) -> dict:
     """
-    Executes a fail-closed negative-control probe inside the container's network namespace (nsenter -n)
-    without entering its cgroup namespace (so zero container memory perturbation).
-    Proves that outbound connections to public IPv4 addresses and non-mocked hosts fail,
-    while the internal bridge mock Riot server (172.28.0.1:443) is reachable.
+    Validates container host mappings without relying on host mount namespace inside `nsenter -n`:
+    1. Checks `docker inspect` -> `HostConfig.ExtraHosts` for exact required `host:GATEWAY_IP` entries.
+    2. Reads the container's `/proc/{host_pid}/root/etc/hosts` directly from the host (zero container
+       cgroup memory impact) and verifies every required hostname resolves exclusively to GATEWAY_IP.
     """
+    raw = subprocess.check_output(["docker", "inspect", container_name], timeout=10).decode("utf-8")
+    info = json.loads(raw)[0]
+    host_cfg = info.get("HostConfig")
+    if not isinstance(host_cfg, dict):
+        raise RuntimeError("FAIL_CLOSED_MISSING_HOST_CONFIG")
+    extra_hosts = host_cfg.get("ExtraHosts")
+    if not isinstance(extra_hosts, list):
+        raise RuntimeError(f"FAIL_CLOSED_MISSING_EXTRA_HOSTS: {extra_hosts}")
+    missing_extra = [entry for entry in EXPECTED_EXTRA_HOSTS if entry not in extra_hosts]
+    if missing_extra:
+        raise RuntimeError(f"FAIL_CLOSED_EXTRA_HOSTS_MISMATCH: missing={missing_extra}, actual={extra_hosts}")
+
+    container_hosts_path = f"/proc/{host_pid}/root/etc/hosts"
+    with open(container_hosts_path, "r") as f:
+        hosts_lines = f.readlines()
+
+    resolved_in_etc_hosts = {}
+    for line in hosts_lines:
+        stripped = line.split("#", 1)[0].strip()
+        if not stripped:
+            continue
+        parts = stripped.split()
+        if len(parts) >= 2:
+            ip_addr = parts[0]
+            for hostname in parts[1:]:
+                resolved_in_etc_hosts.setdefault(hostname, []).append(ip_addr)
+
+    for expected_entry in EXPECTED_EXTRA_HOSTS:
+        hostname, expected_ip = expected_entry.split(":", 1)
+        ips = resolved_in_etc_hosts.get(hostname)
+        if ips != [expected_ip]:
+            raise RuntimeError(
+                f"FAIL_CLOSED_CONTAINER_ETC_HOSTS_MISMATCH: host={hostname} expected={[expected_ip]} actual={ips}"
+            )
+
+    return {
+        "extraHostsVerified": list(EXPECTED_EXTRA_HOSTS),
+        "containerEtcHostsVerified": {k.split(":")[0]: resolved_in_etc_hosts[k.split(":")[0]] for k in EXPECTED_EXTRA_HOSTS}
+    }
+
+
+def verify_egress_deny_from_container_netns(container_name: str, host_pid: int) -> dict:
+    """
+    1. Validates container `--add-host` / `/etc/hosts` mappings via `verify_container_hosts_mapping_fail_closed`.
+    2. Executes a fail-closed negative-control probe inside the container's network namespace (`nsenter -n`)
+       using numeric IPs only (since `nsenter -n` retains the host mount namespace):
+       - External IPs (`1.1.1.1:443`, `8.8.8.8:53`, `93.184.215.14:443`) must fail (`blocked == True`).
+       - Internal numeric gateway (`172.28.0.1:443`) must succeed (`reachable == True`).
+    """
+    hosts_proof = verify_container_hosts_mapping_fail_closed(container_name, host_pid)
+
     probe_code = f"""
-import json, socket, sys
+import json, socket
 
 results = {{}}
 
@@ -161,17 +238,15 @@ check_blocked("external_ip_1_1_1_1_443", "1.1.1.1", 443)
 check_blocked("external_ip_8_8_8_8_53", "8.8.8.8", 53)
 check_blocked("external_ip_93_184_215_14_443", "93.184.215.14", 443)
 
-# Verify internal mock Riot resolution and reachability on GATEWAY_IP:443
-resolved_riot = socket.gethostbyname("euw1.api.riotgames.com")
-resolved_ddragon = socket.gethostbyname("ddragon.leagueoflegends.com")
+# Numeric gateway positive control on GATEWAY_IP:443
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.settimeout(2.0)
 s.connect(("{GATEWAY_IP}", 443))
 s.close()
-results["internal_mock_riot_443"] = {{
+results["internal_numeric_gateway_443"] = {{
     "reachable": True,
-    "resolvedRiotIp": resolved_riot,
-    "resolvedDdragonIp": resolved_ddragon
+    "gatewayIp": "{GATEWAY_IP}",
+    "port": 443
 }}
 print(json.dumps(results))
 """
@@ -183,9 +258,10 @@ print(json.dumps(results))
     for neg_key in ("external_ip_1_1_1_1_443", "external_ip_8_8_8_8_53", "external_ip_93_184_215_14_443"):
         if not parsed.get(neg_key, {}).get("blocked", False):
             raise RuntimeError(f"EGRESS_DENY_NEGATIVE_CONTROL_FAILED: {neg_key} was NOT blocked: {parsed}")
-    internal = parsed.get("internal_mock_riot_443", {})
+    internal = parsed.get("internal_numeric_gateway_443", {})
     if not internal.get("reachable"):
         raise RuntimeError(f"INTERNAL_MOCK_RIOT_UNREACHABLE: {parsed}")
+    parsed["containerHostsProof"] = hosts_proof
     return parsed
 
 
@@ -234,16 +310,52 @@ def inspect_container_fail_closed(container_name: str, expected_pid: int = None,
     }
 
 
+def read_host_cgroup_strict(host_pid: int) -> dict:
+    """
+    Strict fail-closed cgroup v2 reader that raises on missing/unreadable files or non-positive memory values
+    (unlike verify_512m_container.read_host_cgroup_snapshot which defaults to 0 on read error).
+    """
+    cg_dir = f"/proc/{host_pid}/root/sys/fs/cgroup"
+    with open(f"{cg_dir}/memory.current", "r") as f:
+        current_bytes = int(f.read().strip())
+    if current_bytes <= 0:
+        raise RuntimeError(f"FAIL_CLOSED_INVALID_CGROUP_CURRENT_BYTES: {current_bytes}")
+
+    with open(f"{cg_dir}/memory.peak", "r") as f:
+        peak_bytes = int(f.read().strip())
+    if peak_bytes < current_bytes:
+        peak_bytes = current_bytes
+
+    mstat = {}
+    with open(f"{cg_dir}/memory.stat", "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) == 2 and parts[1].isdigit():
+                mstat[parts[0]] = int(parts[1])
+    if "anon" not in mstat or mstat["anon"] <= 0:
+        raise RuntimeError(f"FAIL_CLOSED_INVALID_CGROUP_ANON_BYTES: {mstat.get('anon')}")
+
+    return {
+        "cgroupCurrentBytes": current_bytes,
+        "cgroupCurrentMiB": round(current_bytes / (1024.0 * 1024.0), 2),
+        "cgroupPeakBytes": peak_bytes,
+        "cgroupPeakMiB": round(peak_bytes / (1024.0 * 1024.0), 2),
+        "cgroupAnonBytes": mstat["anon"],
+        "cgroupAnonMiB": round(mstat["anon"] / (1024.0 * 1024.0), 2)
+    }
+
+
 def combined_current_mib(host_pid: int, status: dict = None) -> dict:
-    cg = fixture.read_host_cgroup_snapshot(host_pid)
+    cg = read_host_cgroup_strict(host_pid)
     host_mib = cg["cgroupCurrentMiB"]
     peak_mib = cg["cgroupPeakMiB"]
     status_mib = None
     if status is not None:
         mem = status.get("memoryHeadroom") or {}
         c_bytes = mem.get("cgroupMemoryCurrentBytes")
-        if isinstance(c_bytes, int) and c_bytes > 0:
-            status_mib = round(c_bytes / (1024.0 * 1024.0), 2)
+        if not isinstance(c_bytes, int) or c_bytes <= 0:
+            raise RuntimeError(f"FAIL_CLOSED_MISSING_STATUS_CGROUP_BYTES: {mem}")
+        status_mib = round(c_bytes / (1024.0 * 1024.0), 2)
     effective_mib = max(host_mib, status_mib) if status_mib is not None else host_mib
     return {
         "hostCgroupCurrentMiB": host_mib,
@@ -255,10 +367,11 @@ def combined_current_mib(host_pid: int, status: dict = None) -> dict:
 
 class Cgroup2sWatcher:
     """
-    Independent 2-second host cgroup watcher thread.
-    Samples /proc/{host_pid}/root/sys/fs/cgroup/memory.current and memory.peak every 2.0s.
-    If cgroupCurrentMiB > 360.0 MiB at any sample, immediately requests collector stop
-    (/api/riot/cohorts/euw1/collector/stop) and records the breach.
+    Independent 2-second host cgroup watcher thread with fail-closed exception capture and liveness checks.
+    Samples /proc/{host_pid}/root/sys/fs/cgroup/memory.current, memory.peak, and memory.stat every 2.0s.
+    - If cgroupCurrentMiB > 360.0 MiB at any sample, immediately requests collector stop and records the breach.
+    - If any sampling exception occurs, records fatal_error, immediately requests collector stop, and
+      causes assert_healthy() to raise on the main thread.
     """
     def __init__(self, host_pid: int):
         self.host_pid = host_pid
@@ -266,6 +379,8 @@ class Cgroup2sWatcher:
         self.stop_event = threading.Event()
         self.samples = []
         self.breach = None
+        self.fatal_error = None
+        self.last_sample_ts = 0.0
         self.t0 = time.time()
         self.thread = threading.Thread(target=self._loop, daemon=True)
 
@@ -278,38 +393,59 @@ class Cgroup2sWatcher:
         self.thread.join(timeout=5.0)
 
     def sample_now(self, tag: str) -> dict:
-        cg = fixture.read_host_cgroup_snapshot(self.host_pid)
-        mstat = fixture.parse_kv_bytes_file(f"/proc/{self.host_pid}/root/sys/fs/cgroup/memory.stat")
-        anon_mib = round(mstat.get("anon", 0) / (1024.0 * 1024.0), 2)
-        entry = {
-            "idx": len(self.samples) + 1,
-            "elapsedSec": round(time.time() - self.t0, 2),
-            "tag": tag,
-            "cgroupCurrentMiB": cg["cgroupCurrentMiB"],
-            "cgroupPeakMiB": cg["cgroupPeakMiB"],
-            "cgroupAnonMiB": anon_mib
-        }
-        triggered = False
-        with self.lock:
-            self.samples.append(entry)
-            if entry["cgroupCurrentMiB"] > HARD_STOP_MIB_THRESHOLD and self.breach is None:
-                self.breach = entry
-                triggered = True
-        if triggered:
-            try:
-                fixture.http_json(
-                    f"{BASE_URL}/api/riot/cohorts/{REGION}/collector/stop?patch={PATCH}",
-                    method="POST",
-                    headers=OP_HEADERS,
-                    timeout=5
-                )
-            except Exception:
-                pass
-        return entry
+        try:
+            cg = read_host_cgroup_strict(self.host_pid)
+            now = time.time()
+            entry = {
+                "idx": len(self.samples) + 1,
+                "elapsedSec": round(now - self.t0, 2),
+                "tag": tag,
+                "cgroupCurrentMiB": cg["cgroupCurrentMiB"],
+                "cgroupPeakMiB": cg["cgroupPeakMiB"],
+                "cgroupAnonMiB": cg["cgroupAnonMiB"]
+            }
+            triggered = False
+            with self.lock:
+                self.last_sample_ts = now
+                self.samples.append(entry)
+                if entry["cgroupCurrentMiB"] > HARD_STOP_MIB_THRESHOLD and self.breach is None:
+                    self.breach = entry
+                    triggered = True
+            if triggered:
+                request_collector_stop_best_effort()
+            return entry
+        except BaseException as exc:
+            err_msg = f"{type(exc).__name__}: {exc}"
+            with self.lock:
+                if self.fatal_error is None:
+                    self.fatal_error = err_msg
+            request_collector_stop_best_effort()
+            raise RuntimeError(f"WATCHER_SAMPLING_FAILURE ({tag}): {err_msg}") from exc
 
     def _loop(self):
-        while not self.stop_event.wait(WATCHER_INTERVAL_SEC):
-            self.sample_now("2s_tick")
+        try:
+            while not self.stop_event.wait(WATCHER_INTERVAL_SEC):
+                self.sample_now("2s_tick")
+        except BaseException as exc:
+            with self.lock:
+                if self.fatal_error is None:
+                    self.fatal_error = f"{type(exc).__name__}: {exc}"
+            request_collector_stop_best_effort()
+
+    def assert_healthy(self):
+        with self.lock:
+            fatal = self.fatal_error
+            last_ts = self.last_sample_ts
+        if fatal is not None:
+            request_collector_stop_best_effort()
+            raise RuntimeError(f"WATCHER_FATAL_ERROR: {fatal}")
+        if not self.thread.is_alive():
+            request_collector_stop_best_effort()
+            raise RuntimeError("WATCHER_THREAD_NOT_ALIVE")
+        age = time.time() - last_ts
+        if age > (WATCHER_INTERVAL_SEC * 3.0):
+            request_collector_stop_best_effort()
+            raise RuntimeError(f"WATCHER_LIVENESS_STALE: last_sample_age={age:.2f}s")
 
     def get_breach(self):
         with self.lock:
@@ -318,13 +454,14 @@ class Cgroup2sWatcher:
     def get_summary(self) -> dict:
         with self.lock:
             if not self.samples:
-                return {"sampleCount": 0}
+                return {"sampleCount": 0, "fatalError": self.fatal_error}
             return {
                 "sampleCount": len(self.samples),
                 "maxCurrentMiB": max(s["cgroupCurrentMiB"] for s in self.samples),
                 "maxPeakMiB": max(s["cgroupPeakMiB"] for s in self.samples),
                 "maxAnonMiB": max(s["cgroupAnonMiB"] for s in self.samples),
-                "breach": self.breach
+                "breach": self.breach,
+                "fatalError": self.fatal_error
             }
 
 
@@ -404,13 +541,14 @@ def run_arm(arm_label: str, image_tag: str) -> dict:
     host_pid = initial_inspect["pid"]
     started_at = initial_inspect["startedAt"]
 
-    # 4. Run fail-closed negative-control egress deny verification inside container netns
-    egress_proof = verify_egress_deny_from_container_netns(host_pid)
+    # 4. Run fail-closed container hosts check + negative-control egress deny verification inside container netns
+    egress_proof = verify_egress_deny_from_container_netns("ss-backend-512m", host_pid)
 
     # 5. Wait 3s for ChallengerCacheWarmer and start independent 2s cgroup watcher
     time.sleep(3)
     watcher = Cgroup2sWatcher(host_pid)
     watcher.start()
+    watcher.assert_healthy()
 
     try:
         # 6. Run bounded rate-limit probe (3 HTTP attempts) via deployed probe route
@@ -420,6 +558,7 @@ def run_arm(arm_label: str, image_tag: str) -> dict:
             headers=OP_HEADERS,
             timeout=30
         )
+        watcher.assert_healthy()
         if probe_res.get("stoppedOnRateLimit429") or probe_res.get("probeStatus") == "PAUSED_MEMORY_HEADROOM":
             raise RuntimeError(f"[{arm_label}] Probe stopped early: {probe_res.get('probeStatus')}")
 
@@ -428,6 +567,7 @@ def run_arm(arm_label: str, image_tag: str) -> dict:
 
         for session_idx in range(1, MAX_SESSIONS + 1):
             inspect_container_fail_closed("ss-backend-512m", expected_pid=host_pid, expected_started_at=started_at)
+            watcher.assert_healthy()
 
             if watcher.get_breach() is not None:
                 stop_reason_for_arm = f"HARD_STOP_ABOVE_360_MIB_WATCHER_BEFORE_SESSION_{session_idx}"
@@ -461,16 +601,19 @@ def run_arm(arm_label: str, image_tag: str) -> dict:
                 f"&async=true"
             )
             try:
+                watcher.assert_healthy()
                 start_ack = fixture.http_json(start_url, method="POST", headers=OP_HEADERS, timeout=30)
             except Exception as exc:
-                stop_reason_for_arm = f"HTTP_ERROR_ON_START_SESSION_{session_idx}: {exc}"
+                request_collector_stop_best_effort()
+                stop_reason_for_arm = f"ERROR_ON_START_SESSION_{session_idx}: {exc}"
                 break
 
-            # Poll every 2.0s while async session runs; 2s watcher thread concurrently enforces > 360 MiB stop
+            # Poll every 2.0s while async session runs; 2s watcher thread concurrently enforces > 360 MiB stop and liveness
             poll_deadline = time.time() + 180.0
             end_status = None
             while time.time() < poll_deadline:
                 inspect_container_fail_closed("ss-backend-512m", expected_pid=host_pid, expected_started_at=started_at)
+                watcher.assert_healthy()
                 watcher.sample_now(f"session_{session_idx}_poll")
                 cur_status = fixture.http_json(
                     f"{BASE_URL}/api/riot/cohorts/{REGION}/collector/status?patch={PATCH}",
@@ -478,25 +621,18 @@ def run_arm(arm_label: str, image_tag: str) -> dict:
                     timeout=15
                 )
                 cur_mem = combined_current_mib(host_pid, cur_status)
-                if cur_mem["effectiveCurrentMiB"] > HARD_STOP_MIB_THRESHOLD and watcher.get_breach() is None:
-                    # Trigger stop if status memory exceeded 360.0 MiB between watcher ticks
-                    try:
-                        fixture.http_json(
-                            f"{BASE_URL}/api/riot/cohorts/{REGION}/collector/stop?patch={PATCH}",
-                            method="POST",
-                            headers=OP_HEADERS,
-                            timeout=10
-                        )
-                    except Exception:
-                        pass
+                if cur_mem["effectiveCurrentMiB"] > HARD_STOP_MIB_THRESHOLD:
+                    request_collector_stop_best_effort()
                 if not cur_status.get("runningInProcess", False) and not cur_status.get("overnightSessionArmed", False):
                     end_status = cur_status
                     break
                 time.sleep(WATCHER_INTERVAL_SEC)
 
             if end_status is None:
+                request_collector_stop_best_effort()
                 raise RuntimeError(f"[{arm_label}] Session {session_idx} timed out after 180s")
 
+            watcher.assert_healthy()
             end_mem = combined_current_mib(host_pid, end_status)
             watcher.sample_now(f"session_{session_idx}_end_immediate")
 
@@ -504,10 +640,12 @@ def run_arm(arm_label: str, image_tag: str) -> dict:
             if POST_SESSION_WAIT_SEC > 0 and watcher.get_breach() is None and end_mem["effectiveCurrentMiB"] <= HARD_STOP_MIB_THRESHOLD:
                 wait_end = time.time() + POST_SESSION_WAIT_SEC
                 while time.time() < wait_end:
+                    watcher.assert_healthy()
                     if watcher.get_breach() is not None:
                         break
                     time.sleep(min(WATCHER_INTERVAL_SEC, max(0.1, wait_end - time.time())))
 
+            watcher.assert_healthy()
             post_wait_status = fixture.http_json(
                 f"{BASE_URL}/api/riot/cohorts/{REGION}/collector/status?patch={PATCH}",
                 headers=OP_HEADERS,
@@ -564,7 +702,11 @@ def run_arm(arm_label: str, image_tag: str) -> dict:
                 stop_reason_for_arm = f"STOPPED_CANDIDATES_OR_CELLS_COMPLETE_AFTER_SESSION_{session_idx} ({last_stop})"
                 break
 
+        watcher.assert_healthy()
         final_inspect = inspect_container_fail_closed("ss-backend-512m", expected_pid=host_pid, expected_started_at=started_at)
+    except BaseException:
+        request_collector_stop_best_effort()
+        raise
     finally:
         watcher.stop()
 
