@@ -490,13 +490,284 @@ def main():
         }
     }, indent=2), flush=True)
 
-    # Run 1 productive collector batch (batchSize=2, maxTotalProductiveBatches=1, maxTotalNetworkCalls=30) so checkpoint has processedPuuids, pendingCandidatePuuids, cached matches, and disarms at session cap
-    batch_res = http_json(
-        f"{base_url}/api/riot/cohorts/euw1/collector/start?patch=16.7&maxBatches=1&batchSize=2&maxTotalProductiveBatches=1&maxTotalNetworkCalls=30&async=false",
-        method="POST",
-        headers=op_headers,
-        timeout=60
+    # Verify JFR finite profiling readiness inside the 512 MiB container:
+    # (a) Prove binary-only jcmd (+ libattach.so) on unmodified eclipse-temurin:21-jre-alpine fails without jdk.jcmd in lib/modules,
+    #     and compare old vs new java --list-modules and lib/modules exact byte sizes
+    subprocess.check_call(["docker", "cp", "ss-backend-512m:/opt/java/openjdk/bin/jcmd", "/tmp/jcmd_bin_only"])
+    subprocess.check_call(["docker", "cp", "ss-backend-512m:/opt/java/openjdk/lib/libattach.so", "/tmp/libattach_only.so"])
+    bin_only_proc = subprocess.run([
+        "docker", "run", "--rm", "--entrypoint", "sh",
+        "-v", "/tmp/jcmd_bin_only:/opt/java/openjdk/bin/jcmd:ro",
+        "-v", "/tmp/libattach_only.so:/opt/java/openjdk/lib/libattach.so:ro",
+        "eclipse-temurin:21-jre-alpine", "-c",
+        "stat -c '%s %n' /opt/java/openjdk/lib/modules /opt/java/openjdk/lib/server/classes.jsa && /opt/java/openjdk/bin/jcmd -h 2>&1"
+    ], capture_output=True, text=True)
+    old_jre_mods = subprocess.check_output([
+        "docker", "run", "--rm", "--entrypoint", "/opt/java/openjdk/bin/java",
+        "eclipse-temurin:21-jre-alpine", "--list-modules"
+    ], text=True).strip().splitlines()
+    old_release_mods = subprocess.check_output([
+        "docker", "run", "--rm", "--entrypoint", "sh",
+        "eclipse-temurin:21-jre-alpine", "-c",
+        "grep '^MODULES=' /opt/java/openjdk/release | cut -d'\"' -f2 | tr ' ' '\\n' | sort"
+    ], text=True).strip().splitlines()
+    new_jre_mods = subprocess.check_output([
+        "docker", "exec", "ss-backend-512m", "/opt/java/openjdk/bin/java", "--list-modules"
+    ], text=True).strip().splitlines()
+    container_files_stat = subprocess.check_output([
+        "docker", "exec", "ss-backend-512m", "sh", "-c",
+        "stat -c '%s %n' /opt/java/openjdk/bin/jcmd /opt/java/openjdk/lib/libattach.so /opt/java/openjdk/lib/modules /opt/java/openjdk/lib/server/classes.jsa"
+    ], text=True).strip()
+    old_mod_names = sorted(m.split("@")[0] for m in old_jre_mods)
+    new_mod_names = sorted(m.split("@")[0] for m in new_jre_mods)
+    added_mods = sorted(set(new_mod_names) - set(old_mod_names))
+    removed_mods = sorted(set(old_mod_names) - set(new_mod_names))
+    print("=== BINARY-ONLY jcmd TEST ON UNMODIFIED eclipse-temurin:21-jre-alpine ===", flush=True)
+    print(f"exit_code={bin_only_proc.returncode}\n{bin_only_proc.stdout.strip()}", flush=True)
+    print("=== MODULE LIST & DISK SIZE COMPARISON (UNMODIFIED JRE vs ss-backend-512m) ===", flush=True)
+    print(json.dumps({
+        "unmodifiedJreListModulesCount": len(old_mod_names),
+        "unmodifiedReleaseFileModulesCount": len(old_release_mods),
+        "releaseMatchesListModules": old_mod_names == sorted(old_release_mods),
+        "newJreListModulesCount": len(new_mod_names),
+        "addedModules": added_mods,
+        "removedModules": removed_mods,
+        "newContainerFileBytes": container_files_stat.splitlines()
+    }, indent=2), flush=True)
+    assert bin_only_proc.returncode != 0 and "Module jdk.jcmd not found" in bin_only_proc.stdout, (
+        f"Expected Module jdk.jcmd not found on binary-only copy, got: {bin_only_proc.stdout}"
     )
+    assert added_mods == ["jdk.attach", "jdk.internal.jvmstat", "jdk.jcmd"] and removed_mods == [], (
+        f"Expected only jdk.attach, jdk.internal.jvmstat, jdk.jcmd added, got added={added_mods} removed={removed_mods}"
+    )
+
+    # (b) Helper to sample cgroup memory.current at 10ms intervals during a command so transient subprocess RSS peaks below lifetime memory.peak are still measured
+    def run_with_10ms_cgroup_sampler(fn):
+        pre = read_host_cgroup_snapshot(host_pid)
+        max_cur_bytes = pre["cgroupCurrentBytes"]
+        stop_ev = threading.Event()
+        def _poll():
+            nonlocal max_cur_bytes
+            while not stop_ev.is_set():
+                try:
+                    snap = read_host_cgroup_snapshot(host_pid)
+                    if snap["cgroupCurrentBytes"] > max_cur_bytes:
+                        max_cur_bytes = snap["cgroupCurrentBytes"]
+                except Exception:
+                    pass
+                time.sleep(0.01)
+        t = threading.Thread(target=_poll, daemon=True)
+        t.start()
+        try:
+            res = fn()
+        finally:
+            stop_ev.set()
+            t.join(timeout=1.0)
+        post = read_host_cgroup_snapshot(host_pid)
+        if post["cgroupCurrentBytes"] > max_cur_bytes:
+            max_cur_bytes = post["cgroupCurrentBytes"]
+        max_cur_mib = round(max_cur_bytes / (1024.0 * 1024.0), 2)
+        return res, {
+            "preCurrentMiB": pre["cgroupCurrentMiB"],
+            "sampledMaxCurrentMiB": max_cur_mib,
+            "transientDeltaMiB": round(max_cur_mib - pre["cgroupCurrentMiB"], 2),
+            "postCurrentMiB": post["cgroupCurrentMiB"],
+            "lifetimeCgroupPeakMiB": post["cgroupPeakMiB"]
+        }
+
+    # Verify jcmd + jfr version/module parity, no auto-start on boot, and bounded FlightRecorderOptions (stackdepth=32, memorysize=2m)
+    jcmd_cmd = [
+        "docker", "exec", "ss-backend-512m",
+        "/opt/java/openjdk/bin/jcmd",
+        "-J-Xms8m", "-J-Xmx16m", "-J-XX:+UseSerialGC", "-J-XX:TieredStopAtLevel=1",
+        "1"
+    ]
+    (pre_jfr_check, pre_jfr_cfg), cg_step_pre_jcmd = run_with_10ms_cgroup_sampler(
+        lambda: (
+            subprocess.check_output(jcmd_cmd + ["JFR.check"], text=True).strip(),
+            subprocess.check_output(jcmd_cmd + ["JFR.configure"], text=True).strip()
+        )
+    )
+    print("=== PRE-START JFR.check (MUST HAVE NO AUTO-STARTED RECORDING) ===", flush=True)
+    print(pre_jfr_check, flush=True)
+    print("=== PRE-START JFR.configure (BOUNDED stackdepth=32, memorysize=2m) ===", flush=True)
+    print(pre_jfr_cfg, flush=True)
+    assert "[warning][cds]" not in pre_jfr_check, f"Unexpected CDS mismatch warning: {pre_jfr_check}"
+    assert "No available recordings" in pre_jfr_check, f"Unexpected auto-started JFR recording: {pre_jfr_check}"
+    assert "Stack depth: 32" in pre_jfr_cfg and "Memory size: 2.0 MB" in pre_jfr_cfg, (
+        f"Expected Stack depth: 32 and Memory size: 2.0 MB in JFR.configure: {pre_jfr_cfg}"
+    )
+
+    # (c) Operator-started finite JFR recording with settings=none, explicit +event#setting flags, throttle=20/s, duration=60s auto-expiry (no JFR.stop, no forced GC, path-to-gc-roots=false)
+    t_jfr_start = time.monotonic()
+    (jfr_start_out, jfr_running_check), cg_step_jfr_start = run_with_10ms_cgroup_sampler(
+        lambda: (
+            subprocess.check_output(jcmd_cmd + [
+                "JFR.start",
+                "name=collector_prof",
+                "settings=none",
+                "duration=60s",
+                "maxsize=16m",
+                "maxage=5m",
+                "dumponexit=false",
+                "path-to-gc-roots=false",
+                "filename=/tmp/collector_prof.jfr",
+                "+jdk.ObjectAllocationSample#enabled=true",
+                "+jdk.ObjectAllocationSample#throttle=20/s",
+                "+jdk.ObjectAllocationSample#stackTrace=true",
+                "+jdk.OldObjectSample#enabled=true",
+                "+jdk.OldObjectSample#stackTrace=true",
+                "+jdk.OldObjectSample#cutoff=0ns",
+                "+jdk.GCHeapSummary#enabled=true",
+                "+jdk.GCPhasePause#enabled=true"
+            ], text=True).strip(),
+            subprocess.check_output(jcmd_cmd + ["JFR.check"], text=True).strip()
+        )
+    )
+    print("=== JFR.start (settings=none, duration=60s, throttle=20/s) & JFR.check DURING COLLECTOR BATCH ===", flush=True)
+    print(jfr_start_out, flush=True)
+    print(jfr_running_check, flush=True)
+    assert "running" in jfr_running_check and "maxsize=16.0MB" in jfr_running_check, (
+        f"Expected running JFR recording with maxsize=16.0MB: {jfr_running_check}"
+    )
+
+    # Run 1 productive collector batch (batchSize=2, maxTotalProductiveBatches=1, maxTotalNetworkCalls=30) so checkpoint has processedPuuids, pendingCandidatePuuids, cached matches, and disarms at session cap
+    batch_res, cg_step_batch_during_jfr = run_with_10ms_cgroup_sampler(
+        lambda: http_json(
+            f"{base_url}/api/riot/cohorts/euw1/collector/start?patch=16.7&maxBatches=1&batchSize=2&maxTotalProductiveBatches=1&maxTotalNetworkCalls=30&async=false",
+            method="POST",
+            headers=op_headers,
+            timeout=60
+        )
+    )
+
+    # Measure active /tmp repository and output file disk usage while recording is still running
+    active_tmp_disk_out = subprocess.check_output([
+        "docker", "exec", "ss-backend-512m", "sh", "-c",
+        "du -sk /tmp/*_1 /tmp/collector_prof.jfr 2>/dev/null || true; ls -la /tmp/*_1 2>/dev/null || true"
+    ], text=True).strip()
+
+    # Wait for the 60s recording to auto-expire naturally without calling JFR.stop
+    elapsed_jfr = time.monotonic() - t_jfr_start
+    wait_remaining = max(0.0, 62.0 - elapsed_jfr)
+    print(f"Waiting {wait_remaining:.1f}s for duration=60s JFR recording to auto-expire naturally (no JFR.stop)...", flush=True)
+    _, cg_step_auto_expiry_wait = run_with_10ms_cgroup_sampler(
+        lambda: time.sleep(wait_remaining)
+    )
+
+    # Verify via JFR.check that the recording auto-expired and stopped without JFR.stop
+    post_expiry_jfr_check, cg_step_post_expiry_jcmd_check = run_with_10ms_cgroup_sampler(
+        lambda: subprocess.check_output(jcmd_cmd + ["JFR.check"], text=True).strip()
+    )
+    print("=== POST-60s AUTO-EXPIRY JFR.check (NO JFR.stop CALLED) ===", flush=True)
+    print(post_expiry_jfr_check, flush=True)
+    assert "No available recordings" in post_expiry_jfr_check or "(stopped)" in post_expiry_jfr_check, (
+        f"Expected recording to have auto-expired after 60s, got: {post_expiry_jfr_check}"
+    )
+
+    # Measure final file size, repository directory size, and <=8192-byte chunked SHA-256 retrieval without any in-container analysis JVM
+    (disk_and_sha_info, jfr_summary_out, jfr_weighted_stacks_out), cg_step_out_of_cgroup_retrieve_and_analyze = run_with_10ms_cgroup_sampler(
+        lambda: (
+            subprocess.check_output([
+                "docker", "exec", "ss-backend-512m", "sh", "-c",
+                "stat -c '%s %n' /tmp/collector_prof.jfr && sha256sum /tmp/collector_prof.jfr && (du -sk /tmp/*_1 /tmp/collector_prof.jfr 2>/dev/null || true)"
+            ], text=True).strip(),
+            (
+                subprocess.check_call(["docker", "cp", "ss-backend-512m:/tmp/collector_prof.jfr", "/tmp/collector_prof_host.jfr"]),
+                subprocess.check_output(["jfr", "summary", "/tmp/collector_prof_host.jfr"], text=True).strip()
+            )[1],
+            subprocess.check_output([
+                "sh", "-c",
+                """jfr print --events jdk.ObjectAllocationSample --stack-depth 32 /tmp/collector_prof_host.jfr | awk '
+function parse_bytes(val, unit,   v) {
+  v = val + 0.0
+  if (unit == "B" || unit == "bytes") return v
+  if (unit == "kB" || unit == "KB") return v * 1024.0
+  if (unit == "MB" || unit == "MiB") return v * 1048576.0
+  if (unit == "GB" || unit == "GiB") return v * 1073741824.0
+  return v
+}
+/^jdk\\.ObjectAllocationSample \\{/ { in_ev = 1; obj = "unknown"; w_bytes = 0; in_stack = 0; depth = 0; stack_sig = ""; next }
+in_ev && /^  objectClass = / { sub(/^  objectClass = /, "", $0); sub(/ \\(classLoader = .*\\)$/, "", $0); obj = $0; next }
+in_ev && /^  weight = / { w_bytes = parse_bytes($3, $4); next }
+in_ev && /^  stackTrace = \\[/ { in_stack = 1; depth = 0; stack_sig = ""; next }
+in_ev && in_stack {
+  if ($0 ~ /^  \\]/) { in_stack = 0; next }
+  if (depth < 6) { line = $0; sub(/^[[:space:]]+/, "", line); stack_sig = (stack_sig == "" ? line : stack_sig " <- " line); depth++ }
+  next
+}
+in_ev && /^\\}/ {
+  key = obj " | " (stack_sig == "" ? "<no-stack>" : stack_sig)
+  cnt[key] += 1; bytes[key] += w_bytes; total_cnt += 1; total_bytes += w_bytes; in_ev = 0
+}
+END {
+  printf "TOTAL_ALLOC_SAMPLES=%d TOTAL_WEIGHT_MIB=%.2f\\n", total_cnt, total_bytes / 1048576.0
+  for (k in bytes) printf "%10.2f MiB | %5d samples | %s\\n", bytes[k] / 1048576.0, cnt[k], k
+}' | sort -rn | head -n 15"""
+            ], text=True).strip()
+        )
+    )
+    subprocess.check_call(["docker", "exec", "ss-backend-512m", "rm", "-f", "/tmp/collector_prof.jfr"])
+    subprocess.check_call(["rm", "-f", "/tmp/collector_prof_host.jfr", "/tmp/jcmd_bin_only", "/tmp/libattach_only.so"])
+    cg_after_jfr_cleanup = read_host_cgroup_snapshot(host_pid)
+
+    # Parse all nonzero event counts from jfr summary
+    nonzero_events = {}
+    for line in jfr_summary_out.splitlines():
+        m = re.match(r"^\s*(jdk\.[A-Za-z0-9_]+)\s+([0-9]+)\s+([0-9]+)\s*$", line)
+        if m:
+            ev_name, ev_cnt, ev_bytes = m.group(1), int(m.group(2)), int(m.group(3))
+            if ev_cnt > 0:
+                nonzero_events[ev_name] = {"count": ev_cnt, "bytes": ev_bytes}
+
+    print("=== ACTIVE & FINAL /tmp DISK / REPOSITORY MEASUREMENTS ===", flush=True)
+    print("--- During active recording ---", flush=True)
+    print(active_tmp_disk_out, flush=True)
+    print("--- After 60s auto-expiry ---", flush=True)
+    print(disk_and_sha_info, flush=True)
+    print("=== NONZERO EVENTS IN settings=none RECORDING ===", flush=True)
+    print(json.dumps(nonzero_events, indent=2), flush=True)
+    print("--- jfr summary (head 25 lines) ---", flush=True)
+    print("\n".join(jfr_summary_out.splitlines()[:25]), flush=True)
+    print("--- Top weighted ObjectAllocationSample stacks (analyzed outside 512 MiB cgroup) ---", flush=True)
+    print(jfr_weighted_stacks_out, flush=True)
+    print("=== JFR CGROUP MEMORY DELTAS (10ms SAMPLED PEAK & LIFETIME PEAK ACROSS EVERY STEP) ===", flush=True)
+    print(json.dumps({
+        "1_jcmdPreCheckAndConfigure": cg_step_pre_jcmd,
+        "2_jcmdStartAndCheck_settingsNone_60s": cg_step_jfr_start,
+        "3_collectorBatchDuringJfr": cg_step_batch_during_jfr,
+        "4_autoExpiryWaitTo60s": cg_step_auto_expiry_wait,
+        "5_postAutoExpiryJcmdCheck": cg_step_post_expiry_jcmd_check,
+        "6_outOfCgroupRetrieveAndAnalyze": cg_step_out_of_cgroup_retrieve_and_analyze,
+        "7_afterRmCleanup": {"currentMiB": cg_after_jfr_cleanup["cgroupCurrentMiB"], "lifetimeCgroupPeakMiB": cg_after_jfr_cleanup["cgroupPeakMiB"]}
+    }, indent=2), flush=True)
+    allowed_nonzero = {
+        "jdk.ObjectAllocationSample",
+        "jdk.OldObjectSample",
+        "jdk.GCHeapSummary",
+        "jdk.GCPhasePause",
+        "jdk.Checkpoint",
+        "jdk.CheckPoint",
+        "jdk.Metadata"
+    }
+    unexpected_nonzero = set(nonzero_events.keys()) - allowed_nonzero
+    assert not unexpected_nonzero, f"Unexpected nonzero events under settings=none: {unexpected_nonzero}"
+    assert nonzero_events.get("jdk.ObjectAllocationSample", {}).get("count", 0) > 0, (
+        f"Expected jdk.ObjectAllocationSample count > 0 under settings=none, got: {nonzero_events}"
+    )
+    for disabled_ev in (
+        "jdk.InitialEnvironmentVariable",
+        "jdk.InitialSystemProperty",
+        "jdk.SystemProcess",
+        "jdk.JVMInformation",
+        "jdk.OSInformation",
+        "jdk.InitialSecurityProperty",
+        "jdk.NativeLibrary",
+        "jdk.BooleanFlag",
+        "jdk.StringFlag"
+    ):
+        assert disabled_ev not in nonzero_events, f"Expected {disabled_ev} count to be 0, got {nonzero_events.get(disabled_ev)}"
+
     print("=== 1-BATCH COLLECTOR RUNNER RESULT ===", flush=True)
     print(json.dumps({
         "productiveBatchesCompleted": batch_res.get("productiveBatchesCompleted"),
