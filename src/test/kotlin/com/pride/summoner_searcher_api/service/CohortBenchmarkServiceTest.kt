@@ -2961,7 +2961,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                     gameMode = "CLASSIC",
                     gameVersion = "16.22.615.9999",
                     participants = listOf(
-                        buildParticipant(puuid = "legacy-p1", role = "MID", laneCs10 = 76, totalMinions = 195, neutralMinions = 4)
+                        buildParticipant(puuid = "legacy-p1", role = "MIDDLE", laneCs10 = 76, totalMinions = 195, neutralMinions = 4)
                     )
                 )
             )
@@ -2992,12 +2992,12 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 groundedDuringOutage shouldBe "16.22"
 
                 // First collector batch advances from legacy 16.21 checkpoint to 16.22, resets stale 7/30 passing count to 0/30,
-                // processes legacy-p1 into GOLD:MID (a 15th cell on 16.22), and preserves all 14 existing 16.22 cells!
+                // processes legacy-p1 into GOLD:MIDDLE (a 15th cell on 16.22), and preserves all 14 existing 16.22 cells!
                 cpAfterLegacyAdvance.targetPatch shouldBe "16.22"
                 cpAfterLegacyAdvance.cellsPassingQualityGate shouldBe 0
                 cpAfterLegacyAdvance.processedPuuids shouldBe setOf("legacy-p1")
                 cpAfterLegacyAdvance.pendingCandidatePuuids shouldBe listOf("legacy-p2")
-                pgSampleStates.containsKey("euw1:16.22:420:GOLD:MID") shouldBe true
+                pgSampleStates.containsKey("euw1:16.22:420:GOLD:MIDDLE") shouldBe true
                 cellsAfterFirstBatch shouldHaveSize 15
             }
         }
