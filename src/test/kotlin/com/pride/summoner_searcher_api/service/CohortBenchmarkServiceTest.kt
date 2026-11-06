@@ -3046,7 +3046,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
 
             val serviceWithSeparateClients = RiotApiService(
                 riotRestClient = authenticatedRiotRestClient,
-                rateLimiter = RiotApiRateLimiter(),
+                rateLimiter = RiotApiRateLimiter(SystemTimeProvider()),
                 dataDragonRestClient = unauthenticatedDdragonRestClient
             )
             val versions = serviceWithSeparateClients.fetchDataDragonVersions(maxEntries = 2)
@@ -3065,7 +3065,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 .build()
             val defenseInDepthService = RiotApiService(
                 riotRestClient = authenticatedRiotRestClient,
-                rateLimiter = RiotApiRateLimiter(),
+                rateLimiter = RiotApiRateLimiter(SystemTimeProvider()),
                 dataDragonRestClient = clientWithDefaultToken
             )
             val defenseVersions = defenseInDepthService.fetchDataDragonVersions(maxEntries = 1)
