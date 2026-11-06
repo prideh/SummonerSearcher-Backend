@@ -2,9 +2,9 @@ name: Backend CI
 
 on:
   push:
-    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates, feat/collector-session-memory-series ]
+    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates, feat/collector-session-memory-series, fix/collector-checkpoint-single-encode ]
   pull_request:
-    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates ]
+    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates, feat/collector-session-memory-series ]
 
 jobs:
   backend-tests:
@@ -22,7 +22,7 @@ jobs:
     - name: Run shared preflight (compileKotlin compileTestKotlin + full test)
       run: ./scripts/preflight.sh
     - name: Run Real 512 MB Container Proof on Exact Repo Dockerfile (--memory=512m --memory-swap=512m) [Strict <78% Gate]
-      if: github.ref == 'refs/heads/feat/collector-session-memory-series' || github.ref == 'refs/heads/feat/durable-cohort-cell-aggregates' || github.ref == 'refs/heads/fix/collector-session-hard-cap' || github.ref == 'refs/heads/mem/candidate-512m'
+      if: github.ref == 'refs/heads/fix/collector-checkpoint-single-encode' || github.ref == 'refs/heads/feat/collector-session-memory-series' || github.ref == 'refs/heads/feat/durable-cohort-cell-aggregates' || github.ref == 'refs/heads/fix/collector-session-hard-cap' || github.ref == 'refs/heads/mem/candidate-512m'
       run: |
         docker run -d --name ss-postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=summoner_searcher postgres:16-alpine
         docker run -d --name ss-redis -p 6379:6379 redis:7-alpine
