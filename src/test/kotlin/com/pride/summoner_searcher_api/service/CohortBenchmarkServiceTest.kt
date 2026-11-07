@@ -4906,6 +4906,11 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 unseededNoLatestFallbackResp.sessionNetworkCallsMade shouldBe 42
                 unseededNoLatestFallbackResp.overnightSessionArmed shouldBe false
 
+                seededAdmissionThrown.message shouldBe "simulated-ddragon-redis-failure"
+                lockReleasedAfterSeededAdmissionException shouldBe true
+                runningResetAfterSeededAdmissionException shouldBe true
+                unseededMemPausedCheckpoint.lastStopReason shouldBe "PAUSED_MEMORY_HEADROOM"
+
                 lockedResp.action shouldBe "LOCKED_BY_ANOTHER_INSTANCE"
 
                 // Attempt 1 paused with 500 queue entries (fresh-challenger-seed + 499 existing tail, zero tail loss)

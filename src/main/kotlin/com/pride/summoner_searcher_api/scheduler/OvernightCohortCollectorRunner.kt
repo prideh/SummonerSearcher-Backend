@@ -314,36 +314,41 @@ class OvernightCohortCollectorRunner(
             throw e
         }
         if (cleanSeedPuuids.isNotEmpty()) {
-            val checkpointForSeedCap = existingCheckpoint
-                ?: if (cleanPatch != null) {
-                    try {
+            val checkpointForSeedCap = try {
+                val baseCheckpoint = existingCheckpoint
+                    ?: if (cleanPatch != null) {
                         cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, null)
-                    } catch (e: Exception) {
-                        cohortBenchmarkService.releaseCollectorProcessLock(normalizedRegion)
-                        running.set(false)
-                        throw e
+                    } else {
+                        null
                     }
-                } else {
-                    null
-                }
-            val stalePatchAdvance = cohortBenchmarkService.isCheckpointStalePatchAdvance(
-                region = normalizedRegion,
-                existingCheckpoint = checkpointForSeedCap,
-                requestedPatch = cleanPatch
-            )
-            if (cohortBenchmarkService.wouldExceedPendingQueueCap(
-                    existingCheckpoint = checkpointForSeedCap,
-                    seedPuuids = cleanSeedPuuids,
-                    checkpointStalePatchAdvance = stalePatchAdvance
+                val stalePatchAdvance = cohortBenchmarkService.isCheckpointStalePatchAdvance(
+                    region = normalizedRegion,
+                    existingCheckpoint = baseCheckpoint,
+                    requestedPatch = cleanPatch
                 )
-            ) {
+                if (cohortBenchmarkService.wouldExceedPendingQueueCap(
+                        existingCheckpoint = baseCheckpoint,
+                        seedPuuids = cleanSeedPuuids,
+                        checkpointStalePatchAdvance = stalePatchAdvance
+                    )
+                ) {
+                    baseCheckpoint to true
+                } else {
+                    baseCheckpoint to false
+                }
+            } catch (e: Exception) {
+                cohortBenchmarkService.releaseCollectorProcessLock(normalizedRegion)
+                running.set(false)
+                throw e
+            }
+            if (checkpointForSeedCap.second) {
                 cohortBenchmarkService.releaseCollectorProcessLock(normalizedRegion)
                 running.set(false)
                 return buildInvalidParamStatus(
                     region = normalizedRegion,
-                    targetPatch = cleanPatch ?: checkpointForSeedCap?.targetPatch,
+                    targetPatch = cleanPatch ?: checkpointForSeedCap.first?.targetPatch,
                     note = "Explicit seedPuuid list would exceed pending queue cap (${CohortBenchmarkService.MAX_CHECKPOINT_PENDING_PUUIDS}); refusing before mutation.",
-                    checkpoint = checkpointForSeedCap
+                    checkpoint = checkpointForSeedCap.first
                 )
             }
         }

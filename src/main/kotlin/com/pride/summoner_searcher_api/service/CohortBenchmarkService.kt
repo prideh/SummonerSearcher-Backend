@@ -1732,17 +1732,17 @@ class CohortBenchmarkService(
         }
         val existingCheckpoint = getCollectorCheckpoint(normalizedRegion, cleanRequestedPatch)
             ?: if (cleanRequestedPatch != null) getCollectorCheckpoint(normalizedRegion, null) else null
-        val preScanStalePatchAdvance = isCheckpointStalePatchAdvance(
-            region = normalizedRegion,
-            existingCheckpoint = existingCheckpoint,
-            requestedPatch = cleanRequestedPatch
-        )
-        if (seedPuuids.isNotEmpty() &&
-            wouldExceedPendingQueueCap(existingCheckpoint, seedPuuids, preScanStalePatchAdvance)
-        ) {
-            throw IllegalArgumentException(
-                "Explicit seedPuuid list would exceed pending queue cap ($MAX_CHECKPOINT_PENDING_PUUIDS); refusing before mutation."
+        if (seedPuuids.isNotEmpty()) {
+            val preScanStalePatchAdvance = isCheckpointStalePatchAdvance(
+                region = normalizedRegion,
+                existingCheckpoint = existingCheckpoint,
+                requestedPatch = cleanRequestedPatch
             )
+            if (wouldExceedPendingQueueCap(existingCheckpoint, seedPuuids, preScanStalePatchAdvance)) {
+                throw IllegalArgumentException(
+                    "Explicit seedPuuid list would exceed pending queue cap ($MAX_CHECKPOINT_PENDING_PUUIDS); refusing before mutation."
+                )
+            }
         }
 
         // Pre-scan memory safety check: if memory is near the 512MB cap, yield BEFORE scanning Redis or making network calls!
