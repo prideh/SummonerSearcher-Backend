@@ -417,3 +417,23 @@ data class CohortExtractionReportDto(
     val methodologyNotes: List<String>
 )
 
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class CohortCachedPlayerIngestionResultDto(
+    val region: String,
+    val targetPatch: String?,
+    val status: String,
+    val playerHash: String? = null,
+    val tier: String? = null,
+    val inspectedMatchIdsCount: Int = 0,
+    val qualifiedSamplesExtracted: Int = 0,
+    val netNewSamplesPersisted: Int = 0,
+    val updatedCells: List<CohortBenchmarkCellDto> = emptyList(),
+    val excludedWrongPatchMatches: Int = 0,
+    val excludedStaleOrSkewMatches: Int = 0,
+    val excludedNonSoloOrRemakeMatches: Int = 0,
+    val excludedIneligibleRoleMatches: Int = 0,
+    val missingOrUncachedMatches: Int = 0,
+    val memoryHeadroom: MemoryHeadroomSnapshotDto? = null,
+    val notes: List<String> = emptyList()
+)
+

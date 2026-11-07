@@ -3455,8 +3455,490 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 verify(atLeast = 4) { scalarCellRepo.findDistinctPatchesByRegionWithEligibleGames("euw1") }
             }
         }
+
+        When("ingesting a single cached player by exact match IDs with fail-closed transaction guards, divergent memory refusal, and full-RMW gate serialization") {
+            val nowMs = 1_760_000_000_000L
+            val nowInst = Instant.ofEpochMilli(nowMs)
+            val timeProvider = object : TimeProvider {
+                override fun now(): Long = nowMs
+            }
+
+            val exactRedis = mockk<RedisCacheService>(relaxed = true)
+            val exactCellRepo = mockk<CohortBenchmarkCellRepository>(relaxed = true)
+            val exactSampleRepo = mockk<com.pride.summoner_searcher_api.repository.CohortCellSampleStateRepository>(relaxed = true)
+            val exactCheckpointRepo = mockk<CohortCollectorCheckpointRepository>(relaxed = true)
+            val exactRiotApi = mockk<RiotApiService>(relaxed = true)
+            val exactLimiter = RiotApiRateLimiter(timeProvider)
+
+            val savedSampleEntities = LinkedHashMap<String, com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity>()
+            val savedBenchmarkEntities = LinkedHashMap<String, CohortBenchmarkCellEntity>()
+            val redisMap = LinkedHashMap<String, Any>()
+            val activeRedisLocks = LinkedHashMap<String, String>()
+
+            every { exactRedis.get(any(), any<Class<Any>>()) } answers {
+                val key = firstArg<String>()
+                val clazz = secondArg<Class<Any>>()
+                val lockVal = activeRedisLocks[key]
+                if (clazz == String::class.java && lockVal != null) {
+                    lockVal
+                } else {
+                    val v = redisMap[key]
+                    if (v != null && clazz.isInstance(v)) v else null
+                }
+            }
+            every { exactRedis.set(any(), any<Any>(), any()) } answers {
+                redisMap[firstArg<String>()] = secondArg<Any>()
+            }
+            every { exactRedis.setIfAbsent(any(), any(), any()) } answers {
+                val key = firstArg<String>()
+                val value = secondArg<Any>().toString()
+                if (activeRedisLocks.containsKey(key)) {
+                    false
+                } else {
+                    activeRedisLocks[key] = value
+                    true
+                }
+            }
+            every { exactRedis.delete(any()) } answers {
+                val key = firstArg<String>()
+                activeRedisLocks.remove(key)
+                redisMap.remove(key)
+            }
+            every { exactRiotApi.fetchDataDragonVersions(any()) } returns listOf("16.22.1")
+
+            every {
+                exactSampleRepo.findByRegionAndPatchAndQueueIdAndTierAndRole(any(), any(), any(), any(), any())
+            } answers {
+                val r = arg<String>(0)
+                val p = arg<String>(1)
+                val q = arg<Int>(2)
+                val t = arg<String>(3)
+                val role = arg<String>(4)
+                savedSampleEntities["$r:$p:$q:$t:$role"]
+            }
+            every { exactSampleRepo.save(any()) } answers {
+                val ent = firstArg<com.pride.summoner_searcher_api.model.CohortCellSampleStateEntity>()
+                savedSampleEntities["${ent.region}:${ent.patch}:${ent.queueId}:${ent.tier}:${ent.role}"] = ent
+                ent
+            }
+            every {
+                exactCellRepo.findByRegionAndPatchAndQueueIdAndTierAndRole(any(), any(), any(), any(), any())
+            } answers {
+                val r = arg<String>(0)
+                val p = arg<String>(1)
+                val q = arg<Int>(2)
+                val t = arg<String>(3)
+                val role = arg<String>(4)
+                savedBenchmarkEntities["$r:$p:$q:$t:$role"]
+            }
+            every {
+                exactCellRepo.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(any(), any(), any())
+            } answers {
+                val r = arg<String>(0)
+                val p = arg<String>(1)
+                val q = arg<Int>(2)
+                savedBenchmarkEntities.values.filter { it.region == r && it.patch == p && it.queueId == q }
+            }
+            every { exactCellRepo.save(any()) } answers {
+                val ent = firstArg<CohortBenchmarkCellEntity>()
+                savedBenchmarkEntities["${ent.region}:${ent.patch}:${ent.queueId}:${ent.tier}:${ent.role}"] = ent
+                ent
+            }
+
+            // No-op in-memory PlatformTransactionManager for unit tests (real H2 rollback is tested in CohortPatchMetadataSqlShapeTest)
+            val unitTxManager = object : org.springframework.transaction.support.AbstractPlatformTransactionManager() {
+                override fun doGetTransaction(): Any = Any()
+                override fun doBegin(transaction: Any, definition: org.springframework.transaction.TransactionDefinition) {}
+                override fun doCommit(status: org.springframework.transaction.support.DefaultTransactionStatus) {}
+                override fun doRollback(status: org.springframework.transaction.support.DefaultTransactionStatus) {}
+            }
+            val validTxTemplate = org.springframework.transaction.support.TransactionTemplate(unitTxManager)
+
+            val selectedPuuid = "cached-challenger-top-1"
+            val coParticipantPuuid = "co-participant-must-not-be-ingested"
+
+            // Cache fresh profile with Solo Queue CHALLENGER rank and 12 match IDs (to test <= 10 bound)
+            val all12MatchIds = (1..12).map { "EUW1_EXACT_$it" }
+            redisMap["player:profile:euw1:$selectedPuuid"] = SummonerProfileDto(
+                puuid = selectedPuuid,
+                gameName = "SpearTest",
+                tagLine = "EUW",
+                summonerLevel = 500,
+                profileIconId = 1,
+                soloQueueRank = LeagueEntryDto(
+                    puuid = selectedPuuid,
+                    leaguePoints = 1250,
+                    rank = "I",
+                    wins = 200,
+                    losses = 150,
+                    veteran = true,
+                    inactive = false,
+                    freshBlood = false,
+                    hotStreak = false,
+                    leagueId = "c-1",
+                    queueType = "RANKED_SOLO_5x5",
+                    tier = "CHALLENGER",
+                    summonerName = null
+                ),
+                recentMatches = emptyList(),
+                allMatchIds = all12MatchIds,
+                lastRefreshed = nowInst.minusSeconds(300)
+            )
+            // Also cache a rank snapshot for the co-participant to prove co-participant is NEVER looked up or folded
+            redisMap["cohort:rank:snapshot:euw1:$coParticipantPuuid"] = CohortRankSnapshotDto(
+                puuid = coParticipantPuuid,
+                region = "euw1",
+                tier = "GOLD",
+                rank = "I",
+                leaguePoints = 50,
+                queueType = "RANKED_SOLO_5x5",
+                snapshotAt = nowInst.minusSeconds(300)
+            )
+
+            // Match 1: Qualified Ranked Solo (420) on patch 16.22, role TOP for selectedPuuid + MIDDLE for coParticipantPuuid
+            redisMap["match:euw1:EUW1_EXACT_1"] = MatchDto(
+                metadata = MatchMetadata("EUW1_EXACT_1", listOf(selectedPuuid, coParticipantPuuid)),
+                info = MatchInfo(
+                    gameCreation = nowMs - 3_600_000L,
+                    gameDuration = 1800L,
+                    gameId = 1001L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.22.615.1000",
+                    participants = listOf(
+                        buildParticipant(puuid = selectedPuuid, role = "TOP", laneCs10 = 86, totalMinions = 230, neutralMinions = 8),
+                        buildParticipant(puuid = coParticipantPuuid, role = "MIDDLE", laneCs10 = 78, totalMinions = 200, neutralMinions = 4)
+                    )
+                )
+            )
+            // Match 2: Wrong patch (16.21) -> excludedWrongPatchMatches
+            redisMap["match:euw1:EUW1_EXACT_2"] = MatchDto(
+                metadata = MatchMetadata("EUW1_EXACT_2", listOf(selectedPuuid)),
+                info = MatchInfo(
+                    gameCreation = nowMs - 7_200_000L,
+                    gameDuration = 1800L,
+                    gameId = 1002L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.21.610.1000",
+                    participants = listOf(
+                        buildParticipant(puuid = selectedPuuid, role = "TOP", laneCs10 = 80, totalMinions = 210, neutralMinions = 4)
+                    )
+                )
+            )
+            // Match 3: Stale / skew (> 7 days before rank snapshot) -> excludedStaleOrSkewMatches
+            redisMap["match:euw1:EUW1_EXACT_3"] = MatchDto(
+                metadata = MatchMetadata("EUW1_EXACT_3", listOf(selectedPuuid)),
+                info = MatchInfo(
+                    gameCreation = nowMs - 9L * 24L * 3_600_000L,
+                    gameDuration = 1800L,
+                    gameId = 1003L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.22.615.1000",
+                    participants = listOf(
+                        buildParticipant(puuid = selectedPuuid, role = "TOP", laneCs10 = 82, totalMinions = 215, neutralMinions = 4)
+                    )
+                )
+            )
+            // Match 4: Remake (< 600s) -> excludedNonSoloOrRemakeMatches
+            redisMap["match:euw1:EUW1_EXACT_4"] = MatchDto(
+                metadata = MatchMetadata("EUW1_EXACT_4", listOf(selectedPuuid)),
+                info = MatchInfo(
+                    gameCreation = nowMs - 5_000_000L,
+                    gameDuration = 180L,
+                    gameId = 1004L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.22.615.1000",
+                    participants = listOf(
+                        buildParticipant(puuid = selectedPuuid, role = "TOP", laneCs10 = 20, totalMinions = 20, neutralMinions = 0)
+                    )
+                )
+            )
+            // Match 5: Ineligible role (JUNGLE) -> excludedIneligibleRoleMatches
+            redisMap["match:euw1:EUW1_EXACT_5"] = MatchDto(
+                metadata = MatchMetadata("EUW1_EXACT_5", listOf(selectedPuuid)),
+                info = MatchInfo(
+                    gameCreation = nowMs - 6_000_000L,
+                    gameDuration = 1800L,
+                    gameId = 1005L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.22.615.1000",
+                    participants = listOf(
+                        buildParticipant(puuid = selectedPuuid, role = "JUNGLE", laneCs10 = 10, totalMinions = 30, neutralMinions = 160)
+                    )
+                )
+            )
+            // Matches 6..10 are uncached in Redis -> missingOrUncachedMatches = 5
+            // Match 11 is valid on patch 16.22, but beyond the 10-match bound so it MUST NOT be inspected when taking top 10 from profile!
+            redisMap["match:euw1:EUW1_EXACT_11"] = MatchDto(
+                metadata = MatchMetadata("EUW1_EXACT_11", listOf(selectedPuuid)),
+                info = MatchInfo(
+                    gameCreation = nowMs - 8_000_000L,
+                    gameDuration = 1800L,
+                    gameId = 1011L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.22.615.1000",
+                    participants = listOf(
+                        buildParticipant(puuid = selectedPuuid, role = "TOP", laneCs10 = 90, totalMinions = 250, neutralMinions = 8)
+                    )
+                )
+            )
+
+            // 1. Fail-closed test when CohortCellSampleStateRepository is unwired (null)
+            val serviceUnwiredRepo = CohortBenchmarkService(
+                redisCacheService = exactRedis,
+                cohortBenchmarkCellRepository = exactCellRepo,
+                riotApiRateLimiter = exactLimiter,
+                riotApiService = exactRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = timeProvider,
+                cohortCollectorCheckpointRepository = exactCheckpointRepo,
+                cohortCellSampleStateRepository = null,
+                transactionTemplate = validTxTemplate
+            )
+            val unwiredRepoResult = serviceUnwiredRepo.ingestCachedPlayerByExactIds(
+                region = "euw1",
+                puuid = selectedPuuid,
+                targetPatch = "16.22"
+            )
+
+            // 2. Fail-closed test when TransactionTemplate is null or has null PlatformTransactionManager
+            val serviceMissingTx = CohortBenchmarkService(
+                redisCacheService = exactRedis,
+                cohortBenchmarkCellRepository = exactCellRepo,
+                riotApiRateLimiter = exactLimiter,
+                riotApiService = exactRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = timeProvider,
+                cohortCollectorCheckpointRepository = exactCheckpointRepo,
+                cohortCellSampleStateRepository = exactSampleRepo,
+                transactionTemplate = null
+            )
+            val missingTxResult = serviceMissingTx.ingestCachedPlayerByExactIds(
+                region = "euw1",
+                puuid = selectedPuuid,
+                targetPatch = "16.22"
+            )
+            val serviceEmptyTxTemplate = CohortBenchmarkService(
+                redisCacheService = exactRedis,
+                cohortBenchmarkCellRepository = exactCellRepo,
+                riotApiRateLimiter = exactLimiter,
+                riotApiService = exactRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = timeProvider,
+                cohortCollectorCheckpointRepository = exactCheckpointRepo,
+                cohortCellSampleStateRepository = exactSampleRepo,
+                transactionTemplate = org.springframework.transaction.support.TransactionTemplate()
+            )
+            val emptyTxManagerResult = serviceEmptyTxTemplate.ingestCachedPlayerByExactIds(
+                region = "euw1",
+                puuid = selectedPuuid,
+                targetPatch = "16.22"
+            )
+
+            // 3. Properly wired service: test divergent unsaved in-memory state refusal first
+            val wiredService = CohortBenchmarkService(
+                redisCacheService = exactRedis,
+                cohortBenchmarkCellRepository = exactCellRepo,
+                riotApiRateLimiter = exactLimiter,
+                riotApiService = exactRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = timeProvider,
+                cohortCollectorCheckpointRepository = exactCheckpointRepo,
+                cohortCellSampleStateRepository = exactSampleRepo,
+                transactionTemplate = validTxTemplate
+            )
+            val divergentState = CohortBenchmarkService.DurableCellSampleStateDto(
+                region = "euw1",
+                patch = "16.22",
+                queueId = 420,
+                tier = "CHALLENGER",
+                role = "TOP",
+                maxGamesPerPlayerCap = 10,
+                samplesByPlayerHash = mapOf(
+                    "unsavedplayerhash" to listOf(
+                        CohortBenchmarkService.DeidentifiedMetricSampleDto(
+                            matchIdHash = "unsavedmatchhash",
+                            playerHash = "unsavedplayerhash",
+                            gameCreation = nowMs - 1000L,
+                            rankSnapshotEpochMilli = nowMs - 2000L,
+                            laneCsAt10 = 91.0
+                        )
+                    )
+                ),
+                updatedAtEpochMilli = nowMs
+            )
+            wiredService.putInMemoryDurableCellStateForTest(divergentState)
+            val divergentRefusedResult = wiredService.ingestCachedPlayerByExactIds(
+                region = "euw1",
+                puuid = selectedPuuid,
+                targetPatch = "16.22"
+            )
+
+            // Clear divergent state by creating a fresh wired service and run happy-path ingestion (using top 10 from profile)
+            val cleanWiredService = CohortBenchmarkService(
+                redisCacheService = exactRedis,
+                cohortBenchmarkCellRepository = exactCellRepo,
+                riotApiRateLimiter = exactLimiter,
+                riotApiService = exactRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = timeProvider,
+                cohortCollectorCheckpointRepository = exactCheckpointRepo,
+                cohortCellSampleStateRepository = exactSampleRepo,
+                transactionTemplate = validTxTemplate
+            )
+            clearMocks(exactRiotApi, answers = false)
+            every { exactRiotApi.fetchDataDragonVersions(any()) } returns listOf("16.22.1")
+
+            val firstIngestResult = cleanWiredService.ingestCachedPlayerByExactIds(
+                region = "euw1",
+                puuid = selectedPuuid,
+                targetPatch = "16.22"
+            )
+
+            // 4. Repeat call with same cached match -> deduplicated (NO_NEW_ELIGIBLE_SAMPLES, 0 additional DB writes)
+            val repeatIngestResult = cleanWiredService.ingestCachedPlayerByExactIds(
+                region = "euw1",
+                puuid = selectedPuuid,
+                targetPatch = "16.22"
+            )
+
+            // 5. Exclusive gate & nested getPersistedCohortCells / getPublicCohortReport contention test:
+            //    Remove benchmark Redis cache so getPersistedCohortCells enters cache-miss path while regionWriteGate is held
+            redisMap.remove("cohort:benchmarks:euw1:16.22")
+            redisMap.remove("cohort:report:euw1:16.22")
+            cleanWiredService.tryAcquireRegionWriteGate("euw1") shouldBe true
+            val ingestWhileGateHeld = cleanWiredService.ingestCachedPlayerByExactIds(
+                region = "euw1",
+                puuid = selectedPuuid,
+                targetPatch = "16.22"
+            )
+            val reportWhileGateHeld = cleanWiredService.getPublicCohortReport("euw1", "16.22")
+            val persistedCellsWhileGateHeld = cleanWiredService.getPersistedCohortCells("euw1", "16.22")
+            cleanWiredService.releaseRegionWriteGate("euw1")
+
+            // 6. Controller POST-only endpoint & operator auth verification
+            val runner = com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner(
+                cohortBenchmarkService = cleanWiredService,
+                configuredOperatorToken = "secret-ingest-token",
+                timeProvider = timeProvider
+            )
+            val controller = com.pride.summoner_searcher_api.controller.RiotApiController(
+                riotApiService = exactRiotApi,
+                challengerLeagueService = mockk(relaxed = true),
+                userService = mockk(relaxed = true),
+                summonerProfileService = mockk(relaxed = true),
+                redisCacheService = exactRedis,
+                cohortBenchmarkService = cleanWiredService,
+                overnightCohortCollectorRunner = runner
+            )
+            val request = org.springframework.mock.web.MockHttpServletRequest().apply {
+                remoteAddr = "203.0.113.50"
+            }
+            val forbiddenControllerResp = controller.ingestCachedPlayerForCohort(
+                region = "euw1",
+                puuid = selectedPuuid,
+                patch = "16.22",
+                operatorToken = "wrong-token",
+                httpRequest = request
+            )
+            val authorizedControllerResp = controller.ingestCachedPlayerForCohort(
+                region = "euw1",
+                puuid = selectedPuuid,
+                patch = "16.22",
+                matchIds = listOf("EUW1_EXACT_11"),
+                operatorToken = "secret-ingest-token",
+                httpRequest = request
+            )
+            val ingestEndpointMethod = com.pride.summoner_searcher_api.controller.RiotApiController::class.java.methods
+                .single { it.name == "ingestCachedPlayerForCohort" }
+            val postMappingAnn = ingestEndpointMethod.getAnnotation(org.springframework.web.bind.annotation.PostMapping::class.java)
+            val reqMappingAnn = ingestEndpointMethod.getAnnotation(org.springframework.web.bind.annotation.RequestMapping::class.java)
+
+            Then("it should fail closed without TransactionTemplate/repo, refuse divergent unsaved in-memory state, bound inspection to <=10 own matches with 0 Riot/SCAN/checkpoint calls, serialize full RMW intervals without false empty reports, and enforce POST operator auth") {
+                unwiredRepoResult.status shouldBe "SAMPLE_STATE_REPOSITORY_UNWIRED"
+                unwiredRepoResult.netNewSamplesPersisted shouldBe 0
+                missingTxResult.status shouldBe "TRANSACTION_MANAGER_REQUIRED"
+                missingTxResult.netNewSamplesPersisted shouldBe 0
+                emptyTxManagerResult.status shouldBe "TRANSACTION_MANAGER_REQUIRED"
+                emptyTxManagerResult.netNewSamplesPersisted shouldBe 0
+
+                divergentRefusedResult.status shouldBe "REFUSED_DIVERGENT_IN_MEMORY_CELL_STATE"
+                divergentRefusedResult.netNewSamplesPersisted shouldBe 0
+                savedSampleEntities.isEmpty() shouldBe true
+                savedBenchmarkEntities.isEmpty() shouldBe true
+
+                firstIngestResult.status shouldBe "COMPLETED"
+                firstIngestResult.tier shouldBe "CHALLENGER"
+                firstIngestResult.inspectedMatchIdsCount shouldBe 10 // capped at 10 despite 12 in profile.allMatchIds
+                firstIngestResult.qualifiedSamplesExtracted shouldBe 1
+                firstIngestResult.netNewSamplesPersisted shouldBe 1
+                firstIngestResult.excludedWrongPatchMatches shouldBe 1
+                firstIngestResult.excludedStaleOrSkewMatches shouldBe 1
+                firstIngestResult.excludedNonSoloOrRemakeMatches shouldBe 1
+                firstIngestResult.excludedIneligibleRoleMatches shouldBe 1
+                firstIngestResult.missingOrUncachedMatches shouldBe 5
+                firstIngestResult.updatedCells.size shouldBe 1
+                firstIngestResult.updatedCells.single().tier shouldBe "CHALLENGER"
+                firstIngestResult.updatedCells.single().role shouldBe "TOP"
+                firstIngestResult.updatedCells.single().eligibleGames shouldBe 1
+                firstIngestResult.updatedCells.single().distinctPlayers shouldBe 1
+                // De-identified playerHash: never contains raw PUUID
+                firstIngestResult.playerHash shouldNotBe null
+                firstIngestResult.playerHash!!.contains(selectedPuuid) shouldBe false
+                // Co-participant (GOLD:MIDDLE) was NOT ingested
+                savedSampleEntities.keys shouldBe setOf("euw1:16.22:420:CHALLENGER:TOP")
+                savedBenchmarkEntities.keys shouldBe setOf("euw1:16.22:420:CHALLENGER:TOP")
+                // Because inMemoryDurableCellStates did not contain CHALLENGER:TOP before firstIngestResult, it remains unpopulated
+                cleanWiredService.getInMemoryDurableCellStateForTest("euw1", "16.22", "CHALLENGER", "TOP") shouldBe null
+
+                // Repeat call deduplicates with 0 new DB writes
+                repeatIngestResult.status shouldBe "NO_NEW_ELIGIBLE_SAMPLES"
+                repeatIngestResult.netNewSamplesPersisted shouldBe 0
+                cleanWiredService.getDurableDbWriteCounts()["cohortCellSampleStatesWrites"] shouldBe 1L
+                cleanWiredService.getDurableDbWriteCounts()["cohortBenchmarkCellsWrites"] shouldBe 1L
+                cleanWiredService.getDurableDbWriteCounts()["cohortCollectorCheckpointsWrites"] shouldBe 0L
+
+                // Exclusive gate contention: refuses concurrent ingest, serves non-empty persisted cells on report & getPersistedCohortCells
+                ingestWhileGateHeld.status shouldBe "LOCKED_BY_ACTIVE_WRITER"
+                reportWhileGateHeld.reportSource shouldBe "GUARDED_COOLDOWN_FALLBACK"
+                reportWhileGateHeld.cells.size shouldBe 1
+                reportWhileGateHeld.cells.single().eligibleGames shouldBe 1
+                persistedCellsWhileGateHeld.size shouldBe 1
+                persistedCellsWhileGateHeld.single().eligibleGames shouldBe 1
+
+                // Controller POST-only & operator auth
+                postMappingAnn shouldNotBe null
+                reqMappingAnn shouldBe null
+                forbiddenControllerResp.statusCode shouldBe org.springframework.http.HttpStatus.FORBIDDEN
+                authorizedControllerResp.statusCode shouldBe org.springframework.http.HttpStatus.OK
+                authorizedControllerResp.body!!.status shouldBe "COMPLETED"
+                authorizedControllerResp.body!!.netNewSamplesPersisted shouldBe 1
+                authorizedControllerResp.body!!.updatedCells.single().eligibleGames shouldBe 2
+                // Runner session was NOT armed or started by /ingest-cached
+                runner.getStatus("euw1", "16.22").overnightSessionArmed shouldBe false
+                runner.getStatus("euw1", "16.22").runningInProcess shouldBe false
+
+                // Zero Riot low-priority/foreground calls, zero Redis SCANs, zero checkpoint saves
+                verify(exactly = 0) { exactRedis.scanKeys(any(), any(), any()) }
+                verify(exactly = 0) { exactCheckpointRepo.save(any()) }
+                coVerify(exactly = 0) { exactRiotApi.fetchLeagueRankLowPriority(any(), any(), any(), any(), any()) }
+                coVerify(exactly = 0) { exactRiotApi.getMatchIdsByPuuidLowPriority(any(), any(), any(), any(), any(), any(), any(), any()) }
+                coVerify(exactly = 0) { exactRiotApi.getMatchByIdLowPriority(any(), any(), any(), any(), any()) }
+            }
+        }
     }
 })
+
 
 
 
