@@ -44,6 +44,7 @@ import http.server
 import json
 import math
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -1073,6 +1074,15 @@ def expire_profile_cooldown(puuid: str):
         )
 
 
+SECRET_REDACT_PATTERNS = (
+    re.compile(r"RGAPI-[0-9a-fA-F-]{16,}"),
+    re.compile(r"\bre_[0-9a-zA-Z_]{16,}\b"),
+    re.compile(r"\bgh[pousr]_[0-9a-zA-Z]{20,}\b"),
+    re.compile(r"\bgithub_pat_[0-9a-zA-Z_]{20,}\b"),
+    re.compile(r"(?i)((?:db_pass|postgres_password|jwt_secret_key|twofa_secret_key|cohort_operator_token|riot_api_key|resend_api_key)\s*[=:]\s*)(?!\[REDACTED\])\S+"),
+)
+
+
 def sanitize_text(text: str) -> str:
     forbidden_secrets = (
         EPHEMERAL_DB_PASS,
@@ -1086,7 +1096,98 @@ def sanitize_text(text: str) -> str:
     for tok in forbidden_secrets:
         if tok:
             out = out.replace(tok, "[REDACTED]")
+    for pat in SECRET_REDACT_PATTERNS[:4]:
+        out = pat.sub("[REDACTED]", out)
+    out = SECRET_REDACT_PATTERNS[4].sub(r"\1[REDACTED]", out)
     return out
+
+
+def derive_expected_collector_queue_transition(
+    initial_processed: list,
+    initial_pending: list,
+    initial_processed_match_ids: list,
+    seed_puuids: list,
+    batch_size: int,
+    effective_cap: int = 10,
+    max_pending_cap: int = 500,
+) -> tuple:
+    """
+    Mirrors CohortBenchmarkService.runCollectorBatch (lines 1933-2425) exactly against
+    ACTIVE_MATCH_IDS_BY_PUUID and MATCHES_DICT to derive deterministic post-batch
+    (processed_puuids_list, pending_queue_list, processed_match_ids_list, discovered_extras_list).
+    """
+    processed_list = list(initial_processed)
+    processed_set = set(processed_list)
+
+    # 1. sanitizeSeedPuuids + LinkedHashSet prepend of net-new seeds ahead of existing pending queue
+    clean_seeds = []
+    for s in seed_puuids:
+        cs = s.strip()
+        if cs and cs not in clean_seeds:
+            clean_seeds.append(cs)
+    clean_seeds = clean_seeds[:25]
+
+    pending_list = []
+    for s in clean_seeds:
+        if s not in processed_set and s not in pending_list and len(pending_list) < max_pending_cap:
+            pending_list.append(s)
+    for c in initial_pending:
+        if c not in processed_set and c not in pending_list and len(pending_list) < max_pending_cap:
+            pending_list.append(c)
+
+    baseline_pending_set = set(pending_list)
+    discovered_extras = []
+    processed_match_ids = list(initial_processed_match_ids)
+
+    # 2. candidatesThisBatch = pendingQueue.filter { it !in processedPuuids }.take(effectiveBatchLimit)
+    candidates_this_batch = [c for c in pending_list if c not in processed_set][:batch_size]
+    eligible_roles = {"TOP", "MIDDLE", "BOTTOM"}
+
+    for puuid in candidates_this_batch:
+        raw_match_ids = ACTIVE_MATCH_IDS_BY_PUUID.get(puuid, [])
+        own_match_ids = []
+        for mid in raw_match_ids[:effective_cap]:
+            if mid not in own_match_ids:
+                own_match_ids.append(mid)
+        own_match_id_set = set(own_match_ids)
+        if len(own_match_ids) < effective_cap and processed_match_ids:
+            extra_tail = [m for m in processed_match_ids if m not in own_match_id_set][-effective_cap:]
+            candidate_match_ids = (own_match_ids + extra_tail)[:effective_cap]
+        else:
+            candidate_match_ids = list(own_match_ids)
+
+        for mid in candidate_match_ids:
+            is_own_listed = mid in own_match_id_set
+            if is_own_listed and mid not in processed_match_ids and len(processed_match_ids) < 2500:
+                processed_match_ids.append(mid)
+            match_dto = MATCHES_DICT.get(mid)
+            if not match_dto:
+                continue
+            pts = match_dto["info"]["participants"]
+            if not is_own_listed and all(pt.get("puuid") != puuid for pt in pts):
+                continue
+            for pt in pts:
+                role = pt.get("teamPosition") or pt.get("individualPosition")
+                if role not in eligible_roles:
+                    continue
+                p_puuid = (pt.get("puuid") or "").strip()
+                if not p_puuid:
+                    continue
+                # Line 2370: if (pPuuid !in processedPuuids && pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) pendingQueue.add(pPuuid)
+                if p_puuid not in processed_set and len(pending_list) < max_pending_cap:
+                    if p_puuid not in pending_list:
+                        pending_list.append(p_puuid)
+                        if p_puuid not in baseline_pending_set and p_puuid not in discovered_extras:
+                            discovered_extras.append(p_puuid)
+
+        # Lines 2422-2425: processedPuuids.add(puuid); pendingQueue.remove(puuid) AFTER matchLoop
+        if puuid not in processed_set and len(processed_list) < 1000:
+            processed_list.append(puuid)
+            processed_set.add(puuid)
+        if puuid in pending_list:
+            pending_list.remove(puuid)
+
+    return processed_list, pending_list, processed_match_ids, discovered_extras
 
 
 def capture_sanitized_container_log(artifact_dir: str, container_name: str, log_filename: str):
@@ -1133,13 +1234,6 @@ def write_sanitized_artifacts(artifact_dir: str, summary: dict, cgroup_samples: 
         EPHEMERAL_RESEND_TOKEN,
         EPHEMERAL_OP_TOKEN,
     )
-    secret_patterns = (
-        re.compile(r"RGAPI-[0-9a-fA-F-]{16,}"),
-        re.compile(r"\bre_[0-9a-zA-Z_]{16,}\b"),
-        re.compile(r"\bgh[pousr]_[0-9a-zA-Z]{20,}\b"),
-        re.compile(r"\bgithub_pat_[0-9a-zA-Z_]{20,}\b"),
-        re.compile(r"(?i)(?:db_pass|postgres_password|jwt_secret_key|twofa_secret_key|cohort_operator_token|riot_api_key|resend_api_key)\s*[=:]\s*(?!\[REDACTED\])\S+"),
-    )
     for root_dir, _dirs, files in os.walk(artifact_dir):
         for fname in files:
             fpath = os.path.join(root_dir, fname)
@@ -1149,7 +1243,7 @@ def write_sanitized_artifacts(artifact_dir: str, summary: dict, cgroup_samples: 
                     if tok and tok in content:
                         shutil.rmtree(artifact_dir, ignore_errors=True)
                         raise RuntimeError(f"SECRET_LEAK_IN_ARTIFACT: {fpath}")
-                for pat in secret_patterns:
+                for pat in SECRET_REDACT_PATTERNS:
                     if pat.search(content):
                         shutil.rmtree(artifact_dir, ignore_errors=True)
                         raise RuntimeError(f"SECRET_PATTERN_LEAK_IN_ARTIFACT: {fpath} ({pat.pattern})")
@@ -1829,12 +1923,39 @@ def main():
             + calls_validation_refusal["matchById"]
         ) == 0, f"Expected 0 Riot calls during pre-mutation validation refusals, got {calls_validation_refusal}"
 
+        # Source-ground expected Batch 1 & Batch 2 pending queue transitions from fixture + CohortBenchmarkService.runCollectorBatch order
+        b1_seed_inputs = [COLL_ALREADY_PROCESSED_SEED, COLL_SEED_1, COLL_SEED_2, COLL_SEED_3, COLL_SEED_4, COLL_SEED_1]
+        exp_b1_processed, exp_b1_pending, exp_b1_match_ids, exp_b1_extras = derive_expected_collector_queue_transition(
+            initial_processed=[COLL_ALREADY_PROCESSED_SEED],
+            initial_pending=COLL_TAIL_PUUIDS,
+            initial_processed_match_ids=[],
+            seed_puuids=b1_seed_inputs,
+            batch_size=3,
+        )
+        assert exp_b1_extras == [COLL_DUP_PUUID, "puuid-coll-m18-s1"], (
+            f"Unexpected source-derived Batch 1 co-player extras: {exp_b1_extras}"
+        )
+        assert exp_b1_pending == [COLL_SEED_4] + COLL_TAIL_PUUIDS + exp_b1_extras
+        assert len(exp_b1_pending) == 499 <= 500
+
+        exp_b2_processed, exp_b2_pending, exp_b2_match_ids, exp_b2_new_extras = derive_expected_collector_queue_transition(
+            initial_processed=exp_b1_processed,
+            initial_pending=exp_b1_pending,
+            initial_processed_match_ids=exp_b1_match_ids,
+            seed_puuids=[],
+            batch_size=1,
+        )
+        assert exp_b2_new_extras == ["puuid-coll-m101-s1"], (
+            f"Unexpected source-derived Batch 2 co-player extras: {exp_b2_new_extras}"
+        )
+        exp_b2_all_extras = exp_b1_extras + exp_b2_new_extras
+        assert exp_b2_all_extras == [COLL_DUP_PUUID, "puuid-coll-m18-s1", "puuid-coll-m101-s1"]
+        assert exp_b2_pending == COLL_TAIL_PUUIDS + exp_b2_all_extras
+        assert len(exp_b2_pending) == 499 <= 500
+
         # Batch 1: Normal seeded Controller -> Runner -> Service path (1 already-processed seed + 4 net-new seeds + 1 duplicate seed => 4+496 = 500 <= 500 cap)
         reset_riot_call_counts()
-        seed_b1_qs = "&".join(
-            f"seedPuuid={s}"
-            for s in (COLL_ALREADY_PROCESSED_SEED, COLL_SEED_1, COLL_SEED_2, COLL_SEED_3, COLL_SEED_4, COLL_SEED_1)
-        )
+        seed_b1_qs = "&".join(f"seedPuuid={s}" for s in b1_seed_inputs)
         t_b1_start = time.monotonic()
         coll_b1_status = http_json(
             f"{BASE_URL}/api/riot/cohorts/euw1/collector/start"
@@ -1851,12 +1972,22 @@ def main():
             f"Expected Batch 1 stop reason SESSION_BATCH_CAP_REACHED, got {cp_b1['lastStopReason']}"
         )
         assert coll_b1_status["overnightSessionArmed"] is False, f"Expected overnightSessionArmed=False after reaching session batch cap, got {coll_b1_status['overnightSessionArmed']}"
-        assert set(cp_b1["processedPuuids"]) == {COLL_ALREADY_PROCESSED_SEED, COLL_SEED_1, COLL_SEED_2, COLL_SEED_3}, (
-            f"Expected exact processedPuuids {{already-processed, COLL_SEED_1..3}}, got {cp_b1['processedPuuids']}"
+        assert cp_b1["processedPuuids"] == exp_b1_processed, (
+            f"Expected exact ordered processedPuuids {exp_b1_processed}, got {cp_b1['processedPuuids']}"
         )
-        assert cp_b1["pendingCandidatePuuids"] == [COLL_SEED_4] + COLL_TAIL_PUUIDS, (
-            f"Expected COLL_SEED_4 at head followed by all 496 tail entries (len=497), got len={len(cp_b1['pendingCandidatePuuids'])}"
+        assert len(cp_b1["pendingCandidatePuuids"]) == 499 <= 500, (
+            f"Expected Batch 1 pending queue length 499 (<= 500 cap), got {len(cp_b1['pendingCandidatePuuids'])}"
         )
+        assert cp_b1["pendingCandidatePuuids"][0] == COLL_SEED_4, (
+            f"Expected COLL_SEED_4 at head of pending queue after Batch 1, got {cp_b1['pendingCandidatePuuids'][0]}"
+        )
+        assert cp_b1["pendingCandidatePuuids"][1:1 + len(COLL_TAIL_PUUIDS)] == COLL_TAIL_PUUIDS, (
+            "Batch 1 failed to preserve all 496 original tail entries in exact order after COLL_SEED_4"
+        )
+        assert cp_b1["pendingCandidatePuuids"][1 + len(COLL_TAIL_PUUIDS):] == exp_b1_extras, (
+            f"Expected Batch 1 discovered co-player tail extras {exp_b1_extras}, got {cp_b1['pendingCandidatePuuids'][1 + len(COLL_TAIL_PUUIDS):]}"
+        )
+        assert cp_b1["pendingCandidatePuuids"] == exp_b1_pending
         assert cp_b1["fetchedMatches"] == 25, f"Expected 25 distinct collector matches fetched in Batch 1, got {cp_b1['fetchedMatches']}"
 
         # Verify zero added Riot network calls (0 account-v1, 0 summoner-v4; total HTTP calls == sessionNetworkCallsMade == 31)
@@ -1977,12 +2108,20 @@ def main():
             f"Collector Batch 2 unexpected stop reason on isolated indexed_players SQL failure: {cp_b2['lastStopReason']}"
         )
         assert coll_b2_status["overnightSessionArmed"] is False
-        assert set(cp_b2["processedPuuids"]) == {COLL_ALREADY_PROCESSED_SEED, COLL_SEED_1, COLL_SEED_2, COLL_SEED_3, COLL_SEED_4}, (
-            f"Expected COLL_SEED_4 added to processedPuuids: {cp_b2['processedPuuids']}"
+        assert cp_b2["processedPuuids"] == exp_b2_processed, (
+            f"Expected exact ordered processedPuuids {exp_b2_processed}: {cp_b2['processedPuuids']}"
         )
-        assert cp_b2["pendingCandidatePuuids"] == COLL_TAIL_PUUIDS, (
-            f"Expected all 496 tail entries preserved after Batch 2, got len={len(cp_b2['pendingCandidatePuuids'])}"
+        assert len(cp_b2["pendingCandidatePuuids"]) == 499 <= 500, (
+            f"Expected Batch 2 pending queue length 499 (<= 500 cap), got {len(cp_b2['pendingCandidatePuuids'])}"
         )
+        assert cp_b2["pendingCandidatePuuids"][:len(COLL_TAIL_PUUIDS)] == COLL_TAIL_PUUIDS, (
+            "Batch 2 failed to preserve all 496 original tail entries in exact order at head of queue"
+        )
+        assert cp_b2["pendingCandidatePuuids"][len(COLL_TAIL_PUUIDS):] == exp_b2_all_extras, (
+            f"Expected Batch 2 discovered co-player tail extras {exp_b2_all_extras}, got {cp_b2['pendingCandidatePuuids'][len(COLL_TAIL_PUUIDS):]}"
+        )
+        assert cp_b2["pendingCandidatePuuids"] == exp_b2_pending
+        assert cp_b2["processedMatchIds"] == exp_b2_match_ids
         assert "EUW1_COLL_B2_1" in cp_b2["processedMatchIds"] and "EUW1_COLL_B2_2" in cp_b2["processedMatchIds"]
         assert calls_coll_b2["accountByRiotId"] == 0 and calls_coll_b2["summonerByPuuid"] == 0
         assert calls_coll_b2["leagueByPuuid"] == 1 and calls_coll_b2["matchIdsPages"] == 1 and calls_coll_b2["matchById"] == 2
@@ -2023,13 +2162,13 @@ def main():
         for cp_row in persisted_cp_rows:
             assert cp_row["last_stop_reason"] == "SESSION_BATCH_CAP_REACHED"
             assert cp_row["processed_puuids_count"] == 5
-            assert cp_row["pending_candidates_count"] == 496
+            assert cp_row["pending_candidates_count"] == len(exp_b2_pending) == 499
             assert cp_row["total_network_calls_made"] == 35
             parsed_cp = json.loads(cp_row["checkpoint_json"])
-            assert COLL_SEED_4 in parsed_cp["processedPuuids"], (
-                f"Persisted checkpoint {cp_row['target_patch']} missing COLL_SEED_4: {parsed_cp['processedPuuids']}"
+            assert parsed_cp["processedPuuids"] == exp_b2_processed, (
+                f"Persisted checkpoint {cp_row['target_patch']} processedPuuids mismatch: {parsed_cp['processedPuuids']}"
             )
-            assert parsed_cp["pendingCandidatePuuids"] == COLL_TAIL_PUUIDS
+            assert parsed_cp["pendingCandidatePuuids"] == exp_b2_pending
             assert "EUW1_COLL_B2_1" in parsed_cp["processedMatchIds"] and "EUW1_COLL_B2_2" in parsed_cp["processedMatchIds"]
             assert parsed_cp["lastStopReason"] == "SESSION_BATCH_CAP_REACHED"
 
@@ -2178,6 +2317,8 @@ def main():
                 "batch1ProcessedPuuidsCount": len(cp_b1["processedPuuids"]),
                 "batch1PendingQueueCountAfter": len(cp_b1["pendingCandidatePuuids"]),
                 "batch1NextPendingHead": cp_b1["pendingCandidatePuuids"][0],
+                "batch1Original496TailPreserved": True,
+                "batch1DiscoveredCoPlayerExtras": exp_b1_extras,
                 "batch1PendingTailLast": cp_b1["pendingCandidatePuuids"][-1],
                 "batch1MatchesFetched": cp_b1["fetchedMatches"],
                 "batch1MatchesIndexedCap": 20,
@@ -2202,6 +2343,8 @@ def main():
                 "batch2OvernightSessionArmed": coll_b2_status["overnightSessionArmed"],
                 "batch2ProcessedPuuidsCount": len(cp_b2["processedPuuids"]),
                 "batch2PendingQueueCountAfter": len(cp_b2["pendingCandidatePuuids"]),
+                "batch2Original496TailPreserved": True,
+                "batch2DiscoveredCoPlayerExtras": exp_b2_all_extras,
                 "batch2PendingTailFirst": cp_b2["pendingCandidatePuuids"][0],
                 "batch2PendingTailLast": cp_b2["pendingCandidatePuuids"][-1],
                 "batch2RiotHttpCalls": calls_coll_b2["leagueByPuuid"] + calls_coll_b2["matchIdsPages"] + calls_coll_b2["matchById"],
@@ -2246,6 +2389,21 @@ def main():
     finally:
         teardown_Err = None
         if summary.get("status") != "PASSED":
+            summary["status"] = "FAILED"
+            if sampler_samples:
+                summary["candidateMemory512mPartial"] = {
+                    "sampleCount": len(sampler_samples),
+                    "strictRawByteCeiling": CGROUP_STRICT_GATE_BYTES,
+                    "maxCurrentBytes": max(s["cgroupCurrentBytes"] for s in sampler_samples),
+                    "maxCurrentMiB": max(s["cgroupCurrentMiB"] for s in sampler_samples),
+                    "maxCurrentRatioPct": max(s["cgroupRatioPct"] for s in sampler_samples),
+                    "maxPeakBytes": max(s["cgroupPeakBytes"] for s in sampler_samples),
+                    "maxPeakMiB": max(s["cgroupPeakMiB"] for s in sampler_samples),
+                    "maxPeakRatioPct": max(s["cgroupPeakRatioPct"] for s in sampler_samples),
+                    "oomKilled": any(s.get("oomKilled") for s in sampler_samples),
+                    "restartCount": max(s.get("restartCount", 0) for s in sampler_samples),
+                }
+                print("PARTIAL CANDIDATE 512M MEMORY AT FAILURE:", json.dumps(summary["candidateMemory512mPartial"]), flush=True)
             try:
                 capture_sanitized_container_log(artifact_dir, "ss-backend-512m", "failure_ss_backend_512m.log")
                 write_sanitized_artifacts(artifact_dir, summary, sampler_samples)
@@ -2257,5 +2415,89 @@ def main():
             raise teardown_Err
 
 
+def run_static_smoke_test():
+    """
+    Local static smoke verification for:
+    1. Source-grounded Batch 1 & Batch 2 collector queue transitions against fixture + service algorithm.
+    2. write_sanitized_artifacts & sanitize_text on both success and failure/teardown paths, including fail-closed directory deletion on secret leak.
+    """
+    import tempfile
+
+    b1_seed_inputs = [COLL_ALREADY_PROCESSED_SEED, COLL_SEED_1, COLL_SEED_2, COLL_SEED_3, COLL_SEED_4, COLL_SEED_1]
+    exp_b1_processed, exp_b1_pending, exp_b1_match_ids, exp_b1_extras = derive_expected_collector_queue_transition(
+        initial_processed=[COLL_ALREADY_PROCESSED_SEED],
+        initial_pending=COLL_TAIL_PUUIDS,
+        initial_processed_match_ids=[],
+        seed_puuids=b1_seed_inputs,
+        batch_size=3,
+    )
+    assert exp_b1_processed == [COLL_ALREADY_PROCESSED_SEED, COLL_SEED_1, COLL_SEED_2, COLL_SEED_3]
+    assert exp_b1_extras == [COLL_DUP_PUUID, "puuid-coll-m18-s1"]
+    assert exp_b1_pending == [COLL_SEED_4] + COLL_TAIL_PUUIDS + [COLL_DUP_PUUID, "puuid-coll-m18-s1"]
+    assert len(exp_b1_pending) == 499 <= 500
+    assert len(exp_b1_match_ids) == 25
+
+    exp_b2_processed, exp_b2_pending, exp_b2_match_ids, exp_b2_new_extras = derive_expected_collector_queue_transition(
+        initial_processed=exp_b1_processed,
+        initial_pending=exp_b1_pending,
+        initial_processed_match_ids=exp_b1_match_ids,
+        seed_puuids=[],
+        batch_size=1,
+    )
+    assert exp_b2_processed == [COLL_ALREADY_PROCESSED_SEED, COLL_SEED_1, COLL_SEED_2, COLL_SEED_3, COLL_SEED_4]
+    assert exp_b2_new_extras == ["puuid-coll-m101-s1"]
+    assert exp_b2_pending == COLL_TAIL_PUUIDS + [COLL_DUP_PUUID, "puuid-coll-m18-s1", "puuid-coll-m101-s1"]
+    assert len(exp_b2_pending) == 499 <= 500
+    assert len(exp_b2_match_ids) == 27
+
+    with tempfile.TemporaryDirectory() as tmp_root:
+        raw_dir = os.path.join(tmp_root, "raw")
+        upload_dir = os.path.join(tmp_root, "upload")
+        os.environ["RAW_ARTIFACT_DIR"] = raw_dir
+        os.environ["ARTIFACT_DIR"] = upload_dir
+
+        # 1. Success path artifact write & sanitization
+        sample_summary = {
+            "status": "PASSED",
+            "leakedRiotToken": EPHEMERAL_RIOT_TOKEN,
+            "leakedOpToken": EPHEMERAL_OP_TOKEN,
+            "leakedAssignment": "riot_api_key=super_secret_val",
+        }
+        sample_cgroups = [{"idx": 1, "cgroupCurrentBytes": 210_000_000, "cgroupPeakBytes": 240_000_000, "secret": EPHEMERAL_DB_PASS}]
+        write_sanitized_artifacts(upload_dir, sample_summary, sample_cgroups)
+        assert os.path.isfile(os.path.join(raw_dir, "acceptance_summary.json"))
+        assert os.path.isfile(os.path.join(upload_dir, "acceptance_summary.json"))
+        sanitized_summary_text = open(os.path.join(upload_dir, "acceptance_summary.json"), "r", encoding="utf-8").read()
+        assert EPHEMERAL_RIOT_TOKEN not in sanitized_summary_text
+        assert EPHEMERAL_OP_TOKEN not in sanitized_summary_text
+        assert "super_secret_val" not in sanitized_summary_text
+        assert "[REDACTED]" in sanitized_summary_text
+
+        # 2. Failure / teardown path artifact write & sanitization
+        fail_summary = {"status": "FAILED", "opToken": EPHEMERAL_OP_TOKEN}
+        write_sanitized_artifacts(upload_dir, fail_summary, sample_cgroups)
+        assert os.path.isdir(upload_dir)
+
+        # 3. Fail-closed leak detection deletes upload_dir when unredacted secret file exists in upload_dir
+        with open(os.path.join(upload_dir, "unredacted.txt"), "w", encoding="utf-8") as uf:
+            uf.write(f"leaked={EPHEMERAL_JWT_SECRET}\n")
+        try:
+            write_sanitized_artifacts(upload_dir, fail_summary, sample_cgroups)
+            raise AssertionError("Expected RuntimeError on unredacted secret in upload_dir")
+        except RuntimeError as e:
+            assert "SECRET_LEAK_IN_ARTIFACT" in str(e)
+            assert not os.path.exists(upload_dir), "upload_dir must be deleted on secret scan failure"
+
+    print("STATIC_SMOKE_TEST_OK", json.dumps({
+        "batch1PendingLen": len(exp_b1_pending),
+        "batch1Extras": exp_b1_extras,
+        "batch2PendingLen": len(exp_b2_pending),
+        "batch2Extras": exp_b1_extras + exp_b2_new_extras,
+    }))
+
+
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:] == ["--self-test"]:
+        run_static_smoke_test()
+    else:
+        main()

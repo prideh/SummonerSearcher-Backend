@@ -80,6 +80,7 @@ jobs:
     - name: Run Real 512 MB Container Collector Operator Seed-Control + Identity + Season-Stats Acceptance Proof (87d5f44 + e683777 Rollback)
       run: |
         chmod +x scripts/verify_512m_container.py
+        python3 ./scripts/verify_512m_container.py --self-test
         CAND_IMAGE="ss-backend:cand-87d5f44" BASE_IMAGE="ss-backend:base-e683777" \
         RAW_ARTIFACT_DIR="/tmp/collector-seed-control-512m-proof-raw" \
         ARTIFACT_DIR="/tmp/collector-seed-control-512m-proof-artifacts" \
