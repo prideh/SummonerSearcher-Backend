@@ -89,7 +89,7 @@ jobs:
       id: artifact_gate
       if: always()
       run: |
-        sudo python3 -c '
+        sudo python3 - << 'PYEOF'
         import json, os, re, shutil, sys
         raw_dir = "/tmp/collector-seed-control-512m-proof-raw"
         upload_dir = "/tmp/collector-seed-control-512m-proof-artifacts"
@@ -105,7 +105,7 @@ jobs:
             re.compile(r"\bre_[0-9a-zA-Z_]{16,}\b"),
             re.compile(r"\bgh[pousr]_[0-9a-zA-Z]{20,}\b"),
             re.compile(r"\bgithub_pat_[0-9a-zA-Z_]{20,}\b"),
-            re.compile(r"(?i)((?:db_pass|postgres_password|jwt_secret_key|twofa_secret_key|cohort_operator_token|riot_api_key|resend_api_key)\s*[=:]\s*)(?!\[REDACTED\])\S+"),
+            re.compile(r'(?i)((?:db_pass|postgres_password|jwt_secret_key|twofa_secret_key|cohort_operator_token|riot_api_key|resend_api_key)\s*[=:]\s*)(?!\[REDACTED\])[^\s"\',;<>\]}]+'),
         ]
         # Sanitize staged JDK 21 test logs/XMLs in upload_dir while keeping raw_dir untouched
         jdk_upload_dir = os.path.join(upload_dir, "jdk21-test-87d5f44")
@@ -124,7 +124,7 @@ jobs:
                     text = redact_patterns[4].sub(r"\1[REDACTED]", text)
                     if text != orig:
                         open(fpath, "w", encoding="utf-8").write(text)
-        # Strict post-sanitization leak scan across EVERY file in upload_dir
+        # Strict post-sanitization leak scan and JSON parseability check across EVERY file in upload_dir
         file_count = 0
         for root, _dirs, files in os.walk(upload_dir):
             for fname in files:
@@ -141,11 +141,17 @@ jobs:
                     if pat.search(text):
                         shutil.rmtree(upload_dir, ignore_errors=True)
                         raise RuntimeError(f"SECRET_REGEX_SCAN_GATE_FAILED in {fpath} matching {pat.pattern}")
+                if fname.endswith(".json"):
+                    try:
+                        json.loads(text)
+                    except Exception as e:
+                        shutil.rmtree(upload_dir, ignore_errors=True)
+                        raise RuntimeError(f"INVALID_JSON_ARTIFACT in {fpath}: {e}")
         if file_count == 0:
             shutil.rmtree(upload_dir, ignore_errors=True)
             raise RuntimeError("EMPTY_UPLOAD_DIRECTORY")
         print(f"Verified {file_count} sanitized artifact files with 0 secret leaks.")
-        '
+        PYEOF
     - name: Upload Sanitized 512 MiB Collector Seed-Control Proof & 75-Test XML/Exit Evidence Artifacts
       if: always() && steps.artifact_gate.outcome == 'success'
       uses: actions/upload-artifact@v4

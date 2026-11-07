@@ -1079,7 +1079,7 @@ SECRET_REDACT_PATTERNS = (
     re.compile(r"\bre_[0-9a-zA-Z_]{16,}\b"),
     re.compile(r"\bgh[pousr]_[0-9a-zA-Z]{20,}\b"),
     re.compile(r"\bgithub_pat_[0-9a-zA-Z_]{20,}\b"),
-    re.compile(r"(?i)((?:db_pass|postgres_password|jwt_secret_key|twofa_secret_key|cohort_operator_token|riot_api_key|resend_api_key)\s*[=:]\s*)(?!\[REDACTED\])\S+"),
+    re.compile(r'(?i)((?:db_pass|postgres_password|jwt_secret_key|twofa_secret_key|cohort_operator_token|riot_api_key|resend_api_key)\s*[=:]\s*)(?!\[REDACTED\])[^\s"\',;<>\]}]+'),
 )
 
 
@@ -1100,6 +1100,137 @@ def sanitize_text(text: str) -> str:
         out = pat.sub("[REDACTED]", out)
     out = SECRET_REDACT_PATTERNS[4].sub(r"\1[REDACTED]", out)
     return out
+
+
+def sanitize_json_value(val):
+    if isinstance(val, str):
+        return sanitize_text(val)
+    if isinstance(val, dict):
+        return {sanitize_json_value(k): sanitize_json_value(v) for k, v in val.items()}
+    if isinstance(val, (list, tuple)):
+        return [sanitize_json_value(x) for x in val]
+    return val
+
+
+def assert_exact_string_set(actual_items: list, expected_items: list, context: str):
+    assert isinstance(actual_items, list), f"[{context}] Expected JSON array list, got {type(actual_items)}"
+    assert (
+        len(actual_items) == len(expected_items)
+        and len(set(actual_items)) == len(actual_items)
+        and set(actual_items) == set(expected_items)
+    ), (
+        f"[{context}] Exact set membership/length mismatch: actual_len={len(actual_items)} "
+        f"unique_actual={len(set(actual_items))} expected_len={len(expected_items)} "
+        f"sym_diff={set(actual_items) ^ set(expected_items)}"
+    )
+
+
+# Bounded join timeout exceeding inspect_container_liveness (10s docker inspect) + cgroup file reads + 2s poll wait
+SAMPLER_JOIN_TIMEOUT_SEC = 15.0
+
+
+class SamplerController:
+    def __init__(self, inspect_fn, poll_interval_sec: float = 2.0, join_timeout_sec: float = SAMPLER_JOIN_TIMEOUT_SEC):
+        self.inspect_fn = inspect_fn
+        self.poll_interval_sec = poll_interval_sec
+        self.join_timeout_sec = join_timeout_sec
+        self.samples = []
+        self.errors = []
+        self.lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.thread = None
+
+    def check_health(self):
+        with self.lock:
+            if self.errors:
+                raise RuntimeError(f"Background cgroup sampler failed: {self.errors[0]}") from self.errors[0]
+
+    def record_sample(self, tag: str, check_prior_error: bool = True) -> dict:
+        if check_prior_error:
+            self.check_health()
+        cg = self.inspect_fn()
+        with self.lock:
+            entry = {"idx": len(self.samples) + 1, "tag": tag, "timestampEpochMs": int(time.time() * 1000), **cg}
+            self.samples.append(entry)
+            return entry
+
+    def _loop(self):
+        while not self.stop_event.wait(self.poll_interval_sec):
+            try:
+                self.record_sample("poll_2s", check_prior_error=False)
+            except Exception as e:
+                print(f"SAMPLER ERROR: {e}", flush=True)
+                with self.lock:
+                    self.errors.append(e)
+                self.stop_event.set()
+                return
+
+    def start(self):
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def stop_and_join(self, check_errors: bool = True):
+        self.stop_event.set()
+        if self.thread is not None:
+            self.thread.join(timeout=self.join_timeout_sec)
+            if self.thread.is_alive():
+                raise RuntimeError(
+                    f"SAMPLER_THREAD_JOIN_TIMEOUT: sampler thread still alive after {self.join_timeout_sec}s"
+                )
+        if check_errors:
+            self.check_health()
+
+    def snapshot_samples(self) -> list:
+        with self.lock:
+            return list(self.samples)
+
+
+def finalize_teardown(
+    sampler: SamplerController,
+    proof_completed_ok: bool,
+    summary: dict,
+    artifact_dir: str,
+    capture_log_fn,
+    write_artifacts_fn,
+    teardown_network_fn,
+):
+    teardown_err = None
+    try:
+        sampler.stop_and_join(check_errors=not proof_completed_ok)
+    except Exception as e:
+        proof_completed_ok = False
+        teardown_err = e
+
+    final_samples_snapshot = sampler.snapshot_samples()
+    if not proof_completed_ok:
+        summary["status"] = "FAILED"
+        if final_samples_snapshot:
+            summary["candidateMemory512mPartial"] = {
+                "sampleCount": len(final_samples_snapshot),
+                "strictRawByteCeiling": CGROUP_STRICT_GATE_BYTES,
+                "maxCurrentBytes": max(s["cgroupCurrentBytes"] for s in final_samples_snapshot),
+                "maxCurrentMiB": max(s["cgroupCurrentMiB"] for s in final_samples_snapshot),
+                "maxCurrentRatioPct": max(s["cgroupRatioPct"] for s in final_samples_snapshot),
+                "maxPeakBytes": max(s["cgroupPeakBytes"] for s in final_samples_snapshot),
+                "maxPeakMiB": max(s["cgroupPeakMiB"] for s in final_samples_snapshot),
+                "maxPeakRatioPct": max(s["cgroupPeakRatioPct"] for s in final_samples_snapshot),
+                "oomKilled": any(s.get("oomKilled") for s in final_samples_snapshot),
+                "restartCount": max(s.get("restartCount", 0) for s in final_samples_snapshot),
+            }
+            print("PARTIAL CANDIDATE 512M MEMORY AT FAILURE:", json.dumps(summary["candidateMemory512mPartial"]), flush=True)
+        if teardown_err is not None and "SAMPLER_THREAD_JOIN_TIMEOUT" in str(teardown_err):
+            shutil.rmtree(artifact_dir, ignore_errors=True)
+        else:
+            try:
+                capture_log_fn(artifact_dir, "ss-backend-512m", "failure_ss_backend_512m.log")
+                write_artifacts_fn(artifact_dir, summary, final_samples_snapshot)
+            except Exception as e:
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+                if teardown_err is None:
+                    teardown_err = e
+    teardown_network_fn()
+    if teardown_err is not None and sys.exc_info()[0] is None:
+        raise teardown_err
 
 
 def derive_expected_collector_queue_transition(
@@ -1220,12 +1351,14 @@ def write_sanitized_artifacts(artifact_dir: str, summary: dict, cgroup_samples: 
 
     summary_path = os.path.join(artifact_dir, "acceptance_summary.json")
     samples_path = os.path.join(artifact_dir, "cgroup_samples_2s.json")
+    sanitized_summary = sanitize_json_value(summary)
+    sanitized_samples = sanitize_json_value(cgroup_samples)
     with open(summary_path, "w", encoding="utf-8") as f:
-        f.write(sanitize_text(json.dumps(summary, indent=2)))
+        json.dump(sanitized_summary, f, indent=2)
     with open(samples_path, "w", encoding="utf-8") as f:
-        f.write(sanitize_text(json.dumps(cgroup_samples, indent=2)))
+        json.dump(sanitized_samples, f, indent=2)
 
-    # Fail-closed secret-leak check across all written artifact files (logs + metrics + test XMLs)
+    # Fail-closed secret-leak and JSON parseability check across all written artifact files (logs + metrics + test XMLs)
     forbidden_secrets = (
         EPHEMERAL_DB_PASS,
         EPHEMERAL_JWT_SECRET,
@@ -1247,6 +1380,12 @@ def write_sanitized_artifacts(artifact_dir: str, summary: dict, cgroup_samples: 
                     if pat.search(content):
                         shutil.rmtree(artifact_dir, ignore_errors=True)
                         raise RuntimeError(f"SECRET_PATTERN_LEAK_IN_ARTIFACT: {fpath} ({pat.pattern})")
+                if fname.endswith(".json"):
+                    try:
+                        json.loads(content)
+                    except Exception as e:
+                        shutil.rmtree(artifact_dir, ignore_errors=True)
+                        raise RuntimeError(f"INVALID_JSON_IN_ARTIFACT: {fpath}: {e}")
 
 
 def main():
@@ -1273,7 +1412,13 @@ def main():
         ], sf)
     os.chmod(secrets_manifest_path, 0o600)
 
-    sampler_samples = []
+    cand_pid_holder = [None]
+    sampler = SamplerController(
+        inspect_fn=lambda: inspect_container_liveness("ss-backend-512m", expected_pid=cand_pid_holder[0]),
+        poll_interval_sec=2.0,
+        join_timeout_sec=SAMPLER_JOIN_TIMEOUT_SEC,
+    )
+    proof_completed_ok = False
     summary = {"status": "IN_PROGRESS"}
     setup_isolated_network()
     try:
@@ -1316,30 +1461,13 @@ def main():
 
         print(f"=== 2. Booting Candidate 512 MiB Container ({cand_image}) and verifying outbound egress deny ===", flush=True)
         cand_pid = start_backend_container(cand_image, db_pass)
+        cand_pid_holder[0] = cand_pid
         egress_proof = verify_egress_deny_from_container_netns("ss-backend-512m", cand_pid)
         print("EGRESS DENY PROOF:", json.dumps(egress_proof), flush=True)
 
         # Background 2s cgroup sampler for candidate container
-        sampler_stop = threading.Event()
-        sampler_lock = threading.Lock()
-
-        def record_sample(tag: str) -> dict:
-            cg = inspect_container_liveness("ss-backend-512m", expected_pid=cand_pid)
-            with sampler_lock:
-                entry = {"idx": len(sampler_samples) + 1, "tag": tag, "timestampEpochMs": int(time.time() * 1000), **cg}
-                sampler_samples.append(entry)
-                return entry
-
-        def sampler_loop():
-            while not sampler_stop.wait(2.0):
-                try:
-                    record_sample("poll_2s")
-                except Exception as e:
-                    print(f"SAMPLER ERROR: {e}", flush=True)
-                    os._exit(2)
-
-        sampler_thread = threading.Thread(target=sampler_loop, daemon=True)
-        sampler_thread.start()
+        record_sample = sampler.record_sample
+        sampler.start()
         time.sleep(2)
         record_sample("post_boot_idle")
 
@@ -1972,9 +2100,7 @@ def main():
             f"Expected Batch 1 stop reason SESSION_BATCH_CAP_REACHED, got {cp_b1['lastStopReason']}"
         )
         assert coll_b1_status["overnightSessionArmed"] is False, f"Expected overnightSessionArmed=False after reaching session batch cap, got {coll_b1_status['overnightSessionArmed']}"
-        assert cp_b1["processedPuuids"] == exp_b1_processed, (
-            f"Expected exact ordered processedPuuids {exp_b1_processed}, got {cp_b1['processedPuuids']}"
-        )
+        assert_exact_string_set(cp_b1["processedPuuids"], exp_b1_processed, "Batch 1 cp_b1.processedPuuids")
         assert len(cp_b1["pendingCandidatePuuids"]) == 499 <= 500, (
             f"Expected Batch 1 pending queue length 499 (<= 500 cap), got {len(cp_b1['pendingCandidatePuuids'])}"
         )
@@ -1988,6 +2114,7 @@ def main():
             f"Expected Batch 1 discovered co-player tail extras {exp_b1_extras}, got {cp_b1['pendingCandidatePuuids'][1 + len(COLL_TAIL_PUUIDS):]}"
         )
         assert cp_b1["pendingCandidatePuuids"] == exp_b1_pending
+        assert_exact_string_set(cp_b1["processedMatchIds"], exp_b1_match_ids, "Batch 1 cp_b1.processedMatchIds")
         assert cp_b1["fetchedMatches"] == 25, f"Expected 25 distinct collector matches fetched in Batch 1, got {cp_b1['fetchedMatches']}"
 
         # Verify zero added Riot network calls (0 account-v1, 0 summoner-v4; total HTTP calls == sessionNetworkCallsMade == 31)
@@ -2108,9 +2235,7 @@ def main():
             f"Collector Batch 2 unexpected stop reason on isolated indexed_players SQL failure: {cp_b2['lastStopReason']}"
         )
         assert coll_b2_status["overnightSessionArmed"] is False
-        assert cp_b2["processedPuuids"] == exp_b2_processed, (
-            f"Expected exact ordered processedPuuids {exp_b2_processed}: {cp_b2['processedPuuids']}"
-        )
+        assert_exact_string_set(cp_b2["processedPuuids"], exp_b2_processed, "Batch 2 cp_b2.processedPuuids")
         assert len(cp_b2["pendingCandidatePuuids"]) == 499 <= 500, (
             f"Expected Batch 2 pending queue length 499 (<= 500 cap), got {len(cp_b2['pendingCandidatePuuids'])}"
         )
@@ -2121,7 +2246,8 @@ def main():
             f"Expected Batch 2 discovered co-player tail extras {exp_b2_all_extras}, got {cp_b2['pendingCandidatePuuids'][len(COLL_TAIL_PUUIDS):]}"
         )
         assert cp_b2["pendingCandidatePuuids"] == exp_b2_pending
-        assert cp_b2["processedMatchIds"] == exp_b2_match_ids
+        assert_exact_string_set(cp_b2["processedMatchIds"], exp_b2_match_ids, "Batch 2 cp_b2.processedMatchIds")
+        assert cp_b2["fetchedMatches"] == 27, f"Expected 27 cumulative collector matches fetched after Batch 2, got {cp_b2['fetchedMatches']}"
         assert "EUW1_COLL_B2_1" in cp_b2["processedMatchIds"] and "EUW1_COLL_B2_2" in cp_b2["processedMatchIds"]
         assert calls_coll_b2["accountByRiotId"] == 0 and calls_coll_b2["summonerByPuuid"] == 0
         assert calls_coll_b2["leagueByPuuid"] == 1 and calls_coll_b2["matchIdsPages"] == 1 and calls_coll_b2["matchById"] == 2
@@ -2165,10 +2291,9 @@ def main():
             assert cp_row["pending_candidates_count"] == len(exp_b2_pending) == 499
             assert cp_row["total_network_calls_made"] == 35
             parsed_cp = json.loads(cp_row["checkpoint_json"])
-            assert parsed_cp["processedPuuids"] == exp_b2_processed, (
-                f"Persisted checkpoint {cp_row['target_patch']} processedPuuids mismatch: {parsed_cp['processedPuuids']}"
-            )
+            assert_exact_string_set(parsed_cp["processedPuuids"], exp_b2_processed, f"DB checkpoint {cp_row['target_patch']} processedPuuids")
             assert parsed_cp["pendingCandidatePuuids"] == exp_b2_pending
+            assert_exact_string_set(parsed_cp["processedMatchIds"], exp_b2_match_ids, f"DB checkpoint {cp_row['target_patch']} processedMatchIds")
             assert "EUW1_COLL_B2_1" in parsed_cp["processedMatchIds"] and "EUW1_COLL_B2_2" in parsed_cp["processedMatchIds"]
             assert parsed_cp["lastStopReason"] == "SESSION_BATCH_CAP_REACHED"
 
@@ -2176,12 +2301,13 @@ def main():
         http_json(f"{BASE_URL}/api/riot/cohorts/euw1/collector/stop?patch=16.7", headers=OP_HEADERS, timeout=15)
 
         cand_final_cg = record_sample("cand_final")
-        sampler_stop.set()
+        sampler.stop_and_join(check_errors=True)
+        cand_samples_snapshot = sampler.snapshot_samples()
         capture_sanitized_container_log(artifact_dir, "ss-backend-512m", "candidate_87d5f44_container.log")
-        cand_max_current_bytes = max(s["cgroupCurrentBytes"] for s in sampler_samples)
-        cand_max_peak_bytes = max(s["cgroupPeakBytes"] for s in sampler_samples)
-        cand_max_current_pct = max(s["cgroupRatioPct"] for s in sampler_samples)
-        cand_max_peak_pct = max(s["cgroupPeakRatioPct"] for s in sampler_samples)
+        cand_max_current_bytes = max(s["cgroupCurrentBytes"] for s in cand_samples_snapshot)
+        cand_max_peak_bytes = max(s["cgroupPeakBytes"] for s in cand_samples_snapshot)
+        cand_max_current_pct = max(s["cgroupRatioPct"] for s in cand_samples_snapshot)
+        cand_max_peak_pct = max(s["cgroupPeakRatioPct"] for s in cand_samples_snapshot)
 
         # =========================================================================
         # SCENARIO 5: Rollback e683777 Read-Compatibility on the Same Live Postgres & Redis
@@ -2367,13 +2493,13 @@ def main():
                 "rollbackCgroupPeakRatioPct": rb_cg["cgroupPeakRatioPct"],
             },
             "candidateMemory512m": {
-                "sampleCount": len(sampler_samples),
+                "sampleCount": len(cand_samples_snapshot),
                 "strictRawByteCeiling": CGROUP_STRICT_GATE_BYTES,
                 "maxCurrentBytes": cand_max_current_bytes,
-                "maxCurrentMiB": max(s["cgroupCurrentMiB"] for s in sampler_samples),
+                "maxCurrentMiB": max(s["cgroupCurrentMiB"] for s in cand_samples_snapshot),
                 "maxCurrentRatioPct": cand_max_current_pct,
                 "maxPeakBytes": cand_max_peak_bytes,
-                "maxPeakMiB": max(s["cgroupPeakMiB"] for s in sampler_samples),
+                "maxPeakMiB": max(s["cgroupPeakMiB"] for s in cand_samples_snapshot),
                 "maxPeakRatioPct": cand_max_peak_pct,
                 "finalCurrentBytes": cand_final_cg["cgroupCurrentBytes"],
                 "finalCurrentMiB": cand_final_cg["cgroupCurrentMiB"],
@@ -2382,44 +2508,36 @@ def main():
                 "restartCount": 0,
             },
         }
-        write_sanitized_artifacts(artifact_dir, summary, sampler_samples)
+        write_sanitized_artifacts(artifact_dir, summary, cand_samples_snapshot)
+        proof_completed_ok = True
         print("=== COLLECTOR SEED-CONTROL + IDENTITY + SEASON STATS 512 MB CONTAINER ACCEPTANCE PROOF SUMMARY ===", flush=True)
         print(json.dumps(summary, indent=2), flush=True)
         print("=== ALL COLLECTOR SEED-CONTROL + IDENTITY + SEASON STATS 512 MB ACCEPTANCE PROOFS PASSED ===", flush=True)
     finally:
-        teardown_Err = None
-        if summary.get("status") != "PASSED":
-            summary["status"] = "FAILED"
-            if sampler_samples:
-                summary["candidateMemory512mPartial"] = {
-                    "sampleCount": len(sampler_samples),
-                    "strictRawByteCeiling": CGROUP_STRICT_GATE_BYTES,
-                    "maxCurrentBytes": max(s["cgroupCurrentBytes"] for s in sampler_samples),
-                    "maxCurrentMiB": max(s["cgroupCurrentMiB"] for s in sampler_samples),
-                    "maxCurrentRatioPct": max(s["cgroupRatioPct"] for s in sampler_samples),
-                    "maxPeakBytes": max(s["cgroupPeakBytes"] for s in sampler_samples),
-                    "maxPeakMiB": max(s["cgroupPeakMiB"] for s in sampler_samples),
-                    "maxPeakRatioPct": max(s["cgroupPeakRatioPct"] for s in sampler_samples),
-                    "oomKilled": any(s.get("oomKilled") for s in sampler_samples),
-                    "restartCount": max(s.get("restartCount", 0) for s in sampler_samples),
-                }
-                print("PARTIAL CANDIDATE 512M MEMORY AT FAILURE:", json.dumps(summary["candidateMemory512mPartial"]), flush=True)
-            try:
-                capture_sanitized_container_log(artifact_dir, "ss-backend-512m", "failure_ss_backend_512m.log")
-                write_sanitized_artifacts(artifact_dir, summary, sampler_samples)
-            except Exception as e:
-                shutil.rmtree(artifact_dir, ignore_errors=True)
-                teardown_Err = e
-        teardown_isolated_network()
-        if teardown_Err is not None:
-            raise teardown_Err
+        finalize_teardown(
+            sampler=sampler,
+            proof_completed_ok=proof_completed_ok,
+            summary=summary,
+            artifact_dir=artifact_dir,
+            capture_log_fn=capture_sanitized_container_log,
+            write_artifacts_fn=write_sanitized_artifacts,
+            teardown_network_fn=teardown_isolated_network,
+        )
 
 
 def run_static_smoke_test():
     """
     Local static smoke verification for:
-    1. Source-grounded Batch 1 & Batch 2 collector queue transitions against fixture + service algorithm.
-    2. write_sanitized_artifacts & sanitize_text on both success and failure/teardown paths, including fail-closed directory deletion on secret leak.
+    1. Source-grounded Batch 1 & Batch 2 collector queue transitions against fixture + service algorithm,
+       including proof that arbitrary HashSet permutations of Batch 1 processedMatchIds/processedPuuids
+       cannot affect Batch 2 co-player queue transitions (since COLL_SEED_4 is not in EUW1_COLL_B1_1..25).
+    2. assert_exact_string_set positive and negative cases (duplicates, missing, extra).
+    3. write_sanitized_artifacts & sanitize_json_value / sanitize_text on success and failure/teardown paths,
+       with strict json.loads parseability and fail-closed directory deletion on secret leak or invalid JSON.
+    4. Mocked unit smoke tests (no Docker/CI) for SamplerController & finalize_teardown:
+       - Background sampler error injection without os._exit bypass of finally
+       - Hung sampler thread join timeout failing closed before rollback container swap while still tearing down network
+       - PASSED summary write_sanitized_artifacts failure entering failure teardown and deleting upload_dir fail-closed
     """
     import tempfile
 
@@ -2450,13 +2568,41 @@ def run_static_smoke_test():
     assert len(exp_b2_pending) == 499 <= 500
     assert len(exp_b2_match_ids) == 27
 
+    # Verify that COLL_SEED_4 is absent from all 25 Batch 1 matches (EUW1_COLL_B1_1..25) and that any
+    # HashSet permutation of initial_processed_match_ids / initial_processed entering Batch 2 yields
+    # the exact same ordered exp_b2_pending and exp_b2_new_extras.
+    for seq in range(1, 26):
+        b1_pts = [pt["puuid"] for pt in MATCHES_DICT[f"EUW1_COLL_B1_{seq}"]["info"]["participants"]]
+        assert COLL_SEED_4 not in b1_pts, f"COLL_SEED_4 must not appear in EUW1_COLL_B1_{seq}"
+    for perm_mids in (list(reversed(exp_b1_match_ids)), sorted(exp_b1_match_ids), exp_b1_match_ids[10:] + exp_b1_match_ids[:10]):
+        p_b2_proc, p_b2_pend, p_b2_mids, p_b2_ext = derive_expected_collector_queue_transition(
+            initial_processed=list(reversed(exp_b1_processed)),
+            initial_pending=exp_b1_pending,
+            initial_processed_match_ids=perm_mids,
+            seed_puuids=[],
+            batch_size=1,
+        )
+        assert p_b2_pend == exp_b2_pending
+        assert p_b2_ext == exp_b2_new_extras
+        assert_exact_string_set(p_b2_proc, exp_b2_processed, "perm_b2_processed")
+        assert_exact_string_set(p_b2_mids, exp_b2_match_ids, "perm_b2_match_ids")
+
+    # Verify assert_exact_string_set positive and negative cases
+    assert_exact_string_set(["b", "a", "c"], ["a", "b", "c"], "reordered_ok")
+    for bad_case in (["a", "a", "b"], ["a", "b"], ["a", "b", "d"]):
+        try:
+            assert_exact_string_set(bad_case, ["a", "b", "c"], "expected_set_fail")
+            raise AssertionError(f"Expected assert_exact_string_set to fail on {bad_case}")
+        except AssertionError as e:
+            assert "Exact set membership/length mismatch" in str(e)
+
     with tempfile.TemporaryDirectory() as tmp_root:
         raw_dir = os.path.join(tmp_root, "raw")
         upload_dir = os.path.join(tmp_root, "upload")
         os.environ["RAW_ARTIFACT_DIR"] = raw_dir
         os.environ["ARTIFACT_DIR"] = upload_dir
 
-        # 1. Success path artifact write & sanitization
+        # 1. Success path artifact write, sanitization & JSON parseability
         sample_summary = {
             "status": "PASSED",
             "leakedRiotToken": EPHEMERAL_RIOT_TOKEN,
@@ -2472,11 +2618,28 @@ def run_static_smoke_test():
         assert EPHEMERAL_OP_TOKEN not in sanitized_summary_text
         assert "super_secret_val" not in sanitized_summary_text
         assert "[REDACTED]" in sanitized_summary_text
+        parsed_summary = json.loads(sanitized_summary_text)
+        assert parsed_summary == {
+            "status": "PASSED",
+            "leakedRiotToken": "[REDACTED]",
+            "leakedOpToken": "[REDACTED]",
+            "leakedAssignment": "riot_api_key=[REDACTED]",
+        }
+        parsed_samples = json.loads(open(os.path.join(upload_dir, "cgroup_samples_2s.json"), "r", encoding="utf-8").read())
+        assert parsed_samples[0]["secret"] == "[REDACTED]"
 
-        # 2. Failure / teardown path artifact write & sanitization
+        # Verify direct sanitize_text on json.dumps string also preserves valid JSON quotes
+        direct_json_str = sanitize_text(json.dumps({"status": "PASSED", "leakedAssignment": "riot_api_key=super_secret_val"}))
+        assert json.loads(direct_json_str) == {"status": "PASSED", "leakedAssignment": "riot_api_key=[REDACTED]"}
+
+        # 2. Failure / teardown path artifact write & JSON parseability
         fail_summary = {"status": "FAILED", "opToken": EPHEMERAL_OP_TOKEN}
         write_sanitized_artifacts(upload_dir, fail_summary, sample_cgroups)
         assert os.path.isdir(upload_dir)
+        assert json.loads(open(os.path.join(upload_dir, "acceptance_summary.json"), "r", encoding="utf-8").read()) == {
+            "status": "FAILED",
+            "opToken": "[REDACTED]",
+        }
 
         # 3. Fail-closed leak detection deletes upload_dir when unredacted secret file exists in upload_dir
         with open(os.path.join(upload_dir, "unredacted.txt"), "w", encoding="utf-8") as uf:
@@ -2488,11 +2651,180 @@ def run_static_smoke_test():
             assert "SECRET_LEAK_IN_ARTIFACT" in str(e)
             assert not os.path.exists(upload_dir), "upload_dir must be deleted on secret scan failure"
 
+        # 4. Fail-closed invalid JSON detection deletes upload_dir when corrupt .json file exists in upload_dir
+        os.makedirs(upload_dir, exist_ok=True)
+        with open(os.path.join(upload_dir, "corrupt.json"), "w", encoding="utf-8") as cf:
+            cf.write('{"broken": "unterminated}\n')
+        try:
+            write_sanitized_artifacts(upload_dir, fail_summary, sample_cgroups)
+            raise AssertionError("Expected RuntimeError on corrupt JSON in upload_dir")
+        except RuntimeError as e:
+            assert "INVALID_JSON_IN_ARTIFACT" in str(e)
+            assert not os.path.exists(upload_dir), "upload_dir must be deleted on invalid JSON failure"
+
+        # 5. Mocked unit smoke: SamplerController background error injection (no os._exit bypass of finally)
+        call_idx = [0]
+
+        def failing_inspect_fn():
+            call_idx[0] += 1
+            if call_idx[0] == 1:
+                return {
+                    "pid": 1111,
+                    "restartCount": 0,
+                    "oomKilled": False,
+                    "cgroupCurrentBytes": 310_000_000,
+                    "cgroupCurrentMiB": 295.64,
+                    "cgroupRatioPct": 57.74,
+                    "cgroupPeakBytes": 320_000_000,
+                    "cgroupPeakMiB": 305.18,
+                    "cgroupPeakRatioPct": 59.60,
+                    "cgroupMaxBytes": CGROUP_MAX_BYTES,
+                    "cgroupStrictCeilingBytes": CGROUP_STRICT_GATE_BYTES,
+                }
+            raise RuntimeError("CGROUP_RAW_BYTE_GATE_BREACHED: mock spike")
+
+        err_sampler = SamplerController(inspect_fn=failing_inspect_fn, poll_interval_sec=0.01, join_timeout_sec=1.0)
+        err_sampler.record_sample("post_boot_idle")
+        err_sampler.start()
+        for _ in range(50):
+            if err_sampler.stop_event.is_set():
+                break
+            time.sleep(0.01)
+        assert err_sampler.stop_event.is_set(), "Sampler should have set stop_event on poll error without os._exit"
+        teardown_called_1 = [False]
+        err_upload_dir = os.path.join(tmp_root, "err_upload")
+        err_summary = {"status": "IN_PROGRESS"}
+        caught_sampler_err = None
+        try:
+            try:
+                err_sampler.record_sample("after_stage")
+            finally:
+                finalize_teardown(
+                    sampler=err_sampler,
+                    proof_completed_ok=False,
+                    summary=err_summary,
+                    artifact_dir=err_upload_dir,
+                    capture_log_fn=lambda adir, cname, lfile: open(os.path.join(adir, lfile), "w").write("mock log\n") if os.makedirs(adir, exist_ok=True) is None else None,
+                    write_artifacts_fn=write_sanitized_artifacts,
+                    teardown_network_fn=lambda: teardown_called_1.__setitem__(0, True),
+                )
+        except RuntimeError as e:
+            caught_sampler_err = e
+        assert caught_sampler_err is not None and "CGROUP_RAW_BYTE_GATE_BREACHED" in str(caught_sampler_err)
+        assert teardown_called_1[0] is True
+        err_persisted = json.loads(open(os.path.join(err_upload_dir, "acceptance_summary.json"), "r", encoding="utf-8").read())
+        assert err_persisted["status"] == "FAILED"
+        assert err_persisted["candidateMemory512mPartial"]["maxPeakBytes"] == 320_000_000
+
+        # 6. Mocked unit smoke: Hung sampler stop_and_join timeout fails closed BEFORE rollback container swap
+        unblock_hung = threading.Event()
+
+        def hung_inspect_fn():
+            unblock_hung.wait(2.0)
+            return {
+                "pid": 2222,
+                "restartCount": 0,
+                "oomKilled": False,
+                "cgroupCurrentBytes": 300_000_000,
+                "cgroupCurrentMiB": 286.10,
+                "cgroupRatioPct": 55.88,
+                "cgroupPeakBytes": 300_000_000,
+                "cgroupPeakMiB": 286.10,
+                "cgroupPeakRatioPct": 55.88,
+                "cgroupMaxBytes": CGROUP_MAX_BYTES,
+                "cgroupStrictCeilingBytes": CGROUP_STRICT_GATE_BYTES,
+            }
+
+        hung_sampler = SamplerController(inspect_fn=hung_inspect_fn, poll_interval_sec=0.01, join_timeout_sec=0.05)
+        hung_sampler.start()
+        time.sleep(0.03)
+        rollback_swap_called = [False]
+        teardown_called_2 = [False]
+        hung_upload_dir = os.path.join(tmp_root, "hung_upload")
+        os.makedirs(hung_upload_dir, exist_ok=True)
+        hung_summary = {"status": "IN_PROGRESS"}
+        caught_join_err = None
+        try:
+            try:
+                hung_sampler.stop_and_join(check_errors=True)
+                rollback_swap_called[0] = True
+            finally:
+                finalize_teardown(
+                    sampler=hung_sampler,
+                    proof_completed_ok=False,
+                    summary=hung_summary,
+                    artifact_dir=hung_upload_dir,
+                    capture_log_fn=lambda adir, cname, lfile: None,
+                    write_artifacts_fn=write_sanitized_artifacts,
+                    teardown_network_fn=lambda: teardown_called_2.__setitem__(0, True),
+                )
+        except RuntimeError as e:
+            caught_join_err = e
+        finally:
+            unblock_hung.set()
+            if hung_sampler.thread is not None:
+                hung_sampler.thread.join(timeout=1.0)
+        assert caught_join_err is not None and "SAMPLER_THREAD_JOIN_TIMEOUT" in str(caught_join_err)
+        assert rollback_swap_called[0] is False, "Rollback swap must NOT execute when sampler join times out"
+        assert teardown_called_2[0] is True, "Network teardown must still execute on sampler join timeout"
+        assert not os.path.exists(hung_upload_dir), "upload_dir must be deleted fail-closed on sampler join timeout"
+
+        # 7. Mocked unit smoke: PASSED summary write_sanitized_artifacts failure enters failure path and deletes upload_dir
+        ok_sampler = SamplerController(
+            inspect_fn=lambda: {
+                "pid": 3333,
+                "restartCount": 0,
+                "oomKilled": False,
+                "cgroupCurrentBytes": 300_000_000,
+                "cgroupCurrentMiB": 286.10,
+                "cgroupRatioPct": 55.88,
+                "cgroupPeakBytes": 300_000_000,
+                "cgroupPeakMiB": 286.10,
+                "cgroupPeakRatioPct": 55.88,
+                "cgroupMaxBytes": CGROUP_MAX_BYTES,
+                "cgroupStrictCeilingBytes": CGROUP_STRICT_GATE_BYTES,
+            },
+            poll_interval_sec=0.05,
+            join_timeout_sec=1.0,
+        )
+        ok_sampler.record_sample("cand_final")
+        teardown_called_3 = [False]
+        wf_upload_dir = os.path.join(tmp_root, "wf_upload")
+        os.makedirs(wf_upload_dir, exist_ok=True)
+        wf_summary = {"status": "PASSED"}
+        wf_proof_ok = False
+        caught_wf_err = None
+
+        def failing_write_fn(adir, sdict, slist):
+            raise RuntimeError("MOCK_WRITE_SANITIZED_ARTIFACTS_FAILURE")
+
+        try:
+            try:
+                failing_write_fn(wf_upload_dir, wf_summary, ok_sampler.snapshot_samples())
+                wf_proof_ok = True
+            finally:
+                finalize_teardown(
+                    sampler=ok_sampler,
+                    proof_completed_ok=wf_proof_ok,
+                    summary=wf_summary,
+                    artifact_dir=wf_upload_dir,
+                    capture_log_fn=lambda adir, cname, lfile: None,
+                    write_artifacts_fn=failing_write_fn,
+                    teardown_network_fn=lambda: teardown_called_3.__setitem__(0, True),
+                )
+        except RuntimeError as e:
+            caught_wf_err = e
+        assert caught_wf_err is not None and "MOCK_WRITE_SANITIZED_ARTIFACTS_FAILURE" in str(caught_wf_err)
+        assert wf_summary["status"] == "FAILED", "summary['status'] must flip to FAILED when write_sanitized_artifacts fails before proof_completed_ok=True"
+        assert teardown_called_3[0] is True
+        assert not os.path.exists(wf_upload_dir), "upload_dir must be deleted fail-closed when artifact write fails"
+
     print("STATIC_SMOKE_TEST_OK", json.dumps({
         "batch1PendingLen": len(exp_b1_pending),
         "batch1Extras": exp_b1_extras,
         "batch2PendingLen": len(exp_b2_pending),
         "batch2Extras": exp_b1_extras + exp_b2_new_extras,
+        "mockSamplerLifecycleTests": "PASSED",
     }))
 
 
