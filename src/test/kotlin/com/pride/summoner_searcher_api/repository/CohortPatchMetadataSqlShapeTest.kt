@@ -663,8 +663,13 @@ class CohortPatchMetadataSqlShapeTest {
             io.mockk.coEvery {
                 springWiredRiotApiService.fetchMatchIdsWithOutcomeSince(any(), any(), any())
             } coAnswers {
+                val ids = springWiredRiotApiService.fetchMatchIdsSince(firstArg(), secondArg(), thirdArg())
                 com.pride.summoner_searcher_api.service.RiotApiService.MatchIdsPaginationOutcome(
-                    matchIds = springWiredRiotApiService.fetchMatchIdsSince(firstArg(), secondArg(), thirdArg())
+                    matchIds = ids,
+                    pagesFetched = if (ids.isEmpty()) 1 else (ids.size + 99) / 100,
+                    exhaustedCleanly = ids.size <= 2000,
+                    hitSafetyCap = ids.size > 2000,
+                    stoppedOnPageFailure = false
                 )
             }
             io.mockk.coEvery { springWiredRiotApiService.fetchMatchIdsSince("h2-season-puuid", "euw1", any()) } returns listOf("EUW1_NEW_2000", "EUW1_OLD_1000")

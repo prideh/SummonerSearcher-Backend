@@ -111,16 +111,25 @@ class PlayerCacheService(
             val safeContainerCap = configuredContainerLimitBytes.coerceAtLeast(1L)
             val safeHeapMax = raw.jvmHeapMaxBytes
             val safeHeapUsed = raw.jvmHeapUsedBytes
-            val isBoundedContainerCgroup = raw.cgroupMemoryMaxBytes != null &&
-                raw.cgroupMemoryMaxBytes in 1L..2_147_483_648L &&
-                raw.cgroupMemoryCurrentBytes != null &&
-                raw.cgroupMemoryCurrentBytes > 0L
-            val effectiveLimit = if (isBoundedContainerCgroup) {
+            val hasBoundedContainerCgroupLimit = raw.cgroupMemoryMaxBytes != null &&
+                raw.cgroupMemoryMaxBytes in 1L..2_147_483_648L
+            if (hasBoundedContainerCgroupLimit) {
+                val cgroupCurrent = raw.cgroupMemoryCurrentBytes
+                if (cgroupCurrent == null || cgroupCurrent <= 0L) {
+                    logger.warn(
+                        "Bounded container cgroup limit={} detected with missing/invalid cgroupMemoryCurrentBytes={}; failing safe (false).",
+                        raw.cgroupMemoryMaxBytes,
+                        cgroupCurrent
+                    )
+                    return false
+                }
+            }
+            val effectiveLimit = if (hasBoundedContainerCgroupLimit) {
                 minOf(safeContainerCap, raw.cgroupMemoryMaxBytes!!)
             } else {
                 safeHeapMax
             }
-            val effectiveUsed = if (isBoundedContainerCgroup) {
+            val effectiveUsed = if (hasBoundedContainerCgroupLimit) {
                 maxOf(raw.cgroupMemoryCurrentBytes!!, safeHeapUsed)
             } else {
                 safeHeapUsed
@@ -777,10 +786,6 @@ class PlayerCacheService(
             val freshRank = rankDeferred.await()
             val paginationOutcome = matchIdsOutcomeDeferred.await()
             val rawAllMatchIds = paginationOutcome.matchIds
-            val hasExplicitOutcomeMetadata = paginationOutcome.exhaustedCleanly ||
-                paginationOutcome.hitSafetyCap ||
-                paginationOutcome.stoppedOnPageFailure ||
-                paginationOutcome.pagesFetched > 0
             val rawNonBlankIds = rawAllMatchIds
                 .asSequence()
                 .map { it.trim() }
@@ -793,11 +798,10 @@ class PlayerCacheService(
                 rawAllMatchIds.size > DurablePlayerSeasonStatsDto.RIOT_MATCH_IDS_SAFETY_THRESHOLD ||
                 rawDistinctMatchIds.size > DurablePlayerSeasonStatsDto.RIOT_MATCH_IDS_SAFETY_THRESHOLD
             val rawFetchTruncatedByLedgerCap = rawDistinctMatchIds.size > DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS
-            val paginationExhaustedCleanly = if (hasExplicitOutcomeMetadata) {
-                paginationOutcome.exhaustedCleanly
-            } else {
-                !paginationStoppedOnFailure && !rawFetchHitSafetyLimit && !rawFetchTruncatedByLedgerCap
-            }
+            val paginationExhaustedCleanly = paginationOutcome.exhaustedCleanly &&
+                !paginationStoppedOnFailure &&
+                !rawFetchHitSafetyLimit &&
+                !rawFetchTruncatedByLedgerCap
             val distinctAllMatchIds = rawDistinctMatchIds.take(DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS)
             val metadataAndIdsMs = timeProvider.now() - metaStartMs
 

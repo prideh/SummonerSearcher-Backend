@@ -24,7 +24,13 @@ class PlayerCacheServiceTest : BehaviorSpec({
         io.mockk.clearMocks(redisCacheService, riotApiService, indexedPlayerRepository, answers = false)
         coEvery { riotApiService.fetchMatchIdsWithOutcomeSince(any(), any(), any()) } coAnswers {
             val ids = riotApiService.fetchMatchIdsSince(firstArg(), secondArg(), thirdArg())
-            RiotApiService.MatchIdsPaginationOutcome(matchIds = ids)
+            RiotApiService.MatchIdsPaginationOutcome(
+                matchIds = ids,
+                pagesFetched = if (ids.isEmpty()) 1 else (ids.size + 99) / 100,
+                exhaustedCleanly = ids.size <= 2000,
+                hitSafetyCap = ids.size > 2000,
+                stoppedOnPageFailure = false
+            )
         }
     }
 
@@ -1748,7 +1754,48 @@ class PlayerCacheServiceTest : BehaviorSpec({
             }
             val real2100Outcome = realRiotSpy.fetchMatchIdsWithOutcomeSince(real2100Puuid, region, 0L)
 
-            // 6. Memory headroom guard MUST fail safe (false) when memoryStatsProvider throws or returns non-positive heap limits
+            // 6b. Outcome with exhaustedCleanly=false (and all other flags false/0) MUST NOT fallback-complete
+            val unexhaustedPuuid = "unexhausted-outcome-puuid"
+            coEvery { riotApiService.getSummonerByPuuid(unexhaustedPuuid, region) } returns SummonerDto("id", unexhaustedPuuid, 300L, 11)
+            coEvery { riotApiService.fetchLeagueRank(unexhaustedPuuid, region) } returns null
+            coEvery {
+                riotApiService.fetchMatchIdsWithOutcomeSince(unexhaustedPuuid, region, any())
+            } returns RiotApiService.MatchIdsPaginationOutcome(
+                matchIds = listOf("EUW1_10", "EUW1_9"),
+                pagesFetched = 0,
+                exhaustedCleanly = false,
+                hitSafetyCap = false,
+                stoppedOnPageFailure = false
+            )
+            var unexhaustedSavedEntity: com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity? = null
+            val unexhaustedRepo = mockk<com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository>()
+            every { unexhaustedRepo.findByRegionAndPuuidAndSeasonYearAndQueueId(region, unexhaustedPuuid, 2026, 420) } returns null
+            every { unexhaustedRepo.saveAndFlush(any()) } answers {
+                val arg = firstArg<com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity>()
+                arg.version += 1L
+                unexhaustedSavedEntity = arg
+                arg
+            }
+            every { redisCacheService.get("player:profile:euw1:$unexhaustedPuuid", SummonerProfileDto::class.java) } returns null
+            coEvery { riotApiService.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                val idx = id.substringAfter("_").toInt()
+                buildMatch(id, idx, unexhaustedPuuid)
+            }
+            val unexhaustedService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = unexhaustedRepo,
+                transactionTemplate = txTemplate,
+                objectMapper = mapper
+            )
+            unexhaustedService.getPlayerProfile(unexhaustedPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val unexhaustedState = mapper.readValue(unexhaustedSavedEntity!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+
+            // 7. Memory headroom guard MUST fail safe (false) when memoryStatsProvider throws, returns non-positive heap limits,
+            //    or reports a known bounded cgroup with missing (null) or non-positive (<=0) cgroupMemoryCurrentBytes (no heap fallback)
             val brokenMemoryService = PlayerCacheService(
                 redisCacheService = redisCacheService,
                 riotApiService = riotApiService,
@@ -1775,8 +1822,40 @@ class PlayerCacheServiceTest : BehaviorSpec({
                     )
                 }
             )
+            val boundedCgroupNullCurrentService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = RawMemorySample(
+                        jvmHeapUsedBytes = 32L * 1024L * 1024L,
+                        jvmHeapCommittedBytes = 64L * 1024L * 1024L,
+                        jvmHeapMaxBytes = 256L * 1024L * 1024L,
+                        cgroupMemoryCurrentBytes = null,
+                        cgroupMemoryMaxBytes = 512L * 1024L * 1024L
+                    )
+                }
+            )
+            val boundedCgroupZeroCurrentService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = RawMemorySample(
+                        jvmHeapUsedBytes = 32L * 1024L * 1024L,
+                        jvmHeapCommittedBytes = 64L * 1024L * 1024L,
+                        jvmHeapMaxBytes = 256L * 1024L * 1024L,
+                        cgroupMemoryCurrentBytes = 0L,
+                        cgroupMemoryMaxBytes = 512L * 1024L * 1024L
+                    )
+                }
+            )
             val brokenMemoryGuardResult = brokenMemoryService.hasMemoryHeadroomForSeasonBackfill()
             val zeroLimitMemoryGuardResult = zeroLimitMemoryService.hasMemoryHeadroomForSeasonBackfill()
+            val boundedCgroupNullCurrentResult = boundedCgroupNullCurrentService.hasMemoryHeadroomForSeasonBackfill()
+            val boundedCgroupZeroCurrentResult = boundedCgroupZeroCurrentService.hasMemoryHeadroomForSeasonBackfill()
 
             Then("it preserves 2100 coverage with historyCapped=true/historyComplete=false, advances the 2100 moving window on new games without drift or archive expansion, bounds live MatchDto peak (including 50-match chunk) to <=70, returns committed merged state for Redis, and fails closed on DB/pagination/memory errors") {
                 // 1. 2,100-match fetch preserves all 2,100 matches while marking historyCapped=true and historyComplete=false
@@ -1871,9 +1950,16 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 real2100Outcome.exhaustedCleanly shouldBe false
                 real2100Outcome.stoppedOnPageFailure shouldBe false
 
-                // 7. Memory headroom guard fails safe (false) on metric exception or zero heap limit
+                // 6b. Unexhausted pagination outcome (exhaustedCleanly=false) never fallback-completes
+                unexhaustedState.processedMatchIds shouldBe listOf("EUW1_10", "EUW1_9")
+                unexhaustedState.historyComplete shouldBe false
+                unexhaustedSavedEntity?.historyComplete shouldBe false
+
+                // 7. Memory headroom guard fails safe (false) on metric exception, zero heap limit, or bounded cgroup with missing/invalid current bytes
                 brokenMemoryGuardResult shouldBe false
                 zeroLimitMemoryGuardResult shouldBe false
+                boundedCgroupNullCurrentResult shouldBe false
+                boundedCgroupZeroCurrentResult shouldBe false
             }
         }
     }
