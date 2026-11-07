@@ -4644,9 +4644,26 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
 
             // 3c. Verify runner lock + running flag cleanup if seeded admission check throws, and verify unseeded service batch
             //     does NOT call isCheckpointStalePatchAdvance before pre-scan memory check:
-            every { seedRedis.get("cohort:patch:external:ddragon", String::class.java) } throws RuntimeException("simulated-ddragon-redis-failure")
+            val throwingAdmissionService = io.mockk.spyk(seedService)
+            every {
+                throwingAdmissionService.isCheckpointStalePatchAdvance(any(), any(), any())
+            } throws RuntimeException("simulated-ddragon-redis-failure")
+            val throwingAdmissionRunner = com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner(
+                cohortBenchmarkService = throwingAdmissionService,
+                configuredOperatorToken = "operator-secret-123",
+                timeProvider = testClock
+            )
+            val throwingAdmissionController = com.pride.summoner_searcher_api.controller.RiotApiController(
+                riotApiService = seedRiot,
+                challengerLeagueService = mockk(relaxed = true),
+                userService = mockk(relaxed = true),
+                summonerProfileService = mockk(relaxed = true),
+                redisCacheService = seedRedis,
+                cohortBenchmarkService = throwingAdmissionService,
+                overnightCohortCollectorRunner = throwingAdmissionRunner
+            )
             val seededAdmissionThrown = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
-                seedController.startOrResumeCohortCollector(
+                throwingAdmissionController.startOrResumeCohortCollector(
                     region = "euw1",
                     patch = "16.7",
                     maxBatches = 1,
@@ -4660,37 +4677,41 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 )
             }
             val lockReleasedAfterSeededAdmissionException = !activeLockHeld
-            val runningResetAfterSeededAdmissionException = !seedRunner.getStatus("euw1", "16.7").runningInProcess
+            val runningResetAfterSeededAdmissionException = !throwingAdmissionRunner.getStatus("euw1", "16.7").runningInProcess
 
-            val lowMemService = CohortBenchmarkService(
-                redisCacheService = seedRedis,
-                cohortBenchmarkCellRepository = seedCellRepo,
-                riotApiRateLimiter = limiter,
-                riotApiService = seedRiot,
-                objectMapper = objectMapper,
-                networkCollectionEnabled = true,
-                timeProvider = testClock,
-                memoryStatsProvider = object : MemoryStatsProvider {
-                    override fun sample(): RawMemorySample = RawMemorySample(
-                        cgroupMemoryCurrentBytes = 480L * 1024 * 1024,
-                        cgroupMemoryMaxBytes = 512L * 1024 * 1024,
-                        jvmHeapUsedBytes = 200L * 1024 * 1024,
-                        jvmHeapCommittedBytes = 256L * 1024 * 1024,
-                        jvmHeapMaxBytes = 256L * 1024 * 1024,
-                        jvmNonHeapUsedBytes = 64L * 1024 * 1024,
-                        directBufferUsedBytes = 8L * 1024 * 1024
-                    )
-                },
-                indexedPlayerRepository = mockIndexedRepo
+            val lowMemService = io.mockk.spyk(
+                CohortBenchmarkService(
+                    redisCacheService = seedRedis,
+                    cohortBenchmarkCellRepository = seedCellRepo,
+                    riotApiRateLimiter = limiter,
+                    riotApiService = seedRiot,
+                    objectMapper = objectMapper,
+                    networkCollectionEnabled = true,
+                    timeProvider = testClock,
+                    memoryStatsProvider = object : MemoryStatsProvider {
+                        override fun sample(): RawMemorySample = RawMemorySample(
+                            cgroupMemoryCurrentBytes = 480L * 1024 * 1024,
+                            cgroupMemoryMaxBytes = 512L * 1024 * 1024,
+                            jvmHeapUsedBytes = 200L * 1024 * 1024,
+                            jvmHeapCommittedBytes = 256L * 1024 * 1024,
+                            jvmHeapMaxBytes = 256L * 1024 * 1024,
+                            jvmNonHeapUsedBytes = 64L * 1024 * 1024,
+                            directBufferUsedBytes = 8L * 1024 * 1024
+                        )
+                    },
+                    indexedPlayerRepository = mockIndexedRepo
+                )
             )
-            // With "cohort:patch:external:ddragon" still throwing, an unseeded batch must hit preScanMem first without calling isCheckpointStalePatchAdvance
+            every {
+                lowMemService.isCheckpointStalePatchAdvance(any(), any(), any())
+            } throws RuntimeException("unexpected-stale-patch-check-before-memory-guard")
+            // With isCheckpointStalePatchAdvance throwing on lowMemService, an unseeded batch must hit preScanMem first without calling isCheckpointStalePatchAdvance
             val unseededMemPausedCheckpoint = lowMemService.runResumableLowPriorityCollectorBatch(
                 region = "euw1",
                 targetPatch = "16.7",
                 seedPuuids = emptyList(),
                 maxPlayersPerBatch = 1
             )
-            every { seedRedis.get("cohort:patch:external:ddragon", String::class.java) } returns "16.7"
 
             // Restore 499 pending queue for the valid 499 + 1 net-new seed (== 500) + 1 already-processed seed (0 net-new) run
             savedCheckpoints["cohort:collector:checkpoint:euw1:16.7"] = baselineCheckpoint499
