@@ -3837,6 +3837,8 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 puuid = selectedPuuid,
                 targetPatch = "16.22"
             )
+            val savedSampleEmptyAfterDivergentRefusal = savedSampleEntities.isEmpty()
+            val savedBenchmarkEmptyAfterDivergentRefusal = savedBenchmarkEntities.isEmpty()
 
             // Clear divergent state by creating a fresh wired service (cold in-memory DataDragon cache!) and run happy-path ingestion
             val cleanWiredService = CohortBenchmarkService(
@@ -3943,8 +3945,8 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
 
                 divergentRefusedResult.status shouldBe "REFUSED_DIVERGENT_IN_MEMORY_CELL_STATE"
                 divergentRefusedResult.netNewSamplesPersisted shouldBe 0
-                savedSampleEntities.isEmpty() shouldBe true
-                savedBenchmarkEntities.isEmpty() shouldBe true
+                savedSampleEmptyAfterDivergentRefusal shouldBe true
+                savedBenchmarkEmptyAfterDivergentRefusal shouldBe true
 
                 firstIngestResult.status shouldBe "COMPLETED"
                 firstIngestResult.tier shouldBe "CHALLENGER"

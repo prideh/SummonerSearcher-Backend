@@ -397,6 +397,7 @@ class CohortPatchMetadataSqlShapeTest {
                 arrayOf(CohortBenchmarkCellRepository::class.java)
             ) { _, method, args ->
                 if (method.name == "save" && failBenchmarkSave.get()) {
+                    sampleStateRepository.flush()
                     throw org.springframework.dao.DataIntegrityViolationException("Simulated second-table failure in cohort_benchmark_cells")
                 }
                 if (args == null) {
