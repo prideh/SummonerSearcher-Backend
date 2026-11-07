@@ -22,6 +22,16 @@ class PlayerCacheServiceTest : BehaviorSpec({
 
     beforeTest {
         io.mockk.clearMocks(redisCacheService, riotApiService, indexedPlayerRepository, answers = false)
+        coEvery { riotApiService.fetchMatchIdsWithOutcomeSince(any(), any(), any()) } coAnswers {
+            val ids = riotApiService.fetchMatchIdsSince(firstArg(), secondArg(), thirdArg())
+            RiotApiService.MatchIdsPaginationOutcome(
+                matchIds = ids,
+                pagesFetched = if (ids.isEmpty()) 1 else (ids.size + 99) / 100,
+                exhaustedCleanly = ids.size <= 2000,
+                hitSafetyCap = ids.size > 2000,
+                stoppedOnPageFailure = false
+            )
+        }
     }
 
     Given("A player cache service") {
@@ -909,5 +919,1050 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 lockDeleted.get() shouldBe true
             }
         }
+
+        When("incrementally refreshing 3 new matches on top of 900 durably folded season matches and recovering after Redis match/profile expiry") {
+            val mapper = com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules()
+            val fixedNowMs = java.time.Instant.parse("2026-11-06T12:00:00Z").toEpochMilli()
+            val clock = object : TimeProvider {
+                override fun now(): Long = fixedNowMs
+            }
+            val seasonPuuid = "durable-900-plus-3-puuid"
+            val champions = listOf("Orianna", "Ahri", "Syndra", "Viktor", "Azir", "Taliyah")
+
+            fun buildMatch(idx: Int): MatchDto {
+                val champ = champions[idx % champions.size]
+                val win = idx % 3 != 0
+                val p = mapper.readValue(
+                    """
+                    {
+                      "puuid": "$seasonPuuid",
+                      "championName": "$champ",
+                      "teamId": 100,
+                      "teamPosition": "MIDDLE",
+                      "win": $win,
+                      "kills": ${5 + (idx % 7)},
+                      "deaths": ${1 + (idx % 4)},
+                      "assists": ${6 + (idx % 8)},
+                      "totalMinionsKilled": ${190 + (idx % 40)},
+                      "neutralMinionsKilled": ${4 + (idx % 8)},
+                      "visionScore": ${20 + (idx % 15)}
+                    }
+                    """.trimIndent(),
+                    com.pride.summoner_searcher_api.dto.ParticipantDto::class.java
+                )
+                return MatchDto(
+                    metadata = MatchMetadata("EUW1_$idx", listOf(seasonPuuid)),
+                    info = MatchInfo(
+                        gameCreation = fixedNowMs - (1_000 - idx) * 60_000L,
+                        gameDuration = 1500L + (idx % 300),
+                        gameId = idx.toLong(),
+                        queueId = 420,
+                        gameMode = "CLASSIC",
+                        gameVersion = "16.22.1",
+                        participants = listOf(p),
+                        teams = emptyList()
+                    )
+                )
+            }
+
+            // Build reference 900-game durable state and 903-game full-accumulation reference
+            val baseAcc900 = MatchStatsAccumulator(seasonPuuid)
+            val fullAcc903 = MatchStatsAccumulator(seasonPuuid)
+            val ids900NewestFirst = (900 downTo 1).map { "EUW1_$it" }
+            val ids903NewestFirst = (903 downTo 1).map { "EUW1_$it" }
+            for (idx in 900 downTo 1) {
+                val m = buildMatch(idx)
+                baseAcc900.add(m)
+                fullAcc903.add(m)
+            }
+            for (idx in 903 downTo 901) {
+                fullAcc903.add(buildMatch(idx))
+            }
+            val (expectedChamp903, expectedOverall903) = fullAcc903.getResult()
+            val (baseOverallSnap, baseChampSnaps) = baseAcc900.toAdditiveSnapshots()
+
+            val initialDurableDto = DurablePlayerSeasonStatsDto(
+                schemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION,
+                region = region,
+                puuid = seasonPuuid,
+                seasonYear = 2026,
+                queueId = 420,
+                historyComplete = true,
+                hitPreSeasonBoundary = true,
+                firstPreSeasonMatchId = "EUW1_0",
+                processedMatchIds = ids900NewestFirst,
+                pendingMatchIds = emptyList(),
+                excludedMatchIds = emptyList(),
+                overallCounters = baseOverallSnap,
+                championCounters = baseChampSnaps,
+                updatedAtEpochMilli = fixedNowMs - 600_000L
+            )
+
+            var storedEntity = com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity(
+                id = java.util.UUID.randomUUID(),
+                region = region,
+                puuid = seasonPuuid,
+                seasonYear = 2026,
+                queueId = 420,
+                schemaVersion = 1,
+                historyComplete = true,
+                foldedGamesCount = 900,
+                pendingGamesCount = 0,
+                stateJson = mapper.writeValueAsString(initialDurableDto),
+                updatedAt = java.time.Instant.ofEpochMilli(fixedNowMs - 600_000L),
+                version = 0L
+            )
+
+            val seasonRepo = mockk<com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository>()
+            every {
+                seasonRepo.findByRegionAndPuuidAndSeasonYearAndQueueId(region, seasonPuuid, 2026, 420)
+            } answers { storedEntity }
+            every { seasonRepo.saveAndFlush(any()) } answers {
+                val arg = firstArg<com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity>()
+                arg.version += 1L
+                storedEntity = arg
+                arg
+            }
+
+            val txManager = object : org.springframework.transaction.support.AbstractPlatformTransactionManager() {
+                override fun doGetTransaction(): Any = Any()
+                override fun doBegin(transaction: Any, definition: org.springframework.transaction.TransactionDefinition) {}
+                override fun doCommit(status: org.springframework.transaction.support.DefaultTransactionStatus) {}
+                override fun doRollback(status: org.springframework.transaction.support.DefaultTransactionStatus) {}
+            }
+            val txTemplate = org.springframework.transaction.support.TransactionTemplate(txManager)
+
+            val durableService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = seasonRepo,
+                transactionTemplate = txTemplate,
+                objectMapper = mapper
+            )
+
+            // Warm cached profile has recentMatches for 900..881 so recent-20 cards only need the 3 new matches + 17 already-in-profile cards!
+            val cachedRecent20For900 = (900 downTo 881).map { buildMatch(it) }
+            val (baseChamp900, baseOverall900) = baseAcc900.getResult()
+            val warmProfile900 = SummonerProfileDto(
+                puuid = seasonPuuid,
+                gameName = summonerName,
+                tagLine = tagLine,
+                summonerLevel = 500L,
+                profileIconId = 29,
+                soloQueueRank = null,
+                recentMatches = cachedRecent20For900,
+                allMatchIds = ids900NewestFirst,
+                championStats = baseChamp900,
+                overallStats = baseOverall900,
+                totalMatches = 900,
+                lastRefreshed = java.time.Instant.ofEpochMilli(fixedNowMs - 600_000L)
+            )
+
+            every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            every { redisCacheService.get("player:profile:euw1:$seasonPuuid", SummonerProfileDto::class.java) } returns warmProfile900
+            coEvery { riotApiService.getSummonerByPuuid(seasonPuuid, region) } returns SummonerDto("id", seasonPuuid, 501L, 29)
+            coEvery { riotApiService.fetchLeagueRank(seasonPuuid, region) } returns null
+            coEvery { riotApiService.fetchMatchIdsSince(seasonPuuid, region, any()) } returns ids903NewestFirst
+
+            val multiGetKeysRequested = java.util.Collections.synchronizedList(mutableListOf<String>())
+            every { redisCacheService.multiGet(any(), MatchDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                multiGetKeysRequested.addAll(keys)
+                keys.associateWith { null }
+            }
+
+            val riotFetchedIds = java.util.Collections.synchronizedList(mutableListOf<String>())
+            coEvery { riotApiService.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                riotFetchedIds.add(id)
+                val idx = id.substringAfter("_").toInt()
+                buildMatch(idx)
+            }
+
+            // 1. Incremental refresh with 3 new matches on top of 900 folded matches
+            val incrementalResult = durableService.getPlayerProfile(
+                puuid = seasonPuuid,
+                region = region,
+                summonerName = summonerName,
+                tagLine = tagLine,
+                explicitRefresh = true
+            )
+
+            val multiGetAfterIncremental = multiGetKeysRequested.toList()
+            val riotFetchedAfterIncremental = riotFetchedIds.toList()
+
+            // 2. Simulate full Redis expiry (both player:profile and all match:euw1:* keys expired from Redis)
+            multiGetKeysRequested.clear()
+            riotFetchedIds.clear()
+            every { redisCacheService.get("player:profile:euw1:$seasonPuuid", SummonerProfileDto::class.java) } returns null
+            val recoveredAfterRedisExpiry = durableService.getPlayerProfile(
+                puuid = seasonPuuid,
+                region = region,
+                summonerName = summonerName,
+                tagLine = tagLine,
+                explicitRefresh = true
+            )
+
+            Then("incremental refresh decodes 0 of the 900 folded matches from Redis, and Redis expiry recovery restores identical 903-game seasonal stats from Postgres") {
+                // Zero of the 900 old matches were requested via Redis multiGet or Riot getMatchById during the 3-match incremental update!
+                multiGetAfterIncremental shouldBe listOf(
+                    "match:euw1:EUW1_903",
+                    "match:euw1:EUW1_902",
+                    "match:euw1:EUW1_901"
+                )
+                riotFetchedAfterIncremental shouldBe listOf("EUW1_903", "EUW1_902", "EUW1_901")
+
+                incrementalResult?.totalMatches shouldBe 903
+                incrementalResult?.overallStats shouldBe expectedOverall903
+                incrementalResult?.championStats shouldBe expectedChamp903
+                incrementalResult?.recentMatches?.size shouldBe 20
+                incrementalResult?.recentMatches?.first()?.metadata?.matchId shouldBe "EUW1_903"
+
+                // After Redis profile + match keys expire completely, seasonal totals (903 games) are restored intact from durable state
+                // while only the 20 recent card matches are re-fetched for the UI card list.
+                recoveredAfterRedisExpiry?.totalMatches shouldBe 903
+                recoveredAfterRedisExpiry?.overallStats shouldBe expectedOverall903
+                recoveredAfterRedisExpiry?.championStats shouldBe expectedChamp903
+                recoveredAfterRedisExpiry?.recentMatches?.size shouldBe 20
+                riotFetchedIds.size shouldBe 20
+            }
+        }
+
+        When("handling partial match fetch failures, memory headroom pauses, duplicates, out-of-order backfills, and year rollover") {
+            val mapper = com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules()
+            val clockMs = java.util.concurrent.atomic.AtomicLong(java.time.Instant.parse("2026-11-06T12:00:00Z").toEpochMilli())
+            val clock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            val gapPuuid = "durable-gap-backfill-puuid"
+
+            fun buildMatchForClock(id: String, creationMs: Long, kills: Int = 6): MatchDto {
+                val p = mapper.readValue(
+                    """
+                    {
+                      "puuid": "$gapPuuid",
+                      "championName": "Sylas",
+                      "teamId": 100,
+                      "teamPosition": "MIDDLE",
+                      "win": true,
+                      "kills": $kills,
+                      "deaths": 2,
+                      "assists": 7,
+                      "totalMinionsKilled": 205,
+                      "neutralMinionsKilled": 8,
+                      "visionScore": 24
+                    }
+                    """.trimIndent(),
+                    com.pride.summoner_searcher_api.dto.ParticipantDto::class.java
+                )
+                return MatchDto(
+                    metadata = MatchMetadata(id, listOf(gapPuuid)),
+                    info = MatchInfo(
+                        gameCreation = creationMs,
+                        gameDuration = 1800L,
+                        gameId = id.hashCode().toLong(),
+                        queueId = 420,
+                        gameMode = "CLASSIC",
+                        gameVersion = "16.22.1",
+                        participants = listOf(p),
+                        teams = emptyList()
+                    )
+                )
+            }
+
+            val rowsByYear = mutableMapOf<Int, com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity>()
+            val seasonRepo = mockk<com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository>()
+            every {
+                seasonRepo.findByRegionAndPuuidAndSeasonYearAndQueueId(region, gapPuuid, any(), 420)
+            } answers {
+                val yr = thirdArg<Int>()
+                rowsByYear[yr]
+            }
+            every { seasonRepo.saveAndFlush(any()) } answers {
+                val entity = firstArg<com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity>()
+                entity.version += 1L
+                rowsByYear[entity.seasonYear] = entity
+                entity
+            }
+
+            val txManager = object : org.springframework.transaction.support.AbstractPlatformTransactionManager() {
+                override fun doGetTransaction(): Any = Any()
+                override fun doBegin(transaction: Any, definition: org.springframework.transaction.TransactionDefinition) {}
+                override fun doCommit(status: org.springframework.transaction.support.DefaultTransactionStatus) {}
+                override fun doRollback(status: org.springframework.transaction.support.DefaultTransactionStatus) {}
+            }
+            val txTemplate = org.springframework.transaction.support.TransactionTemplate(txManager)
+
+            val durableService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = seasonRepo,
+                transactionTemplate = txTemplate,
+                objectMapper = mapper
+            )
+
+            var cachedProfileInRedis: SummonerProfileDto? = null
+            every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            every { redisCacheService.get("player:profile:euw1:$gapPuuid", SummonerProfileDto::class.java) } answers { cachedProfileInRedis }
+            every {
+                redisCacheService.set<SummonerProfileDto>("player:profile:euw1:$gapPuuid", any(), any())
+            } answers {
+                cachedProfileInRedis = secondArg()
+            }
+            every { redisCacheService.multiGet(any(), MatchDto::class.java) } answers {
+                firstArg<List<String>>().associateWith { null }
+            }
+            coEvery { riotApiService.getSummonerByPuuid(gapPuuid, region) } returns SummonerDto("id", gapPuuid, 310L, 44)
+            coEvery { riotApiService.fetchLeagueRank(gapPuuid, region) } returns null
+
+            // Step 1: Duplicate IDs ("EUW1_5" twice) + transient fetch failure on "EUW1_2"
+            coEvery { riotApiService.fetchMatchIdsSince(gapPuuid, region, any()) } returns listOf(
+                "EUW1_5", "EUW1_5", "EUW1_4", "EUW1_2", "EUW1_1"
+            )
+            val failMatch2 = java.util.concurrent.atomic.AtomicBoolean(true)
+            coEvery { riotApiService.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                if (id == "EUW1_2" && failMatch2.get()) {
+                    null
+                } else {
+                    buildMatchForClock(id, clockMs.get() - 60_000L)
+                }
+            }
+
+            val step1Profile = durableService.getPlayerProfile(gapPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val step1State = mapper.readValue(rowsByYear[2026]!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+
+            // Step 1b: Next refresh omits "EUW1_2" from fetchMatchIdsSince window while "EUW1_2" still fails to resolve;
+            // unresolved pending ID "EUW1_2" MUST be preserved (never silently dropped) and historyComplete MUST stay false!
+            clockMs.addAndGet(120_000L)
+            coEvery { riotApiService.fetchMatchIdsSince(gapPuuid, region, any()) } returns listOf(
+                "EUW1_5", "EUW1_4", "EUW1_1"
+            )
+            val step1bProfile = durableService.getPlayerProfile(gapPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val step1bState = mapper.readValue(rowsByYear[2026]!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+
+            // Step 2: Transient failure heals AND out-of-order backfilled match "EUW1_3" appears in the middle (while newest ID is still "EUW1_5")
+            failMatch2.set(false)
+            clockMs.addAndGet(120_000L)
+            coEvery { riotApiService.fetchMatchIdsSince(gapPuuid, region, any()) } returns listOf(
+                "EUW1_5", "EUW1_4", "EUW1_3", "EUW1_2", "EUW1_1"
+            )
+            val step2FetchedIds = java.util.Collections.synchronizedList(mutableListOf<String>())
+            coEvery { riotApiService.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                step2FetchedIds.add(id)
+                buildMatchForClock(id, clockMs.get() - 60_000L)
+            }
+
+            val step2Profile = durableService.getPlayerProfile(gapPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val step2FetchedSet = step2FetchedIds.toSet()
+            val step2State = mapper.readValue(rowsByYear[2026]!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+
+            // Step 3: Advance clock to 2027-01-15 (Season year rollover) with 2 new 2027 matches
+            clockMs.set(java.time.Instant.parse("2027-01-15T12:00:00Z").toEpochMilli())
+            coEvery { riotApiService.fetchMatchIdsSince(gapPuuid, region, any()) } returns listOf("EUW1_2027_2", "EUW1_2027_1")
+            val step3Profile = durableService.getPlayerProfile(gapPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val step3State2027 = mapper.readValue(rowsByYear[2027]!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+
+            // Measure actual serialized JSON payload sizes for 150-game and 924-game (Kaori-scale) durable states
+            val acc150 = MatchStatsAccumulator(gapPuuid)
+            for (i in 1..150) {
+                val champName = "Champ_${i % 20}"
+                val p = mapper.readValue(
+                    """{"puuid":"$gapPuuid","championName":"$champName","teamId":100,"teamPosition":"BOTTOM","win":${i % 2 == 0},"kills":7,"deaths":3,"assists":8,"totalMinionsKilled":230,"neutralMinionsKilled":8,"visionScore":22}""",
+                    com.pride.summoner_searcher_api.dto.ParticipantDto::class.java
+                )
+                acc150.add(
+                    MatchDto(
+                        metadata = MatchMetadata("EUW1_${7000000000L + i}", listOf(gapPuuid)),
+                        info = MatchInfo(
+                            gameCreation = clockMs.get() - i * 1000L,
+                            gameDuration = 1800L,
+                            gameId = i.toLong(),
+                            queueId = 420,
+                            gameMode = "CLASSIC",
+                            gameVersion = "16.22.1",
+                            participants = listOf(p)
+                        )
+                    )
+                )
+            }
+            val (overall150, champs150) = acc150.toAdditiveSnapshots()
+            val durable150Bytes = mapper.writeValueAsBytes(
+                DurablePlayerSeasonStatsDto(
+                    region = "euw1",
+                    puuid = gapPuuid,
+                    seasonYear = 2026,
+                    queueId = 420,
+                    historyComplete = true,
+                    hitPreSeasonBoundary = true,
+                    processedMatchIds = (150 downTo 1).map { "EUW1_${7000000000L + it}" },
+                    overallCounters = overall150,
+                    championCounters = champs150,
+                    updatedAtEpochMilli = clockMs.get()
+                )
+            ).size
+
+            val kaoriAcc = MatchStatsAccumulator(gapPuuid)
+            for (i in 1..924) {
+                val champName = "Champ_${i % 40}"
+                val p = mapper.readValue(
+                    """{"puuid":"$gapPuuid","championName":"$champName","teamId":100,"teamPosition":"BOTTOM","win":${i % 2 == 0},"kills":7,"deaths":3,"assists":8,"totalMinionsKilled":230,"neutralMinionsKilled":8,"visionScore":22}""",
+                    com.pride.summoner_searcher_api.dto.ParticipantDto::class.java
+                )
+                kaoriAcc.add(
+                    MatchDto(
+                        metadata = MatchMetadata("EUW1_${7000000000L + i}", listOf(gapPuuid)),
+                        info = MatchInfo(
+                            gameCreation = clockMs.get() - i * 1000L,
+                            gameDuration = 1800L,
+                            gameId = i.toLong(),
+                            queueId = 420,
+                            gameMode = "CLASSIC",
+                            gameVersion = "16.22.1",
+                            participants = listOf(p)
+                        )
+                    )
+                )
+            }
+            val (kaoriOverall, kaoriChamps) = kaoriAcc.toAdditiveSnapshots()
+            val kaoriDurableDto = DurablePlayerSeasonStatsDto(
+                region = "euw1",
+                puuid = gapPuuid,
+                seasonYear = 2026,
+                queueId = 420,
+                historyComplete = true,
+                hitPreSeasonBoundary = true,
+                processedMatchIds = (924 downTo 1).map { "EUW1_${7000000000L + it}" },
+                overallCounters = kaoriOverall,
+                championCounters = kaoriChamps,
+                updatedAtEpochMilli = clockMs.get()
+            )
+            val kaoriBytes = mapper.writeValueAsBytes(kaoriDurableDto).size
+            println("[MEASURED_DURABLE_SEASON_STATE_BYTES] 150-game/20-champ UTF-8 bytes = $durable150Bytes bytes | 924-game/40-champ state_json UTF-8 bytes = $kaoriBytes bytes")
+
+            Then("it tracks pending gaps with historyComplete=false, preserves unresolved pending IDs absent from current window, heals gaps + out-of-order backfills once, and isolates 2027 rollover") {
+                // Step 1: Duplicate EUW1_5 folded once; failed EUW1_2 recorded as pending gap; historyComplete is FALSE
+                step1Profile?.totalMatches shouldBe 3
+                step1State.historyComplete shouldBe false
+                step1State.processedMatchIds shouldBe listOf("EUW1_5", "EUW1_4", "EUW1_1")
+                step1State.pendingMatchIds shouldBe listOf("EUW1_2")
+
+                // Step 1b: Even when EUW1_2 is absent from the returned match ID window, unresolved EUW1_2 is preserved
+                step1bProfile?.totalMatches shouldBe 3
+                step1bState.historyComplete shouldBe false
+                step1bState.pendingMatchIds shouldBe listOf("EUW1_2")
+
+                // Step 2: Only the missing gap ("EUW1_2") and the out-of-order backfill ("EUW1_3") are fetched and folded;
+                // historyComplete flips to TRUE with all 5 unique matches folded once
+                step2FetchedSet shouldBe setOf("EUW1_2", "EUW1_3")
+                step2Profile?.totalMatches shouldBe 5
+                step2Profile?.overallStats?.wins shouldBe 5
+                step2State.historyComplete shouldBe true
+                step2State.pendingMatchIds shouldBe emptyList()
+                step2State.processedMatchIds shouldBe listOf("EUW1_5", "EUW1_4", "EUW1_3", "EUW1_2", "EUW1_1")
+
+                // Step 3: 2027 rollover starts clean 2-game 2027 state while 2026 row remains intact at 5 games
+                step3Profile?.totalMatches shouldBe 2
+                step3State2027.seasonYear shouldBe 2027
+                step3State2027.processedMatchIds shouldBe listOf("EUW1_2027_2", "EUW1_2027_1")
+                rowsByYear[2026]?.foldedGamesCount shouldBe 5
+
+                // Kaori-scale 924-game / 40-champion state_json is compact (< 30 KB)
+                (kaoriBytes in 10_000..30_000) shouldBe true
+            }
+        }
+
+        When("fetching >2000 matches (2100-match pagination safety cap), rolling forward past cap, merging concurrent writers on conflict, and handling durability failure") {
+            val mapper = com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules()
+            val clockMs = java.util.concurrent.atomic.AtomicLong(java.time.Instant.parse("2026-11-06T12:00:00Z").toEpochMilli())
+            val clock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            val capPuuid = "durable-2100-cap-puuid"
+
+            fun buildMatch(id: String, idx: Int, forPuuid: String = capPuuid): MatchDto {
+                val isTailLoss = (forPuuid == capPuuid && idx in 1..3)
+                val isNewAboveCapWin = (forPuuid == capPuuid && idx > 2100)
+                val champ = when {
+                    isTailLoss -> "Aatrox"
+                    isNewAboveCapWin -> "Ahri"
+                    else -> "Orianna"
+                }
+                val isWin = !isTailLoss
+                val k = when {
+                    isTailLoss -> 1
+                    isNewAboveCapWin -> 16
+                    else -> 8
+                }
+                val d = when {
+                    isTailLoss -> 7
+                    isNewAboveCapWin -> 1
+                    else -> 2
+                }
+                val a = when {
+                    isTailLoss -> 2
+                    isNewAboveCapWin -> 12
+                    else -> 9
+                }
+                val p = mapper.readValue(
+                    """
+                    {
+                      "puuid": "$forPuuid",
+                      "championName": "$champ",
+                      "teamId": 100,
+                      "teamPosition": "MIDDLE",
+                      "win": $isWin,
+                      "kills": $k,
+                      "deaths": $d,
+                      "assists": $a,
+                      "totalMinionsKilled": 210,
+                      "neutralMinionsKilled": 10,
+                      "visionScore": 25
+                    }
+                    """.trimIndent(),
+                    com.pride.summoner_searcher_api.dto.ParticipantDto::class.java
+                )
+                return MatchDto(
+                    metadata = MatchMetadata(id, listOf(forPuuid)),
+                    info = MatchInfo(
+                        gameCreation = clockMs.get() - (3000 - idx).coerceAtLeast(1) * 60_000L,
+                        gameDuration = 1800L,
+                        gameId = idx.toLong(),
+                        queueId = 420,
+                        gameMode = "CLASSIC",
+                        gameVersion = "16.22.1",
+                        participants = listOf(p),
+                        teams = emptyList()
+                    )
+                )
+            }
+
+            var storedCapEntity: com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity? = null
+            val capSeasonRepo = mockk<com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository>()
+            every {
+                capSeasonRepo.findByRegionAndPuuidAndSeasonYearAndQueueId(region, capPuuid, 2026, 420)
+            } answers { storedCapEntity }
+            every { capSeasonRepo.saveAndFlush(any()) } answers {
+                val arg = firstArg<com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity>()
+                arg.version += 1L
+                storedCapEntity = arg
+                arg
+            }
+
+            val txManager = object : org.springframework.transaction.support.AbstractPlatformTransactionManager() {
+                override fun doGetTransaction(): Any = Any()
+                override fun doBegin(transaction: Any, definition: org.springframework.transaction.TransactionDefinition) {}
+                override fun doCommit(status: org.springframework.transaction.support.DefaultTransactionStatus) {}
+                override fun doRollback(status: org.springframework.transaction.support.DefaultTransactionStatus) {}
+            }
+            val txTemplate = org.springframework.transaction.support.TransactionTemplate(txManager)
+
+            val capService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = capSeasonRepo,
+                transactionTemplate = txTemplate,
+                objectMapper = mapper
+            )
+
+            var cachedCapProfile: SummonerProfileDto? = null
+            every { redisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            every { redisCacheService.get("player:profile:euw1:$capPuuid", SummonerProfileDto::class.java) } answers { cachedCapProfile }
+            every {
+                redisCacheService.set<SummonerProfileDto>("player:profile:euw1:$capPuuid", any(), any())
+            } answers {
+                cachedCapProfile = secondArg()
+            }
+            coEvery { riotApiService.getSummonerByPuuid(capPuuid, region) } returns SummonerDto("id", capPuuid, 600L, 88)
+            coEvery { riotApiService.fetchLeagueRank(capPuuid, region) } returns null
+
+            // 1. Real >2000 fetch path: RiotApiService.fetchMatchIdsSince returns 2,100 match IDs (21 pages of 100 stopping at >2000 guard)
+            val ids2100 = (2100 downTo 1).map { "EUW1_$it" }
+            coEvery { riotApiService.fetchMatchIdsSince(capPuuid, region, any()) } returns ids2100
+            every { redisCacheService.multiGet(any(), MatchDto::class.java) } answers {
+                val keys = firstArg<List<String>>()
+                keys.associateWith { key ->
+                    val id = key.substringAfterLast(":")
+                    val idx = id.substringAfter("_").toInt()
+                    buildMatch(id, idx)
+                }
+            }
+            coEvery { riotApiService.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                val idx = id.substringAfter("_").toInt()
+                buildMatch(id, idx)
+            }
+
+            val profile2100 = capService.getPlayerProfile(capPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val state2100 = mapper.readValue(storedCapEntity!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+            val telemetryAfter2100 = capService.getDiscoveryAndSeasonWriteTelemetry()
+            val peakLiveMatchDtosDuring2100 = telemetryAfter2100["lastRefreshPeakLiveMatchDtos"] ?: 0L
+            val peakCrossChunkMatchDtosDuring2100 = telemetryAfter2100["lastRefreshPeakCrossChunkRetainedMatchDtos"] ?: 0L
+            val deltaFieldTypes = SingleMatchAdditiveDelta::class.java.declaredFields.map { it.type }
+
+            // 2a. Capped player plays 1 NEW game (EUW1_2101): moving 2,100 window advances to EUW1_2101..EUW1_2 (evicting EUW1_1)
+            clockMs.addAndGet(120_000L)
+            val idsAfter1NewGame = (2101 downTo 2).map { "EUW1_$it" }
+            coEvery { riotApiService.fetchMatchIdsSince(capPuuid, region, any()) } returns idsAfter1NewGame
+            val profileAfter2101 = capService.getPlayerProfile(capPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val stateAfter2101 = mapper.readValue(storedCapEntity!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+            val expectedAcc2101 = MatchStatsAccumulator(capPuuid).also { acc ->
+                for (idx in 2101 downTo 2) {
+                    acc.add(buildMatch("EUW1_$idx", idx, capPuuid))
+                }
+            }
+            val (expectedOverall2101, expectedChamps2101) = expectedAcc2101.toAdditiveSnapshots()
+
+            // 2b. Capped player plays 2 more new games (EUW1_2103, EUW1_2102): moving 2,100 window advances to EUW1_2103..EUW1_4 (evicting EUW1_3, EUW1_2)
+            clockMs.addAndGet(120_000L)
+            val idsRollforward = ((2103 downTo 4).map { "EUW1_$it" })
+            coEvery { riotApiService.fetchMatchIdsSince(capPuuid, region, any()) } returns idsRollforward
+            val profileAfterRollforward = capService.getPlayerProfile(capPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val stateAfterRollforward = mapper.readValue(storedCapEntity!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+            val expectedAcc2103 = MatchStatsAccumulator(capPuuid).also { acc ->
+                for (idx in 2103 downTo 4) {
+                    acc.add(buildMatch("EUW1_$idx", idx, capPuuid))
+                }
+            }
+            val (expectedOverall2103, expectedChamps2103) = expectedAcc2103.toAdditiveSnapshots()
+
+            // 3. Concurrent writer merge: verify returned profile AND Redis profile reflect COMMITTED MERGED state (4 games), not stale local totals (3 games)
+            val mergePuuid = "concurrent-merge-redis-puuid"
+            val baseAcc2 = MatchStatsAccumulator(mergePuuid)
+            baseAcc2.add(buildMatch("EUW1_1", 1, mergePuuid))
+            baseAcc2.add(buildMatch("EUW1_2", 2, mergePuuid))
+            val (snap2Overall, snap2Champs) = baseAcc2.toAdditiveSnapshots()
+            val initial2Dto = DurablePlayerSeasonStatsDto(
+                region = region,
+                puuid = mergePuuid,
+                seasonYear = 2026,
+                queueId = 420,
+                processedMatchIds = listOf("EUW1_2", "EUW1_1"),
+                hitPreSeasonBoundary = true,
+                firstPreSeasonMatchId = "EUW1_0",
+                historyComplete = true,
+                overallCounters = snap2Overall,
+                championCounters = snap2Champs,
+                updatedAtEpochMilli = clockMs.get()
+            )
+            // Concurrent writer already committed EUW1_3 (version = 1L), while this caller loaded version = 0L and folds EUW1_4
+            val concurrentAcc3 = MatchStatsAccumulator(mergePuuid)
+            concurrentAcc3.add(buildMatch("EUW1_1", 1, mergePuuid))
+            concurrentAcc3.add(buildMatch("EUW1_2", 2, mergePuuid))
+            concurrentAcc3.add(buildMatch("EUW1_3", 3, mergePuuid))
+            val (snap3Overall, snap3Champs) = concurrentAcc3.toAdditiveSnapshots()
+            val concurrent3Dto = initial2Dto.copy(
+                processedMatchIds = listOf("EUW1_3", "EUW1_2", "EUW1_1"),
+                overallCounters = snap3Overall,
+                championCounters = snap3Champs
+            )
+
+            val findCallCount = java.util.concurrent.atomic.AtomicInteger(0)
+            var mergeSavedEntity: com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity? = null
+            val mergeRepo = mockk<com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository>()
+            every {
+                mergeRepo.findByRegionAndPuuidAndSeasonYearAndQueueId(region, mergePuuid, 2026, 420)
+            } answers {
+                val c = findCallCount.incrementAndGet()
+                if (c == 1) {
+                    // Initial load outside tx sees version = 0L (2 games: EUW1_2, EUW1_1)
+                    com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity(
+                        region = region,
+                        puuid = mergePuuid,
+                        seasonYear = 2026,
+                        queueId = 420,
+                        schemaVersion = 1,
+                        foldedGamesCount = 2,
+                        pendingGamesCount = 0,
+                        historyComplete = true,
+                        stateJson = mapper.writeValueAsString(initial2Dto),
+                        updatedAt = java.time.Instant.ofEpochMilli(clockMs.get()),
+                        version = 0L
+                    )
+                } else {
+                    // Inside tx, concurrent writer has already advanced version to 1L with 3 games (EUW1_3, EUW1_2, EUW1_1)
+                    com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity(
+                        region = region,
+                        puuid = mergePuuid,
+                        seasonYear = 2026,
+                        queueId = 420,
+                        schemaVersion = 1,
+                        foldedGamesCount = 3,
+                        pendingGamesCount = 0,
+                        historyComplete = true,
+                        stateJson = mapper.writeValueAsString(concurrent3Dto),
+                        updatedAt = java.time.Instant.ofEpochMilli(clockMs.get()),
+                        version = 1L
+                    )
+                }
+            }
+            every { mergeRepo.saveAndFlush(any()) } answers {
+                val arg = firstArg<com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity>()
+                arg.version += 1L
+                mergeSavedEntity = arg
+                arg
+            }
+
+            var redisSavedMergeProfile: SummonerProfileDto? = null
+            every { redisCacheService.get("player:profile:euw1:$mergePuuid", SummonerProfileDto::class.java) } returns null
+            every {
+                redisCacheService.set<SummonerProfileDto>("player:profile:euw1:$mergePuuid", any(), any())
+            } answers {
+                redisSavedMergeProfile = secondArg()
+            }
+            every { redisCacheService.multiGet(any(), MatchDto::class.java) } answers {
+                firstArg<List<String>>().associateWith { null }
+            }
+            coEvery { riotApiService.getSummonerByPuuid(mergePuuid, region) } returns SummonerDto("id", mergePuuid, 450L, 22)
+            coEvery { riotApiService.fetchLeagueRank(mergePuuid, region) } returns null
+            // Caller only sees [EUW1_4, EUW1_2, EUW1_1] in its local window, so locally it folded 3 games (2 baseline + EUW1_4),
+            // while DB had 3 games (EUW1_3, EUW1_2, EUW1_1). Committed merge produces 4 games!
+            coEvery { riotApiService.fetchMatchIdsSince(mergePuuid, region, any()) } returns listOf("EUW1_4", "EUW1_2", "EUW1_1")
+            coEvery { riotApiService.getMatchById("EUW1_4", region) } returns buildMatch("EUW1_4", 4, mergePuuid)
+            coEvery { riotApiService.getMatchById("EUW1_3", region) } returns buildMatch("EUW1_3", 3, mergePuuid)
+            coEvery { riotApiService.getMatchById("EUW1_2", region) } returns buildMatch("EUW1_2", 2, mergePuuid)
+            coEvery { riotApiService.getMatchById("EUW1_1", region) } returns buildMatch("EUW1_1", 1, mergePuuid)
+
+            val mergeService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = mergeRepo,
+                transactionTemplate = txTemplate,
+                objectMapper = mapper
+            )
+            val mergedReturnedProfile = mergeService.getPlayerProfile(mergePuuid, region, summonerName, tagLine, explicitRefresh = true)
+
+            // 4. Durability failure MUST fail closed and NEVER write uncommitted profile to Redis
+            val failDbPuuid = "durable-db-fail-puuid"
+            val failingRepo = mockk<com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository>()
+            every { failingRepo.findByRegionAndPuuidAndSeasonYearAndQueueId(region, failDbPuuid, 2026, 420) } returns null
+            every { failingRepo.saveAndFlush(any()) } throws org.springframework.dao.DataIntegrityViolationException("Simulated DB write failure")
+
+            var redisSavedOnDbFail: SummonerProfileDto? = null
+            every { redisCacheService.get("player:profile:euw1:$failDbPuuid", SummonerProfileDto::class.java) } returns null
+            every {
+                redisCacheService.set<SummonerProfileDto>("player:profile:euw1:$failDbPuuid", any(), any())
+            } answers {
+                redisSavedOnDbFail = secondArg()
+            }
+            coEvery { riotApiService.getSummonerByPuuid(failDbPuuid, region) } returns SummonerDto("id", failDbPuuid, 450L, 22)
+            coEvery { riotApiService.fetchLeagueRank(failDbPuuid, region) } returns null
+            coEvery { riotApiService.fetchMatchIdsSince(failDbPuuid, region, any()) } returns listOf("EUW1_1")
+            coEvery { riotApiService.getMatchById("EUW1_1", region) } returns buildMatch("EUW1_1", 1, failDbPuuid)
+
+            val failingDurableService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = failingRepo,
+                transactionTemplate = txTemplate,
+                objectMapper = mapper
+            )
+            val dbFailException = runCatching {
+                failingDurableService.getPlayerProfile(failDbPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            }.exceptionOrNull()
+
+            // 5. Real RiotApiService.fetchMatchIdsSince pagination loop:
+            //    (a) Page-0 null failure -> stoppedOnPageFailure=true, exhaustedCleanly=false; cold profile refresh returns null and writes 0 DB rows
+            //    (b) Page-1 null failure after 100 IDs on page 0 -> stoppedOnPageFailure=true, exhaustedCleanly=false; folds 100 games with historyComplete=false
+            //    (c) 21 pages of 100 IDs (2,100 total) stopping at >2000 guard -> hitSafetyCap=true, exhaustedCleanly=false
+            val realRiotSpy = spyk(
+                RiotApiService(
+                    riotRestClient = mockk(relaxed = true),
+                    rateLimiter = RiotApiRateLimiter(clock)
+                )
+            )
+            val page0FailPuuid = "page0-null-fail-puuid"
+            coEvery { realRiotSpy.getSummonerByPuuid(page0FailPuuid, region) } returns SummonerDto("id", page0FailPuuid, 300L, 11)
+            coEvery { realRiotSpy.fetchLeagueRank(page0FailPuuid, region) } returns null
+            coEvery { realRiotSpy.getMatchIdsByPuuid(page0FailPuuid, region, 420, any(), any(), 100, 0) } returns null
+
+            var page0SavedEntity: com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity? = null
+            val page0Repo = mockk<com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository>()
+            every { page0Repo.findByRegionAndPuuidAndSeasonYearAndQueueId(region, page0FailPuuid, 2026, 420) } returns null
+            every { page0Repo.saveAndFlush(any()) } answers {
+                page0SavedEntity = firstArg()
+                page0SavedEntity!!
+            }
+            every { redisCacheService.get("player:profile:euw1:$page0FailPuuid", SummonerProfileDto::class.java) } returns null
+            val page0Service = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = realRiotSpy,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = page0Repo,
+                transactionTemplate = txTemplate,
+                objectMapper = mapper
+            )
+            val page0FailProfile = page0Service.getPlayerProfile(page0FailPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val page0Outcome = realRiotSpy.fetchMatchIdsWithOutcomeSince(page0FailPuuid, region, 0L)
+
+            val page1FailPuuid = "page1-null-fail-puuid"
+            coEvery { realRiotSpy.getSummonerByPuuid(page1FailPuuid, region) } returns SummonerDto("id", page1FailPuuid, 300L, 11)
+            coEvery { realRiotSpy.fetchLeagueRank(page1FailPuuid, region) } returns null
+            coEvery {
+                realRiotSpy.getMatchIdsByPuuid(page1FailPuuid, region, 420, any(), any(), 100, 0)
+            } returns (100 downTo 1).map { "EUW1_$it" }
+            coEvery {
+                realRiotSpy.getMatchIdsByPuuid(page1FailPuuid, region, 420, any(), any(), 100, 100)
+            } returns null
+            coEvery { realRiotSpy.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                val idx = id.substringAfter("_").toInt()
+                buildMatch(id, idx, page1FailPuuid)
+            }
+            var page1SavedEntity: com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity? = null
+            val page1Repo = mockk<com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository>()
+            every { page1Repo.findByRegionAndPuuidAndSeasonYearAndQueueId(region, page1FailPuuid, 2026, 420) } returns null
+            every { page1Repo.saveAndFlush(any()) } answers {
+                val arg = firstArg<com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity>()
+                arg.version += 1L
+                page1SavedEntity = arg
+                arg
+            }
+            every { redisCacheService.get("player:profile:euw1:$page1FailPuuid", SummonerProfileDto::class.java) } returns null
+            val page1Service = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = realRiotSpy,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = page1Repo,
+                transactionTemplate = txTemplate,
+                objectMapper = mapper
+            )
+            val page1FailProfile = page1Service.getPlayerProfile(page1FailPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val page1Outcome = realRiotSpy.fetchMatchIdsWithOutcomeSince(page1FailPuuid, region, 0L)
+            val page1State = mapper.readValue(page1SavedEntity!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+
+            val real2100Puuid = "real-pagination-2100-puuid"
+            coEvery {
+                realRiotSpy.getMatchIdsByPuuid(real2100Puuid, region, 420, any(), any(), 100, any())
+            } answers {
+                val pageStart = arg<Int>(6)
+                val firstNum = 2100 - pageStart
+                (firstNum downTo (firstNum - 99)).map { "EUW1_$it" }
+            }
+            val real2100Outcome = realRiotSpy.fetchMatchIdsWithOutcomeSince(real2100Puuid, region, 0L)
+
+            // 6b. Outcome with exhaustedCleanly=false (and all other flags false/0) MUST NOT fallback-complete
+            val unexhaustedPuuid = "unexhausted-outcome-puuid"
+            coEvery { riotApiService.getSummonerByPuuid(unexhaustedPuuid, region) } returns SummonerDto("id", unexhaustedPuuid, 300L, 11)
+            coEvery { riotApiService.fetchLeagueRank(unexhaustedPuuid, region) } returns null
+            coEvery {
+                riotApiService.fetchMatchIdsWithOutcomeSince(unexhaustedPuuid, region, any())
+            } returns RiotApiService.MatchIdsPaginationOutcome(
+                matchIds = listOf("EUW1_10", "EUW1_9"),
+                pagesFetched = 0,
+                exhaustedCleanly = false,
+                hitSafetyCap = false,
+                stoppedOnPageFailure = false
+            )
+            var unexhaustedSavedEntity: com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity? = null
+            val unexhaustedRepo = mockk<com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository>()
+            every { unexhaustedRepo.findByRegionAndPuuidAndSeasonYearAndQueueId(region, unexhaustedPuuid, 2026, 420) } returns null
+            every { unexhaustedRepo.saveAndFlush(any()) } answers {
+                val arg = firstArg<com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity>()
+                arg.version += 1L
+                unexhaustedSavedEntity = arg
+                arg
+            }
+            every { redisCacheService.get("player:profile:euw1:$unexhaustedPuuid", SummonerProfileDto::class.java) } returns null
+            coEvery { riotApiService.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                val idx = id.substringAfter("_").toInt()
+                buildMatch(id, idx, unexhaustedPuuid)
+            }
+            val unexhaustedService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = unexhaustedRepo,
+                transactionTemplate = txTemplate,
+                objectMapper = mapper
+            )
+            unexhaustedService.getPlayerProfile(unexhaustedPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val unexhaustedState = mapper.readValue(unexhaustedSavedEntity!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+
+            // 7. Memory headroom guard MUST fail safe (false) when memoryStatsProvider throws, returns non-positive heap limits,
+            //    or reports a known bounded cgroup with missing (null) or non-positive (<=0) cgroupMemoryCurrentBytes (no heap fallback)
+            val brokenMemoryService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample {
+                        throw RuntimeException("Simulated cgroup/heap metric read error")
+                    }
+                }
+            )
+            val zeroLimitMemoryService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = RawMemorySample(
+                        jvmHeapUsedBytes = 0L,
+                        jvmHeapCommittedBytes = 0L,
+                        jvmHeapMaxBytes = 0L,
+                        cgroupMemoryCurrentBytes = null,
+                        cgroupMemoryMaxBytes = null
+                    )
+                }
+            )
+            val boundedCgroupNullCurrentService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = RawMemorySample(
+                        jvmHeapUsedBytes = 32L * 1024L * 1024L,
+                        jvmHeapCommittedBytes = 64L * 1024L * 1024L,
+                        jvmHeapMaxBytes = 256L * 1024L * 1024L,
+                        cgroupMemoryCurrentBytes = null,
+                        cgroupMemoryMaxBytes = 512L * 1024L * 1024L
+                    )
+                }
+            )
+            val boundedCgroupZeroCurrentService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = RawMemorySample(
+                        jvmHeapUsedBytes = 32L * 1024L * 1024L,
+                        jvmHeapCommittedBytes = 64L * 1024L * 1024L,
+                        jvmHeapMaxBytes = 256L * 1024L * 1024L,
+                        cgroupMemoryCurrentBytes = 0L,
+                        cgroupMemoryMaxBytes = 512L * 1024L * 1024L
+                    )
+                }
+            )
+            val brokenMemoryGuardResult = brokenMemoryService.hasMemoryHeadroomForSeasonBackfill()
+            val zeroLimitMemoryGuardResult = zeroLimitMemoryService.hasMemoryHeadroomForSeasonBackfill()
+            val boundedCgroupNullCurrentResult = boundedCgroupNullCurrentService.hasMemoryHeadroomForSeasonBackfill()
+            val boundedCgroupZeroCurrentResult = boundedCgroupZeroCurrentService.hasMemoryHeadroomForSeasonBackfill()
+
+            Then("it preserves 2100 coverage with historyCapped=true/historyComplete=false, advances the 2100 moving window on new games without drift or archive expansion, bounds live MatchDto peak (including 50-match chunk) to <=70, returns committed merged state for Redis, and fails closed on DB/pagination/memory errors") {
+                // 1. 2,100-match fetch preserves all 2,100 matches while marking historyCapped=true and historyComplete=false
+                profile2100?.totalMatches shouldBe 2100
+                profile2100?.allMatchIds?.first() shouldBe "EUW1_2100"
+                profile2100?.allMatchIds?.last() shouldBe "EUW1_1"
+                profile2100?.recentMatches?.first()?.metadata?.matchId shouldBe "EUW1_2100"
+                state2100.processedMatchIds.size shouldBe 2100
+                state2100.overallCounters.totalGames shouldBe 2100
+                state2100.overallCounters.totalWins shouldBe 2097 // matches 1..3 are losses, 4..2100 are wins
+                state2100.historyCapped shouldBe true
+                state2100.historyComplete shouldBe false
+
+                // 2. Prove actual live MatchDto bound:
+                //    - <= 70 distinct live MatchDto instances at peak across 2,100 matches (50 in current chunk + 20 cross-chunk cards/index)
+                //    - <= 20 distinct MatchDto instances retained across chunk boundaries
+                //    - SingleMatchAdditiveDelta holds zero MatchDto/MatchInfo/ParticipantDto fields
+                peakLiveMatchDtosDuring2100 shouldBe 70L
+                peakCrossChunkMatchDtosDuring2100 shouldBe 20L
+                deltaFieldTypes.none {
+                    it == MatchDto::class.java ||
+                        it == MatchInfo::class.java ||
+                        it == com.pride.summoner_searcher_api.dto.ParticipantDto::class.java
+                } shouldBe true
+
+                // 3a. Capped player plays 1 NEW game (EUW1_2101): newest cards and totals update to EUW1_2101..EUW1_2 (evicting EUW1_1)
+                profileAfter2101?.totalMatches shouldBe 2100
+                profileAfter2101?.allMatchIds?.size shouldBe 2100
+                profileAfter2101?.allMatchIds?.first() shouldBe "EUW1_2101"
+                profileAfter2101?.allMatchIds?.last() shouldBe "EUW1_2"
+                profileAfter2101?.recentMatches?.first()?.metadata?.matchId shouldBe "EUW1_2101"
+                stateAfter2101.processedMatchIds.size shouldBe 2100
+                stateAfter2101.processedMatchIds.first() shouldBe "EUW1_2101"
+                stateAfter2101.processedMatchIds.last() shouldBe "EUW1_2"
+                stateAfter2101.pendingMatchIds shouldBe emptyList()
+                stateAfter2101.overallCounters.totalGames shouldBe 2100
+                stateAfter2101.overallCounters.totalWins shouldBe 2098 // +1 win (EUW1_2101) and -1 loss (evicted EUW1_1)
+                stateAfter2101.overallCounters shouldBe expectedOverall2101
+                stateAfter2101.championCounters shouldBe expectedChamps2101
+                stateAfter2101.historyCapped shouldBe true
+                stateAfter2101.historyComplete shouldBe false
+                capService.isValidDurableSeasonState(stateAfter2101, region, capPuuid, 2026) shouldBe true
+
+                // 3b. Rollforward past 2,100 cap (EUW1_2103..EUW1_4): all 3 tail losses on Aatrox (1..3) evicted, 3 new wins on Ahri (2101..2103) folded
+                stateAfterRollforward.processedMatchIds.size shouldBe 2100
+                stateAfterRollforward.processedMatchIds.first() shouldBe "EUW1_2103"
+                stateAfterRollforward.processedMatchIds.last() shouldBe "EUW1_4"
+                stateAfterRollforward.pendingMatchIds shouldBe emptyList()
+                stateAfterRollforward.overallCounters.totalGames shouldBe 2100
+                stateAfterRollforward.overallCounters.totalWins shouldBe 2100
+                stateAfterRollforward.overallCounters shouldBe expectedOverall2103
+                stateAfterRollforward.championCounters shouldBe expectedChamps2103
+                stateAfterRollforward.championCounters.none { it.championName == "Aatrox" } shouldBe true
+                stateAfterRollforward.championCounters.single { it.championName == "Ahri" }.games shouldBe 3
+                stateAfterRollforward.historyCapped shouldBe true
+                stateAfterRollforward.historyComplete shouldBe false
+                profileAfterRollforward?.totalMatches shouldBe 2100
+                profileAfterRollforward?.allMatchIds?.first() shouldBe "EUW1_2103"
+                profileAfterRollforward?.recentMatches?.first()?.metadata?.matchId shouldBe "EUW1_2103"
+                capService.isValidDurableSeasonState(stateAfterRollforward, region, capPuuid, 2026) shouldBe true
+
+                // 4. Concurrent merge: both returned profile and Redis cached profile reflect committed 4-game merged state (not 3-game local state)
+                mergeSavedEntity?.foldedGamesCount shouldBe 4
+                mergedReturnedProfile?.totalMatches shouldBe 4
+                mergedReturnedProfile?.overallStats?.wins shouldBe 4
+                mergedReturnedProfile?.allMatchIds shouldBe listOf("EUW1_4", "EUW1_2", "EUW1_1", "EUW1_3")
+                redisSavedMergeProfile?.totalMatches shouldBe 4
+                redisSavedMergeProfile?.overallStats?.wins shouldBe 4
+                redisSavedMergeProfile?.allMatchIds shouldBe listOf("EUW1_4", "EUW1_2", "EUW1_1", "EUW1_3")
+
+                // 5. Durability failure fails closed and never writes uncommitted profile to Redis
+                (dbFailException is IllegalStateException) shouldBe true
+                redisSavedOnDbFail shouldBe null
+
+                // 6. Real RiotApiService pagination outcome checks:
+                page0Outcome?.stoppedOnPageFailure shouldBe true
+                page0Outcome?.exhaustedCleanly shouldBe false
+                page0Outcome?.pagesFetched shouldBe 0
+                page0FailProfile shouldBe null
+                page0SavedEntity shouldBe null
+
+                page1Outcome?.stoppedOnPageFailure shouldBe true
+                page1Outcome?.exhaustedCleanly shouldBe false
+                page1Outcome?.pagesFetched shouldBe 1
+                page1FailProfile?.totalMatches shouldBe 100
+                page1State.processedMatchIds.size shouldBe 100
+                page1State.historyComplete shouldBe false
+
+                real2100Outcome.matchIds.size shouldBe 2100
+                real2100Outcome.pagesFetched shouldBe 21
+                real2100Outcome.hitSafetyCap shouldBe true
+                real2100Outcome.exhaustedCleanly shouldBe false
+                real2100Outcome.stoppedOnPageFailure shouldBe false
+
+                // 6b. Unexhausted pagination outcome (exhaustedCleanly=false) never fallback-completes
+                unexhaustedState.processedMatchIds shouldBe listOf("EUW1_10", "EUW1_9")
+                unexhaustedState.historyComplete shouldBe false
+                unexhaustedSavedEntity?.historyComplete shouldBe false
+
+                // 7. Memory headroom guard fails safe (false) on metric exception, zero heap limit, or bounded cgroup with missing/invalid current bytes
+                brokenMemoryGuardResult shouldBe false
+                zeroLimitMemoryGuardResult shouldBe false
+                boundedCgroupNullCurrentResult shouldBe false
+                boundedCgroupZeroCurrentResult shouldBe false
+            }
+        }
     }
 })
+
+

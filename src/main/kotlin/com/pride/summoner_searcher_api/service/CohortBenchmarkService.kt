@@ -8,6 +8,9 @@ import com.pride.summoner_searcher_api.model.CohortCollectorCheckpointEntity
 import com.pride.summoner_searcher_api.repository.CohortBenchmarkCellRepository
 import com.pride.summoner_searcher_api.repository.CohortCellSampleStateRepository
 import com.pride.summoner_searcher_api.repository.CohortCollectorCheckpointRepository
+import com.pride.summoner_searcher_api.repository.IndexedPlayerRepository
+import com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository
+import com.pride.summoner_searcher_api.repository.indexParticipantsFromMatchesBounded
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Value
@@ -35,7 +38,11 @@ data class RawMemorySample(
     val mappedBufferUsedBytes: Long = 0L,
     val jvmThreadCount: Int = 0,
     val cgroupMemoryCurrentBytes: Long? = null,
-    val cgroupMemoryMaxBytes: Long? = null
+    val cgroupMemoryMaxBytes: Long? = null,
+    val cgroupMemoryPeakBytes: Long? = null,
+    val cgroupAnonBytes: Long? = null,
+    val cgroupFileCacheBytes: Long? = null,
+    val oldGenGcCount: Long = 0L
 )
 
 interface MemoryStatsProvider {
@@ -109,10 +116,29 @@ class SystemMemoryStatsProvider : MemoryStatsProvider {
             0
         }
 
+        var oldGenGcCount = 0L
+        try {
+            for (gc in java.lang.management.ManagementFactory.getGarbageCollectorMXBeans()) {
+                val gcName = gc.name ?: ""
+                val pools = gc.memoryPoolNames ?: emptyArray()
+                val isOldOrFullCollector = gcName.contains("MarkSweep", ignoreCase = true) ||
+                    gcName.contains("Old", ignoreCase = true) ||
+                    gcName.contains("Major", ignoreCase = true) ||
+                    pools.any { it.contains("Tenured", ignoreCase = true) || it.contains("Old", ignoreCase = true) }
+                if (isOldOrFullCollector && gc.collectionCount > 0L) {
+                    oldGenGcCount += gc.collectionCount
+                }
+            }
+        } catch (_: Exception) {
+        }
+
         val cgroupCurrent = readLongFromFile("/sys/fs/cgroup/memory.current")
             ?: readLongFromFile("/sys/fs/cgroup/memory/memory.usage_in_bytes")
         val cgroupMax = readLongFromFile("/sys/fs/cgroup/memory.max")
             ?: readLongFromFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")?.takeIf { it in 1L..68_719_476_736L }
+        val cgroupPeak = readLongFromFile("/sys/fs/cgroup/memory.peak")
+            ?: readLongFromFile("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")
+        val (cgroupAnon, cgroupFileCache) = readCgroupAnonAndFileBytes()
 
         return RawMemorySample(
             jvmHeapUsedBytes = used,
@@ -130,7 +156,11 @@ class SystemMemoryStatsProvider : MemoryStatsProvider {
             mappedBufferUsedBytes = mappedUsed,
             jvmThreadCount = threadCount,
             cgroupMemoryCurrentBytes = cgroupCurrent,
-            cgroupMemoryMaxBytes = cgroupMax
+            cgroupMemoryMaxBytes = cgroupMax,
+            cgroupMemoryPeakBytes = cgroupPeak,
+            cgroupAnonBytes = cgroupAnon,
+            cgroupFileCacheBytes = cgroupFileCache,
+            oldGenGcCount = oldGenGcCount
         )
     }
 
@@ -143,6 +173,38 @@ class SystemMemoryStatsProvider : MemoryStatsProvider {
             raw.toLongOrNull()?.takeIf { it > 0L }
         } catch (_: Exception) {
             null
+        }
+    }
+
+    private fun readCgroupAnonAndFileBytes(): Pair<Long?, Long?> {
+        val statFile = sequenceOf(
+            java.io.File("/sys/fs/cgroup/memory.stat"),
+            java.io.File("/sys/fs/cgroup/memory/memory.stat")
+        ).firstOrNull { it.exists() && it.canRead() } ?: return null to null
+
+        return try {
+            var anon: Long? = null
+            var fileCache: Long? = null
+            var rssFallback: Long? = null
+            var cacheFallback: Long? = null
+            statFile.forEachLine { line ->
+                val parts = line.trim().split(' ', '\t')
+                if (parts.size >= 2) {
+                    val key = parts[0]
+                    val value = parts[1].toLongOrNull()?.coerceAtLeast(0L)
+                    if (value != null) {
+                        when (key) {
+                            "anon" -> anon = value
+                            "file" -> fileCache = value
+                            "rss" -> rssFallback = value
+                            "cache" -> cacheFallback = value
+                        }
+                    }
+                }
+            }
+            (anon ?: rssFallback) to (fileCache ?: cacheFallback)
+        } catch (_: Exception) {
+            null to null
         }
     }
 }
@@ -167,13 +229,27 @@ class CohortBenchmarkService(
     @Autowired(required = false)
     private val cohortCollectorCheckpointRepository: CohortCollectorCheckpointRepository? = null,
     @Autowired(required = false)
-    private val cohortCellSampleStateRepository: CohortCellSampleStateRepository? = null
+    private val cohortCellSampleStateRepository: CohortCellSampleStateRepository? = null,
+    @Autowired(required = false)
+    private val transactionTemplate: org.springframework.transaction.support.TransactionTemplate? = null,
+    @Autowired(required = false)
+    private val indexedPlayerRepository: IndexedPlayerRepository? = null,
+    @Autowired(required = false)
+    private val playerSeasonStatsRepository: PlayerSeasonStatsRepository? = null
 ) {
     private val logger = LoggerFactory.getLogger(javaClass)
     private val lastGcHintAtMs = java.util.concurrent.atomic.AtomicLong(0L)
     private val inMemoryDurableCellStates = java.util.concurrent.ConcurrentHashMap<String, DurableCellSampleStateDto>()
     private val inMemoryGroundedPatchByRegion = java.util.concurrent.ConcurrentHashMap<String, String>()
     private val freshRankedSoloMatchPatchByRegion = java.util.concurrent.ConcurrentHashMap<String, String>()
+    /**
+     * Per-region exclusive write gate covering full read-modify-write intervals across
+     * report recomputation, cache-miss cell repair, collector batches, and exact-ID cached player ingestion.
+     *
+     * Limitation: This in-memory [java.util.concurrent.atomic.AtomicBoolean] gate only serializes writers
+     * within a single-JVM (same-process) deployment; it does not provide distributed multi-instance transaction isolation.
+     */
+    private val regionWriteGates = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.atomic.AtomicBoolean>()
     @Volatile private var cachedDataDragonPatch: String? = null
     @Volatile private var cachedDataDragonPatchExpiresAtMs: Long = 0L
     @Volatile private var lastDataDragonLookupFailureAtMs: Long = 0L
@@ -181,12 +257,87 @@ class CohortBenchmarkService(
     private val durableSampleStateDbWriteCount = java.util.concurrent.atomic.AtomicLong(0L)
     private val benchmarkCellDbWriteCount = java.util.concurrent.atomic.AtomicLong(0L)
     private val checkpointDbWriteCount = java.util.concurrent.atomic.AtomicLong(0L)
+    private val collectorIndexedPlayersUpsertedCount = java.util.concurrent.atomic.AtomicLong(0L)
+    private val collectorIndexedPlayersStaleSkippedCount = java.util.concurrent.atomic.AtomicLong(0L)
+    private val collectorIndexedPlayersFailureCount = java.util.concurrent.atomic.AtomicLong(0L)
+
+    internal fun tryAcquireRegionWriteGate(region: String): Boolean {
+        val normalizedRegion = region.lowercase().trim()
+        val gate = regionWriteGates.computeIfAbsent(normalizedRegion) { java.util.concurrent.atomic.AtomicBoolean(false) }
+        return gate.compareAndSet(false, true)
+    }
+
+    internal fun releaseRegionWriteGate(region: String) {
+        val normalizedRegion = region.lowercase().trim()
+        regionWriteGates[normalizedRegion]?.set(false)
+    }
+
+    internal fun putInMemoryDurableCellStateForTest(state: DurableCellSampleStateDto) {
+        val mapKey = durableCellMapKey(state.region, state.patch, state.tier, state.role)
+        inMemoryDurableCellStates[mapKey] = state
+    }
+
+    internal fun getInMemoryDurableCellStateForTest(region: String, patch: String, tier: String, role: String): DurableCellSampleStateDto? {
+        return inMemoryDurableCellStates[durableCellMapKey(region, patch, tier, role)]
+    }
 
     fun getDurableDbWriteCounts(): Map<String, Long> = mapOf(
         "cohortCellSampleStatesWrites" to durableSampleStateDbWriteCount.get(),
         "cohortBenchmarkCellsWrites" to benchmarkCellDbWriteCount.get(),
         "cohortCollectorCheckpointsWrites" to checkpointDbWriteCount.get()
     )
+
+    internal fun getCollectorParticipantIndexingCounts(): Map<String, Long> = mapOf(
+        "collectorIndexedPlayersUpserted" to collectorIndexedPlayersUpsertedCount.get(),
+        "collectorIndexedPlayersStaleSkipped" to collectorIndexedPlayersStaleSkippedCount.get(),
+        "collectorIndexedPlayersFailures" to collectorIndexedPlayersFailureCount.get()
+    )
+
+    /**
+     * Upserts searchable participant identities from matches already resolved during collector execution
+     * using the exact same bounded (`<= 20` matches, `<= 200` players) newer-only `lastSeenAt` helper
+     * used by profile refresh (`PlayerCacheService.indexPlayersFromMatches`).
+     *
+     * Failure isolation & cancellation contract:
+     * - Rethrows [kotlinx.coroutines.CancellationException] immediately so coroutine cancellation is preserved.
+     * - Isolates any database/runtime failure in `indexed_players` so benchmark cell persistence,
+     *   collector checkpoint persistence, and collector session health (`lastStopReason`) are never aborted.
+     */
+    internal fun indexResolvedCollectorMatchesSafely(
+        matches: List<MatchDto>,
+        region: String
+    ): com.pride.summoner_searcher_api.repository.ParticipantBatchIndexingOutcome {
+        val repo = indexedPlayerRepository ?: return com.pride.summoner_searcher_api.repository.ParticipantBatchIndexingOutcome()
+        if (matches.isEmpty()) return com.pride.summoner_searcher_api.repository.ParticipantBatchIndexingOutcome()
+        return try {
+            val outcome = repo.indexParticipantsFromMatchesBounded(
+                matches = matches,
+                region = region,
+                fallbackNowEpochMilli = timeProvider.now(),
+                transactionTemplate = transactionTemplate,
+                maxMatches = com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING,
+                maxPlayersPerBatch = com.pride.summoner_searcher_api.repository.MAX_INDEXED_PLAYERS_PER_BATCH
+            )
+            if (outcome.upsertedCount > 0L) {
+                collectorIndexedPlayersUpsertedCount.addAndGet(outcome.upsertedCount)
+            }
+            if (outcome.staleSkippedCount > 0L) {
+                collectorIndexedPlayersStaleSkippedCount.addAndGet(outcome.staleSkippedCount)
+            }
+            outcome
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            collectorIndexedPlayersFailureCount.incrementAndGet()
+            logger.warn(
+                "[CohortBenchmark] Non-fatal participant identity indexing failure for region={} (isolated from benchmark/checkpoint/session): {}",
+                region,
+                e.message
+            )
+            com.pride.summoner_searcher_api.repository.ParticipantBatchIndexingOutcome()
+        }
+    }
+
 
     companion object {
         const val SOLO_QUEUE_ID = 420
@@ -249,6 +400,12 @@ class CohortBenchmarkService(
             "match-v5-match-by-id"
         )
     }
+
+    /**
+     * Read-only raw memory sample used by per-session memory series instrumentation.
+     * Never calls System.gc() and never alters GC hint cooldown state.
+     */
+    fun sampleRawMemoryStats(): RawMemorySample = memoryStatsProvider.sample()
 
     /**
      * Evaluates live JVM heap + Linux container cgroup memory headroom against the 512MB container cap.
@@ -480,77 +637,106 @@ class CohortBenchmarkService(
             )
         }
 
-        val guardKey = recomputeGuardLockKey(normalizedRegion, cleanPatch)
-        val acquiredGuard = redisCacheService.setIfAbsent(guardKey, "LOCKED", RECOMPUTE_GUARD_TTL)
-        if (!acquiredGuard) {
-            val persistedCells = getPersistedCohortCells(normalizedRegion, cleanPatch)
-            val fallbackPatch = cleanPatch ?: groundedPatch ?: persistedCells.firstOrNull()?.patch
-            return CohortExtractionReportDto(
-                reportSource = "GUARDED_COOLDOWN_FALLBACK",
-                inventory = CohortCacheInventoryDto(
-                    region = normalizedRegion,
-                    scannedAt = now,
-                    scanKeyCapPerNamespace = MAX_SCAN_KEYS_PER_NAMESPACE,
-                    maxRankSnapshotAgeHours = MAX_RANK_SNAPSHOT_AGE.toHours(),
-                    maxMatchAgeHours = MAX_MATCH_AGE.toHours(),
-                    maxMatchToSnapshotSkewHours = MAX_MATCH_TO_SNAPSHOT_SKEW.toHours(),
-                    cachedProfileCount = 0,
-                    profilesWithSoloQueueRankSnapshot = 0,
-                    cachedChallengerLeaderboardPlayers = 0,
-                    totalDistinctRankedPlayersInCache = 0,
-                    ranksByTier = emptyMap(),
-                    cachedMatchCount = 0,
-                    cachedTimelineCount = 0,
-                    matchesByPatch = emptyMap(),
-                    latestCachedPatch = fallbackPatch,
-                    selectedTargetPatch = fallbackPatch,
-                    patchSelectionSource = if (cleanPatch != null) "EXPLICIT_TARGET_PATCH" else "PERSISTED_CACHE_FALLBACK",
-                    soloQueue420MatchesOnTargetPatch = 0,
-                    excludedNonSoloQueueMatches = 0,
-                    excludedMissingGameVersionMatches = 0,
-                    excludedOtherPatchMatches = 0,
-                    excludedShortOrRemakeMatches = 0,
-                    topMidBotParticipantCandidates = 0,
-                    excludedOtherRoleParticipants = 0,
-                    participantsWithRankSnapshot = 0,
-                    participantsWithoutRankSnapshot = 0,
-                    deduplicatedParticipantEntries = 0,
-                    excludedOverPlayerCapSamples = persistedCells.sumOf { it.excludedOverPlayerCapGames },
-                    eligibleCohortSamples = persistedCells.sumOf { it.eligibleGames },
-                    distinctEligibleCohortPlayers = persistedCells.sumOf { it.distinctPlayers },
-                    cellsTotal = persistedCells.size,
-                    cellsPassingQualityGate = persistedCells.count { it.passesQualityGate }
-                ),
-                rateLimitVerification = riotApiRateLimiter.getVerificationSnapshot(
-                    region = normalizedRegion,
-                    networkCollectionEnabled = networkCollectionEnabled
-                ),
-                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
-                cells = persistedCells,
-                methodologyNotes = listOf(
-                    "Recompute cooldown active for region '$normalizedRegion'; serving persisted de-identified cells with zero Redis scans and zero DB writes."
-                )
+        if (isCollectorProcessLockHeld(normalizedRegion) || !tryAcquireRegionWriteGate(normalizedRegion)) {
+            return buildGuardedCooldownFallbackReport(
+                normalizedRegion = normalizedRegion,
+                cleanPatch = cleanPatch,
+                groundedPatch = groundedPatch,
+                now = now,
+                holdsRegionGate = false
             )
         }
 
-        val freshReport = extractCachedCohortsAndReport(
-            region = normalizedRegion,
-            targetPatch = cleanPatch,
-            maxGamesPerPlayer = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
-        )
         try {
-            redisCacheService.set(rKey, freshReport, REPORT_CACHE_TTL)
-            if (cleanPatch == null && freshReport.inventory.selectedTargetPatch != null) {
-                redisCacheService.set(
-                    reportCacheKey(normalizedRegion, freshReport.inventory.selectedTargetPatch),
-                    freshReport,
-                    REPORT_CACHE_TTL
+            val guardKey = recomputeGuardLockKey(normalizedRegion, cleanPatch)
+            val acquiredGuard = redisCacheService.setIfAbsent(guardKey, "LOCKED", RECOMPUTE_GUARD_TTL)
+            if (!acquiredGuard) {
+                return buildGuardedCooldownFallbackReport(
+                    normalizedRegion = normalizedRegion,
+                    cleanPatch = cleanPatch,
+                    groundedPatch = groundedPatch,
+                    now = now,
+                    holdsRegionGate = true
                 )
             }
-        } catch (e: Exception) {
-            logger.warn("Failed to cache cohort report for {}: {}", normalizedRegion, e.message)
+
+            val freshReport = extractCachedCohortsAndReportInternal(
+                region = normalizedRegion,
+                targetPatch = cleanPatch,
+                maxGamesPerPlayer = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
+            )
+            try {
+                redisCacheService.set(rKey, freshReport, REPORT_CACHE_TTL)
+                if (cleanPatch == null && freshReport.inventory.selectedTargetPatch != null) {
+                    redisCacheService.set(
+                        reportCacheKey(normalizedRegion, freshReport.inventory.selectedTargetPatch),
+                        freshReport,
+                        REPORT_CACHE_TTL
+                    )
+                }
+            } catch (e: Exception) {
+                logger.warn("Failed to cache cohort report for {}: {}", normalizedRegion, e.message)
+            }
+            return freshReport
+        } finally {
+            releaseRegionWriteGate(normalizedRegion)
         }
-        return freshReport
+    }
+
+    private fun buildGuardedCooldownFallbackReport(
+        normalizedRegion: String,
+        cleanPatch: String?,
+        groundedPatch: String?,
+        now: Instant,
+        holdsRegionGate: Boolean,
+        note: String = "Recompute cooldown active for region '$normalizedRegion'; serving persisted de-identified cells with zero Redis scans and zero DB writes."
+    ): CohortExtractionReportDto {
+        val persistedCells = getPersistedCohortCellsInternal(normalizedRegion, cleanPatch, holdsRegionGate = holdsRegionGate)
+        val fallbackPatch = cleanPatch ?: groundedPatch ?: persistedCells.firstOrNull()?.patch
+        return CohortExtractionReportDto(
+            reportSource = "GUARDED_COOLDOWN_FALLBACK",
+            inventory = CohortCacheInventoryDto(
+                region = normalizedRegion,
+                scannedAt = now,
+                scanKeyCapPerNamespace = MAX_SCAN_KEYS_PER_NAMESPACE,
+                maxRankSnapshotAgeHours = MAX_RANK_SNAPSHOT_AGE.toHours(),
+                maxMatchAgeHours = MAX_MATCH_AGE.toHours(),
+                maxMatchToSnapshotSkewHours = MAX_MATCH_TO_SNAPSHOT_SKEW.toHours(),
+                cachedProfileCount = 0,
+                profilesWithSoloQueueRankSnapshot = 0,
+                cachedChallengerLeaderboardPlayers = 0,
+                totalDistinctRankedPlayersInCache = 0,
+                ranksByTier = emptyMap(),
+                cachedMatchCount = 0,
+                cachedTimelineCount = 0,
+                matchesByPatch = emptyMap(),
+                latestCachedPatch = fallbackPatch,
+                selectedTargetPatch = fallbackPatch,
+                patchSelectionSource = if (cleanPatch != null) "EXPLICIT_TARGET_PATCH" else "PERSISTED_CACHE_FALLBACK",
+                soloQueue420MatchesOnTargetPatch = 0,
+                excludedNonSoloQueueMatches = 0,
+                excludedMissingGameVersionMatches = 0,
+                excludedOtherPatchMatches = 0,
+                excludedShortOrRemakeMatches = 0,
+                topMidBotParticipantCandidates = 0,
+                excludedOtherRoleParticipants = 0,
+                participantsWithRankSnapshot = 0,
+                participantsWithoutRankSnapshot = 0,
+                deduplicatedParticipantEntries = 0,
+                excludedOverPlayerCapSamples = persistedCells.sumOf { it.excludedOverPlayerCapGames },
+                eligibleCohortSamples = persistedCells.sumOf { it.eligibleGames },
+                distinctEligibleCohortPlayers = persistedCells.sumOf { it.distinctPlayers },
+                cellsTotal = persistedCells.size,
+                cellsPassingQualityGate = persistedCells.count { it.passesQualityGate }
+            ),
+            rateLimitVerification = riotApiRateLimiter.getVerificationSnapshot(
+                region = normalizedRegion,
+                networkCollectionEnabled = networkCollectionEnabled
+            ),
+            memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+            cells = persistedCells,
+            methodologyNotes = listOf(note)
+        )
     }
 
     /**
@@ -563,6 +749,35 @@ class CohortBenchmarkService(
      *   participant lacks `challenges.laneMinionsFirst10Minutes`.
      */
     fun extractCachedCohortsAndReport(
+        region: String = "euw1",
+        targetPatch: String? = null,
+        maxGamesPerPlayer: Int = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
+    ): CohortExtractionReportDto {
+        val normalizedRegion = region.lowercase().trim()
+        if (!tryAcquireRegionWriteGate(normalizedRegion)) {
+            val cleanPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
+            val groundedPatch = resolveGroundedCurrentPatch(normalizedRegion, allowLightRedisMatchProbe = false)
+            return buildGuardedCooldownFallbackReport(
+                normalizedRegion = normalizedRegion,
+                cleanPatch = cleanPatch,
+                groundedPatch = groundedPatch,
+                now = Instant.ofEpochMilli(timeProvider.now()),
+                holdsRegionGate = false,
+                note = "Concurrent cohort write active in-process for region '$normalizedRegion'; serving persisted de-identified cells with zero Redis scans and zero DB writes."
+            )
+        }
+        return try {
+            extractCachedCohortsAndReportInternal(
+                region = region,
+                targetPatch = targetPatch,
+                maxGamesPerPlayer = maxGamesPerPlayer
+            )
+        } finally {
+            releaseRegionWriteGate(normalizedRegion)
+        }
+    }
+
+    private fun extractCachedCohortsAndReportInternal(
         region: String = "euw1",
         targetPatch: String? = null,
         maxGamesPerPlayer: Int = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
@@ -1210,7 +1425,14 @@ class CohortBenchmarkService(
      * from the durable Postgres store (`cohort_benchmark_cells` / `cohort_cell_sample_states`).
      * Refuses non-current [patch] when a grounded current patch is established for [region].
      */
-    fun getPersistedCohortCells(region: String, patch: String? = null): List<CohortBenchmarkCellDto> {
+    fun getPersistedCohortCells(region: String, patch: String? = null): List<CohortBenchmarkCellDto> =
+        getPersistedCohortCellsInternal(region = region, patch = patch, holdsRegionGate = false)
+
+    private fun getPersistedCohortCellsInternal(
+        region: String,
+        patch: String? = null,
+        holdsRegionGate: Boolean = false
+    ): List<CohortBenchmarkCellDto> {
         val normalizedRegion = region.lowercase().trim()
         val cleanPatch = patch?.trim()?.takeIf { it.isNotBlank() }
         if (cleanPatch != null && !PATCH_REGEX.matches(cleanPatch)) {
@@ -1229,55 +1451,77 @@ class CohortBenchmarkService(
             if (cached != null && cached.isNotEmpty()) {
                 return cached.toList()
             }
-            val entities = cohortBenchmarkCellRepository.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(
-                region = normalizedRegion,
-                patch = effectivePatch,
-                queueId = SOLO_QUEUE_ID
-            )
-            val fromBenchmarkTableByKey = entities.mapNotNull { entityToDto(it) }
-                .associateBy { it.tier.uppercase() to it.role.uppercase() }
-            val durableStates = loadDurableCellSampleStatesForPatch(normalizedRegion, effectivePatch)
-            if (fromBenchmarkTableByKey.isEmpty() && durableStates.isEmpty()) {
-                return emptyList()
+            val acquiredGateForRepair = if (holdsRegionGate) {
+                true
+            } else if (isCollectorProcessLockHeld(normalizedRegion)) {
+                false
+            } else {
+                tryAcquireRegionWriteGate(normalizedRegion)
             }
-            val now = Instant.ofEpochMilli(timeProvider.now())
-            val allKeys = (fromBenchmarkTableByKey.keys + durableStates.keys)
-                .distinct()
-                .sortedWith(compareBy<Pair<String, String>> { tierIndex(it.first) }.thenBy { roleIndex(it.second) })
-            val mergedCells = mutableListOf<CohortBenchmarkCellDto>()
-            val missingFromBenchmarkTable = mutableListOf<CohortBenchmarkCellDto>()
-            for (k in allKeys) {
-                val legacy = fromBenchmarkTableByKey[k]
-                val st = durableStates[k]
-                if (st != null && st.samplesByPlayerHash.isNotEmpty()) {
-                    val rebuilt = buildCellDtoFromDurableState(
-                        state = st,
-                        patchSelectionSource = GROUNDED_PATCH_SOURCE_LABEL,
-                        computedAt = now
-                    )
-                    if (legacy == null || rebuilt.eligibleGames >= legacy.eligibleGames) {
-                        mergedCells.add(rebuilt)
-                        if (legacy == null || rebuilt.eligibleGames > legacy.eligibleGames) {
-                            missingFromBenchmarkTable.add(rebuilt)
-                        }
-                    } else {
-                        mergedCells.add(legacy)
-                    }
-                } else if (legacy != null) {
-                    mergedCells.add(legacy)
-                }
-            }
-            if (missingFromBenchmarkTable.isNotEmpty()) {
-                persistDeidentifiedCells(
+            if (!acquiredGateForRepair) {
+                // Another writer holds the per-region gate or collector lock; serve persisted benchmark cells
+                // read-only without mutating inMemoryDurableCellStates or DB tables (no self-contention or false empty report).
+                return cohortBenchmarkCellRepository.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(
                     region = normalizedRegion,
                     patch = effectivePatch,
-                    cellsToSaveInDb = missingFromBenchmarkTable,
-                    allCellsForCache = mergedCells
-                )
-            } else if (mergedCells.isNotEmpty()) {
-                runCatching { redisCacheService.set(cacheKey, mergedCells, BENCHMARK_CACHE_TTL) }
+                    queueId = SOLO_QUEUE_ID
+                ).mapNotNull { entityToDto(it) }
             }
-            return mergedCells
+            try {
+                val entities = cohortBenchmarkCellRepository.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(
+                    region = normalizedRegion,
+                    patch = effectivePatch,
+                    queueId = SOLO_QUEUE_ID
+                )
+                val fromBenchmarkTableByKey = entities.mapNotNull { entityToDto(it) }
+                    .associateBy { it.tier.uppercase() to it.role.uppercase() }
+                val durableStates = loadDurableCellSampleStatesForPatch(normalizedRegion, effectivePatch)
+                if (fromBenchmarkTableByKey.isEmpty() && durableStates.isEmpty()) {
+                    return emptyList()
+                }
+                val now = Instant.ofEpochMilli(timeProvider.now())
+                val allKeys = (fromBenchmarkTableByKey.keys + durableStates.keys)
+                    .distinct()
+                    .sortedWith(compareBy<Pair<String, String>> { tierIndex(it.first) }.thenBy { roleIndex(it.second) })
+                val mergedCells = mutableListOf<CohortBenchmarkCellDto>()
+                val missingFromBenchmarkTable = mutableListOf<CohortBenchmarkCellDto>()
+                for (k in allKeys) {
+                    val legacy = fromBenchmarkTableByKey[k]
+                    val st = durableStates[k]
+                    if (st != null && st.samplesByPlayerHash.isNotEmpty()) {
+                        val rebuilt = buildCellDtoFromDurableState(
+                            state = st,
+                            patchSelectionSource = GROUNDED_PATCH_SOURCE_LABEL,
+                            computedAt = now
+                        )
+                        if (legacy == null || rebuilt.eligibleGames >= legacy.eligibleGames) {
+                            mergedCells.add(rebuilt)
+                            if (legacy == null || rebuilt.eligibleGames > legacy.eligibleGames) {
+                                missingFromBenchmarkTable.add(rebuilt)
+                            }
+                        } else {
+                            mergedCells.add(legacy)
+                        }
+                    } else if (legacy != null) {
+                        mergedCells.add(legacy)
+                    }
+                }
+                if (missingFromBenchmarkTable.isNotEmpty()) {
+                    persistDeidentifiedCells(
+                        region = normalizedRegion,
+                        patch = effectivePatch,
+                        cellsToSaveInDb = missingFromBenchmarkTable,
+                        allCellsForCache = mergedCells
+                    )
+                } else if (mergedCells.isNotEmpty()) {
+                    runCatching { redisCacheService.set(cacheKey, mergedCells, BENCHMARK_CACHE_TTL) }
+                }
+                return mergedCells
+            } finally {
+                if (!holdsRegionGate) {
+                    releaseRegionWriteGate(normalizedRegion)
+                }
+            }
         }
 
         val allForRegion = cohortBenchmarkCellRepository.findByRegionOrderByPatchDescTierAscRoleAsc(normalizedRegion)
@@ -1348,6 +1592,12 @@ class CohortBenchmarkService(
         }
 
         var fetchedMatches = 0
+        val resolvedMatchesForParticipantIndexing = ArrayList<MatchDto>(
+            com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING
+        )
+        val seenMatchIdsForParticipantIndexing = HashSet<String>(
+            com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING * 2
+        )
         for (puuid in candidatePuuids.distinct()) {
             if (!getMemoryHeadroomSnapshot().hasHeadroomForLowPriority) {
                 logger.info("Low-priority cohort worker pausing on {}: memory headroom near cap", normalizedRegion)
@@ -1370,7 +1620,13 @@ class CohortBenchmarkService(
 
             for (matchId in matchIds.take(effectiveCap)) {
                 val matchKey = "match:$normalizedRegion:$matchId"
-                if (redisCacheService.get(matchKey, MatchDto::class.java) != null) {
+                val cachedMatch = redisCacheService.get(matchKey, MatchDto::class.java)
+                if (cachedMatch != null) {
+                    if (resolvedMatchesForParticipantIndexing.size < com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING &&
+                        seenMatchIdsForParticipantIndexing.add(matchId)
+                    ) {
+                        resolvedMatchesForParticipantIndexing.add(cachedMatch)
+                    }
                     continue
                 }
                 if (!getMemoryHeadroomSnapshot().hasHeadroomForLowPriority) {
@@ -1386,7 +1642,18 @@ class CohortBenchmarkService(
                 val match = riotApiService.getMatchByIdLowPriority(matchId, normalizedRegion) ?: continue
                 redisCacheService.set(matchKey, match, MATCH_CACHE_TTL)
                 fetchedMatches++
+                if (resolvedMatchesForParticipantIndexing.size < com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING &&
+                    seenMatchIdsForParticipantIndexing.add(matchId)
+                ) {
+                    resolvedMatchesForParticipantIndexing.add(match)
+                }
             }
+        }
+
+        if (resolvedMatchesForParticipantIndexing.isNotEmpty()) {
+            indexResolvedCollectorMatchesSafely(resolvedMatchesForParticipantIndexing, normalizedRegion)
+            resolvedMatchesForParticipantIndexing.clear()
+            seenMatchIdsForParticipantIndexing.clear()
         }
 
         return mapOf(
@@ -1430,6 +1697,32 @@ class CohortBenchmarkService(
         val nowInstant = Instant.ofEpochMilli(timeProvider.now())
         val cleanRequestedPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
 
+        if (!tryAcquireRegionWriteGate(normalizedRegion)) {
+            val existingWhenLocked = getCollectorCheckpoint(normalizedRegion, cleanRequestedPatch)
+                ?: if (cleanRequestedPatch != null) getCollectorCheckpoint(normalizedRegion, null) else null
+            return (existingWhenLocked ?: CohortCollectorCheckpointDto(
+                region = normalizedRegion,
+                targetPatch = cleanRequestedPatch,
+                patchSelectionSource = if (cleanRequestedPatch != null) "EXPLICIT_TARGET_PATCH" else "LOCKED_BY_ACTIVE_WRITER",
+                maxGamesPerPlayerCap = effectiveCap,
+                cellProgress = buildAllTargetCellProgress(
+                    getPersistedCohortCellsInternal(normalizedRegion, cleanRequestedPatch, holdsRegionGate = false)
+                ),
+                startedAt = nowInstant,
+                updatedAt = nowInstant
+            )).let { base ->
+                base.copy(
+                    sessionProductiveBatchesCompleted = sessionProductiveBatchesBeforeBatch,
+                    maxSessionProductiveBatches = maxSessionProductiveBatches,
+                    sessionNetworkCallsMade = (base.totalNetworkCallsMade - sessionBaselineNetworkCalls).coerceAtLeast(0),
+                    maxSessionNetworkCalls = maxSessionNetworkCalls ?: 0,
+                    lastStopReason = "LOCKED_BY_ACTIVE_WRITER",
+                    updatedAt = Instant.ofEpochMilli(timeProvider.now())
+                )
+            }
+        }
+
+        try {
         val existingCheckpoint = getCollectorCheckpoint(normalizedRegion, cleanRequestedPatch)
             ?: if (cleanRequestedPatch != null) getCollectorCheckpoint(normalizedRegion, null) else null
 
@@ -1470,7 +1763,9 @@ class CohortBenchmarkService(
                 targetPatch = initialGroundedPatch,
                 patchSelectionSource = GROUNDED_PATCH_SOURCE_LABEL,
                 maxGamesPerPlayerCap = effectiveCap,
-                cellProgress = buildAllTargetCellProgress(getPersistedCohortCells(normalizedRegion, initialGroundedPatch)),
+                cellProgress = buildAllTargetCellProgress(
+                    getPersistedCohortCellsInternal(normalizedRegion, initialGroundedPatch, holdsRegionGate = true)
+                ),
                 startedAt = nowInstant,
                 updatedAt = nowInstant
             )).let { base ->
@@ -1500,7 +1795,7 @@ class CohortBenchmarkService(
             initialGroundedPatch != null -> initialGroundedPatch
             else -> existingCheckpoint?.targetPatch
         }
-        val persistedCells = getPersistedCohortCells(normalizedRegion, effectivePatch)
+        val persistedCells = getPersistedCohortCellsInternal(normalizedRegion, effectivePatch, holdsRegionGate = true)
         if (effectivePatch == null && persistedCells.isNotEmpty()) {
             effectivePatch = persistedCells.first().patch
         }
@@ -1764,6 +2059,12 @@ class CohortBenchmarkService(
             }
         }
 
+        val resolvedMatchesForParticipantIndexing = ArrayList<MatchDto>(
+            com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING
+        )
+        val seenMatchIdsForParticipantIndexing = HashSet<String>(
+            com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING * 2
+        )
         val candidatesThisBatch = pendingQueue.filter { it !in processedPuuids }.take(effectiveBatchLimit)
         outerLoop@ for (puuid in candidatesThisBatch) {
             val prePlayerPause = evaluateLivePauseReason()
@@ -1982,6 +2283,11 @@ class CohortBenchmarkService(
                 if (!isOwnListedMatch && info.participants.none { it.puuid == puuid }) {
                     continue@matchLoop
                 }
+                if (resolvedMatchesForParticipantIndexing.size < com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING &&
+                    seenMatchIdsForParticipantIndexing.add(matchId)
+                ) {
+                    resolvedMatchesForParticipantIndexing.add(match)
+                }
                 val matchPatch = extractMajorMinorPatch(info.gameVersion)
                 if (info.queueId == SOLO_QUEUE_ID && matchPatch != null) {
                     if (freshlyFetchedFromRiot) {
@@ -2007,7 +2313,7 @@ class CohortBenchmarkService(
                         durableStatesByCell.clear()
                         durableStatesByCell.putAll(loadDurableCellSampleStatesForPatch(normalizedRegion, liveGrounded))
                         persistedCellsByKey.clear()
-                        getPersistedCohortCells(normalizedRegion, liveGrounded).forEach {
+                        getPersistedCohortCellsInternal(normalizedRegion, liveGrounded, holdsRegionGate = true).forEach {
                             persistedCellsByKey[it.tier.uppercase() to it.role.uppercase()] = it
                         }
                         playerCellGameCounts.clear()
@@ -2105,6 +2411,12 @@ class CohortBenchmarkService(
             }
         }
 
+        if (resolvedMatchesForParticipantIndexing.isNotEmpty()) {
+            indexResolvedCollectorMatchesSafely(resolvedMatchesForParticipantIndexing, normalizedRegion)
+            resolvedMatchesForParticipantIndexing.clear()
+            seenMatchIdsForParticipantIndexing.clear()
+        }
+
         // 6. Flush batched dirty cell states & benchmark cells once at the end of the productive batch
         flushDirtyCellsToPostgres()
         if (playersProcessedThisBatch > 0 || fetchedMatches > (existingCheckpoint?.fetchedMatches ?: 0)) {
@@ -2140,6 +2452,9 @@ class CohortBenchmarkService(
         val finalCheckpoint = buildCurrentCheckpoint(stopReason)
         saveCollectorCheckpoint(finalCheckpoint)
         return finalCheckpoint
+        } finally {
+            releaseRegionWriteGate(normalizedRegion)
+        }
     }
 
     fun isValidRegion(region: String): Boolean = region.lowercase().trim() in ALLOWED_REGIONS
@@ -2163,6 +2478,22 @@ class CohortBenchmarkService(
         return redisCacheService.setIfAbsent("lock:cohort:collector:active:$normalizedRegion", "ACTIVE", COLLECTOR_LOCK_TTL)
     }
 
+    fun isCollectorProcessLockHeld(region: String): Boolean {
+        val normalizedRegion = region.lowercase().trim()
+        val value = runCatching {
+            redisCacheService.get("lock:cohort:collector:active:$normalizedRegion", String::class.java)
+        }.getOrNull()
+        return value != null && value.isNotBlank()
+    }
+
+    private fun isReportRecomputeGuardHeld(region: String, patch: String?): Boolean {
+        val normalizedRegion = region.lowercase().trim()
+        val value = runCatching {
+            redisCacheService.get(recomputeGuardLockKey(normalizedRegion, patch), String::class.java)
+        }.getOrNull()
+        return value != null && value.isNotBlank()
+    }
+
     fun refreshCollectorProcessLock(region: String) {
         val normalizedRegion = region.lowercase().trim()
         redisCacheService.set("lock:cohort:collector:active:$normalizedRegion", "ACTIVE", COLLECTOR_LOCK_TTL)
@@ -2171,6 +2502,748 @@ class CohortBenchmarkService(
     fun releaseCollectorProcessLock(region: String) {
         val normalizedRegion = region.lowercase().trim()
         redisCacheService.delete("lock:cohort:collector:active:$normalizedRegion")
+    }
+
+    private data class PendingSingleCellWrite(
+        val mapKey: String,
+        val tier: String,
+        val role: String,
+        val updatedState: DurableCellSampleStateDto,
+        val stateJson: String,
+        val distinctPlayersCount: Int,
+        val eligibleGamesCount: Int,
+        val passesGate: Boolean,
+        val updatedAtInstant: Instant,
+        val cellDto: CohortBenchmarkCellDto,
+        val metricsJson: String,
+        val netNewSamplesInCell: Int
+    )
+
+    /**
+     * Bounded, cache-only cohort ingestion for a single cached player ([puuid]) and at most 10 exact cached match IDs.
+     *
+     * Strictly enforces:
+     * - Zero Riot API network calls and zero Redis `SCAN` (`scanKeys`) calls.
+     * - Extracts ONLY [puuid]'s own qualified Ranked Solo (`420`) samples (`TOP`, `MIDDLE`, `BOTTOM`) on the grounded current patch.
+     * - Zero co-participant rank lookups and zero `cohort_collector_checkpoints` / `pendingQueue` / `processedPuuids` writes.
+     * - Requires both [cohortCellSampleStateRepository] and a usable [org.springframework.transaction.support.TransactionTemplate]
+     *   (with a non-null `transactionManager`) when persisting; fails closed with `0` writes if either is missing/unwired.
+     * - Serializes against same-process report/collector/repair writers via [regionWriteGates] (same-process only; does not
+     *   provide distributed multi-JVM transaction isolation) plus exact Redis lock keys (`lock:cohort:collector:active:{region}`
+     *   and exact `lock:cohort:report:{region}:{patch|latest}`).
+     * - Point-loads only the touched `(tier, role)` cell(s), refuses to overwrite divergent unsaved [inMemoryDurableCellStates]
+     *   entries (`REFUSED_DIVERGENT_IN_MEMORY_CELL_STATE`), and commits both `cohort_cell_sample_states` and
+     *   `cohort_benchmark_cells` inside a single atomic DB transaction.
+     */
+    fun ingestCachedPlayerByExactIds(
+        region: String = "euw1",
+        puuid: String,
+        targetPatch: String? = null,
+        explicitMatchIds: List<String> = emptyList(),
+        maxGamesPerPlayer: Int = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER
+    ): CohortCachedPlayerIngestionResultDto {
+        val normalizedRegion = region.lowercase().trim()
+        val cleanPatch = targetPatch?.trim()?.takeIf { it.isNotBlank() }
+        if (normalizedRegion !in ALLOWED_REGIONS) {
+            return CohortCachedPlayerIngestionResultDto(
+                region = normalizedRegion,
+                targetPatch = cleanPatch,
+                status = "INVALID_REGION",
+                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                notes = listOf("Unsupported region '$normalizedRegion'; zero Redis or DB operations executed.")
+            )
+        }
+        val cleanPuuid = puuid.trim()
+        if (cleanPuuid.isBlank() || cleanPuuid.any { it.isWhitespace() || it == ',' }) {
+            return CohortCachedPlayerIngestionResultDto(
+                region = normalizedRegion,
+                targetPatch = cleanPatch,
+                status = "INVALID_PUUID",
+                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                notes = listOf("Exactly one non-blank PUUID is required; zero Redis or DB operations executed.")
+            )
+        }
+        if (cleanPatch != null && !PATCH_REGEX.matches(cleanPatch)) {
+            return CohortCachedPlayerIngestionResultDto(
+                region = normalizedRegion,
+                targetPatch = cleanPatch,
+                status = "INVALID_PATCH_FORMAT",
+                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                notes = listOf("Invalid patch format '$cleanPatch' (expected major.minor); zero Redis or DB operations executed.")
+            )
+        }
+
+        val playerHash = hashIdentifier("player:$normalizedRegion:$cleanPuuid")
+        val sampleRepo = cohortCellSampleStateRepository
+        if (sampleRepo == null) {
+            return CohortCachedPlayerIngestionResultDto(
+                region = normalizedRegion,
+                targetPatch = cleanPatch,
+                status = "SAMPLE_STATE_REPOSITORY_UNWIRED",
+                playerHash = playerHash,
+                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                notes = listOf("CohortCellSampleStateRepository is not wired; failing closed with zero writes.")
+            )
+        }
+        val txTemplate = transactionTemplate
+        if (txTemplate == null || txTemplate.transactionManager == null) {
+            return CohortCachedPlayerIngestionResultDto(
+                region = normalizedRegion,
+                targetPatch = cleanPatch,
+                status = "TRANSACTION_MANAGER_REQUIRED",
+                playerHash = playerHash,
+                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                notes = listOf("Usable PlatformTransactionManager/TransactionTemplate is required for atomic two-table cohort ingestion; failing closed with zero writes.")
+            )
+        }
+
+        val memSnap = getMemoryHeadroomSnapshot()
+        if (!memSnap.hasHeadroomForLowPriority) {
+            return CohortCachedPlayerIngestionResultDto(
+                region = normalizedRegion,
+                targetPatch = cleanPatch,
+                status = "PAUSED_MEMORY_HEADROOM",
+                playerHash = playerHash,
+                memoryHeadroom = memSnap,
+                notes = listOf("Memory headroom is above low-priority safety threshold; skipping cached ingestion with zero writes.")
+            )
+        }
+
+        if (!tryAcquireRegionWriteGate(normalizedRegion)) {
+            return CohortCachedPlayerIngestionResultDto(
+                region = normalizedRegion,
+                targetPatch = cleanPatch,
+                status = "LOCKED_BY_ACTIVE_WRITER",
+                playerHash = playerHash,
+                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                notes = listOf("Another cohort write is active in-process for region '$normalizedRegion'; zero writes performed.")
+            )
+        }
+
+        try {
+            if (isReportRecomputeGuardHeld(normalizedRegion, null) ||
+                (cleanPatch != null && isReportRecomputeGuardHeld(normalizedRegion, cleanPatch))
+            ) {
+                return CohortCachedPlayerIngestionResultDto(
+                    region = normalizedRegion,
+                    targetPatch = cleanPatch,
+                    status = "LOCKED_BY_ACTIVE_WRITER",
+                    playerHash = playerHash,
+                    memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                    notes = listOf("Report recompute lock is active in Redis for region '$normalizedRegion'; zero writes performed.")
+                )
+            }
+
+            if (!acquireCollectorProcessLock(normalizedRegion)) {
+                return CohortCachedPlayerIngestionResultDto(
+                    region = normalizedRegion,
+                    targetPatch = cleanPatch,
+                    status = "LOCKED_BY_ACTIVE_WRITER",
+                    playerHash = playerHash,
+                    memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                    notes = listOf("Collector process lock is active in Redis for region '$normalizedRegion'; zero writes performed.")
+                )
+            }
+
+            try {
+                val groundedPatch = resolveGroundedCurrentPatch(
+                    region = normalizedRegion,
+                    allowLightRedisMatchProbe = false,
+                    allowExternalNetworkLookup = false
+                )
+                if (groundedPatch == null) {
+                    return CohortCachedPlayerIngestionResultDto(
+                        region = normalizedRegion,
+                        targetPatch = cleanPatch,
+                        status = "GROUNDED_PATCH_UNAVAILABLE",
+                        playerHash = playerHash,
+                        memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                        notes = listOf("No grounded current patch available in cache or durable stores for region '$normalizedRegion' (network-free fail-closed resolver); zero writes performed.")
+                    )
+                }
+                if (cleanPatch != null && cleanPatch != groundedPatch) {
+                    return CohortCachedPlayerIngestionResultDto(
+                        region = normalizedRegion,
+                        targetPatch = groundedPatch,
+                        status = STOP_REASON_NON_CURRENT_PATCH_REFUSED,
+                        playerHash = playerHash,
+                        memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                        notes = listOf("Refused non-current patch '$cleanPatch' for region '$normalizedRegion': grounded current patch is '$groundedPatch'.")
+                    )
+                }
+                if (groundedPatch != cleanPatch && isReportRecomputeGuardHeld(normalizedRegion, groundedPatch)) {
+                    return CohortCachedPlayerIngestionResultDto(
+                        region = normalizedRegion,
+                        targetPatch = groundedPatch,
+                        status = "LOCKED_BY_ACTIVE_WRITER",
+                        playerHash = playerHash,
+                        memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                        notes = listOf("Report recompute lock is active in Redis for patch '$groundedPatch' in region '$normalizedRegion'; zero writes performed.")
+                    )
+                }
+
+                val now = Instant.ofEpochMilli(timeProvider.now())
+                val minSnapshotInstant = now.minus(MAX_RANK_SNAPSHOT_AGE)
+                val maxFutureSkewInstant = now.plus(Duration.ofHours(2))
+                val minMatchInstant = now.minus(MAX_MATCH_AGE)
+                val effectiveCap = maxGamesPerPlayer.coerceIn(1, CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER)
+
+                // 1. Point-lookup single player's fresh Solo Queue rank snapshot from exact keys (zero SCAN, zero Riot calls)
+                val cachedProfile = redisCacheService.get("player:profile:$normalizedRegion:$cleanPuuid", SummonerProfileDto::class.java)
+                val cachedRankSnap = redisCacheService.get("cohort:rank:snapshot:$normalizedRegion:$cleanPuuid", CohortRankSnapshotDto::class.java)
+
+                var resolvedRankSnapshot: RankSnapshot? = null
+                val profileRank = cachedProfile?.soloQueueRank
+                val profileRefreshedAt = cachedProfile?.lastRefreshed
+                val profileTier = profileRank?.tier?.uppercase()?.trim()?.takeIf { it in TIER_ORDER }
+                if (profileTier != null &&
+                    (profileRank.queueType == null || profileRank.queueType == "RANKED_SOLO_5x5") &&
+                    profileRefreshedAt != null &&
+                    !profileRefreshedAt.isBefore(minSnapshotInstant) &&
+                    !profileRefreshedAt.isAfter(maxFutureSkewInstant)
+                ) {
+                    resolvedRankSnapshot = RankSnapshot(
+                        puuid = cleanPuuid,
+                        tier = profileTier,
+                        snapshotAt = profileRefreshedAt
+                    )
+                }
+
+                if (cachedRankSnap != null && cachedRankSnap.queueType == "RANKED_SOLO_5x5") {
+                    val snapTier = cachedRankSnap.tier.uppercase().trim().takeIf { it in TIER_ORDER }
+                    val snapAt = cachedRankSnap.snapshotAt
+                    if (snapTier != null && !snapAt.isBefore(minSnapshotInstant) && !snapAt.isAfter(maxFutureSkewInstant)) {
+                        if (resolvedRankSnapshot == null || snapAt.isAfter(resolvedRankSnapshot.snapshotAt)) {
+                            resolvedRankSnapshot = RankSnapshot(
+                                puuid = cleanPuuid,
+                                tier = snapTier,
+                                snapshotAt = snapAt
+                            )
+                        }
+                    }
+                }
+
+                if (resolvedRankSnapshot == null) {
+                    val lbKeys = listOf(
+                        "leaderboard:$normalizedRegion::RANKED_SOLO_5x5",
+                        "leaderboard:$normalizedRegion:RANKED_SOLO_5x5"
+                    )
+                    for (lbKey in lbKeys) {
+                        val cachedLb = redisCacheService.get(lbKey, CachedLeaderboardDto::class.java) ?: continue
+                        val lbRefreshed = cachedLb.lastRefreshed ?: continue
+                        val queue = cachedLb.leaderboard?.queue
+                        if (queue != null && queue != "RANKED_SOLO_5x5") continue
+                        if (lbRefreshed.isBefore(minSnapshotInstant) || lbRefreshed.isAfter(maxFutureSkewInstant)) continue
+                        val hasEntry = cachedLb.leaderboard?.entries?.any { it.puuid?.trim() == cleanPuuid } == true
+                        if (hasEntry) {
+                            val lbTier = cachedLb.leaderboard?.tier?.uppercase()?.trim()?.takeIf { it in TIER_ORDER } ?: "CHALLENGER"
+                            resolvedRankSnapshot = RankSnapshot(
+                                puuid = cleanPuuid,
+                                tier = lbTier,
+                                snapshotAt = lbRefreshed
+                            )
+                            break
+                        }
+                    }
+                }
+
+                if (resolvedRankSnapshot == null) {
+                    return CohortCachedPlayerIngestionResultDto(
+                        region = normalizedRegion,
+                        targetPatch = groundedPatch,
+                        status = "SKIPPED_UNRANKED_OR_STALE_RANK",
+                        playerHash = playerHash,
+                        memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                        notes = listOf("No fresh Ranked Solo (queueId=420) rank snapshot found in cache for player; zero writes performed.")
+                    )
+                }
+
+                // 2. Select at most effectiveCap (<= 10) exact match IDs lazily via Sequence from explicitMatchIds or cached profile
+                val cleanedExplicitIds = explicitMatchIds
+                    .asSequence()
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .distinct()
+                    .take(effectiveCap)
+                    .toList()
+                val candidateMatchIds = if (cleanedExplicitIds.isNotEmpty()) {
+                    cleanedExplicitIds
+                } else {
+                    val fromAllIds = cachedProfile?.allMatchIds.orEmpty()
+                        .asSequence()
+                        .map { it.trim() }
+                        .filter { it.isNotBlank() }
+                        .distinct()
+                        .take(effectiveCap)
+                        .toList()
+                    if (fromAllIds.isNotEmpty()) {
+                        fromAllIds
+                    } else {
+                        cachedProfile?.recentMatches.orEmpty()
+                            .asSequence()
+                            .mapNotNull { it.metadata?.matchId?.trim()?.takeIf { id -> id.isNotBlank() } }
+                            .distinct()
+                            .take(effectiveCap)
+                            .toList()
+                    }
+                }
+
+                if (candidateMatchIds.isEmpty()) {
+                    return CohortCachedPlayerIngestionResultDto(
+                        region = normalizedRegion,
+                        targetPatch = groundedPatch,
+                        status = "NO_CACHED_MATCH_IDS",
+                        playerHash = playerHash,
+                        tier = resolvedRankSnapshot.tier,
+                        memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                        notes = listOf("No explicit or profile-cached match IDs available for player; zero writes performed.")
+                    )
+                }
+
+                val candidateMatchIdSet = candidateMatchIds.toSet()
+                val profileRecentByMatchId = cachedProfile?.recentMatches.orEmpty()
+                    .asSequence()
+                    .mapNotNull { m ->
+                        val id = m.metadata?.matchId?.trim()?.takeIf { it in candidateMatchIdSet }
+                        if (id != null) id to m else null
+                    }
+                    .toMap()
+
+                val resolvedPatch: String = groundedPatch
+                var excludedWrongPatchMatches = 0
+                var excludedStaleOrSkewMatches = 0
+                var excludedNonSoloOrRemakeMatches = 0
+                var excludedIneligibleRoleMatches = 0
+                var missingOrUncachedMatches = 0
+                val seenMatchIds = HashSet<String>()
+                val extractedSamples = mutableListOf<ParticipantSample>()
+
+                for (matchId in candidateMatchIds) {
+                    if (!seenMatchIds.add(matchId)) continue
+                    val match = redisCacheService.get("match:$normalizedRegion:$matchId", MatchDto::class.java)
+                        ?: profileRecentByMatchId[matchId]
+                    val info = match?.info
+                    if (info == null) {
+                        missingOrUncachedMatches++
+                        continue
+                    }
+
+                    val durationSeconds = info.gameDuration ?: 0L
+                    val isRemakeOrEarlySurrender = durationSeconds < MIN_GAME_DURATION_SECONDS ||
+                        info.participants.any { it.gameEndedInEarlySurrender == true || it.teamEarlySurrendered == true }
+                    if (info.queueId != SOLO_QUEUE_ID || isRemakeOrEarlySurrender) {
+                        excludedNonSoloOrRemakeMatches++
+                        continue
+                    }
+
+                    val matchPatch = extractMajorMinorPatch(info.gameVersion)
+                    if (matchPatch == null || matchPatch != resolvedPatch) {
+                        excludedWrongPatchMatches++
+                        continue
+                    }
+
+                    val gameCreation = info.gameCreation ?: 0L
+                    if (gameCreation <= 0L) {
+                        excludedStaleOrSkewMatches++
+                        continue
+                    }
+                    val matchPlayedAt = Instant.ofEpochMilli(gameCreation)
+                    if (matchPlayedAt.isBefore(minMatchInstant) || matchPlayedAt.isAfter(maxFutureSkewInstant)) {
+                        excludedStaleOrSkewMatches++
+                        continue
+                    }
+                    val matchToSnapshotDistance = Duration.between(matchPlayedAt, resolvedRankSnapshot.snapshotAt).abs()
+                    if (matchToSnapshotDistance > MAX_MATCH_TO_SNAPSHOT_SKEW) {
+                        excludedStaleOrSkewMatches++
+                        continue
+                    }
+
+                    val ownParticipant = info.participants.find { it.puuid?.trim() == cleanPuuid }
+                    if (ownParticipant == null) {
+                        missingOrUncachedMatches++
+                        continue
+                    }
+                    val role = resolveNormalizedRole(ownParticipant)
+                    if (role !in ELIGIBLE_ROLES) {
+                        excludedIneligibleRoleMatches++
+                        continue
+                    }
+
+                    val durationMinutes = durationSeconds.toDouble() / 60.0
+                    val teamKillsByTeamId = info.participants
+                        .groupBy { it.teamId ?: 0 }
+                        .mapValues { (_, plist) -> plist.sumOf { it.kills ?: 0 } }
+
+                    extractedSamples.add(
+                        extractParticipantSampleFromMatch(
+                            matchId = matchId,
+                            puuid = cleanPuuid,
+                            tier = resolvedRankSnapshot.tier,
+                            role = role,
+                            gameCreation = gameCreation,
+                            rankSnapshotAt = resolvedRankSnapshot.snapshotAt,
+                            participant = ownParticipant,
+                            durationSeconds = durationSeconds,
+                            durationMinutes = durationMinutes,
+                            teamKillsByTeamId = teamKillsByTeamId
+                        )
+                    )
+                }
+
+                if (extractedSamples.isEmpty()) {
+                    return CohortCachedPlayerIngestionResultDto(
+                        region = normalizedRegion,
+                        targetPatch = resolvedPatch,
+                        status = "NO_ELIGIBLE_SAMPLES",
+                        playerHash = playerHash,
+                        tier = resolvedRankSnapshot.tier,
+                        inspectedMatchIdsCount = candidateMatchIds.size,
+                        qualifiedSamplesExtracted = 0,
+                        netNewSamplesPersisted = 0,
+                        excludedWrongPatchMatches = excludedWrongPatchMatches,
+                        excludedStaleOrSkewMatches = excludedStaleOrSkewMatches,
+                        excludedNonSoloOrRemakeMatches = excludedNonSoloOrRemakeMatches,
+                        excludedIneligibleRoleMatches = excludedIneligibleRoleMatches,
+                        missingOrUncachedMatches = missingOrUncachedMatches,
+                        memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                        notes = listOf("No eligible current-patch Ranked Solo TOP/MIDDLE/BOTTOM samples found in inspected cached matches; zero writes performed.")
+                    )
+                }
+
+                // 3. Point-load only the touched (tier, role) cells, refuse divergent unsaved in-memory state, and fold samples
+                val samplesByCell = extractedSamples.groupBy { it.tier.uppercase().trim() to it.role.uppercase().trim() }
+                val pendingWrites = mutableListOf<PendingSingleCellWrite>()
+                val nowEpochMilli = now.toEpochMilli()
+
+                for ((cellKey, cellSamples) in samplesByCell) {
+                    val (cellTier, cellRole) = cellKey
+                    val mapKey = durableCellMapKey(normalizedRegion, resolvedPatch, cellTier, cellRole)
+
+                    val existingSampleEntity = try {
+                        sampleRepo.findByRegionAndPatchAndQueueIdAndTierAndRole(
+                            region = normalizedRegion,
+                            patch = resolvedPatch,
+                            queueId = SOLO_QUEUE_ID,
+                            tier = cellTier,
+                            role = cellRole
+                        )
+                    } catch (e: Exception) {
+                        logger.warn("Failed to point-load durable cell sample state for {} {} {} {}: {}", normalizedRegion, resolvedPatch, cellTier, cellRole, e.message)
+                        return CohortCachedPlayerIngestionResultDto(
+                            region = normalizedRegion,
+                            targetPatch = resolvedPatch,
+                            status = "PERSISTENCE_ERROR",
+                            playerHash = playerHash,
+                            tier = resolvedRankSnapshot.tier,
+                            inspectedMatchIdsCount = candidateMatchIds.size,
+                            qualifiedSamplesExtracted = extractedSamples.size,
+                            netNewSamplesPersisted = 0,
+                            excludedWrongPatchMatches = excludedWrongPatchMatches,
+                            excludedStaleOrSkewMatches = excludedStaleOrSkewMatches,
+                            excludedNonSoloOrRemakeMatches = excludedNonSoloOrRemakeMatches,
+                            excludedIneligibleRoleMatches = excludedIneligibleRoleMatches,
+                            missingOrUncachedMatches = missingOrUncachedMatches,
+                            memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                            notes = listOf("Failed to read existing durable cell sample state for $cellTier:$cellRole; zero writes performed.")
+                        )
+                    }
+
+                    val dbState: DurableCellSampleStateDto? = if (existingSampleEntity != null) {
+                        try {
+                            objectMapper.readValue(existingSampleEntity.samplesJson, DurableCellSampleStateDto::class.java)
+                        } catch (e: Exception) {
+                            logger.warn("Corrupt durable cell sample state JSON for {} {} {} {}: {}", normalizedRegion, resolvedPatch, cellTier, cellRole, e.message)
+                            return CohortCachedPlayerIngestionResultDto(
+                                region = normalizedRegion,
+                                targetPatch = resolvedPatch,
+                                status = "PERSISTENCE_ERROR",
+                                playerHash = playerHash,
+                                tier = resolvedRankSnapshot.tier,
+                                inspectedMatchIdsCount = candidateMatchIds.size,
+                                qualifiedSamplesExtracted = extractedSamples.size,
+                                netNewSamplesPersisted = 0,
+                                excludedWrongPatchMatches = excludedWrongPatchMatches,
+                                excludedStaleOrSkewMatches = excludedStaleOrSkewMatches,
+                                excludedNonSoloOrRemakeMatches = excludedNonSoloOrRemakeMatches,
+                                excludedIneligibleRoleMatches = excludedIneligibleRoleMatches,
+                                missingOrUncachedMatches = missingOrUncachedMatches,
+                                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                                notes = listOf("Corrupt durable cell sample state JSON for $cellTier:$cellRole; failing closed with zero writes.")
+                            )
+                        }
+                    } else {
+                        null
+                    }
+
+                    val inMemState = inMemoryDurableCellStates[mapKey]
+                    if (inMemState != null && (dbState == null || inMemState != dbState)) {
+                        return CohortCachedPlayerIngestionResultDto(
+                            region = normalizedRegion,
+                            targetPatch = resolvedPatch,
+                            status = "REFUSED_DIVERGENT_IN_MEMORY_CELL_STATE",
+                            playerHash = playerHash,
+                            tier = resolvedRankSnapshot.tier,
+                            inspectedMatchIdsCount = candidateMatchIds.size,
+                            qualifiedSamplesExtracted = extractedSamples.size,
+                            netNewSamplesPersisted = 0,
+                            excludedWrongPatchMatches = excludedWrongPatchMatches,
+                            excludedStaleOrSkewMatches = excludedStaleOrSkewMatches,
+                            excludedNonSoloOrRemakeMatches = excludedNonSoloOrRemakeMatches,
+                            excludedIneligibleRoleMatches = excludedIneligibleRoleMatches,
+                            missingOrUncachedMatches = missingOrUncachedMatches,
+                            memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                            notes = listOf("Refused to overwrite divergent unsaved in-memory durable cell state for $cellTier:$cellRole; zero DB or Redis writes performed.")
+                        )
+                    }
+
+                    val baseState = dbState ?: DurableCellSampleStateDto(
+                        region = normalizedRegion,
+                        patch = resolvedPatch,
+                        queueId = SOLO_QUEUE_ID,
+                        tier = cellTier,
+                        role = cellRole,
+                        maxGamesPerPlayerCap = effectiveCap,
+                        updatedAtEpochMilli = nowEpochMilli
+                    )
+                    val beforePlayerMatches = baseState.samplesByPlayerHash[playerHash]?.map { it.matchIdHash }?.toSet().orEmpty()
+                    val updatedState = foldParticipantSamplesIntoDurableState(
+                        state = baseState,
+                        samples = cellSamples,
+                        effectiveCap = effectiveCap,
+                        nowEpochMilli = nowEpochMilli
+                    )
+                    if (updatedState == baseState) {
+                        continue
+                    }
+                    val afterPlayerMatches = updatedState.samplesByPlayerHash[playerHash]?.map { it.matchIdHash }?.toSet().orEmpty()
+                    val netNewInCell = (afterPlayerMatches - beforePlayerMatches).size
+                    val cellDto = buildCellDtoFromDurableState(
+                        state = updatedState,
+                        patchSelectionSource = if (cleanPatch != null) "EXPLICIT_TARGET_PATCH" else GROUNDED_PATCH_SOURCE_LABEL,
+                        computedAt = now
+                    )
+                    val stateJson = objectMapper.writeValueAsString(updatedState)
+                    val metricsJson = objectMapper.writeValueAsString(cellDto.metrics)
+                    pendingWrites.add(
+                        PendingSingleCellWrite(
+                            mapKey = mapKey,
+                            tier = cellTier,
+                            role = cellRole,
+                            updatedState = updatedState,
+                            stateJson = stateJson,
+                            distinctPlayersCount = cellDto.distinctPlayers,
+                            eligibleGamesCount = cellDto.eligibleGames,
+                            passesGate = cellDto.passesQualityGate,
+                            updatedAtInstant = now,
+                            cellDto = cellDto,
+                            metricsJson = metricsJson,
+                            netNewSamplesInCell = netNewInCell
+                        )
+                    )
+                }
+
+                if (pendingWrites.isEmpty()) {
+                    return CohortCachedPlayerIngestionResultDto(
+                        region = normalizedRegion,
+                        targetPatch = resolvedPatch,
+                        status = "NO_NEW_ELIGIBLE_SAMPLES",
+                        playerHash = playerHash,
+                        tier = resolvedRankSnapshot.tier,
+                        inspectedMatchIdsCount = candidateMatchIds.size,
+                        qualifiedSamplesExtracted = extractedSamples.size,
+                        netNewSamplesPersisted = 0,
+                        excludedWrongPatchMatches = excludedWrongPatchMatches,
+                        excludedStaleOrSkewMatches = excludedStaleOrSkewMatches,
+                        excludedNonSoloOrRemakeMatches = excludedNonSoloOrRemakeMatches,
+                        excludedIneligibleRoleMatches = excludedIneligibleRoleMatches,
+                        missingOrUncachedMatches = missingOrUncachedMatches,
+                        memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                        notes = listOf("All qualified samples for player were already recorded or capped in durable cell storage; zero DB writes performed.")
+                    )
+                }
+
+                // 4. Persist both cohort_cell_sample_states and cohort_benchmark_cells inside a single atomic DB transaction
+                try {
+                    txTemplate.executeWithoutResult {
+                        for (plan in pendingWrites) {
+                            val existingSample = sampleRepo.findByRegionAndPatchAndQueueIdAndTierAndRole(
+                                region = normalizedRegion,
+                                patch = resolvedPatch,
+                                queueId = SOLO_QUEUE_ID,
+                                tier = plan.tier,
+                                role = plan.role
+                            )
+                            if (existingSample != null) {
+                                existingSample.distinctPlayers = plan.distinctPlayersCount
+                                existingSample.eligibleGames = plan.eligibleGamesCount
+                                existingSample.excludedOverPlayerCapGames = plan.updatedState.excludedOverPlayerCapGames
+                                existingSample.passesQualityGate = plan.passesGate
+                                existingSample.samplesJson = plan.stateJson
+                                existingSample.updatedAt = plan.updatedAtInstant
+                                sampleRepo.save(existingSample)
+                            } else {
+                                sampleRepo.save(
+                                    CohortCellSampleStateEntity(
+                                        region = normalizedRegion,
+                                        patch = resolvedPatch,
+                                        queueId = SOLO_QUEUE_ID,
+                                        tier = plan.tier,
+                                        role = plan.role,
+                                        distinctPlayers = plan.distinctPlayersCount,
+                                        eligibleGames = plan.eligibleGamesCount,
+                                        excludedOverPlayerCapGames = plan.updatedState.excludedOverPlayerCapGames,
+                                        passesQualityGate = plan.passesGate,
+                                        samplesJson = plan.stateJson,
+                                        updatedAt = plan.updatedAtInstant
+                                    )
+                                )
+                            }
+
+                            val existingBench = cohortBenchmarkCellRepository.findByRegionAndPatchAndQueueIdAndTierAndRole(
+                                region = normalizedRegion,
+                                patch = resolvedPatch,
+                                queueId = SOLO_QUEUE_ID,
+                                tier = plan.tier,
+                                role = plan.role
+                            )
+                            if (existingBench != null) {
+                                existingBench.distinctPlayers = plan.cellDto.distinctPlayers
+                                existingBench.eligibleGames = plan.cellDto.eligibleGames
+                                existingBench.maxGamesPerPlayerCap = plan.cellDto.maxGamesPerPlayerCap
+                                existingBench.excludedOverPlayerCapGames = plan.cellDto.excludedOverPlayerCapGames
+                                existingBench.passesQualityGate = plan.cellDto.passesQualityGate
+                                existingBench.colorBandsEnabled = plan.cellDto.colorBandsEnabled
+                                existingBench.earliestRankSnapshotAt = plan.cellDto.earliestRankSnapshotAt
+                                existingBench.latestRankSnapshotAt = plan.cellDto.latestRankSnapshotAt
+                                existingBench.computedAt = plan.cellDto.computedAt
+                                existingBench.metricsJson = plan.metricsJson
+                                cohortBenchmarkCellRepository.save(existingBench)
+                            } else {
+                                cohortBenchmarkCellRepository.save(
+                                    CohortBenchmarkCellEntity(
+                                        region = normalizedRegion,
+                                        patch = resolvedPatch,
+                                        queueId = SOLO_QUEUE_ID,
+                                        tier = plan.tier,
+                                        role = plan.role,
+                                        distinctPlayers = plan.cellDto.distinctPlayers,
+                                        eligibleGames = plan.cellDto.eligibleGames,
+                                        maxGamesPerPlayerCap = plan.cellDto.maxGamesPerPlayerCap,
+                                        excludedOverPlayerCapGames = plan.cellDto.excludedOverPlayerCapGames,
+                                        passesQualityGate = plan.cellDto.passesQualityGate,
+                                        colorBandsEnabled = plan.cellDto.colorBandsEnabled,
+                                        earliestRankSnapshotAt = plan.cellDto.earliestRankSnapshotAt,
+                                        latestRankSnapshotAt = plan.cellDto.latestRankSnapshotAt,
+                                        computedAt = plan.cellDto.computedAt,
+                                        metricsJson = plan.metricsJson
+                                    )
+                                )
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    logger.warn("Atomic DB transaction failed during exact cached player ingestion for {} {}: {}", normalizedRegion, resolvedPatch, e.message)
+                    return CohortCachedPlayerIngestionResultDto(
+                        region = normalizedRegion,
+                        targetPatch = resolvedPatch,
+                        status = "PERSISTENCE_ERROR",
+                        playerHash = playerHash,
+                        tier = resolvedRankSnapshot.tier,
+                        inspectedMatchIdsCount = candidateMatchIds.size,
+                        qualifiedSamplesExtracted = extractedSamples.size,
+                        netNewSamplesPersisted = 0,
+                        excludedWrongPatchMatches = excludedWrongPatchMatches,
+                        excludedStaleOrSkewMatches = excludedStaleOrSkewMatches,
+                        excludedNonSoloOrRemakeMatches = excludedNonSoloOrRemakeMatches,
+                        excludedIneligibleRoleMatches = excludedIneligibleRoleMatches,
+                        missingOrUncachedMatches = missingOrUncachedMatches,
+                        memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                        notes = listOf("Atomic database transaction rolled back on persistence error; zero cell state or benchmark changes committed.")
+                    )
+                }
+
+                // 5. Post-commit synchronization: update in-memory map ONLY if key already existed, increment counters, and refresh/evict Redis caches
+                for (plan in pendingWrites) {
+                    durableSampleStateDbWriteCount.incrementAndGet()
+                    benchmarkCellDbWriteCount.incrementAndGet()
+                    if (inMemoryDurableCellStates.containsKey(plan.mapKey)) {
+                        inMemoryDurableCellStates[plan.mapKey] = plan.updatedState
+                    }
+                }
+                inMemoryGroundedPatchByRegion[normalizedRegion] = resolvedPatch
+
+                val postCommitCacheWarnings = mutableListOf<String>()
+                runCatching {
+                    val allPersistedCells = cohortBenchmarkCellRepository.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(
+                        region = normalizedRegion,
+                        patch = resolvedPatch,
+                        queueId = SOLO_QUEUE_ID
+                    ).mapNotNull { entityToDto(it) }
+                    if (allPersistedCells.isNotEmpty()) {
+                        redisCacheService.set(benchmarkCacheKey(normalizedRegion, resolvedPatch), allPersistedCells, BENCHMARK_CACHE_TTL)
+                    } else {
+                        redisCacheService.delete(benchmarkCacheKey(normalizedRegion, resolvedPatch))
+                    }
+                }.onFailure { err ->
+                    postCommitCacheWarnings.add("Failed to refresh benchmark Redis cache (${err.javaClass.simpleName})")
+                    runCatching {
+                        redisCacheService.delete(benchmarkCacheKey(normalizedRegion, resolvedPatch))
+                    }.onFailure { delErr ->
+                        postCommitCacheWarnings.add("Failed fallback eviction of benchmark Redis cache (${delErr.javaClass.simpleName})")
+                    }
+                }
+                runCatching {
+                    redisCacheService.delete(reportCacheKey(normalizedRegion, resolvedPatch))
+                }.onFailure { err ->
+                    postCommitCacheWarnings.add("Failed to evict patch report Redis cache (${err.javaClass.simpleName})")
+                }
+                runCatching {
+                    redisCacheService.delete(reportCacheKey(normalizedRegion, null))
+                }.onFailure { err ->
+                    postCommitCacheWarnings.add("Failed to evict latest report Redis cache (${err.javaClass.simpleName})")
+                }
+
+                val totalNetNew = pendingWrites.sumOf { it.netNewSamplesInCell }
+                val updatedCellDtos = pendingWrites.map { it.cellDto }
+                val finalStatus = if (postCommitCacheWarnings.isEmpty()) {
+                    "COMPLETED"
+                } else {
+                    "COMMITTED_WITH_CACHE_REFRESH_WARNING"
+                }
+                val finalNotes = buildList {
+                    add(
+                        "Atomically folded $totalNetNew net-new qualified sample(s) for single cached player into ${updatedCellDtos.size} cell(s) on patch '$resolvedPatch' with zero Riot API calls and zero Redis SCANs."
+                    )
+                    if (postCommitCacheWarnings.isNotEmpty()) {
+                        add(
+                            "Database transaction committed, but post-commit Redis cache refresh/eviction encountered warning(s): ${postCommitCacheWarnings.joinToString("; ")}."
+                        )
+                    }
+                }
+                return CohortCachedPlayerIngestionResultDto(
+                    region = normalizedRegion,
+                    targetPatch = resolvedPatch,
+                    status = finalStatus,
+                    playerHash = playerHash,
+                    tier = resolvedRankSnapshot.tier,
+                    inspectedMatchIdsCount = candidateMatchIds.size,
+                    qualifiedSamplesExtracted = extractedSamples.size,
+                    netNewSamplesPersisted = totalNetNew,
+                    updatedCells = updatedCellDtos,
+                    excludedWrongPatchMatches = excludedWrongPatchMatches,
+                    excludedStaleOrSkewMatches = excludedStaleOrSkewMatches,
+                    excludedNonSoloOrRemakeMatches = excludedNonSoloOrRemakeMatches,
+                    excludedIneligibleRoleMatches = excludedIneligibleRoleMatches,
+                    missingOrUncachedMatches = missingOrUncachedMatches,
+                    memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                    notes = finalNotes
+                )
+            } finally {
+                releaseCollectorProcessLock(normalizedRegion)
+            }
+        } finally {
+            releaseRegionWriteGate(normalizedRegion)
+        }
     }
 
     fun acquireCollectorProbeLock(region: String, ttl: Duration = Duration.ofSeconds(30)): Boolean {
@@ -2538,6 +3611,7 @@ class CohortBenchmarkService(
                         usedMatchId = true
                         if (match != null) {
                             redisCacheService.set("match:$normalizedRegion:$matchIdToProbe", match, MATCH_CACHE_TTL)
+                            indexResolvedCollectorMatchesSafely(listOf(match), normalizedRegion)
                         }
                         val snapAfterMatch = getLiveRateLimitVerification(normalizedRegion)
                         when {
@@ -3036,7 +4110,7 @@ class CohortBenchmarkService(
      * - Uses a 60-second failure cooldown on network/parse failure.
      * - Safe fallback: returns `null` (or last valid cached patch) on failure without throwing or advancing.
      */
-    internal fun resolveDataDragonLatestPatch(): String? {
+    internal fun resolveDataDragonLatestPatch(allowExternalNetworkLookup: Boolean = true): String? {
         val nowMs = timeProvider.now()
         val localCached = cachedDataDragonPatch
         if (localCached != null && nowMs < cachedDataDragonPatchExpiresAtMs) {
@@ -3049,6 +4123,9 @@ class CohortBenchmarkService(
             cachedDataDragonPatch = redisCached
             cachedDataDragonPatchExpiresAtMs = nowMs + EXTERNAL_PATCH_CACHE_TTL_MS
             return redisCached
+        }
+        if (!allowExternalNetworkLookup) {
+            return localCached
         }
         if (lastDataDragonLookupFailureAtMs > 0L && nowMs - lastDataDragonLookupFailureAtMs < EXTERNAL_PATCH_FAILURE_COOLDOWN_MS) {
             return localCached
@@ -3095,10 +4172,11 @@ class CohortBenchmarkService(
     fun resolveGroundedCurrentPatch(
         region: String,
         observedCandidatePatch: String? = null,
-        allowLightRedisMatchProbe: Boolean = false
+        allowLightRedisMatchProbe: Boolean = false,
+        allowExternalNetworkLookup: Boolean = true
     ): String? {
         val normalizedRegion = region.lowercase().trim()
-        val dataDragonPatch = resolveDataDragonLatestPatch()
+        val dataDragonPatch = resolveDataDragonLatestPatch(allowExternalNetworkLookup = allowExternalNetworkLookup)
         val cleanObserved = cleanPatchCandidate(observedCandidatePatch)
         val freshMatchPatch = cleanPatchCandidate(freshRankedSoloMatchPatchByRegion[normalizedRegion]) ?: cleanObserved
 
@@ -3141,17 +4219,15 @@ class CohortBenchmarkService(
         val sampleRepo = cohortCellSampleStateRepository
         if (sampleRepo != null) {
             runCatching {
-                sampleRepo.findByRegionOrderByPatchDescTierAscRoleAsc(normalizedRegion)
+                sampleRepo.findDistinctPatchesByRegionWithEligibleGames(normalizedRegion)
             }.getOrNull().orEmpty()
-                .filter { it.eligibleGames > 0 }
-                .forEach { addVerifiedCandidate(it.patch) }
+                .forEach { addVerifiedCandidate(it) }
         }
 
         runCatching {
-            cohortBenchmarkCellRepository.findByRegionOrderByPatchDescTierAscRoleAsc(normalizedRegion)
+            cohortBenchmarkCellRepository.findDistinctPatchesByRegionWithEligibleGames(normalizedRegion)
         }.getOrNull().orEmpty()
-            .filter { it.eligibleGames > 0 }
-            .forEach { addVerifiedCandidate(it.patch) }
+            .forEach { addVerifiedCandidate(it) }
 
         val cpRepo = cohortCollectorCheckpointRepository
         if (cpRepo != null) {
@@ -3853,4 +4929,144 @@ class CohortBenchmarkService(
         val majorCmp = (aParts.getOrElse(0) { 0 }).compareTo(bParts.getOrElse(0) { 0 })
         if (majorCmp != 0) majorCmp else (aParts.getOrElse(1) { 0 }).compareTo(bParts.getOrElse(1) { 0 })
     }
+
+    /**
+     * Operator read-only aggregate coverage report separating:
+     * 1. Broad searchable player identity index counts (`indexed_players`),
+     * 2. Durable current-year Ranked Solo (`queueId = 420`) history completeness for viewed players (`player_season_stats`),
+     * 3. Current-patch cohort benchmark cell quality (`cohort_benchmark_cells`).
+     *
+     * Executes scalar SQL aggregates only (`O(rows)` DB scan, zero candidate list materialization,
+     * zero Riot API calls, zero Redis SCANs).
+     */
+    fun getDiscoveryAndSeasonCoverageSummary(
+        region: String,
+        seasonYear: Int? = null
+    ): CohortDiscoveryAndSeasonCoverageDto {
+        val normalizedRegion = region.lowercase().trim()
+        val nowInstant = Instant.ofEpochMilli(timeProvider.now())
+        val effectiveSeasonYear = seasonYear
+            ?: nowInstant.atZone(java.time.ZoneOffset.UTC).year
+
+        val identityRepo = indexedPlayerRepository
+            ?: throw IllegalStateException("IndexedPlayerRepository is not wired; cannot compute discovery coverage summary")
+        val seasonStatsRepo = playerSeasonStatsRepository
+            ?: throw IllegalStateException("PlayerSeasonStatsRepository is not wired; cannot compute season history completeness summary")
+
+        val regionCounts = identityRepo.countPlayersGroupedByRegion().mapNotNull { row ->
+            val reg = (row.getOrNull(0) as? String)?.lowercase()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val cnt = (row.getOrNull(1) as? Number)?.toLong() ?: 0L
+            val latestSeen = when (val rawSeen = row.getOrNull(2)) {
+                is Instant -> rawSeen
+                is Number -> rawSeen.toLong().takeIf { it > 0L }?.let { Instant.ofEpochMilli(it) }
+                else -> null
+            }
+            RegionIndexedPlayerCountDto(
+                region = reg,
+                indexedPlayerCount = cnt,
+                latestSeenAt = latestSeen
+            )
+        }
+
+        val totalIndexedGlobal = regionCounts.sumOf { it.indexedPlayerCount }
+        val targetIndexedCount = regionCounts.firstOrNull { it.region == normalizedRegion }?.indexedPlayerCount ?: 0L
+
+        val seasonByRegion = seasonStatsRepo.summarizeByRegionForSeasonYear(
+            seasonYear = effectiveSeasonYear,
+            queueId = SOLO_QUEUE_ID,
+            currentSchemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION
+        ).mapNotNull { row ->
+            val reg = (row.getOrNull(0) as? String)?.lowercase()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val tracked = (row.getOrNull(1) as? Number)?.toLong() ?: 0L
+            val complete = (row.getOrNull(2) as? Number)?.toLong() ?: 0L
+            val partial = (row.getOrNull(3) as? Number)?.toLong() ?: 0L
+            val capped = (row.getOrNull(4) as? Number)?.toLong() ?: 0L
+            val staleSchema = (row.getOrNull(5) as? Number)?.toLong() ?: 0L
+            val foldedGames = (row.getOrNull(6) as? Number)?.toLong() ?: 0L
+            val pendingGames = (row.getOrNull(7) as? Number)?.toLong() ?: 0L
+            val maxUpdated = row.getOrNull(8) as? Instant
+            RegionSeasonStatsCompletenessDto(
+                region = reg,
+                seasonYear = effectiveSeasonYear,
+                queueId = SOLO_QUEUE_ID,
+                currentSchemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION,
+                maxTrackedMatchIdsCapPerPlayer = DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS,
+                trackedViewedPlayers = tracked,
+                completeHistoryPlayers = complete,
+                partialHistoryPlayers = partial,
+                cappedHistoryPlayers = capped,
+                staleSchemaVersionPlayers = staleSchema,
+                totalFoldedSeasonGames = foldedGames,
+                totalPendingGapGames = pendingGames,
+                latestUpdatedAt = maxUpdated
+            )
+        }
+
+        val targetSeasonStats = seasonByRegion.firstOrNull { it.region == normalizedRegion }
+            ?: RegionSeasonStatsCompletenessDto(
+                region = normalizedRegion,
+                seasonYear = effectiveSeasonYear,
+                queueId = SOLO_QUEUE_ID,
+                currentSchemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION,
+                maxTrackedMatchIdsCapPerPlayer = DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS
+            )
+
+        val cellSummaryRows = if (normalizedRegion in ALLOWED_REGIONS) {
+            cohortBenchmarkCellRepository.summarizeCellCountsByPatchForRegion(
+                region = normalizedRegion,
+                queueId = SOLO_QUEUE_ID
+            )
+        } else {
+            emptyList()
+        }
+        val cellCountsByPatch = LinkedHashMap<String, Pair<Int, Int>>()
+        for (row in cellSummaryRows) {
+            val rawPatch = (row.getOrNull(0) as? String)?.let { cleanPatchCandidate(it) } ?: continue
+            val totalCells = (row.getOrNull(1) as? Number)?.toInt() ?: 0
+            val passingCells = (row.getOrNull(2) as? Number)?.toInt() ?: 0
+            cellCountsByPatch[rawPatch] = totalCells to passingCells
+        }
+        val sampleStatePatches = if (normalizedRegion in ALLOWED_REGIONS && cohortCellSampleStateRepository != null) {
+            cohortCellSampleStateRepository.findDistinctPatchesByRegionWithEligibleGames(normalizedRegion)
+                .mapNotNull { cleanPatchCandidate(it) }
+        } else {
+            emptyList()
+        }
+        val targetPatch = (cellCountsByPatch.keys + sampleStatePatches).maxWithOrNull(patchComparator)
+            ?: resolveGroundedCurrentPatch(
+                normalizedRegion,
+                allowLightRedisMatchProbe = false,
+                allowExternalNetworkLookup = false
+            )
+        val (persistedCellsCount, cellsPassingQualityGate) = if (targetPatch != null) {
+            cellCountsByPatch[targetPatch] ?: (0 to 0)
+        } else {
+            0 to 0
+        }
+
+        return CohortDiscoveryAndSeasonCoverageDto(
+            region = normalizedRegion,
+            measuredAt = nowInstant,
+            identityIndexCoverage = IdentityIndexCoverageSummaryDto(
+                totalIndexedPlayersGlobal = totalIndexedGlobal,
+                targetRegionIndexedPlayers = targetIndexedCount,
+                byRegion = regionCounts
+            ),
+            seasonHistoryCompleteness = SeasonHistoryCompletenessSummaryDto(
+                seasonYear = effectiveSeasonYear,
+                queueId = SOLO_QUEUE_ID,
+                targetRegionStats = targetSeasonStats,
+                byRegion = seasonByRegion
+            ),
+            benchmarkQualitySummary = BenchmarkQualitySummaryDto(
+                region = normalizedRegion,
+                targetPatch = targetPatch,
+                persistedCellsCount = persistedCellsCount,
+                cellsPassingQualityGate = cellsPassingQualityGate,
+                targetCellsCount = 30
+            ),
+            memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
+        )
+    }
 }
+

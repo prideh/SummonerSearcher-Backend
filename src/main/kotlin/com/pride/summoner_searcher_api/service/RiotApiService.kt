@@ -438,41 +438,95 @@ class RiotApiService(
         }
     }
     
+    data class MatchIdsPaginationOutcome(
+        val matchIds: List<String>,
+        val pagesFetched: Int = 0,
+        val exhaustedCleanly: Boolean = false,
+        val hitSafetyCap: Boolean = false,
+        val stoppedOnPageFailure: Boolean = false
+    )
+
     /**
-     * Fetches all match IDs since a given start time.
-     * Use this instead of fetching full match details to save memory.
+     * Paginates Ranked Solo (`queueId = 420`) match IDs since [startTime] while returning explicit
+     * pagination completion metadata ([MatchIdsPaginationOutcome]):
+     * - `matchIds == null` (or page fetch exception) sets `stoppedOnPageFailure = true` and `exhaustedCleanly = false`
+     *   (never conflating a failed page with clean empty exhaustion).
+     * - `matchIds.isEmpty()` or `matchIds.size < count` sets `exhaustedCleanly = true`.
+     * - `allMatchIds.size > 2000` sets `hitSafetyCap = true` and `exhaustedCleanly = false`.
      */
-    suspend fun fetchMatchIdsSince(puuid: String, region: String, startTime: Long? = null): List<String> = coroutineScope {
+    suspend fun fetchMatchIdsWithOutcomeSince(
+        puuid: String,
+        region: String,
+        startTime: Long? = null
+    ): MatchIdsPaginationOutcome = coroutineScope {
         val allMatchIds = mutableListOf<String>()
         var start = 0
         val count = 100
-        
+        var pagesFetched = 0
+        var exhaustedCleanly = false
+        var hitSafetyCap = false
+        var stoppedOnPageFailure = false
+
         while (true) {
             logger.info("Fetching match IDs for $puuid: start=$start, count=$count")
             // We ask for queue 420 (Ranked Solo)
-            val matchIds = getMatchIdsByPuuid(puuid, region, 420, startTime, null, count, start)
-            
-            if (matchIds.isNullOrEmpty()) {
+            val matchIds = try {
+                getMatchIdsByPuuid(puuid, region, 420, startTime, null, count, start)
+            } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                logger.warn("Error fetching match IDs page for {} ({}) at start={}: {}", puuid, region, start, e.message)
+                null
+            }
+
+            if (matchIds == null) {
+                stoppedOnPageFailure = true
+                exhaustedCleanly = false
+                logger.warn("Match ID pagination stopped on null/failed page for {} ({}) at start={}", puuid, region, start)
                 break
             }
-            
-            allMatchIds.addAll(matchIds)
-            
-            if (matchIds.size < count) {
-                break 
+
+            pagesFetched++
+            if (matchIds.isEmpty()) {
+                exhaustedCleanly = true
+                break
             }
-            
+
+            allMatchIds.addAll(matchIds)
+
+            if (matchIds.size < count) {
+                exhaustedCleanly = true
+                break
+            }
+
             start += count
             // Safety break
             if (allMatchIds.size > 2000) {
+                hitSafetyCap = true
+                exhaustedCleanly = false
                 logger.warn("Hit safety limit of 2000 match IDs. Stopping.")
-                break 
+                break
             }
         }
-        
-        logger.info("Found total ${allMatchIds.size} match IDs since $startTime for $puuid")
-        allMatchIds
+
+        val outcome = MatchIdsPaginationOutcome(
+            matchIds = allMatchIds.toList(),
+            pagesFetched = pagesFetched,
+            exhaustedCleanly = exhaustedCleanly,
+            hitSafetyCap = hitSafetyCap,
+            stoppedOnPageFailure = stoppedOnPageFailure
+        )
+        logger.info(
+            "Found total ${allMatchIds.size} match IDs since $startTime for $puuid (pagesFetched=$pagesFetched, exhaustedCleanly=$exhaustedCleanly, hitSafetyCap=$hitSafetyCap, stoppedOnPageFailure=$stoppedOnPageFailure)"
+        )
+        outcome
     }
+
+    /**
+     * Fetches all match IDs since a given start time.
+     */
+    suspend fun fetchMatchIdsSince(puuid: String, region: String, startTime: Long? = null): List<String> =
+        fetchMatchIdsWithOutcomeSince(puuid, region, startTime).matchIds
 
     // DEPRECATED: Use fetchMatchIdsSince + batch processing instead to avoid OOM
     suspend fun fetchAllMatchesSince(puuid: String, region: String, startTime: Long? = null): List<MatchDto> = coroutineScope {

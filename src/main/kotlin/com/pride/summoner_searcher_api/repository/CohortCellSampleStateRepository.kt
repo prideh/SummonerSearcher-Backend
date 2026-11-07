@@ -22,4 +22,11 @@ interface CohortCellSampleStateRepository : JpaRepository<CohortCellSampleStateE
         tier: String,
         role: String
     ): CohortCellSampleStateEntity?
+
+    @org.springframework.data.jpa.repository.Query(
+        "SELECT DISTINCT e.patch FROM CohortCellSampleStateEntity e WHERE e.region = :region AND e.eligibleGames > 0"
+    )
+    fun findDistinctPatchesByRegionWithEligibleGames(
+        @org.springframework.data.repository.query.Param("region") region: String
+    ): List<String>
 }

@@ -315,6 +315,45 @@ data class CohortCollectorCheckpointDto(
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
+data class CollectorSessionMemoryPointDto(
+    val phase: String,
+    val batchIndex: Int,
+    val totalRiotNetworkCalls: Int,
+    val timestampEpochMs: Long,
+    val cgroupCurrentMiB: Double,
+    val cgroupPeakMiB: Double? = null,
+    val cgroupAnonMiB: Double,
+    val cgroupFileCacheMiB: Double,
+    val heapUsedMiB: Double,
+    val heapCommittedMiB: Double,
+    val heapUnusedCommittedMiB: Double,
+    val metaspaceUsedMiB: Double,
+    val metaspaceCommittedMiB: Double,
+    val directBuffersUsedMiB: Double,
+    val nativeResidualMiB: Double,
+    val nativeAnonResidualMiB: Double
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class CollectorSessionMemoryDeltaDto(
+    val postGcCaptured: Boolean = false,
+    val startAnonMiB: Double,
+    val peakCurrentMiB: Double,
+    val endPreGcAnonMiB: Double? = null,
+    val endPostGcAnonMiB: Double? = null,
+    val totalRetainedAnonPreGcMiB: Double? = null,
+    val totalRetainedAnonPostGcMiB: Double? = null,
+    val reclaimedByEndFullGcMiB: Double? = null,
+    val deltaHeapUsedPreGcMiB: Double? = null,
+    val deltaHeapCommittedPreGcMiB: Double? = null,
+    val deltaNativeAnonResidualPreGcMiB: Double? = null,
+    val deltaHeapUsedPostGcMiB: Double? = null,
+    val deltaHeapCommittedPostGcMiB: Double? = null,
+    val deltaMetaspaceCommittedMiB: Double? = null,
+    val deltaNativeAnonResidualPostGcMiB: Double? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
 data class CohortCollectorStatusDto(
     val region: String,
     val targetPatch: String?,
@@ -340,7 +379,9 @@ data class CohortCollectorStatusDto(
     val lastRunCompletedAt: Instant? = null,
     val rateLimitVerification: RateLimitVerificationSnapshotDto,
     val memoryHeadroom: MemoryHeadroomSnapshotDto? = null,
-    val checkpoint: CohortCollectorCheckpointDto? = null
+    val checkpoint: CohortCollectorCheckpointDto? = null,
+    val sessionMemorySeries: List<CollectorSessionMemoryPointDto> = emptyList(),
+    val sessionMemoryDelta: CollectorSessionMemoryDeltaDto? = null
 )
 
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -374,5 +415,92 @@ data class CohortExtractionReportDto(
     val memoryHeadroom: MemoryHeadroomSnapshotDto? = null,
     val cells: List<CohortBenchmarkCellDto>,
     val methodologyNotes: List<String>
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class CohortCachedPlayerIngestionResultDto(
+    val region: String,
+    val targetPatch: String?,
+    val status: String,
+    val playerHash: String? = null,
+    val tier: String? = null,
+    val inspectedMatchIdsCount: Int = 0,
+    val qualifiedSamplesExtracted: Int = 0,
+    val netNewSamplesPersisted: Int = 0,
+    val updatedCells: List<CohortBenchmarkCellDto> = emptyList(),
+    val excludedWrongPatchMatches: Int = 0,
+    val excludedStaleOrSkewMatches: Int = 0,
+    val excludedNonSoloOrRemakeMatches: Int = 0,
+    val excludedIneligibleRoleMatches: Int = 0,
+    val missingOrUncachedMatches: Int = 0,
+    val memoryHeadroom: MemoryHeadroomSnapshotDto? = null,
+    val notes: List<String> = emptyList()
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class RegionIndexedPlayerCountDto(
+    val region: String,
+    val indexedPlayerCount: Long,
+    val latestSeenAt: Instant? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class IdentityIndexCoverageSummaryDto(
+    val totalIndexedPlayersGlobal: Long = 0L,
+    val targetRegionIndexedPlayers: Long = 0L,
+    val byRegion: List<RegionIndexedPlayerCountDto> = emptyList(),
+    val queryComplexityNote: String = "O(rows) SQL aggregate GROUP BY LOWER(TRIM(region)); no candidate list materialized."
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class RegionSeasonStatsCompletenessDto(
+    val region: String,
+    val seasonYear: Int,
+    val queueId: Int = 420,
+    val currentSchemaVersion: Int = 1,
+    val maxTrackedMatchIdsCapPerPlayer: Int = 2_100,
+    val trackedViewedPlayers: Long = 0L,
+    val completeHistoryPlayers: Long = 0L,
+    val partialHistoryPlayers: Long = 0L,
+    val cappedHistoryPlayers: Long = 0L,
+    val staleSchemaVersionPlayers: Long = 0L,
+    val totalFoldedSeasonGames: Long = 0L,
+    val totalPendingGapGames: Long = 0L,
+    val latestUpdatedAt: Instant? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class SeasonHistoryCompletenessSummaryDto(
+    val seasonYear: Int,
+    val queueId: Int = 420,
+    val targetRegionStats: RegionSeasonStatsCompletenessDto,
+    val byRegion: List<RegionSeasonStatsCompletenessDto> = emptyList()
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class BenchmarkQualitySummaryDto(
+    val region: String,
+    val targetPatch: String?,
+    val persistedCellsCount: Int = 0,
+    val cellsPassingQualityGate: Int = 0,
+    val targetCellsCount: Int = 30
+)
+
+/**
+ * Operator read-only aggregate coverage report separating:
+ * 1. Broad searchable player identity discovery (`indexed_players`),
+ * 2. Durable current-year Ranked Solo (`queueId = 420`) history completeness for viewed players (`player_season_stats`),
+ * 3. Current-patch cohort benchmark cell quality (`cohort_benchmark_cells`).
+ *
+ * Returns scalar aggregates only (zero candidate list materialization, zero Riot API calls, zero Redis SCANs).
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class CohortDiscoveryAndSeasonCoverageDto(
+    val region: String,
+    val measuredAt: Instant,
+    val identityIndexCoverage: IdentityIndexCoverageSummaryDto,
+    val seasonHistoryCompleteness: SeasonHistoryCompletenessSummaryDto,
+    val benchmarkQualitySummary: BenchmarkQualitySummaryDto,
+    val memoryHeadroom: MemoryHeadroomSnapshotDto? = null
 )
 

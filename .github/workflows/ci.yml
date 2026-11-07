@@ -2,9 +2,9 @@ name: Backend CI
 
 on:
   push:
-    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates ]
+    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates, feat/collector-session-memory-series, feat/scalar-patch-metadata-queries, feat/cached-player-exact-ingestion ]
   pull_request:
-    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap ]
+    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates ]
 
 jobs:
   backend-tests:
@@ -22,9 +22,11 @@ jobs:
     - name: Run shared preflight (compileKotlin compileTestKotlin + full test)
       run: ./scripts/preflight.sh
     - name: Run Real 512 MB Container Proof on Exact Repo Dockerfile (--memory=512m --memory-swap=512m) [Strict <78% Gate]
-      if: github.ref == 'refs/heads/feat/durable-cohort-cell-aggregates' || github.ref == 'refs/heads/fix/collector-session-hard-cap' || github.ref == 'refs/heads/mem/candidate-512m'
+      if: github.ref == 'refs/heads/feat/collector-session-memory-series' || github.ref == 'refs/heads/feat/durable-cohort-cell-aggregates' || github.ref == 'refs/heads/fix/collector-session-hard-cap' || github.ref == 'refs/heads/mem/candidate-512m'
       run: |
-        docker run -d --name ss-postgres -p 5432:5432 -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=summoner_searcher postgres:16-alpine
+        PG_FIXTURE_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
+        test "${#PG_FIXTURE_PASSWORD}" -eq 48
+        POSTGRES_PASSWORD="$PG_FIXTURE_PASSWORD" docker run -d --name ss-postgres -p 5432:5432 -e POSTGRES_PASSWORD -e POSTGRES_DB=summoner_searcher postgres:16-alpine
         docker run -d --name ss-redis -p 6379:6379 redis:7-alpine
         docker build -f Dockerfile -t ss-backend:512m-proof .
         openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/mockriot.key -out /tmp/mockriot.crt -days 1 \
@@ -35,4 +37,4 @@ jobs:
         docker rm "$cid"
         keytool -importcert -noprompt -trustcacerts -alias mockriot -file /tmp/mockriot.crt -keystore /tmp/cacerts -storepass changeit
         chmod 644 /tmp/cacerts
-        sudo PROOF_MODE=10_CYCLE ENABLE_NMT=0 python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
+        PROOF_MODE=10_CYCLE ENABLE_NMT=0 DB_PASS="$PG_FIXTURE_PASSWORD" sudo --preserve-env=PROOF_MODE,ENABLE_NMT,DB_PASS python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
