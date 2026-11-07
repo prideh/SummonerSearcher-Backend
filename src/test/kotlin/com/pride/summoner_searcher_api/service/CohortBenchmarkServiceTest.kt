@@ -4011,8 +4011,261 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 verify(exactly = 0) { exactCheckpointRepo.save(any()) }
             }
         }
+
+        When("collector batches and low-priority steps resolve MatchDtos with IndexedPlayerRepository wired, unwired, failing, or cancelled") {
+            val nowMs = nowInstant.toEpochMilli()
+            val timeProvider = object : TimeProvider {
+                override fun now(): Long = nowMs
+            }
+
+            fun buildNamedParticipant(
+                puuid: String,
+                role: String,
+                gameName: String,
+                tagLine: String,
+                profileIcon: Int = 55,
+                summonerLevel: Int = 250
+            ): ParticipantDto {
+                val json = """
+                    {
+                      "puuid": "$puuid",
+                      "riotIdGameName": "$gameName",
+                      "riotIdTagline": "$tagLine",
+                      "profileIcon": $profileIcon,
+                      "summonerLevel": $summonerLevel,
+                      "teamId": 100,
+                      "teamPosition": "$role",
+                      "individualPosition": "$role",
+                      "kills": 7,
+                      "deaths": 2,
+                      "assists": 9,
+                      "totalMinionsKilled": 220,
+                      "neutralMinionsKilled": 10,
+                      "goldEarned": 14000,
+                      "totalDamageDealtToChampions": 28000,
+                      "visionScore": 36,
+                      "totalTimeSpentDead": 45,
+                      "win": true,
+                      "challenges": {
+                        "laneMinionsFirst10Minutes": 86,
+                        "jungleCsBefore10Minutes": 4.0,
+                        "goldPerMinute": 466.0,
+                        "damagePerMinute": 933.0,
+                        "visionScorePerMinute": 1.2,
+                        "killParticipation": 0.72
+                      }
+                    }
+                """.trimIndent()
+                return objectMapper.readValue(json, ParticipantDto::class.java)
+            }
+
+            val inMemoryIndexStore = java.util.concurrent.ConcurrentHashMap<String, com.pride.summoner_searcher_api.model.IndexedPlayer>()
+            val mockIndexedRepo = mockk<com.pride.summoner_searcher_api.repository.IndexedPlayerRepository>()
+            every {
+                mockIndexedRepo.updatePlayerIfNewer(any(), any(), any(), any(), any(), any(), any())
+            } answers {
+                val pid = arg<String>(0)
+                val gName = arg<String>(1)
+                val tLine = arg<String>(2)
+                val reg = arg<String>(3)
+                val icon = arg<Int>(4)
+                val lvl = arg<Long>(5)
+                val seen = arg<Instant>(6)
+                val existing = inMemoryIndexStore[pid]
+                if (existing != null && !seen.isBefore(existing.lastSeenAt)) {
+                    inMemoryIndexStore[pid] = com.pride.summoner_searcher_api.model.IndexedPlayer(
+                        puuid = pid,
+                        gameName = gName,
+                        tagLine = tLine,
+                        region = reg,
+                        profileIconId = icon,
+                        summonerLevel = lvl,
+                        lastSeenAt = seen
+                    )
+                    1
+                } else {
+                    0
+                }
+            }
+            every {
+                mockIndexedRepo.insertPlayerIfAbsent(any(), any(), any(), any(), any(), any(), any())
+            } answers {
+                val pid = arg<String>(0)
+                val gName = arg<String>(1)
+                val tLine = arg<String>(2)
+                val reg = arg<String>(3)
+                val icon = arg<Int>(4)
+                val lvl = arg<Long>(5)
+                val seen = arg<Instant>(6)
+                val inserted = inMemoryIndexStore.putIfAbsent(
+                    pid,
+                    com.pride.summoner_searcher_api.model.IndexedPlayer(
+                        puuid = pid,
+                        gameName = gName,
+                        tagLine = tLine,
+                        region = reg,
+                        profileIconId = icon,
+                        summonerLevel = lvl,
+                        lastSeenAt = seen
+                    )
+                )
+                if (inserted == null) 1 else 0
+            }
+
+            val stepRedis = mockk<RedisCacheService>(relaxed = true)
+            val stepRiot = mockk<RiotApiService>(relaxed = true)
+            val stepCellRepo = mockk<CohortBenchmarkCellRepository>(relaxed = true)
+            val stepLimiter = RiotApiRateLimiter(timeProvider)
+            for (ep in listOf("league-v4-entries-by-puuid", "match-v5-ids-by-puuid", "match-v5-match-by-id")) {
+                stepLimiter.updateLimits(
+                    region = "euw1",
+                    limitHeader = "20:1,100:120",
+                    countHeader = "1:1,5:120",
+                    endpointKey = ep,
+                    methodLimitHeader = "500:10",
+                    methodCountHeader = "1:10"
+                )
+            }
+
+            val mOld = MatchDto(
+                metadata = MatchMetadata("EUW1_STEP_OLD", listOf("step-seed", "step-sup")),
+                info = MatchInfo(
+                    gameCreation = nowMs - 20_000L,
+                    gameDuration = 1800L,
+                    gameId = 9001L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.22.615.1000",
+                    participants = listOf(
+                        buildNamedParticipant("step-seed", "TOP", "StepSeedOld", "OLD"),
+                        buildNamedParticipant("step-sup", "UTILITY", "StepSup", "EUW")
+                    )
+                )
+            )
+            val mNew = MatchDto(
+                metadata = MatchMetadata("EUW1_STEP_NEW", listOf("step-seed", "step-jg")),
+                info = MatchInfo(
+                    gameCreation = nowMs - 5_000L,
+                    gameDuration = 1800L,
+                    gameId = 9002L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.22.615.1000",
+                    participants = listOf(
+                        buildNamedParticipant("step-seed", "TOP", "StepSeedNew", "NEW"),
+                        buildNamedParticipant("step-jg", "JUNGLE", "StepJg", "EUW")
+                    )
+                )
+            )
+
+            every { stepRedis.get(any(), any<Class<Any>>()) } returns null
+            every { stepRedis.get("match:euw1:EUW1_STEP_OLD", MatchDto::class.java) } returns mOld
+            every { stepRedis.get("match:euw1:EUW1_STEP_NEW", MatchDto::class.java) } returns null
+            coEvery {
+                stepRiot.getMatchIdsByPuuidLowPriority("step-seed", "euw1", 420, any(), 0)
+            } returns listOf("EUW1_STEP_OLD", "EUW1_STEP_NEW")
+            coEvery {
+                stepRiot.getMatchByIdLowPriority("EUW1_STEP_NEW", "euw1")
+            } returns mNew
+
+            val stepService = CohortBenchmarkService(
+                redisCacheService = stepRedis,
+                cohortBenchmarkCellRepository = stepCellRepo,
+                riotApiRateLimiter = stepLimiter,
+                riotApiService = stepRiot,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = timeProvider,
+                indexedPlayerRepository = mockIndexedRepo
+            )
+
+            val stepResult = stepService.runGuardedLowPriorityCollectionStep(
+                region = "euw1",
+                candidatePuuids = listOf("step-seed")
+            )
+
+            // Verify diagnostic probe also indexes resolved MatchDto participants safely
+            val probeMatch = MatchDto(
+                metadata = MatchMetadata("EUW1_PROBE_1", listOf("probe-mid")),
+                info = MatchInfo(
+                    gameCreation = nowMs - 1_000L,
+                    gameDuration = 1800L,
+                    gameId = 9003L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.22.615.1000",
+                    participants = listOf(
+                        buildNamedParticipant("probe-mid", "MIDDLE", "ProbeMid", "EUW")
+                    )
+                )
+            )
+            val probeLimiter = RiotApiRateLimiter(timeProvider)
+            probeLimiter.updateLimits(
+                region = "euw1",
+                limitHeader = "20:1,100:120",
+                countHeader = "1:1,5:120",
+                endpointKey = "league-v4-entries-by-puuid",
+                methodLimitHeader = "500:10",
+                methodCountHeader = "1:10"
+            )
+            probeLimiter.updateLimits(
+                region = "euw1",
+                limitHeader = "20:1,100:120",
+                countHeader = "1:1,5:120",
+                endpointKey = "match-v5-ids-by-puuid",
+                methodLimitHeader = "500:10",
+                methodCountHeader = "1:10"
+            )
+            coEvery {
+                stepRiot.getMatchByIdLowPriority("EUW1_PROBE_1", "euw1", 0, any(), any())
+            } answers {
+                arg<java.util.concurrent.atomic.AtomicInteger>(3).incrementAndGet()
+                kotlinx.coroutines.runBlocking {
+                    probeLimiter.updateLimits(
+                        region = "euw1",
+                        limitHeader = "20:1,100:120",
+                        countHeader = "1:1,5:120",
+                        endpointKey = "match-v5-match-by-id",
+                        methodLimitHeader = "500:10",
+                        methodCountHeader = "1:10"
+                    )
+                }
+                probeMatch
+            }
+            val probeService = CohortBenchmarkService(
+                redisCacheService = stepRedis,
+                cohortBenchmarkCellRepository = stepCellRepo,
+                riotApiRateLimiter = probeLimiter,
+                riotApiService = stepRiot,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = timeProvider,
+                indexedPlayerRepository = mockIndexedRepo
+            )
+            val probeResult = probeService.runBoundedDiagnosticRateLimitProbe(
+                region = "euw1",
+                explicitSeedPuuid = "step-seed",
+                explicitSeedMatchId = "EUW1_PROBE_1"
+            )
+
+            Then("low-priority step and diagnostic probe should index deduplicated newest participant identities across all roles with zero extra network calls") {
+                stepResult["executed"] shouldBe true
+                stepResult["fetchedMatches"] shouldBe 1
+                inMemoryIndexStore["step-seed"]?.gameName shouldBe "StepSeedNew"
+                inMemoryIndexStore["step-seed"]?.tagLine shouldBe "NEW"
+                inMemoryIndexStore["step-seed"]?.lastSeenAt?.toEpochMilli() shouldBe (nowMs - 5_000L)
+                inMemoryIndexStore["step-sup"]?.gameName shouldBe "StepSup"
+                inMemoryIndexStore["step-jg"]?.gameName shouldBe "StepJg"
+                stepService.getCollectorParticipantIndexingCounts()["collectorIndexedPlayersUpserted"] shouldBe 3L
+
+                probeResult.totalProbeCallsMade shouldBe 1
+                inMemoryIndexStore["probe-mid"]?.gameName shouldBe "ProbeMid"
+                probeService.getCollectorParticipantIndexingCounts()["collectorIndexedPlayersUpserted"] shouldBe 1L
+            }
+        }
     }
 })
+
 
 
 

@@ -143,3 +143,120 @@ fun IndexedPlayerRepository.upsertPlayerIfNewer(
     )
 }
 
+const val MAX_MATCHES_FOR_PARTICIPANT_INDEXING = 20
+const val MAX_INDEXED_PLAYERS_PER_BATCH = 200
+
+data class ParticipantBatchIndexingOutcome(
+    val upsertedCount: Long = 0L,
+    val staleSkippedCount: Long = 0L,
+    val inspectedMatchesCount: Int = 0,
+    val uniqueCandidatesCount: Int = 0
+)
+
+/**
+ * Shared bounded participant identity batch indexing for already-resolved [com.pride.summoner_searcher_api.dto.MatchDto] payloads,
+ * reused identically by profile refresh (`PlayerCacheService`) and low-priority cohort collection (`CohortBenchmarkService`).
+ *
+ * Strictly enforces:
+ * - Inspects at most [maxMatches] (`20`) matches per batch.
+ * - Deduplicates participants across all inspected matches by `puuid`, keeping only the newest
+ *   `lastSeenAt` (`match.info.gameCreation`, falling back to [fallbackNowEpochMilli] only if `<= 0L`).
+ * - Sorts deduplicated candidates by `lastSeenAt` descending and caps upserts at [maxPlayersPerBatch] (`200`).
+ * - Executes [upsertPlayerIfNewer] inside [transactionTemplate] when provided, with zero `findAllById`
+ *   read-before-write races and zero `emptyMap()` fallback overwrites.
+ */
+fun IndexedPlayerRepository.indexParticipantsFromMatchesBounded(
+    matches: List<com.pride.summoner_searcher_api.dto.MatchDto>,
+    region: String,
+    fallbackNowEpochMilli: Long,
+    transactionTemplate: org.springframework.transaction.support.TransactionTemplate? = null,
+    maxMatches: Int = MAX_MATCHES_FOR_PARTICIPANT_INDEXING,
+    maxPlayersPerBatch: Int = MAX_INDEXED_PLAYERS_PER_BATCH
+): ParticipantBatchIndexingOutcome {
+    if (matches.isEmpty() || maxMatches <= 0 || maxPlayersPerBatch <= 0) {
+        return ParticipantBatchIndexingOutcome()
+    }
+    val normalizedRegion = region.lowercase().trim()
+    val boundedMatches = matches.take(maxMatches)
+    val latestByPuuid = LinkedHashMap<String, IndexedPlayer>()
+
+    for (match in boundedMatches) {
+        val info = match.info ?: continue
+        val matchPlayedAtMs = (info.gameCreation ?: 0L).takeIf { it > 0L } ?: fallbackNowEpochMilli
+        val matchPlayedAt = java.time.Instant.ofEpochMilli(matchPlayedAtMs)
+
+        for (p in info.participants) {
+            val cleanPuuid = p.puuid?.trim()?.takeIf { it.isNotBlank() } ?: continue
+            val cleanGameName = p.riotIdGameName?.trim()?.takeIf { it.isNotBlank() } ?: continue
+            val cleanTagLine = p.riotIdTagline?.trim()?.takeIf { it.isNotBlank() } ?: continue
+
+            val existingInBatch = latestByPuuid[cleanPuuid]
+            if (existingInBatch == null || !matchPlayedAt.isBefore(existingInBatch.lastSeenAt)) {
+                latestByPuuid[cleanPuuid] = IndexedPlayer(
+                    puuid = cleanPuuid,
+                    gameName = cleanGameName,
+                    tagLine = cleanTagLine,
+                    region = normalizedRegion,
+                    profileIconId = p.profileIcon ?: 0,
+                    summonerLevel = p.summonerLevel?.toLong() ?: 0L,
+                    lastSeenAt = matchPlayedAt
+                )
+            }
+        }
+    }
+
+    if (latestByPuuid.isEmpty()) {
+        return ParticipantBatchIndexingOutcome(
+            inspectedMatchesCount = boundedMatches.size,
+            uniqueCandidatesCount = 0
+        )
+    }
+
+    val boundedCandidates = latestByPuuid.values
+        .sortedByDescending { it.lastSeenAt }
+        .take(maxPlayersPerBatch)
+
+    var upsertedInBatch = 0L
+    var staleSkippedInBatch = 0L
+    val upsertBlock = {
+        for (candidate in boundedCandidates) {
+            val updatedRows = upsertPlayerIfNewer(
+                puuid = candidate.puuid,
+                gameName = candidate.gameName,
+                tagLine = candidate.tagLine,
+                region = candidate.region,
+                profileIconId = candidate.profileIconId,
+                summonerLevel = candidate.summonerLevel,
+                lastSeenAt = candidate.lastSeenAt
+            )
+            if (updatedRows > 0) {
+                upsertedInBatch++
+            } else {
+                staleSkippedInBatch++
+            }
+        }
+    }
+
+    if (transactionTemplate != null && transactionTemplate.transactionManager != null) {
+        transactionTemplate.executeWithoutResult { upsertBlock() }
+    } else if (transactionTemplate != null) {
+        try {
+            transactionTemplate.executeWithoutResult { upsertBlock() }
+        } catch (_: IllegalStateException) {
+            upsertBlock()
+        } catch (_: IllegalArgumentException) {
+            upsertBlock()
+        }
+    } else {
+        upsertBlock()
+    }
+
+    return ParticipantBatchIndexingOutcome(
+        upsertedCount = upsertedInBatch,
+        staleSkippedCount = staleSkippedInBatch,
+        inspectedMatchesCount = boundedMatches.size,
+        uniqueCandidatesCount = boundedCandidates.size
+    )
+}
+
+

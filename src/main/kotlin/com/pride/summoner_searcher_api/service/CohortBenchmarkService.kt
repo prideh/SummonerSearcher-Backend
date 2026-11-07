@@ -10,6 +10,7 @@ import com.pride.summoner_searcher_api.repository.CohortCellSampleStateRepositor
 import com.pride.summoner_searcher_api.repository.CohortCollectorCheckpointRepository
 import com.pride.summoner_searcher_api.repository.IndexedPlayerRepository
 import com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository
+import com.pride.summoner_searcher_api.repository.indexParticipantsFromMatchesBounded
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Value
@@ -256,6 +257,9 @@ class CohortBenchmarkService(
     private val durableSampleStateDbWriteCount = java.util.concurrent.atomic.AtomicLong(0L)
     private val benchmarkCellDbWriteCount = java.util.concurrent.atomic.AtomicLong(0L)
     private val checkpointDbWriteCount = java.util.concurrent.atomic.AtomicLong(0L)
+    private val collectorIndexedPlayersUpsertedCount = java.util.concurrent.atomic.AtomicLong(0L)
+    private val collectorIndexedPlayersStaleSkippedCount = java.util.concurrent.atomic.AtomicLong(0L)
+    private val collectorIndexedPlayersFailureCount = java.util.concurrent.atomic.AtomicLong(0L)
 
     internal fun tryAcquireRegionWriteGate(region: String): Boolean {
         val normalizedRegion = region.lowercase().trim()
@@ -282,6 +286,58 @@ class CohortBenchmarkService(
         "cohortBenchmarkCellsWrites" to benchmarkCellDbWriteCount.get(),
         "cohortCollectorCheckpointsWrites" to checkpointDbWriteCount.get()
     )
+
+    internal fun getCollectorParticipantIndexingCounts(): Map<String, Long> = mapOf(
+        "collectorIndexedPlayersUpserted" to collectorIndexedPlayersUpsertedCount.get(),
+        "collectorIndexedPlayersStaleSkipped" to collectorIndexedPlayersStaleSkippedCount.get(),
+        "collectorIndexedPlayersFailures" to collectorIndexedPlayersFailureCount.get()
+    )
+
+    /**
+     * Upserts searchable participant identities from matches already resolved during collector execution
+     * using the exact same bounded (`<= 20` matches, `<= 200` players) newer-only `lastSeenAt` helper
+     * used by profile refresh (`PlayerCacheService.indexPlayersFromMatches`).
+     *
+     * Failure isolation & cancellation contract:
+     * - Rethrows [kotlinx.coroutines.CancellationException] immediately so coroutine cancellation is preserved.
+     * - Isolates any database/runtime failure in `indexed_players` so benchmark cell persistence,
+     *   collector checkpoint persistence, and collector session health (`lastStopReason`) are never aborted.
+     */
+    internal fun indexResolvedCollectorMatchesSafely(
+        matches: List<MatchDto>,
+        region: String
+    ): com.pride.summoner_searcher_api.repository.ParticipantBatchIndexingOutcome {
+        val repo = indexedPlayerRepository ?: return com.pride.summoner_searcher_api.repository.ParticipantBatchIndexingOutcome()
+        if (matches.isEmpty()) return com.pride.summoner_searcher_api.repository.ParticipantBatchIndexingOutcome()
+        return try {
+            val outcome = repo.indexParticipantsFromMatchesBounded(
+                matches = matches,
+                region = region,
+                fallbackNowEpochMilli = timeProvider.now(),
+                transactionTemplate = transactionTemplate,
+                maxMatches = com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING,
+                maxPlayersPerBatch = com.pride.summoner_searcher_api.repository.MAX_INDEXED_PLAYERS_PER_BATCH
+            )
+            if (outcome.upsertedCount > 0L) {
+                collectorIndexedPlayersUpsertedCount.addAndGet(outcome.upsertedCount)
+            }
+            if (outcome.staleSkippedCount > 0L) {
+                collectorIndexedPlayersStaleSkippedCount.addAndGet(outcome.staleSkippedCount)
+            }
+            outcome
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            collectorIndexedPlayersFailureCount.incrementAndGet()
+            logger.warn(
+                "[CohortBenchmark] Non-fatal participant identity indexing failure for region={} (isolated from benchmark/checkpoint/session): {}",
+                region,
+                e.message
+            )
+            com.pride.summoner_searcher_api.repository.ParticipantBatchIndexingOutcome()
+        }
+    }
+
 
     companion object {
         const val SOLO_QUEUE_ID = 420
@@ -1536,6 +1592,12 @@ class CohortBenchmarkService(
         }
 
         var fetchedMatches = 0
+        val resolvedMatchesForParticipantIndexing = ArrayList<MatchDto>(
+            com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING
+        )
+        val seenMatchIdsForParticipantIndexing = HashSet<String>(
+            com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING * 2
+        )
         for (puuid in candidatePuuids.distinct()) {
             if (!getMemoryHeadroomSnapshot().hasHeadroomForLowPriority) {
                 logger.info("Low-priority cohort worker pausing on {}: memory headroom near cap", normalizedRegion)
@@ -1558,7 +1620,13 @@ class CohortBenchmarkService(
 
             for (matchId in matchIds.take(effectiveCap)) {
                 val matchKey = "match:$normalizedRegion:$matchId"
-                if (redisCacheService.get(matchKey, MatchDto::class.java) != null) {
+                val cachedMatch = redisCacheService.get(matchKey, MatchDto::class.java)
+                if (cachedMatch != null) {
+                    if (resolvedMatchesForParticipantIndexing.size < com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING &&
+                        seenMatchIdsForParticipantIndexing.add(matchId)
+                    ) {
+                        resolvedMatchesForParticipantIndexing.add(cachedMatch)
+                    }
                     continue
                 }
                 if (!getMemoryHeadroomSnapshot().hasHeadroomForLowPriority) {
@@ -1574,7 +1642,18 @@ class CohortBenchmarkService(
                 val match = riotApiService.getMatchByIdLowPriority(matchId, normalizedRegion) ?: continue
                 redisCacheService.set(matchKey, match, MATCH_CACHE_TTL)
                 fetchedMatches++
+                if (resolvedMatchesForParticipantIndexing.size < com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING &&
+                    seenMatchIdsForParticipantIndexing.add(matchId)
+                ) {
+                    resolvedMatchesForParticipantIndexing.add(match)
+                }
             }
+        }
+
+        if (resolvedMatchesForParticipantIndexing.isNotEmpty()) {
+            indexResolvedCollectorMatchesSafely(resolvedMatchesForParticipantIndexing, normalizedRegion)
+            resolvedMatchesForParticipantIndexing.clear()
+            seenMatchIdsForParticipantIndexing.clear()
         }
 
         return mapOf(
@@ -1980,6 +2059,12 @@ class CohortBenchmarkService(
             }
         }
 
+        val resolvedMatchesForParticipantIndexing = ArrayList<MatchDto>(
+            com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING
+        )
+        val seenMatchIdsForParticipantIndexing = HashSet<String>(
+            com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING * 2
+        )
         val candidatesThisBatch = pendingQueue.filter { it !in processedPuuids }.take(effectiveBatchLimit)
         outerLoop@ for (puuid in candidatesThisBatch) {
             val prePlayerPause = evaluateLivePauseReason()
@@ -2198,6 +2283,11 @@ class CohortBenchmarkService(
                 if (!isOwnListedMatch && info.participants.none { it.puuid == puuid }) {
                     continue@matchLoop
                 }
+                if (resolvedMatchesForParticipantIndexing.size < com.pride.summoner_searcher_api.repository.MAX_MATCHES_FOR_PARTICIPANT_INDEXING &&
+                    seenMatchIdsForParticipantIndexing.add(matchId)
+                ) {
+                    resolvedMatchesForParticipantIndexing.add(match)
+                }
                 val matchPatch = extractMajorMinorPatch(info.gameVersion)
                 if (info.queueId == SOLO_QUEUE_ID && matchPatch != null) {
                     if (freshlyFetchedFromRiot) {
@@ -2319,6 +2409,12 @@ class CohortBenchmarkService(
                 flushDirtyCellsToPostgres()
                 saveCollectorCheckpoint(buildCurrentCheckpoint("IN_PROGRESS"))
             }
+        }
+
+        if (resolvedMatchesForParticipantIndexing.isNotEmpty()) {
+            indexResolvedCollectorMatchesSafely(resolvedMatchesForParticipantIndexing, normalizedRegion)
+            resolvedMatchesForParticipantIndexing.clear()
+            seenMatchIdsForParticipantIndexing.clear()
         }
 
         // 6. Flush batched dirty cell states & benchmark cells once at the end of the productive batch
@@ -3515,6 +3611,7 @@ class CohortBenchmarkService(
                         usedMatchId = true
                         if (match != null) {
                             redisCacheService.set("match:$normalizedRegion:$matchIdToProbe", match, MATCH_CACHE_TTL)
+                            indexResolvedCollectorMatchesSafely(listOf(match), normalizedRegion)
                         }
                         val snapAfterMatch = getLiveRateLimitVerification(normalizedRegion)
                         when {

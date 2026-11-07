@@ -1012,6 +1012,434 @@ class CohortPatchMetadataSqlShapeTest {
             indexedPlayerRepository.deleteAll()
         }
     }
+
+    @Test
+    @org.springframework.transaction.annotation.Transactional(
+        propagation = org.springframework.transaction.annotation.Propagation.NOT_SUPPORTED
+    )
+    fun `collector resolved matches populate IndexedPlayerRepository with bounds and isolation`() {
+        playerSeasonStatsRepository.deleteAll()
+        indexedPlayerRepository.deleteAll()
+        sampleStateRepository.deleteAll()
+        benchmarkCellRepository.deleteAll()
+        checkpointRepository.deleteAll()
+        clearMocks(springWiredRedisCacheService, springWiredRiotApiService)
+
+        try {
+            val objectMapper = ObjectMapper().findAndRegisterModules()
+            val fixedNow = Instant.parse("2026-11-06T12:00:00Z")
+            val nowMs = fixedNow.toEpochMilli()
+            val clock = object : com.pride.summoner_searcher_api.service.TimeProvider {
+                override fun now(): Long = nowMs
+            }
+
+            fun buildMatchWithParticipants(
+                matchId: String,
+                gameCreationMs: Long,
+                participants: List<Triple<String, String, Pair<String, String>>>
+            ): com.pride.summoner_searcher_api.dto.MatchDto {
+                val participantsJson = participants.mapIndexed { idx, (puuid, role, riotId) ->
+                    val (gameName, tagLine) = riotId
+                    """
+                    {
+                      "puuid": "$puuid",
+                      "riotIdGameName": "$gameName",
+                      "riotIdTagline": "$tagLine",
+                      "profileIcon": ${100 + idx},
+                      "summonerLevel": ${200 + idx},
+                      "teamId": ${if (idx < 5) 100 else 200},
+                      "teamPosition": "$role",
+                      "individualPosition": "$role",
+                      "kills": 6,
+                      "deaths": 2,
+                      "assists": 8,
+                      "totalMinionsKilled": 210,
+                      "neutralMinionsKilled": 12,
+                      "goldEarned": 13500,
+                      "totalDamageDealtToChampions": 26000,
+                      "visionScore": 35,
+                      "totalTimeSpentDead": 60,
+                      "win": ${idx < 5},
+                      "challenges": {
+                        "laneMinionsFirst10Minutes": 84,
+                        "jungleCsBefore10Minutes": 4.0,
+                        "goldPerMinute": 450.0,
+                        "damagePerMinute": 866.0,
+                        "visionScorePerMinute": 1.16,
+                        "killParticipation": 0.70
+                      }
+                    }
+                    """.trimIndent()
+                }.joinToString(",\n")
+
+                val pListJson = participants.joinToString(",") { "\"${it.first}\"" }
+                val json = """
+                {
+                  "metadata": {
+                    "matchId": "$matchId",
+                    "participants": [$pListJson]
+                  },
+                  "info": {
+                    "gameCreation": $gameCreationMs,
+                    "gameDuration": 1800,
+                    "gameId": ${gameCreationMs % 100000},
+                    "queueId": 420,
+                    "gameMode": "CLASSIC",
+                    "gameVersion": "16.22.615.1000",
+                    "participants": [$participantsJson]
+                  }
+                }
+                """.trimIndent()
+                return objectMapper.readValue(json, com.pride.summoner_searcher_api.dto.MatchDto::class.java)
+            }
+
+            // Prepare rate limiter with verified App + Method headers so collector batch runs cleanly
+            val rateLimiter = com.pride.summoner_searcher_api.service.RiotApiRateLimiter(clock)
+            kotlinx.coroutines.runBlocking {
+                for (ep in listOf("league-v4-entries-by-puuid", "match-v5-ids-by-puuid", "match-v5-match-by-id")) {
+                    rateLimiter.updateLimits(
+                        region = "euw1",
+                        limitHeader = "20:1,100:120",
+                        countHeader = "1:1,5:120",
+                        endpointKey = ep,
+                        methodLimitHeader = "500:10",
+                        methodCountHeader = "1:10"
+                    )
+                }
+            }
+
+            val redisStore = java.util.concurrent.ConcurrentHashMap<String, Any>()
+            redisStore["cohort:patch:external:ddragon"] = "16.22"
+            redisStore["cohort:rank:snapshot:euw1:seed-top-puuid"] = com.pride.summoner_searcher_api.dto.CohortRankSnapshotDto(
+                puuid = "seed-top-puuid",
+                region = "euw1",
+                tier = "DIAMOND",
+                rank = "I",
+                leaguePoints = 75,
+                queueType = "RANKED_SOLO_5x5",
+                snapshotAt = fixedNow.minusSeconds(600)
+            )
+
+            // Match 1 (older, cached in Redis, t = nowMs - 7_200_000L) and Match 2 (newer, fetched via low-priority Riot API, t = nowMs - 3_600_000L)
+            // Both contain all 5 roles (TOP, JUNGLE, MIDDLE, BOTTOM, UTILITY) and share "seed-top-puuid" + "shared-jg-puuid" to test within-batch dedup!
+            val olderGameMs = nowMs - 7_200_000L
+            val newerGameMs = nowMs - 3_600_000L
+            val match1Cached = buildMatchWithParticipants(
+                matchId = "EUW1_COLL_1",
+                gameCreationMs = olderGameMs,
+                participants = listOf(
+                    Triple("seed-top-puuid", "TOP", "SeedTopOld" to "OLD"),
+                    Triple("shared-jg-puuid", "JUNGLE", "SharedJgOld" to "OLD"),
+                    Triple("m1-mid-puuid", "MIDDLE", "M1Mid" to "EUW"),
+                    Triple("m1-bot-puuid", "BOTTOM", "M1Bot" to "EUW"),
+                    Triple("m1-sup-puuid", "UTILITY", "M1Sup" to "EUW")
+                )
+            )
+            val match2Fetched = buildMatchWithParticipants(
+                matchId = "EUW1_COLL_2",
+                gameCreationMs = newerGameMs,
+                participants = listOf(
+                    Triple("seed-top-puuid", "TOP", "SeedTopNew" to "NEW"),
+                    Triple("shared-jg-puuid", "JUNGLE", "SharedJgNew" to "NEW"),
+                    Triple("m2-mid-puuid", "MIDDLE", "M2Mid" to "EUW"),
+                    Triple("m2-bot-puuid", "BOTTOM", "M2Bot" to "EUW"),
+                    Triple("m2-sup-puuid", "UTILITY", "M2Sup" to "EUW")
+                )
+            )
+            redisStore["match:euw1:EUW1_COLL_1"] = match1Cached
+
+            every { springWiredRedisCacheService.get(any(), any<Class<Any>>()) } answers {
+                redisStore[firstArg<String>()]
+            }
+            every { springWiredRedisCacheService.set(any(), any<Any>(), any()) } answers {
+                redisStore[firstArg<String>()] = secondArg<Any>()
+            }
+            every { springWiredRedisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            every { springWiredRedisCacheService.delete(any()) } answers {
+                redisStore.remove(firstArg<String>())
+            }
+
+            io.mockk.coEvery {
+                springWiredRiotApiService.getMatchIdsByPuuidLowPriority(
+                    puuid = "seed-top-puuid",
+                    region = "euw1",
+                    queueId = 420,
+                    count = any(),
+                    start = 0,
+                    maxRetries = 0,
+                    httpAttemptCounter = any(),
+                    failureReasonHolder = any()
+                )
+            } answers {
+                arg<java.util.concurrent.atomic.AtomicInteger>(6).incrementAndGet()
+                listOf("EUW1_COLL_2", "EUW1_COLL_1")
+            }
+
+            io.mockk.coEvery {
+                springWiredRiotApiService.getMatchByIdLowPriority(
+                    matchId = "EUW1_COLL_2",
+                    region = "euw1",
+                    maxRetries = 0,
+                    httpAttemptCounter = any(),
+                    failureReasonHolder = any()
+                )
+            } answers {
+                arg<java.util.concurrent.atomic.AtomicInteger>(3).incrementAndGet()
+                match2Fetched
+            }
+
+            val collectorService = CohortBenchmarkService(
+                redisCacheService = springWiredRedisCacheService,
+                cohortBenchmarkCellRepository = benchmarkCellRepository,
+                riotApiRateLimiter = rateLimiter,
+                riotApiService = springWiredRiotApiService,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = clock,
+                cohortCollectorCheckpointRepository = checkpointRepository,
+                cohortCellSampleStateRepository = sampleStateRepository,
+                transactionTemplate = transactionTemplate,
+                indexedPlayerRepository = indexedPlayerRepository,
+                playerSeasonStatsRepository = playerSeasonStatsRepository
+            )
+
+            // 1. Actual identity growth + within-batch deduplication + zero added network calls
+            val coverageBefore = collectorService.getDiscoveryAndSeasonCoverageSummary("euw1", 2026)
+            coverageBefore.identityIndexCoverage.targetRegionIndexedPlayers shouldBe 0L
+
+            val batchStartNs = System.nanoTime()
+            val checkpoint = kotlinx.coroutines.runBlocking {
+                collectorService.runResumableLowPriorityCollectorBatch(
+                    region = "euw1",
+                    targetPatch = "16.22",
+                    seedPuuids = listOf("seed-top-puuid"),
+                    maxPlayersPerBatch = 1,
+                    maxGamesPerPlayer = 10
+                )
+            }
+            val batchElapsedMs = (System.nanoTime() - batchStartNs) / 1_000_000.0
+
+            checkpoint.lastStopReason shouldBe "BATCH_BUDGET_REACHED_RESUMABLE"
+            // Exactly 2 Riot network calls: 1 getMatchIdsByPuuidLowPriority + 1 getMatchByIdLowPriority for EUW1_COLL_2 (EUW1_COLL_1 was cached)
+            checkpoint.totalNetworkCallsMade shouldBe 2
+            checkpoint.fetchedMatchIdLists shouldBe 1
+            checkpoint.fetchedMatches shouldBe 1
+            io.mockk.coVerify(exactly = 1) {
+                springWiredRiotApiService.getMatchIdsByPuuidLowPriority(any(), any(), any(), any(), any(), any(), any(), any())
+            }
+            io.mockk.coVerify(exactly = 1) {
+                springWiredRiotApiService.getMatchByIdLowPriority(any(), any(), any(), any(), any())
+            }
+            io.mockk.coVerify(exactly = 0) {
+                springWiredRiotApiService.getSummonerByPuuid(any(), any())
+            }
+            io.mockk.coVerify(exactly = 0) {
+                springWiredRiotApiService.fetchLeagueRankLowPriority(any(), any(), any(), any(), any())
+            }
+
+            // Verify all 8 distinct participants across both matches (including JUNGLE and UTILITY) are indexed in H2
+            val coverageAfterBatch = collectorService.getDiscoveryAndSeasonCoverageSummary("euw1", 2026)
+            coverageAfterBatch.identityIndexCoverage.targetRegionIndexedPlayers shouldBe 8L
+            coverageAfterBatch.identityIndexCoverage.totalIndexedPlayersGlobal shouldBe 8L
+            collectorService.getCollectorParticipantIndexingCounts()["collectorIndexedPlayersUpserted"] shouldBe 8L
+            // Viewed-player season stats remain untouched by collector (0 rows)
+            playerSeasonStatsRepository.count() shouldBe 0L
+
+            // Verify within-batch deduplication kept the NEWER match's Riot ID and timestamp for shared participants
+            val seedIndexed = indexedPlayerRepository.findById("seed-top-puuid").orElseThrow()
+            seedIndexed.gameName shouldBe "SeedTopNew"
+            seedIndexed.tagLine shouldBe "NEW"
+            seedIndexed.lastSeenAt.toEpochMilli() shouldBe newerGameMs
+
+            val sharedJgIndexed = indexedPlayerRepository.findById("shared-jg-puuid").orElseThrow()
+            sharedJgIndexed.gameName shouldBe "SharedJgNew"
+            sharedJgIndexed.tagLine shouldBe "NEW"
+            sharedJgIndexed.lastSeenAt.toEpochMilli() shouldBe newerGameMs
+
+            // Verify collector pendingCandidatePuuids only queued eligible roles (TOP/MIDDLE/BOTTOM), NOT JUNGLE or UTILITY
+            checkpoint.pendingCandidatePuuids.contains("shared-jg-puuid") shouldBe false
+            checkpoint.pendingCandidatePuuids.contains("m1-sup-puuid") shouldBe false
+            checkpoint.pendingCandidatePuuids.contains("m2-sup-puuid") shouldBe false
+            checkpoint.pendingCandidatePuuids.containsAll(listOf("m1-mid-puuid", "m1-bot-puuid", "m2-mid-puuid", "m2-bot-puuid")) shouldBe true
+
+            // 2. Newer-only monotonic lastSeenAt: resolving an older match later NEVER overwrites newer identity
+            val staleMatch = buildMatchWithParticipants(
+                matchId = "EUW1_COLL_STALE",
+                gameCreationMs = olderGameMs - 500_000L,
+                participants = listOf(
+                    Triple("seed-top-puuid", "TOP", "StaleOverwriteAttempt" to "STALE")
+                )
+            )
+            val staleOutcome = collectorService.indexResolvedCollectorMatchesSafely(listOf(staleMatch), "euw1")
+            staleOutcome.upsertedCount shouldBe 0L
+            staleOutcome.staleSkippedCount shouldBe 1L
+            val seedAfterStale = indexedPlayerRepository.findById("seed-top-puuid").orElseThrow()
+            seedAfterStale.gameName shouldBe "SeedTopNew"
+            seedAfterStale.tagLine shouldBe "NEW"
+            seedAfterStale.lastSeenAt.toEpochMilli() shouldBe newerGameMs
+
+            // 3. Bounds enforcement: >20 matches (25 matches) and >200 unique participants (25 * 10 = 250 participants)
+            val twentyFiveMatches = (1..25).map { mIdx ->
+                val matchTime = newerGameMs + mIdx * 1000L
+                val tenParticipants = (1..10).map { pIdx ->
+                    val pid = "bounded-m$mIdx-p$pIdx"
+                    Triple(pid, "TOP", "BoundedName_${mIdx}_$pIdx" to "EUW")
+                }
+                buildMatchWithParticipants("EUW1_BOUND_$mIdx", matchTime, tenParticipants)
+            }
+            val boundStartNs = System.nanoTime()
+            val boundedOutcome = collectorService.indexResolvedCollectorMatchesSafely(twentyFiveMatches, "euw1")
+            val boundElapsedMs = (System.nanoTime() - boundStartNs) / 1_000_000.0
+            boundedOutcome.inspectedMatchesCount shouldBe 20
+            boundedOutcome.uniqueCandidatesCount shouldBe 200
+            boundedOutcome.upsertedCount shouldBe 200L
+            // Matches 21..25 were beyond MAX_MATCHES_FOR_PARTICIPANT_INDEXING (20) and must not be indexed
+            indexedPlayerRepository.findById("bounded-m21-p1").isPresent shouldBe false
+            indexedPlayerRepository.findById("bounded-m20-p1").isPresent shouldBe true
+            println("FINITE_OVERHEAD_METRIC: collector_batch_ms=$batchElapsedMs bounded_20m_200p_upsert_ms=$boundElapsedMs")
+
+            // 4. Concurrency test: concurrent collector + profile refreshes racing older & newer timestamps on the same PUUID
+            val cacheServiceForRace = com.pride.summoner_searcher_api.service.PlayerCacheService(
+                redisCacheService = springWiredRedisCacheService,
+                riotApiService = springWiredRiotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = playerSeasonStatsRepository,
+                transactionTemplate = transactionTemplate,
+                objectMapper = objectMapper
+            )
+            val raceTimestamps = (1..16).map { it * 1_000_000L }.shuffled()
+            val racePool = java.util.concurrent.Executors.newFixedThreadPool(8)
+            val startLatch = java.util.concurrent.CountDownLatch(1)
+            try {
+                val futures = raceTimestamps.mapIndexed { idx, ts ->
+                    racePool.submit(java.util.concurrent.Callable {
+                        startLatch.await()
+                        val raceMatch = buildMatchWithParticipants(
+                            matchId = "EUW1_RACE_$ts",
+                            gameCreationMs = ts,
+                            participants = listOf(
+                                Triple("concurrent-shared-puuid", "MIDDLE", "RaceName_$ts" to "T$ts")
+                            )
+                        )
+                        if (idx % 2 == 0) {
+                            collectorService.indexResolvedCollectorMatchesSafely(listOf(raceMatch), "euw1")
+                        } else {
+                            cacheServiceForRace.indexPlayersFromMatches(listOf(raceMatch), "euw1")
+                        }
+                    })
+                }
+                startLatch.countDown()
+                futures.forEach { it.get(15, java.util.concurrent.TimeUnit.SECONDS) }
+            } finally {
+                racePool.shutdownNow()
+            }
+            val raceWinner = indexedPlayerRepository.findById("concurrent-shared-puuid").orElseThrow()
+            raceWinner.lastSeenAt.toEpochMilli() shouldBe 16_000_000L
+            raceWinner.gameName shouldBe "RaceName_16000000"
+            raceWinner.tagLine shouldBe "T16000000"
+
+            // 5. Failure isolation & cancellation preservation:
+            //    5a. Non-cancellation DB failure in indexedPlayerRepository MUST NOT fail benchmark cells, checkpoints, or collector session
+            val failingIdentityRepo = io.mockk.mockk<IndexedPlayerRepository>()
+            io.mockk.every {
+                failingIdentityRepo.updatePlayerIfNewer(any(), any(), any(), any(), any(), any(), any())
+            } throws org.springframework.dao.DataAccessResourceFailureException("Simulated indexed_players write outage")
+
+            redisStore["cohort:rank:snapshot:euw1:m1-mid-puuid"] = com.pride.summoner_searcher_api.dto.CohortRankSnapshotDto(
+                puuid = "m1-mid-puuid",
+                region = "euw1",
+                tier = "EMERALD",
+                rank = "II",
+                leaguePoints = 50,
+                queueType = "RANKED_SOLO_5x5",
+                snapshotAt = fixedNow.minusSeconds(300)
+            )
+            io.mockk.coEvery {
+                springWiredRiotApiService.getMatchIdsByPuuidLowPriority(
+                    puuid = "m1-mid-puuid",
+                    region = "euw1",
+                    queueId = 420,
+                    count = any(),
+                    start = 0,
+                    maxRetries = 0,
+                    httpAttemptCounter = any(),
+                    failureReasonHolder = any()
+                )
+            } answers {
+                arg<java.util.concurrent.atomic.AtomicInteger>(6).incrementAndGet()
+                listOf("EUW1_COLL_1")
+            }
+
+            val isolatedCollectorService = CohortBenchmarkService(
+                redisCacheService = springWiredRedisCacheService,
+                cohortBenchmarkCellRepository = benchmarkCellRepository,
+                riotApiRateLimiter = rateLimiter,
+                riotApiService = springWiredRiotApiService,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = clock,
+                cohortCollectorCheckpointRepository = checkpointRepository,
+                cohortCellSampleStateRepository = sampleStateRepository,
+                transactionTemplate = transactionTemplate,
+                indexedPlayerRepository = failingIdentityRepo,
+                playerSeasonStatsRepository = playerSeasonStatsRepository
+            )
+
+            val isolatedCheckpoint = kotlinx.coroutines.runBlocking {
+                isolatedCollectorService.runResumableLowPriorityCollectorBatch(
+                    region = "euw1",
+                    targetPatch = "16.22",
+                    seedPuuids = listOf("m1-mid-puuid"),
+                    maxPlayersPerBatch = 1,
+                    maxGamesPerPlayer = 10
+                )
+            }
+            isolatedCheckpoint.lastStopReason shouldBe "BATCH_BUDGET_REACHED_RESUMABLE"
+            isolatedCollectorService.getCollectorParticipantIndexingCounts()["collectorIndexedPlayersFailures"] shouldBe 1L
+            // Verify EMERALD:MIDDLE benchmark cell & checkpoint persisted despite indexed_players failure!
+            val emeraldMidCell = benchmarkCellRepository.findByRegionAndPatchAndQueueIdAndTierAndRole(
+                region = "euw1",
+                patch = "16.22",
+                queueId = 420,
+                tier = "EMERALD",
+                role = "MIDDLE"
+            )
+            (emeraldMidCell != null) shouldBe true
+            emeraldMidCell!!.eligibleGames shouldBe 1
+
+            //    5b. CancellationException MUST be rethrown and never swallowed
+            val cancellingIdentityRepo = io.mockk.mockk<IndexedPlayerRepository>()
+            io.mockk.every {
+                cancellingIdentityRepo.updatePlayerIfNewer(any(), any(), any(), any(), any(), any(), any())
+            } throws kotlinx.coroutines.CancellationException("Simulated collector coroutine cancellation")
+            val cancellingService = CohortBenchmarkService(
+                redisCacheService = springWiredRedisCacheService,
+                cohortBenchmarkCellRepository = benchmarkCellRepository,
+                riotApiRateLimiter = rateLimiter,
+                riotApiService = springWiredRiotApiService,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = clock,
+                cohortCollectorCheckpointRepository = checkpointRepository,
+                cohortCellSampleStateRepository = sampleStateRepository,
+                transactionTemplate = transactionTemplate,
+                indexedPlayerRepository = cancellingIdentityRepo,
+                playerSeasonStatsRepository = playerSeasonStatsRepository
+            )
+            val cancellationThrown = runCatching {
+                cancellingService.indexResolvedCollectorMatchesSafely(listOf(match1Cached), "euw1")
+            }.exceptionOrNull()
+            (cancellationThrown is kotlinx.coroutines.CancellationException) shouldBe true
+        } finally {
+            playerSeasonStatsRepository.deleteAll()
+            indexedPlayerRepository.deleteAll()
+            sampleStateRepository.deleteAll()
+            benchmarkCellRepository.deleteAll()
+            checkpointRepository.deleteAll()
+        }
+    }
 }
+
 
 

@@ -2,6 +2,7 @@ package com.pride.summoner_searcher_api.service
 
 import com.pride.summoner_searcher_api.dto.MatchDto
 import com.pride.summoner_searcher_api.dto.SummonerProfileDto
+import com.pride.summoner_searcher_api.repository.indexParticipantsFromMatchesBounded
 import com.pride.summoner_searcher_api.repository.upsertPlayerIfNewer
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
@@ -1481,68 +1482,21 @@ class PlayerCacheService(
      *   inside [transactionTemplate] with zero `findAllById` read-before-write races and zero `emptyMap()` fallback overwrites.
      */
     internal fun indexPlayersFromMatches(matches: List<com.pride.summoner_searcher_api.dto.MatchDto>, region: String) {
-        val normalizedRegion = region.lowercase().trim()
-        val latestByPuuid = LinkedHashMap<String, com.pride.summoner_searcher_api.model.IndexedPlayer>()
-
-        for (match in matches.take(MAX_MATCHES_FOR_PARTICIPANT_INDEXING)) {
-            val info = match.info ?: continue
-            val matchPlayedAtMs = (info.gameCreation ?: 0L).takeIf { it > 0L } ?: timeProvider.now()
-            val matchPlayedAt = Instant.ofEpochMilli(matchPlayedAtMs)
-
-            for (p in info.participants) {
-                val cleanPuuid = p.puuid?.trim()?.takeIf { it.isNotBlank() } ?: continue
-                val cleanGameName = p.riotIdGameName?.trim()?.takeIf { it.isNotBlank() } ?: continue
-                val cleanTagLine = p.riotIdTagline?.trim()?.takeIf { it.isNotBlank() } ?: continue
-
-                val existingInBatch = latestByPuuid[cleanPuuid]
-                if (existingInBatch == null || !matchPlayedAt.isBefore(existingInBatch.lastSeenAt)) {
-                    latestByPuuid[cleanPuuid] = com.pride.summoner_searcher_api.model.IndexedPlayer(
-                        puuid = cleanPuuid,
-                        gameName = cleanGameName,
-                        tagLine = cleanTagLine,
-                        region = normalizedRegion,
-                        profileIconId = p.profileIcon ?: 0,
-                        summonerLevel = p.summonerLevel?.toLong() ?: 0L,
-                        lastSeenAt = matchPlayedAt
-                    )
-                }
-            }
+        if (matches.isEmpty()) return
+        val outcome = indexedPlayerRepository.indexParticipantsFromMatchesBounded(
+            matches = matches,
+            region = region,
+            fallbackNowEpochMilli = timeProvider.now(),
+            transactionTemplate = transactionTemplate,
+            maxMatches = MAX_MATCHES_FOR_PARTICIPANT_INDEXING,
+            maxPlayersPerBatch = MAX_INDEXED_PLAYERS_PER_BATCH
+        )
+        if (outcome.upsertedCount > 0L) {
+            indexedPlayersUpsertedCounter.addAndGet(outcome.upsertedCount)
         }
-
-        if (latestByPuuid.isEmpty()) return
-
-        val boundedCandidates = latestByPuuid.values
-            .sortedByDescending { it.lastSeenAt }
-            .take(MAX_INDEXED_PLAYERS_PER_BATCH)
-
-        val upsertBlock = {
-            var upsertedInBatch = 0L
-            for (candidate in boundedCandidates) {
-                val updatedRows = indexedPlayerRepository.upsertPlayerIfNewer(
-                    puuid = candidate.puuid,
-                    gameName = candidate.gameName,
-                    tagLine = candidate.tagLine,
-                    region = candidate.region,
-                    profileIconId = candidate.profileIconId,
-                    summonerLevel = candidate.summonerLevel,
-                    lastSeenAt = candidate.lastSeenAt
-                )
-                if (updatedRows > 0) {
-                    upsertedInBatch++
-                } else {
-                    indexedPlayersStaleSkippedCounter.incrementAndGet()
-                }
-            }
-            if (upsertedInBatch > 0L) {
-                indexedPlayersUpsertedCounter.addAndGet(upsertedInBatch)
-            }
-        }
-
-        val tx = transactionTemplate
-        if (tx != null) {
-            tx.executeWithoutResult { upsertBlock() }
-        } else {
-            upsertBlock()
+        if (outcome.staleSkippedCount > 0L) {
+            indexedPlayersStaleSkippedCounter.addAndGet(outcome.staleSkippedCount)
         }
     }
 }
+
