@@ -1619,7 +1619,119 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 failingDurableService.getPlayerProfile(failDbPuuid, region, summonerName, tagLine, explicitRefresh = true)
             }.exceptionOrNull()
 
-            Then("it preserves 2100 coverage with historyCapped=true/historyComplete=false, bounds retained MatchDto instances to <=40, keeps counters equal to processedMatchIds ledger, returns committed merged state for Redis, and fails closed on DB error") {
+            // 5. Real RiotApiService.fetchMatchIdsSince pagination loop:
+            //    (a) Page-0 null failure -> stoppedOnPageFailure=true, exhaustedCleanly=false; cold profile refresh returns null and writes 0 DB rows
+            //    (b) Page-1 null failure after 100 IDs on page 0 -> stoppedOnPageFailure=true, exhaustedCleanly=false; folds 100 games with historyComplete=false
+            //    (c) 21 pages of 100 IDs (2,100 total) stopping at >2000 guard -> hitSafetyCap=true, exhaustedCleanly=false
+            val realRiotSpy = spyk(
+                RiotApiService(
+                    riotRestClient = mockk(relaxed = true),
+                    rateLimiter = RiotApiRateLimiter(clock)
+                )
+            )
+            val page0FailPuuid = "page0-null-fail-puuid"
+            coEvery { realRiotSpy.getSummonerByPuuid(page0FailPuuid, region) } returns SummonerDto("id", page0FailPuuid, 300L, 11)
+            coEvery { realRiotSpy.fetchLeagueRank(page0FailPuuid, region) } returns null
+            coEvery { realRiotSpy.getMatchIdsByPuuid(page0FailPuuid, region, 420, any(), any(), 100, 0) } returns null
+
+            var page0SavedEntity: com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity? = null
+            val page0Repo = mockk<com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository>()
+            every { page0Repo.findByRegionAndPuuidAndSeasonYearAndQueueId(region, page0FailPuuid, 2026, 420) } returns null
+            every { page0Repo.saveAndFlush(any()) } answers {
+                page0SavedEntity = firstArg()
+                page0SavedEntity!!
+            }
+            every { redisCacheService.get("player:profile:euw1:$page0FailPuuid", SummonerProfileDto::class.java) } returns null
+            val page0Service = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = realRiotSpy,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = page0Repo,
+                transactionTemplate = txTemplate,
+                objectMapper = mapper
+            )
+            val page0FailProfile = page0Service.getPlayerProfile(page0FailPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val page0Outcome = realRiotSpy.getLastMatchIdsPaginationOutcome(page0FailPuuid, region)
+
+            val page1FailPuuid = "page1-null-fail-puuid"
+            coEvery { realRiotSpy.getSummonerByPuuid(page1FailPuuid, region) } returns SummonerDto("id", page1FailPuuid, 300L, 11)
+            coEvery { realRiotSpy.fetchLeagueRank(page1FailPuuid, region) } returns null
+            coEvery {
+                realRiotSpy.getMatchIdsByPuuid(page1FailPuuid, region, 420, any(), any(), 100, 0)
+            } returns (100 downTo 1).map { "EUW1_$it" }
+            coEvery {
+                realRiotSpy.getMatchIdsByPuuid(page1FailPuuid, region, 420, any(), any(), 100, 100)
+            } returns null
+            coEvery { realRiotSpy.getMatchById(any(), region) } answers {
+                val id = firstArg<String>()
+                val idx = id.substringAfter("_").toInt()
+                buildMatch(id, idx, page1FailPuuid)
+            }
+            var page1SavedEntity: com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity? = null
+            val page1Repo = mockk<com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository>()
+            every { page1Repo.findByRegionAndPuuidAndSeasonYearAndQueueId(region, page1FailPuuid, 2026, 420) } returns null
+            every { page1Repo.saveAndFlush(any()) } answers {
+                val arg = firstArg<com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity>()
+                arg.version += 1L
+                page1SavedEntity = arg
+                arg
+            }
+            every { redisCacheService.get("player:profile:euw1:$page1FailPuuid", SummonerProfileDto::class.java) } returns null
+            val page1Service = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = realRiotSpy,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = page1Repo,
+                transactionTemplate = txTemplate,
+                objectMapper = mapper
+            )
+            val page1FailProfile = page1Service.getPlayerProfile(page1FailPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val page1Outcome = realRiotSpy.getLastMatchIdsPaginationOutcome(page1FailPuuid, region)
+            val page1State = mapper.readValue(page1SavedEntity!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+
+            val real2100Puuid = "real-pagination-2100-puuid"
+            coEvery {
+                realRiotSpy.getMatchIdsByPuuid(real2100Puuid, region, 420, any(), any(), 100, any())
+            } answers {
+                val pageStart = arg<Int>(6)
+                val firstNum = 2100 - pageStart
+                (firstNum downTo (firstNum - 99)).map { "EUW1_$it" }
+            }
+            val real2100Outcome = realRiotSpy.fetchMatchIdsWithOutcomeSince(real2100Puuid, region, 0L)
+
+            // 6. Memory headroom guard MUST fail safe (false) when memoryStatsProvider throws or returns non-positive heap limits
+            val brokenMemoryService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample {
+                        throw RuntimeException("Simulated cgroup/heap metric read error")
+                    }
+                }
+            )
+            val zeroLimitMemoryService = PlayerCacheService(
+                redisCacheService = redisCacheService,
+                riotApiService = riotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = RawMemorySample(
+                        jvmHeapUsedBytes = 0L,
+                        jvmHeapCommittedBytes = 0L,
+                        jvmHeapMaxBytes = 0L,
+                        cgroupMemoryCurrentBytes = null,
+                        cgroupMemoryMaxBytes = null
+                    )
+                }
+            )
+            val brokenMemoryGuardResult = brokenMemoryService.hasMemoryHeadroomForSeasonBackfill()
+            val zeroLimitMemoryGuardResult = zeroLimitMemoryService.hasMemoryHeadroomForSeasonBackfill()
+
+            Then("it preserves 2100 coverage with historyCapped=true/historyComplete=false, bounds retained MatchDto instances to <=40, keeps counters equal to processedMatchIds ledger, returns committed merged state for Redis, and fails closed on DB/pagination/memory errors") {
                 // 1. 2,100-match fetch preserves all 2,100 matches while marking historyCapped=true and historyComplete=false
                 profile2100?.totalMatches shouldBe 2100
                 state2100.processedMatchIds.size shouldBe 2100
@@ -1657,6 +1769,30 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 // 5. Durability failure fails closed and never writes uncommitted profile to Redis
                 (dbFailException is IllegalStateException) shouldBe true
                 redisSavedOnDbFail shouldBe null
+
+                // 6. Real RiotApiService pagination outcome checks:
+                page0Outcome?.stoppedOnPageFailure shouldBe true
+                page0Outcome?.exhaustedCleanly shouldBe false
+                page0Outcome?.pagesFetched shouldBe 0
+                page0FailProfile shouldBe null
+                page0SavedEntity shouldBe null
+
+                page1Outcome?.stoppedOnPageFailure shouldBe true
+                page1Outcome?.exhaustedCleanly shouldBe false
+                page1Outcome?.pagesFetched shouldBe 1
+                page1FailProfile?.totalMatches shouldBe 100
+                page1State.processedMatchIds.size shouldBe 100
+                page1State.historyComplete shouldBe false
+
+                real2100Outcome.matchIds.size shouldBe 2100
+                real2100Outcome.pagesFetched shouldBe 21
+                real2100Outcome.hitSafetyCap shouldBe true
+                real2100Outcome.exhaustedCleanly shouldBe false
+                real2100Outcome.stoppedOnPageFailure shouldBe false
+
+                // 7. Memory headroom guard fails safe (false) on metric exception or zero heap limit
+                brokenMemoryGuardResult shouldBe false
+                zeroLimitMemoryGuardResult shouldBe false
             }
         }
     }

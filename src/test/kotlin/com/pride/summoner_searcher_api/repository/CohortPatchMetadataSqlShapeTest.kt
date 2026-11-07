@@ -938,9 +938,14 @@ class CohortPatchMetadataSqlShapeTest {
             val coverageSummary = springWiredCohortBenchmarkService.getDiscoveryAndSeasonCoverageSummary("euw1", 2026)
             val coverageSql = CapturingStatementInspector.executedSql.toList()
 
-            // Verify scalar aggregate SQL does NOT select state_json
+            // Verify scalar aggregate SQL does NOT select state_json, samples_json, or metrics_json
             val seasonSummarySql = coverageSql.single { it.contains("player_season_stats", ignoreCase = true) }
             seasonSummarySql shouldNotContainIgnoringCase "state_json"
+            coverageSql.forEach { sql ->
+                sql shouldNotContainIgnoringCase "state_json"
+                sql shouldNotContainIgnoringCase "samples_json"
+                sql shouldNotContainIgnoringCase "metrics_json"
+            }
 
             coverageSummary.identityIndexCoverage.totalIndexedPlayersGlobal shouldBe 3L
             coverageSummary.identityIndexCoverage.targetRegionIndexedPlayers shouldBe 3L
@@ -951,6 +956,45 @@ class CohortPatchMetadataSqlShapeTest {
             coverageSummary.seasonHistoryCompleteness.targetRegionStats.staleSchemaVersionPlayers shouldBe 1L
             coverageSummary.seasonHistoryCompleteness.targetRegionStats.totalFoldedSeasonGames shouldBe 2155L
             coverageSummary.seasonHistoryCompleteness.targetRegionStats.totalPendingGapGames shouldBe 5L
+
+            // Verify coverage SQL failure or unwired repository NEVER fakes zero counts
+            val brokenIdentityRepo = io.mockk.mockk<IndexedPlayerRepository>()
+            io.mockk.every {
+                brokenIdentityRepo.countPlayersGroupedByRegion()
+            } throws org.springframework.dao.DataAccessResourceFailureException("Simulated indexed_players SQL failure")
+            val brokenCoverageService = CohortBenchmarkService(
+                redisCacheService = springWiredRedisCacheService,
+                riotApiService = springWiredRiotApiService,
+                riotApiRateLimiter = RiotApiRateLimiter(clock),
+                cohortBenchmarkCellRepository = benchmarkCellRepository,
+                cohortCellSampleStateRepository = sampleStateRepository,
+                cohortCollectorCheckpointRepository = checkpointRepository,
+                indexedPlayerRepository = brokenIdentityRepo,
+                playerSeasonStatsRepository = playerSeasonStatsRepository,
+                transactionTemplate = transactionTemplate,
+                objectMapper = objectMapper
+            )
+            val coverageSqlError = runCatching {
+                brokenCoverageService.getDiscoveryAndSeasonCoverageSummary("euw1", 2026)
+            }.exceptionOrNull()
+            (coverageSqlError is org.springframework.dao.DataAccessResourceFailureException) shouldBe true
+
+            val unwiredCoverageService = CohortBenchmarkService(
+                redisCacheService = springWiredRedisCacheService,
+                riotApiService = springWiredRiotApiService,
+                riotApiRateLimiter = RiotApiRateLimiter(clock),
+                cohortBenchmarkCellRepository = benchmarkCellRepository,
+                cohortCellSampleStateRepository = sampleStateRepository,
+                cohortCollectorCheckpointRepository = checkpointRepository,
+                indexedPlayerRepository = null,
+                playerSeasonStatsRepository = null,
+                transactionTemplate = transactionTemplate,
+                objectMapper = objectMapper
+            )
+            val unwiredCoverageError = runCatching {
+                unwiredCoverageService.getDiscoveryAndSeasonCoverageSummary("euw1", 2026)
+            }.exceptionOrNull()
+            (unwiredCoverageError is IllegalStateException) shouldBe true
         } finally {
             playerSeasonStatsRepository.deleteAll()
             indexedPlayerRepository.deleteAll()

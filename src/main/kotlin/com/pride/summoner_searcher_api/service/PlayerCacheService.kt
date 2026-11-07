@@ -93,9 +93,12 @@ class PlayerCacheService(
     internal fun hasMemoryHeadroomForSeasonBackfill(): Boolean {
         return try {
             val raw = memoryStatsProvider.sample()
+            if (raw.jvmHeapMaxBytes <= 0L || raw.jvmHeapUsedBytes < 0L) {
+                return false
+            }
             val safeContainerCap = configuredContainerLimitBytes.coerceAtLeast(1L)
-            val safeHeapMax = raw.jvmHeapMaxBytes.coerceAtLeast(1L)
-            val safeHeapUsed = raw.jvmHeapUsedBytes.coerceAtLeast(0L)
+            val safeHeapMax = raw.jvmHeapMaxBytes
+            val safeHeapUsed = raw.jvmHeapUsedBytes
             val isBoundedContainerCgroup = raw.cgroupMemoryMaxBytes != null &&
                 raw.cgroupMemoryMaxBytes in 1L..2_147_483_648L &&
                 raw.cgroupMemoryCurrentBytes != null &&
@@ -110,11 +113,15 @@ class PlayerCacheService(
             } else {
                 safeHeapUsed
             }
+            if (effectiveLimit <= 0L) {
+                return false
+            }
             val freeBytes = (effectiveLimit - effectiveUsed).coerceAtLeast(0L)
             val ratio = effectiveUsed.toDouble() / effectiveLimit.toDouble()
-            ratio < maxMemoryUtilizationRatio && freeBytes >= minFreeMemoryBytes
-        } catch (_: Exception) {
-            true
+            ratio.isFinite() && ratio < maxMemoryUtilizationRatio && freeBytes >= minFreeMemoryBytes
+        } catch (e: Exception) {
+            logger.warn("Memory headroom sample failed during seasonal backfill guard; failing safe (false): {}", e.message)
+            false
         }
     }
 
@@ -198,6 +205,7 @@ class PlayerCacheService(
         effectiveSeasonalWindowIds: List<String> = emptyList(),
         rawFetchHitSafetyLimit: Boolean = false,
         rawFetchTruncatedByLedgerCap: Boolean = false,
+        paginationExhaustedCleanly: Boolean = true,
         stoppedForMemoryHeadroom: Boolean = false
     ): DurablePlayerSeasonStatsDto {
         val repo = playerSeasonStatsRepository
@@ -253,6 +261,7 @@ class PlayerCacheService(
                                     effectiveSeasonalWindowIds = effectiveSeasonalWindowIds,
                                     rawFetchHitSafetyLimit = rawFetchHitSafetyLimit,
                                     rawFetchTruncatedByLedgerCap = rawFetchTruncatedByLedgerCap,
+                                    paginationExhaustedCleanly = paginationExhaustedCleanly,
                                     stoppedForMemoryHeadroom = stoppedForMemoryHeadroom
                                 )
                             }
@@ -322,6 +331,7 @@ class PlayerCacheService(
         effectiveSeasonalWindowIds: List<String>,
         rawFetchHitSafetyLimit: Boolean,
         rawFetchTruncatedByLedgerCap: Boolean,
+        paginationExhaustedCleanly: Boolean,
         stoppedForMemoryHeadroom: Boolean
     ): DurablePlayerSeasonStatsDto {
         val normalizedRegion = candidateState.region.lowercase().trim()
@@ -401,12 +411,17 @@ class PlayerCacheService(
 
         val mergedHitBoundary = existingDto.hitPreSeasonBoundary || candidateState.hitPreSeasonBoundary
         val mergedBoundaryId = candidateState.firstPreSeasonMatchId ?: existingDto.firstPreSeasonMatchId
+        val mergedPaginationCoversSeasonHistory = paginationExhaustedCleanly ||
+            mergedHitBoundary ||
+            (existingDto.historyComplete &&
+                windowList.any { it in existingDto.processedMatchIds || it in existingDto.excludedMatchIds })
         val isCapped = existingDto.historyCapped ||
             candidateState.historyCapped ||
             hitLedgerCapDuringMerge ||
             rawFetchTruncatedByLedgerCap ||
             (!mergedHitBoundary && rawFetchHitSafetyLimit)
         val isComplete = !isCapped &&
+            mergedPaginationCoversSeasonHistory &&
             !stoppedForMemoryHeadroom &&
             orderedPending.isEmpty() &&
             windowList.all { it in mergedFoldedSet || it in mergedExcludedSet }
@@ -708,21 +723,44 @@ class PlayerCacheService(
             val matchIdsDeferred = async { riotApiService.fetchMatchIdsSince(puuid, region, startOfYear) }
             val freshRank = rankDeferred.await()
             val rawAllMatchIds = matchIdsDeferred.await()
+            val recordedOutcome = riotApiService.getLastMatchIdsPaginationOutcome(puuid, region)
+                ?.takeIf {
+                    (it.exhaustedCleanly || it.hitSafetyCap || it.stoppedOnPageFailure || it.pagesFetched > 0) &&
+                        it.matchIds == rawAllMatchIds
+                }
             val rawNonBlankIds = rawAllMatchIds
                 .asSequence()
                 .map { it.trim() }
                 .filter { it.isNotBlank() }
                 .toList()
             val rawDistinctMatchIds = rawNonBlankIds.distinct()
+            val paginationStoppedOnFailure = recordedOutcome?.stoppedOnPageFailure ?: false
             // Capture pagination safety-cap and truncation evidence BEFORE truncating to MAX_TRACKED_SEASON_MATCH_IDS (2,100).
-            val rawFetchHitSafetyLimit = rawAllMatchIds.size > DurablePlayerSeasonStatsDto.RIOT_MATCH_IDS_SAFETY_THRESHOLD ||
+            val rawFetchHitSafetyLimit = (recordedOutcome?.hitSafetyCap == true) ||
+                rawAllMatchIds.size > DurablePlayerSeasonStatsDto.RIOT_MATCH_IDS_SAFETY_THRESHOLD ||
                 rawDistinctMatchIds.size > DurablePlayerSeasonStatsDto.RIOT_MATCH_IDS_SAFETY_THRESHOLD
             val rawFetchTruncatedByLedgerCap = rawDistinctMatchIds.size > DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS
+            val paginationExhaustedCleanly = recordedOutcome?.exhaustedCleanly
+                ?: (!paginationStoppedOnFailure && !rawFetchHitSafetyLimit && !rawFetchTruncatedByLedgerCap)
             val distinctAllMatchIds = rawDistinctMatchIds.take(DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS)
             val metadataAndIdsMs = timeProvider.now() - metaStartMs
 
             val loadedDurable = loadValidDurableSeasonState(normalizedRegion, puuid, currentYear)
             val durableState = loadedDurable?.state
+
+            // Never conflate a page-0 match-ID pagination failure (`matchIds == null` at start=0) with an empty season:
+            if (paginationStoppedOnFailure && (recordedOutcome?.pagesFetched ?: 0) == 0 && distinctAllMatchIds.isEmpty()) {
+                logger.warn(
+                    "Match ID pagination failed on page 0 for {}#{} ({}); refusing to treat failed page as empty season.",
+                    summonerName, tagLine, region
+                )
+                if (cachedProfile != null) {
+                    return@coroutineScope cachedProfile
+                }
+                if (durableState == null) {
+                    return@coroutineScope null
+                }
+            }
 
             val candidateWindowIds = if (durableState != null && durableState.hitPreSeasonBoundary && durableState.firstPreSeasonMatchId != null) {
                 val boundaryIdx = distinctAllMatchIds.indexOf(durableState.firstPreSeasonMatchId)
@@ -1051,11 +1089,16 @@ class PlayerCacheService(
                 }
             }
 
+            val paginationCoversSeasonHistory = paginationExhaustedCleanly ||
+                hitPreSeasonBoundary ||
+                (durableState?.historyComplete == true &&
+                    effectiveSeasonalWindowIds.any { it in durableState.processedMatchIds || it in durableState.excludedMatchIds })
             val isHistoryCapped = (durableState?.historyCapped == true) ||
                 hitLedgerCapDuringRefresh ||
                 rawFetchTruncatedByLedgerCap ||
                 (!hitPreSeasonBoundary && rawFetchHitSafetyLimit)
             val isHistoryComplete = !isHistoryCapped &&
+                paginationCoversSeasonHistory &&
                 orderedPendingIds.isEmpty() &&
                 !stoppedForMemoryHeadroom &&
                 effectiveSeasonalWindowIds.all { it in foldedSet || it in excludedSet }
@@ -1089,6 +1132,7 @@ class PlayerCacheService(
                     effectiveSeasonalWindowIds = effectiveSeasonalWindowIds,
                     rawFetchHitSafetyLimit = rawFetchHitSafetyLimit,
                     rawFetchTruncatedByLedgerCap = rawFetchTruncatedByLedgerCap,
+                    paginationExhaustedCleanly = paginationExhaustedCleanly,
                     stoppedForMemoryHeadroom = stoppedForMemoryHeadroom
                 )
             } else {

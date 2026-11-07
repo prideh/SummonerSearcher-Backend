@@ -4851,7 +4851,12 @@ class CohortBenchmarkService(
         val effectiveSeasonYear = seasonYear
             ?: nowInstant.atZone(java.time.ZoneOffset.UTC).year
 
-        val regionCounts = indexedPlayerRepository?.countPlayersGroupedByRegion().orEmpty().mapNotNull { row ->
+        val identityRepo = indexedPlayerRepository
+            ?: throw IllegalStateException("IndexedPlayerRepository is not wired; cannot compute discovery coverage summary")
+        val seasonStatsRepo = playerSeasonStatsRepository
+            ?: throw IllegalStateException("PlayerSeasonStatsRepository is not wired; cannot compute season history completeness summary")
+
+        val regionCounts = identityRepo.countPlayersGroupedByRegion().mapNotNull { row ->
             val reg = (row.getOrNull(0) as? String)?.lowercase()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val cnt = (row.getOrNull(1) as? Number)?.toLong() ?: 0L
             val latestSeen = when (val rawSeen = row.getOrNull(2)) {
@@ -4869,11 +4874,11 @@ class CohortBenchmarkService(
         val totalIndexedGlobal = regionCounts.sumOf { it.indexedPlayerCount }
         val targetIndexedCount = regionCounts.firstOrNull { it.region == normalizedRegion }?.indexedPlayerCount ?: 0L
 
-        val seasonByRegion = playerSeasonStatsRepository?.summarizeByRegionForSeasonYear(
+        val seasonByRegion = seasonStatsRepo.summarizeByRegionForSeasonYear(
             seasonYear = effectiveSeasonYear,
             queueId = SOLO_QUEUE_ID,
             currentSchemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION
-        ).orEmpty().mapNotNull { row ->
+        ).mapNotNull { row ->
             val reg = (row.getOrNull(0) as? String)?.lowercase()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             val tracked = (row.getOrNull(1) as? Number)?.toLong() ?: 0L
             val complete = (row.getOrNull(2) as? Number)?.toLong() ?: 0L
@@ -4909,19 +4914,37 @@ class CohortBenchmarkService(
                 maxTrackedMatchIdsCapPerPlayer = DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS
             )
 
-        val targetPatch = resolveGroundedCurrentPatch(
-            normalizedRegion,
-            allowLightRedisMatchProbe = false,
-            allowExternalNetworkLookup = false
-        )
-        val persistedCells = if (normalizedRegion in ALLOWED_REGIONS) {
-            getPersistedCohortCellsInternal(
-                normalizedRegion,
-                targetPatch,
-                holdsRegionGate = false
+        val cellSummaryRows = if (normalizedRegion in ALLOWED_REGIONS) {
+            cohortBenchmarkCellRepository.summarizeCellCountsByPatchForRegion(
+                region = normalizedRegion,
+                queueId = SOLO_QUEUE_ID
             )
         } else {
             emptyList()
+        }
+        val cellCountsByPatch = LinkedHashMap<String, Pair<Int, Int>>()
+        for (row in cellSummaryRows) {
+            val rawPatch = (row.getOrNull(0) as? String)?.let { cleanPatchCandidate(it) } ?: continue
+            val totalCells = (row.getOrNull(1) as? Number)?.toInt() ?: 0
+            val passingCells = (row.getOrNull(2) as? Number)?.toInt() ?: 0
+            cellCountsByPatch[rawPatch] = totalCells to passingCells
+        }
+        val sampleStatePatches = if (normalizedRegion in ALLOWED_REGIONS && cohortCellSampleStateRepository != null) {
+            cohortCellSampleStateRepository.findDistinctPatchesByRegionWithEligibleGames(normalizedRegion)
+                .mapNotNull { cleanPatchCandidate(it) }
+        } else {
+            emptyList()
+        }
+        val targetPatch = (cellCountsByPatch.keys + sampleStatePatches).maxWithOrNull(patchComparator)
+            ?: resolveGroundedCurrentPatch(
+                normalizedRegion,
+                allowLightRedisMatchProbe = false,
+                allowExternalNetworkLookup = false
+            )
+        val (persistedCellsCount, cellsPassingQualityGate) = if (targetPatch != null) {
+            cellCountsByPatch[targetPatch] ?: (0 to 0)
+        } else {
+            0 to 0
         }
 
         return CohortDiscoveryAndSeasonCoverageDto(
@@ -4940,9 +4963,9 @@ class CohortBenchmarkService(
             ),
             benchmarkQualitySummary = BenchmarkQualitySummaryDto(
                 region = normalizedRegion,
-                targetPatch = targetPatch ?: persistedCells.firstOrNull()?.patch,
-                persistedCellsCount = persistedCells.size,
-                cellsPassingQualityGate = persistedCells.count { it.passesQualityGate },
+                targetPatch = targetPatch,
+                persistedCellsCount = persistedCellsCount,
+                cellsPassingQualityGate = cellsPassingQualityGate,
                 targetCellsCount = 30
             ),
             memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
