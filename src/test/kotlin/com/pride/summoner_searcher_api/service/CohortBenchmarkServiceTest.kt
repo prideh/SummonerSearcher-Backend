@@ -4642,6 +4642,56 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 httpRequest = httpReq
             ).body!!
 
+            // 3c. Verify runner lock + running flag cleanup if seeded admission check throws, and verify unseeded service batch
+            //     does NOT call isCheckpointStalePatchAdvance before pre-scan memory check:
+            every { seedRedis.get("cohort:patch:external:ddragon", String::class.java) } throws RuntimeException("simulated-ddragon-redis-failure")
+            val seededAdmissionThrown = org.junit.jupiter.api.Assertions.assertThrows(RuntimeException::class.java) {
+                seedController.startOrResumeCohortCollector(
+                    region = "euw1",
+                    patch = "16.7",
+                    maxBatches = 1,
+                    batchSize = 1,
+                    maxTotalProductiveBatches = 1,
+                    maxTotalNetworkCalls = 15,
+                    seedPuuids = listOf("fresh-challenger-seed"),
+                    async = false,
+                    operatorToken = "operator-secret-123",
+                    httpRequest = httpReq
+                )
+            }
+            val lockReleasedAfterSeededAdmissionException = !activeLockHeld
+            val runningResetAfterSeededAdmissionException = !seedRunner.getStatus("euw1", "16.7").runningInProcess
+
+            val lowMemService = CohortBenchmarkService(
+                redisCacheService = seedRedis,
+                cohortBenchmarkCellRepository = seedCellRepo,
+                riotApiRateLimiter = limiter,
+                riotApiService = seedRiot,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = testClock,
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = RawMemorySample(
+                        cgroupMemoryCurrentBytes = 480L * 1024 * 1024,
+                        cgroupMemoryMaxBytes = 512L * 1024 * 1024,
+                        jvmHeapUsedBytes = 200L * 1024 * 1024,
+                        jvmHeapCommittedBytes = 256L * 1024 * 1024,
+                        jvmHeapMaxBytes = 256L * 1024 * 1024,
+                        jvmNonHeapUsedBytes = 64L * 1024 * 1024,
+                        directBufferUsedBytes = 8L * 1024 * 1024
+                    )
+                },
+                indexedPlayerRepository = mockIndexedRepo
+            )
+            // With "cohort:patch:external:ddragon" still throwing, an unseeded batch must hit preScanMem first without calling isCheckpointStalePatchAdvance
+            val unseededMemPausedCheckpoint = lowMemService.runResumableLowPriorityCollectorBatch(
+                region = "euw1",
+                targetPatch = "16.7",
+                seedPuuids = emptyList(),
+                maxPlayersPerBatch = 1
+            )
+            every { seedRedis.get("cohort:patch:external:ddragon", String::class.java) } returns "16.7"
+
             // Restore 499 pending queue for the valid 499 + 1 net-new seed (== 500) + 1 already-processed seed (0 net-new) run
             savedCheckpoints["cohort:collector:checkpoint:euw1:16.7"] = baselineCheckpoint499
             savedCheckpoints["cohort:collector:checkpoint:euw1:latest"] = baselineCheckpoint499
