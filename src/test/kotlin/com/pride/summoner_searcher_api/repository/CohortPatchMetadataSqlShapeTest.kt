@@ -660,6 +660,13 @@ class CohortPatchMetadataSqlShapeTest {
             io.mockk.coEvery { springWiredRiotApiService.getSummonerByPuuid("h2-season-puuid", "euw1") } returns
                 com.pride.summoner_searcher_api.dto.SummonerDto("id", "h2-season-puuid", 400L, 77)
             io.mockk.coEvery { springWiredRiotApiService.fetchLeagueRank("h2-season-puuid", "euw1") } returns null
+            io.mockk.coEvery {
+                springWiredRiotApiService.fetchMatchIdsWithOutcomeSince(any(), any(), any())
+            } coAnswers {
+                com.pride.summoner_searcher_api.service.RiotApiService.MatchIdsPaginationOutcome(
+                    matchIds = springWiredRiotApiService.fetchMatchIdsSince(firstArg(), secondArg(), thirdArg())
+                )
+            }
             io.mockk.coEvery { springWiredRiotApiService.fetchMatchIdsSince("h2-season-puuid", "euw1", any()) } returns listOf("EUW1_NEW_2000", "EUW1_OLD_1000")
             every { springWiredRedisCacheService.multiGet(any(), com.pride.summoner_searcher_api.dto.MatchDto::class.java) } answers {
                 firstArg<List<String>>().associateWith { null }

@@ -22,6 +22,10 @@ class PlayerCacheServiceTest : BehaviorSpec({
 
     beforeTest {
         io.mockk.clearMocks(redisCacheService, riotApiService, indexedPlayerRepository, answers = false)
+        coEvery { riotApiService.fetchMatchIdsWithOutcomeSince(any(), any(), any()) } coAnswers {
+            val ids = riotApiService.fetchMatchIdsSince(firstArg(), secondArg(), thirdArg())
+            RiotApiService.MatchIdsPaginationOutcome(matchIds = ids)
+        }
     }
 
     Given("A player cache service") {
@@ -1695,7 +1699,7 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 objectMapper = mapper
             )
             val page0FailProfile = page0Service.getPlayerProfile(page0FailPuuid, region, summonerName, tagLine, explicitRefresh = true)
-            val page0Outcome = realRiotSpy.getLastMatchIdsPaginationOutcome(page0FailPuuid, region)
+            val page0Outcome = realRiotSpy.fetchMatchIdsWithOutcomeSince(page0FailPuuid, region, 0L)
 
             val page1FailPuuid = "page1-null-fail-puuid"
             coEvery { realRiotSpy.getSummonerByPuuid(page1FailPuuid, region) } returns SummonerDto("id", page1FailPuuid, 300L, 11)
@@ -1731,7 +1735,7 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 objectMapper = mapper
             )
             val page1FailProfile = page1Service.getPlayerProfile(page1FailPuuid, region, summonerName, tagLine, explicitRefresh = true)
-            val page1Outcome = realRiotSpy.getLastMatchIdsPaginationOutcome(page1FailPuuid, region)
+            val page1Outcome = realRiotSpy.fetchMatchIdsWithOutcomeSince(page1FailPuuid, region, 0L)
             val page1State = mapper.readValue(page1SavedEntity!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
 
             val real2100Puuid = "real-pagination-2100-puuid"

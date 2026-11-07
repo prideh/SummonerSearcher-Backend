@@ -446,14 +446,8 @@ class RiotApiService(
         val stoppedOnPageFailure: Boolean = false
     )
 
-    private val lastMatchIdsPaginationOutcomes =
-        java.util.concurrent.ConcurrentHashMap<String, MatchIdsPaginationOutcome>()
-
-    fun getLastMatchIdsPaginationOutcome(puuid: String, region: String): MatchIdsPaginationOutcome? =
-        lastMatchIdsPaginationOutcomes["${region.lowercase().trim()}:${puuid.trim()}"]
-
     /**
-     * Paginates Ranked Solo (`queueId = 420`) match IDs since [startTime] while recording explicit
+     * Paginates Ranked Solo (`queueId = 420`) match IDs since [startTime] while returning explicit
      * pagination completion metadata ([MatchIdsPaginationOutcome]):
      * - `matchIds == null` (or page fetch exception) sets `stoppedOnPageFailure = true` and `exhaustedCleanly = false`
      *   (never conflating a failed page with clean empty exhaustion).
@@ -522,7 +516,6 @@ class RiotApiService(
             hitSafetyCap = hitSafetyCap,
             stoppedOnPageFailure = stoppedOnPageFailure
         )
-        lastMatchIdsPaginationOutcomes["${region.lowercase().trim()}:${puuid.trim()}"] = outcome
         logger.info(
             "Found total ${allMatchIds.size} match IDs since $startTime for $puuid (pagesFetched=$pagesFetched, exhaustedCleanly=$exhaustedCleanly, hitSafetyCap=$hitSafetyCap, stoppedOnPageFailure=$stoppedOnPageFailure)"
         )
@@ -530,8 +523,7 @@ class RiotApiService(
     }
 
     /**
-     * Fetches all match IDs since a given start time and records [MatchIdsPaginationOutcome]
-     * for [getLastMatchIdsPaginationOutcome].
+     * Fetches all match IDs since a given start time.
      */
     suspend fun fetchMatchIdsSince(puuid: String, region: String, startTime: Long? = null): List<String> =
         fetchMatchIdsWithOutcomeSince(puuid, region, startTime).matchIds

@@ -769,30 +769,35 @@ class PlayerCacheService(
             val refreshedLevel = freshSummoner.summonerLevel ?: cachedProfile?.summonerLevel
             val refreshedIconId = freshSummoner.profileIconId ?: cachedProfile?.profileIconId
 
-            // Fetch rank and season match ID list concurrently
+            // Fetch rank and season match ID list (with explicit pagination outcome) concurrently
             val rankDeferred = async { riotApiService.fetchLeagueRank(puuid, region) }
-            val matchIdsDeferred = async { riotApiService.fetchMatchIdsSince(puuid, region, startOfYear) }
+            val matchIdsOutcomeDeferred = async {
+                riotApiService.fetchMatchIdsWithOutcomeSince(puuid, region, startOfYear)
+            }
             val freshRank = rankDeferred.await()
-            val rawAllMatchIds = matchIdsDeferred.await()
-            val recordedOutcome = riotApiService.getLastMatchIdsPaginationOutcome(puuid, region)
-                ?.takeIf {
-                    (it.exhaustedCleanly || it.hitSafetyCap || it.stoppedOnPageFailure || it.pagesFetched > 0) &&
-                        it.matchIds == rawAllMatchIds
-                }
+            val paginationOutcome = matchIdsOutcomeDeferred.await()
+            val rawAllMatchIds = paginationOutcome.matchIds
+            val hasExplicitOutcomeMetadata = paginationOutcome.exhaustedCleanly ||
+                paginationOutcome.hitSafetyCap ||
+                paginationOutcome.stoppedOnPageFailure ||
+                paginationOutcome.pagesFetched > 0
             val rawNonBlankIds = rawAllMatchIds
                 .asSequence()
                 .map { it.trim() }
                 .filter { it.isNotBlank() }
                 .toList()
             val rawDistinctMatchIds = rawNonBlankIds.distinct()
-            val paginationStoppedOnFailure = recordedOutcome?.stoppedOnPageFailure ?: false
+            val paginationStoppedOnFailure = paginationOutcome.stoppedOnPageFailure
             // Capture pagination safety-cap and truncation evidence BEFORE truncating to MAX_TRACKED_SEASON_MATCH_IDS (2,100).
-            val rawFetchHitSafetyLimit = (recordedOutcome?.hitSafetyCap == true) ||
+            val rawFetchHitSafetyLimit = paginationOutcome.hitSafetyCap ||
                 rawAllMatchIds.size > DurablePlayerSeasonStatsDto.RIOT_MATCH_IDS_SAFETY_THRESHOLD ||
                 rawDistinctMatchIds.size > DurablePlayerSeasonStatsDto.RIOT_MATCH_IDS_SAFETY_THRESHOLD
             val rawFetchTruncatedByLedgerCap = rawDistinctMatchIds.size > DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS
-            val paginationExhaustedCleanly = recordedOutcome?.exhaustedCleanly
-                ?: (!paginationStoppedOnFailure && !rawFetchHitSafetyLimit && !rawFetchTruncatedByLedgerCap)
+            val paginationExhaustedCleanly = if (hasExplicitOutcomeMetadata) {
+                paginationOutcome.exhaustedCleanly
+            } else {
+                !paginationStoppedOnFailure && !rawFetchHitSafetyLimit && !rawFetchTruncatedByLedgerCap
+            }
             val distinctAllMatchIds = rawDistinctMatchIds.take(DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS)
             val metadataAndIdsMs = timeProvider.now() - metaStartMs
 
@@ -800,7 +805,7 @@ class PlayerCacheService(
             val durableState = loadedDurable?.state
 
             // Never conflate a page-0 match-ID pagination failure (`matchIds == null` at start=0) with an empty season:
-            if (paginationStoppedOnFailure && (recordedOutcome?.pagesFetched ?: 0) == 0 && distinctAllMatchIds.isEmpty()) {
+            if (paginationStoppedOnFailure && paginationOutcome.pagesFetched == 0 && distinctAllMatchIds.isEmpty()) {
                 logger.warn(
                     "Match ID pagination failed on page 0 for {}#{} ({}); refusing to treat failed page as empty season.",
                     summonerName, tagLine, region
