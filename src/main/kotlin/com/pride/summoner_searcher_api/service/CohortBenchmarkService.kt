@@ -2544,8 +2544,22 @@ class CohortBenchmarkService(
             }
 
             try {
-                val groundedPatch = resolveGroundedCurrentPatch(normalizedRegion, allowLightRedisMatchProbe = false)
-                if (cleanPatch != null && groundedPatch != null && cleanPatch != groundedPatch) {
+                val groundedPatch = resolveGroundedCurrentPatch(
+                    region = normalizedRegion,
+                    allowLightRedisMatchProbe = false,
+                    allowExternalNetworkLookup = false
+                )
+                if (groundedPatch == null) {
+                    return CohortCachedPlayerIngestionResultDto(
+                        region = normalizedRegion,
+                        targetPatch = cleanPatch,
+                        status = "GROUNDED_PATCH_UNAVAILABLE",
+                        playerHash = playerHash,
+                        memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
+                        notes = listOf("No grounded current patch available in cache or durable stores for region '$normalizedRegion' (network-free fail-closed resolver); zero writes performed.")
+                    )
+                }
+                if (cleanPatch != null && cleanPatch != groundedPatch) {
                     return CohortCachedPlayerIngestionResultDto(
                         region = normalizedRegion,
                         targetPatch = groundedPatch,
@@ -2555,7 +2569,7 @@ class CohortBenchmarkService(
                         notes = listOf("Refused non-current patch '$cleanPatch' for region '$normalizedRegion': grounded current patch is '$groundedPatch'.")
                     )
                 }
-                if (groundedPatch != null && groundedPatch != cleanPatch && isReportRecomputeGuardHeld(normalizedRegion, groundedPatch)) {
+                if (groundedPatch != cleanPatch && isReportRecomputeGuardHeld(normalizedRegion, groundedPatch)) {
                     return CohortCachedPlayerIngestionResultDto(
                         region = normalizedRegion,
                         targetPatch = groundedPatch,
@@ -2634,7 +2648,7 @@ class CohortBenchmarkService(
                 if (resolvedRankSnapshot == null) {
                     return CohortCachedPlayerIngestionResultDto(
                         region = normalizedRegion,
-                        targetPatch = cleanPatch ?: groundedPatch,
+                        targetPatch = groundedPatch,
                         status = "SKIPPED_UNRANKED_OR_STALE_RANK",
                         playerHash = playerHash,
                         memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
@@ -2642,29 +2656,40 @@ class CohortBenchmarkService(
                     )
                 }
 
-                // 2. Select at most effectiveCap (<= 10) exact match IDs from explicitMatchIds or cached profile
+                // 2. Select at most effectiveCap (<= 10) exact match IDs lazily via Sequence from explicitMatchIds or cached profile
                 val cleanedExplicitIds = explicitMatchIds
+                    .asSequence()
                     .map { it.trim() }
                     .filter { it.isNotBlank() }
                     .distinct()
                     .take(effectiveCap)
+                    .toList()
                 val candidateMatchIds = if (cleanedExplicitIds.isNotEmpty()) {
                     cleanedExplicitIds
                 } else {
                     val fromAllIds = cachedProfile?.allMatchIds.orEmpty()
+                        .asSequence()
                         .map { it.trim() }
                         .filter { it.isNotBlank() }
-                    val fromRecentDtos = cachedProfile?.recentMatches.orEmpty()
-                        .mapNotNull { it.metadata?.matchId?.trim()?.takeIf { id -> id.isNotBlank() } }
-                    (if (fromAllIds.isNotEmpty()) fromAllIds else fromRecentDtos)
                         .distinct()
                         .take(effectiveCap)
+                        .toList()
+                    if (fromAllIds.isNotEmpty()) {
+                        fromAllIds
+                    } else {
+                        cachedProfile?.recentMatches.orEmpty()
+                            .asSequence()
+                            .mapNotNull { it.metadata?.matchId?.trim()?.takeIf { id -> id.isNotBlank() } }
+                            .distinct()
+                            .take(effectiveCap)
+                            .toList()
+                    }
                 }
 
                 if (candidateMatchIds.isEmpty()) {
                     return CohortCachedPlayerIngestionResultDto(
                         region = normalizedRegion,
-                        targetPatch = cleanPatch ?: groundedPatch,
+                        targetPatch = groundedPatch,
                         status = "NO_CACHED_MATCH_IDS",
                         playerHash = playerHash,
                         tier = resolvedRankSnapshot.tier,
@@ -2673,11 +2698,16 @@ class CohortBenchmarkService(
                     )
                 }
 
+                val candidateMatchIdSet = candidateMatchIds.toSet()
                 val profileRecentByMatchId = cachedProfile?.recentMatches.orEmpty()
-                    .mapNotNull { m -> m.metadata?.matchId?.trim()?.takeIf { it.isNotBlank() }?.let { it to m } }
+                    .asSequence()
+                    .mapNotNull { m ->
+                        val id = m.metadata?.matchId?.trim()?.takeIf { it in candidateMatchIdSet }
+                        if (id != null) id to m else null
+                    }
                     .toMap()
 
-                var activePatch: String? = cleanPatch ?: groundedPatch
+                val resolvedPatch: String = groundedPatch
                 var excludedWrongPatchMatches = 0
                 var excludedStaleOrSkewMatches = 0
                 var excludedNonSoloOrRemakeMatches = 0
@@ -2705,30 +2735,7 @@ class CohortBenchmarkService(
                     }
 
                     val matchPatch = extractMajorMinorPatch(info.gameVersion)
-                    if (matchPatch == null) {
-                        excludedWrongPatchMatches++
-                        continue
-                    }
-                    if (activePatch == null) {
-                        val groundedWithCandidate = resolveGroundedCurrentPatch(
-                            region = normalizedRegion,
-                            observedCandidatePatch = matchPatch,
-                            allowLightRedisMatchProbe = false
-                        ) ?: matchPatch
-                        if (groundedWithCandidate != activePatch && isReportRecomputeGuardHeld(normalizedRegion, groundedWithCandidate)) {
-                            return CohortCachedPlayerIngestionResultDto(
-                                region = normalizedRegion,
-                                targetPatch = groundedWithCandidate,
-                                status = "LOCKED_BY_ACTIVE_WRITER",
-                                playerHash = playerHash,
-                                tier = resolvedRankSnapshot.tier,
-                                memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
-                                notes = listOf("Report recompute lock is active in Redis for patch '$groundedWithCandidate' in region '$normalizedRegion'; zero writes performed.")
-                            )
-                        }
-                        activePatch = groundedWithCandidate
-                    }
-                    if (matchPatch != activePatch) {
+                    if (matchPatch == null || matchPatch != resolvedPatch) {
                         excludedWrongPatchMatches++
                         continue
                     }
@@ -2781,8 +2788,7 @@ class CohortBenchmarkService(
                     )
                 }
 
-                val resolvedPatch = activePatch
-                if (extractedSamples.isEmpty() || resolvedPatch == null) {
+                if (extractedSamples.isEmpty()) {
                     return CohortCachedPlayerIngestionResultDto(
                         region = normalizedRegion,
                         targetPatch = resolvedPatch,
@@ -3064,6 +3070,7 @@ class CohortBenchmarkService(
                 }
                 inMemoryGroundedPatchByRegion[normalizedRegion] = resolvedPatch
 
+                val postCommitCacheWarnings = mutableListOf<String>()
                 runCatching {
                     val allPersistedCells = cohortBenchmarkCellRepository.findByRegionAndPatchAndQueueIdOrderByTierAscRoleAsc(
                         region = normalizedRegion,
@@ -3072,19 +3079,49 @@ class CohortBenchmarkService(
                     ).mapNotNull { entityToDto(it) }
                     if (allPersistedCells.isNotEmpty()) {
                         redisCacheService.set(benchmarkCacheKey(normalizedRegion, resolvedPatch), allPersistedCells, BENCHMARK_CACHE_TTL)
+                    } else {
+                        redisCacheService.delete(benchmarkCacheKey(normalizedRegion, resolvedPatch))
+                    }
+                }.onFailure { err ->
+                    postCommitCacheWarnings.add("Failed to refresh benchmark Redis cache (${err.javaClass.simpleName})")
+                    runCatching {
+                        redisCacheService.delete(benchmarkCacheKey(normalizedRegion, resolvedPatch))
+                    }.onFailure { delErr ->
+                        postCommitCacheWarnings.add("Failed fallback eviction of benchmark Redis cache (${delErr.javaClass.simpleName})")
                     }
                 }
                 runCatching {
                     redisCacheService.delete(reportCacheKey(normalizedRegion, resolvedPatch))
+                }.onFailure { err ->
+                    postCommitCacheWarnings.add("Failed to evict patch report Redis cache (${err.javaClass.simpleName})")
+                }
+                runCatching {
                     redisCacheService.delete(reportCacheKey(normalizedRegion, null))
+                }.onFailure { err ->
+                    postCommitCacheWarnings.add("Failed to evict latest report Redis cache (${err.javaClass.simpleName})")
                 }
 
                 val totalNetNew = pendingWrites.sumOf { it.netNewSamplesInCell }
                 val updatedCellDtos = pendingWrites.map { it.cellDto }
+                val finalStatus = if (postCommitCacheWarnings.isEmpty()) {
+                    "COMPLETED"
+                } else {
+                    "COMMITTED_WITH_CACHE_REFRESH_WARNING"
+                }
+                val finalNotes = buildList {
+                    add(
+                        "Atomically folded $totalNetNew net-new qualified sample(s) for single cached player into ${updatedCellDtos.size} cell(s) on patch '$resolvedPatch' with zero Riot API calls and zero Redis SCANs."
+                    )
+                    if (postCommitCacheWarnings.isNotEmpty()) {
+                        add(
+                            "Database transaction committed, but post-commit Redis cache refresh/eviction encountered warning(s): ${postCommitCacheWarnings.joinToString("; ")}."
+                        )
+                    }
+                }
                 return CohortCachedPlayerIngestionResultDto(
                     region = normalizedRegion,
                     targetPatch = resolvedPatch,
-                    status = "COMPLETED",
+                    status = finalStatus,
                     playerHash = playerHash,
                     tier = resolvedRankSnapshot.tier,
                     inspectedMatchIdsCount = candidateMatchIds.size,
@@ -3097,9 +3134,7 @@ class CohortBenchmarkService(
                     excludedIneligibleRoleMatches = excludedIneligibleRoleMatches,
                     missingOrUncachedMatches = missingOrUncachedMatches,
                     memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
-                    notes = listOf(
-                        "Atomically folded $totalNetNew net-new qualified sample(s) for single cached player into ${updatedCellDtos.size} cell(s) on patch '$resolvedPatch' with zero Riot API calls and zero Redis SCANs."
-                    )
+                    notes = finalNotes
                 )
             } finally {
                 releaseCollectorProcessLock(normalizedRegion)
@@ -3972,7 +4007,7 @@ class CohortBenchmarkService(
      * - Uses a 60-second failure cooldown on network/parse failure.
      * - Safe fallback: returns `null` (or last valid cached patch) on failure without throwing or advancing.
      */
-    internal fun resolveDataDragonLatestPatch(): String? {
+    internal fun resolveDataDragonLatestPatch(allowExternalNetworkLookup: Boolean = true): String? {
         val nowMs = timeProvider.now()
         val localCached = cachedDataDragonPatch
         if (localCached != null && nowMs < cachedDataDragonPatchExpiresAtMs) {
@@ -3985,6 +4020,9 @@ class CohortBenchmarkService(
             cachedDataDragonPatch = redisCached
             cachedDataDragonPatchExpiresAtMs = nowMs + EXTERNAL_PATCH_CACHE_TTL_MS
             return redisCached
+        }
+        if (!allowExternalNetworkLookup) {
+            return localCached
         }
         if (lastDataDragonLookupFailureAtMs > 0L && nowMs - lastDataDragonLookupFailureAtMs < EXTERNAL_PATCH_FAILURE_COOLDOWN_MS) {
             return localCached
@@ -4031,10 +4069,11 @@ class CohortBenchmarkService(
     fun resolveGroundedCurrentPatch(
         region: String,
         observedCandidatePatch: String? = null,
-        allowLightRedisMatchProbe: Boolean = false
+        allowLightRedisMatchProbe: Boolean = false,
+        allowExternalNetworkLookup: Boolean = true
     ): String? {
         val normalizedRegion = region.lowercase().trim()
-        val dataDragonPatch = resolveDataDragonLatestPatch()
+        val dataDragonPatch = resolveDataDragonLatestPatch(allowExternalNetworkLookup = allowExternalNetworkLookup)
         val cleanObserved = cleanPatchCandidate(observedCandidatePatch)
         val freshMatchPatch = cleanPatchCandidate(freshRankedSoloMatchPatchByRegion[normalizedRegion]) ?: cleanObserved
 

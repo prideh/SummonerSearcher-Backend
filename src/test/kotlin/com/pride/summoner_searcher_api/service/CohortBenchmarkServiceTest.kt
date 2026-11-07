@@ -3475,6 +3475,8 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             val redisMap = LinkedHashMap<String, Any>()
             val activeRedisLocks = LinkedHashMap<String, String>()
 
+            val failPostCommitCacheRefresh = java.util.concurrent.atomic.AtomicBoolean(false)
+
             every { exactRedis.get(any(), any<Class<Any>>()) } answers {
                 val key = firstArg<String>()
                 val clazz = secondArg<Class<Any>>()
@@ -3487,7 +3489,11 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 }
             }
             every { exactRedis.set(any(), any<Any>(), any()) } answers {
-                redisMap[firstArg<String>()] = secondArg<Any>()
+                val key = firstArg<String>()
+                if (failPostCommitCacheRefresh.get() && key.startsWith("cohort:benchmarks:")) {
+                    throw RuntimeException("Simulated Redis benchmark cache write timeout after DB commit")
+                }
+                redisMap[key] = secondArg<Any>()
             }
             every { exactRedis.setIfAbsent(any(), any(), any()) } answers {
                 val key = firstArg<String>()
@@ -3502,9 +3508,20 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             every { exactRedis.delete(any()) } answers {
                 val key = firstArg<String>()
                 activeRedisLocks.remove(key)
+                if (failPostCommitCacheRefresh.get() && key.startsWith("cohort:report:")) {
+                    throw RuntimeException("Simulated Redis report cache eviction failure after DB commit")
+                }
                 redisMap.remove(key)
             }
-            every { exactRiotApi.fetchDataDragonVersions(any()) } returns listOf("16.22.1")
+            every { exactSampleRepo.findDistinctPatchesByRegionWithEligibleGames(any()) } answers {
+                val r = firstArg<String>()
+                savedSampleEntities.values.filter { it.region == r && it.eligibleGames > 0 }.map { it.patch }.distinct()
+            }
+            every { exactCellRepo.findDistinctPatchesByRegionWithEligibleGames(any()) } answers {
+                val r = firstArg<String>()
+                savedBenchmarkEntities.values.filter { it.region == r && it.eligibleGames > 0 }.map { it.patch }.distinct()
+            }
+            every { exactCheckpointRepo.findFirstByRegionAndQueueIdOrderByUpdatedAtDesc(any(), any()) } returns null
 
             every {
                 exactSampleRepo.findByRegionAndPatchAndQueueIdAndTierAndRole(any(), any(), any(), any(), any())
@@ -3687,6 +3704,21 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                     )
                 )
             )
+            // Match 12 is valid on patch 16.22 for testing post-commit cache failure warning
+            redisMap["match:euw1:EUW1_EXACT_12"] = MatchDto(
+                metadata = MatchMetadata("EUW1_EXACT_12", listOf(selectedPuuid)),
+                info = MatchInfo(
+                    gameCreation = nowMs - 9_000_000L,
+                    gameDuration = 1800L,
+                    gameId = 1012L,
+                    queueId = 420,
+                    gameMode = "CLASSIC",
+                    gameVersion = "16.22.615.1000",
+                    participants = listOf(
+                        buildParticipant(puuid = selectedPuuid, role = "TOP", laneCs10 = 94, totalMinions = 260, neutralMinions = 8)
+                    )
+                )
+            )
 
             // 1. Fail-closed test when CohortCellSampleStateRepository is unwired (null)
             val serviceUnwiredRepo = CohortBenchmarkService(
@@ -3743,6 +3775,29 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 targetPatch = "16.22"
             )
 
+            // 2b. Network-free fail-closed patch resolver on completely cold cache (no Redis ddragon key, no DB grounded patches):
+            //     Must return GROUNDED_PATCH_UNAVAILABLE with 0 writes and 0 RiotApiService interactions (no fetchDataDragonVersions call!)
+            val coldCacheService = CohortBenchmarkService(
+                redisCacheService = exactRedis,
+                cohortBenchmarkCellRepository = exactCellRepo,
+                riotApiRateLimiter = exactLimiter,
+                riotApiService = exactRiotApi,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = timeProvider,
+                cohortCollectorCheckpointRepository = exactCheckpointRepo,
+                cohortCellSampleStateRepository = exactSampleRepo,
+                transactionTemplate = validTxTemplate
+            )
+            val coldCacheUnavailablePatchResult = coldCacheService.ingestCachedPlayerByExactIds(
+                region = "euw1",
+                puuid = selectedPuuid,
+                targetPatch = null
+            )
+
+            // Now seed grounded patch in Redis ("cohort:patch:external:ddragon" -> "16.22") while in-memory DataDragon cache on new services is still cold
+            redisMap["cohort:patch:external:ddragon"] = "16.22"
+
             // 3. Properly wired service: test divergent unsaved in-memory state refusal first
             val wiredService = CohortBenchmarkService(
                 redisCacheService = exactRedis,
@@ -3783,7 +3838,7 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 targetPatch = "16.22"
             )
 
-            // Clear divergent state by creating a fresh wired service and run happy-path ingestion (using top 10 from profile)
+            // Clear divergent state by creating a fresh wired service (cold in-memory DataDragon cache!) and run happy-path ingestion
             val cleanWiredService = CohortBenchmarkService(
                 redisCacheService = exactRedis,
                 cohortBenchmarkCellRepository = exactCellRepo,
@@ -3796,8 +3851,6 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 cohortCellSampleStateRepository = exactSampleRepo,
                 transactionTemplate = validTxTemplate
             )
-            clearMocks(exactRiotApi, answers = false)
-            every { exactRiotApi.fetchDataDragonVersions(any()) } returns listOf("16.22.1")
 
             val firstIngestResult = cleanWiredService.ingestCachedPlayerByExactIds(
                 region = "euw1",
@@ -3864,13 +3917,29 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             val postMappingAnn = ingestEndpointMethod.getAnnotation(org.springframework.web.bind.annotation.PostMapping::class.java)
             val reqMappingAnn = ingestEndpointMethod.getAnnotation(org.springframework.web.bind.annotation.RequestMapping::class.java)
 
-            Then("it should fail closed without TransactionTemplate/repo, refuse divergent unsaved in-memory state, bound inspection to <=10 own matches with 0 Riot/SCAN/checkpoint calls, serialize full RMW intervals without false empty reports, and enforce POST operator auth") {
+            // 7. Post-commit Redis cache refresh/eviction failure reports COMMITTED_WITH_CACHE_REFRESH_WARNING instead of silently COMPLETED
+            failPostCommitCacheRefresh.set(true)
+            val postCommitCacheWarnResult = try {
+                cleanWiredService.ingestCachedPlayerByExactIds(
+                    region = "euw1",
+                    puuid = selectedPuuid,
+                    targetPatch = "16.22",
+                    explicitMatchIds = listOf("EUW1_EXACT_12")
+                )
+            } finally {
+                failPostCommitCacheRefresh.set(false)
+            }
+
+            Then("it should fail closed without TransactionTemplate/repo/groundedPatch, refuse divergent unsaved in-memory state, bound inspection to <=10 own matches with 0 entire-RiotApiService/SCAN/checkpoint calls, report post-commit cache failure as COMMITTED_WITH_CACHE_REFRESH_WARNING, serialize full RMW intervals, and enforce POST operator auth") {
                 unwiredRepoResult.status shouldBe "SAMPLE_STATE_REPOSITORY_UNWIRED"
                 unwiredRepoResult.netNewSamplesPersisted shouldBe 0
                 missingTxResult.status shouldBe "TRANSACTION_MANAGER_REQUIRED"
                 missingTxResult.netNewSamplesPersisted shouldBe 0
                 emptyTxManagerResult.status shouldBe "TRANSACTION_MANAGER_REQUIRED"
                 emptyTxManagerResult.netNewSamplesPersisted shouldBe 0
+
+                coldCacheUnavailablePatchResult.status shouldBe "GROUNDED_PATCH_UNAVAILABLE"
+                coldCacheUnavailablePatchResult.netNewSamplesPersisted shouldBe 0
 
                 divergentRefusedResult.status shouldBe "REFUSED_DIVERGENT_IN_MEMORY_CELL_STATE"
                 divergentRefusedResult.netNewSamplesPersisted shouldBe 0
@@ -3904,9 +3973,6 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 // Repeat call deduplicates with 0 new DB writes
                 repeatIngestResult.status shouldBe "NO_NEW_ELIGIBLE_SAMPLES"
                 repeatIngestResult.netNewSamplesPersisted shouldBe 0
-                cleanWiredService.getDurableDbWriteCounts()["cohortCellSampleStatesWrites"] shouldBe 1L
-                cleanWiredService.getDurableDbWriteCounts()["cohortBenchmarkCellsWrites"] shouldBe 1L
-                cleanWiredService.getDurableDbWriteCounts()["cohortCollectorCheckpointsWrites"] shouldBe 0L
 
                 // Exclusive gate contention: refuses concurrent ingest, serves non-empty persisted cells on report & getPersistedCohortCells
                 ingestWhileGateHeld.status shouldBe "LOCKED_BY_ACTIVE_WRITER"
@@ -3928,12 +3994,19 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 runner.getStatus("euw1", "16.22").overnightSessionArmed shouldBe false
                 runner.getStatus("euw1", "16.22").runningInProcess shouldBe false
 
-                // Zero Riot low-priority/foreground calls, zero Redis SCANs, zero checkpoint saves
+                // Post-commit Redis cache refresh/eviction failure reports COMMITTED_WITH_CACHE_REFRESH_WARNING while preserving committed DB state
+                postCommitCacheWarnResult.status shouldBe "COMMITTED_WITH_CACHE_REFRESH_WARNING"
+                postCommitCacheWarnResult.netNewSamplesPersisted shouldBe 1
+                postCommitCacheWarnResult.updatedCells.single().eligibleGames shouldBe 3
+                postCommitCacheWarnResult.notes.any { it.contains("post-commit Redis cache refresh/eviction encountered warning") } shouldBe true
+                cleanWiredService.getDurableDbWriteCounts()["cohortCellSampleStatesWrites"] shouldBe 3L
+                cleanWiredService.getDurableDbWriteCounts()["cohortBenchmarkCellsWrites"] shouldBe 3L
+                cleanWiredService.getDurableDbWriteCounts()["cohortCollectorCheckpointsWrites"] shouldBe 0L
+
+                // Zero interactions on the ENTIRE RiotApiService mock (including fetchDataDragonVersions on cold cache!), zero Redis SCANs, zero checkpoint saves
+                verify { exactRiotApi wasNot Called }
                 verify(exactly = 0) { exactRedis.scanKeys(any(), any(), any()) }
                 verify(exactly = 0) { exactCheckpointRepo.save(any()) }
-                coVerify(exactly = 0) { exactRiotApi.fetchLeagueRankLowPriority(any(), any(), any(), any(), any()) }
-                coVerify(exactly = 0) { exactRiotApi.getMatchIdsByPuuidLowPriority(any(), any(), any(), any(), any(), any(), any(), any()) }
-                coVerify(exactly = 0) { exactRiotApi.getMatchByIdLowPriority(any(), any(), any(), any(), any()) }
             }
         }
     }
