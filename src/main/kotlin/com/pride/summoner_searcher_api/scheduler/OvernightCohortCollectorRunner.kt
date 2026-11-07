@@ -223,6 +223,7 @@ class OvernightCohortCollectorRunner(
         maxPauseCycles: Int = 240,
         maxTotalProductiveBatches: Int = DEFAULT_MAX_SESSION_PRODUCTIVE_BATCHES,
         maxTotalNetworkCalls: Int = DEFAULT_MAX_SESSION_NETWORK_CALLS,
+        seedPuuids: List<String> = emptyList(),
         async: Boolean = true
     ): CohortCollectorStatusDto {
         return startOrResumeInternal(
@@ -234,6 +235,7 @@ class OvernightCohortCollectorRunner(
             maxPauseCycles = maxPauseCycles,
             maxTotalProductiveBatches = maxTotalProductiveBatches,
             maxTotalNetworkCalls = maxTotalNetworkCalls,
+            seedPuuids = seedPuuids,
             async = async,
             isAutoResume = false
         )
@@ -248,6 +250,7 @@ class OvernightCohortCollectorRunner(
         maxPauseCycles: Int,
         maxTotalProductiveBatches: Int,
         maxTotalNetworkCalls: Int,
+        seedPuuids: List<String> = emptyList(),
         async: Boolean,
         isAutoResume: Boolean
     ): CohortCollectorStatusDto {
@@ -260,6 +263,16 @@ class OvernightCohortCollectorRunner(
         if (!cohortBenchmarkService.isValidPatchOrNull(cleanPatch)) {
             return buildInvalidParamStatus(normalizedRegion, cleanPatch, "Invalid patch format '$cleanPatch' (expected major.minor).")
         }
+        if (seedPuuids.size > CohortBenchmarkService.MAX_EXPLICIT_SEED_PUUIDS ||
+            seedPuuids.any { !cohortBenchmarkService.isValidCandidatePuuid(it) }
+        ) {
+            return buildInvalidParamStatus(
+                normalizedRegion,
+                cleanPatch,
+                "Invalid seedPuuid parameter (max ${CohortBenchmarkService.MAX_EXPLICIT_SEED_PUUIDS} non-blank PUUIDs of length <= ${CohortBenchmarkService.MAX_CANDIDATE_PUUID_LENGTH} without whitespace or commas)."
+            )
+        }
+        val cleanSeedPuuids = if (isAutoResume) emptyList() else cohortBenchmarkService.sanitizeSeedPuuids(seedPuuids)
 
         val coercedMaxBatches = maxBatches.coerceIn(1, 500)
         val coercedBatchSize = batchSize.coerceIn(1, 200)
@@ -293,7 +306,27 @@ class OvernightCohortCollectorRunner(
             )
         }
 
-        val existingCheckpoint = cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch)
+        val existingCheckpoint = try {
+            cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, cleanPatch)
+                ?: if (cleanPatch != null) cohortBenchmarkService.getCollectorCheckpoint(normalizedRegion, null) else null
+        } catch (e: Exception) {
+            cohortBenchmarkService.releaseCollectorProcessLock(normalizedRegion)
+            running.set(false)
+            throw e
+        }
+        if (cleanSeedPuuids.isNotEmpty() &&
+            cohortBenchmarkService.wouldExceedPendingQueueCap(existingCheckpoint, cleanSeedPuuids)
+        ) {
+            cohortBenchmarkService.releaseCollectorProcessLock(normalizedRegion)
+            running.set(false)
+            return buildInvalidParamStatus(
+                region = normalizedRegion,
+                targetPatch = cleanPatch ?: existingCheckpoint?.targetPatch,
+                note = "Explicit seedPuuid list would exceed pending queue cap (${CohortBenchmarkService.MAX_CHECKPOINT_PENDING_PUUIDS}); refusing before mutation.",
+                checkpoint = existingCheckpoint
+            )
+        }
+
         stopRequested.set(false)
         overnightSessionArmed.set(true)
         activeRegion = normalizedRegion
@@ -330,7 +363,8 @@ class OvernightCohortCollectorRunner(
                         maxBatches = effectiveChunkMaxBatches,
                         batchSize = coercedBatchSize,
                         pauseDelayMs = coercedPauseMs,
-                        maxPauseCycles = coercedMaxPauseCycles
+                        maxPauseCycles = coercedMaxPauseCycles,
+                        seedPuuids = cleanSeedPuuids
                     )
                 } catch (e: Exception) {
                     logger.error("[OvernightCollector] Error during same-process background collector run for {}", normalizedRegion, e)
@@ -355,7 +389,8 @@ class OvernightCohortCollectorRunner(
                         maxBatches = effectiveChunkMaxBatches,
                         batchSize = coercedBatchSize,
                         pauseDelayMs = coercedPauseMs,
-                        maxPauseCycles = coercedMaxPauseCycles
+                        maxPauseCycles = coercedMaxPauseCycles,
+                        seedPuuids = cleanSeedPuuids
                     )
                 }
             } finally {
@@ -679,7 +714,8 @@ class OvernightCohortCollectorRunner(
         maxBatches: Int = DEFAULT_MAX_BATCHES_PER_CHUNK,
         batchSize: Int = DEFAULT_BATCH_SIZE,
         pauseDelayMs: Long = 2_500L,
-        maxPauseCycles: Int = 240
+        maxPauseCycles: Int = 240,
+        seedPuuids: List<String> = emptyList()
     ): CohortCollectorCheckpointDto? {
         logger.info(
             "[OvernightCollector] Starting same-process resumable LOW-priority cohort collector: region={}, patch={}, maxProductiveBatches={}, maxSessionBatches={}/{}, maxSessionNetworkCalls={}/{}, maxPauseCycles={}, batchSize={}, maxGamesPerPlayer={}",
@@ -752,6 +788,7 @@ class OvernightCohortCollectorRunner(
                 cohortBenchmarkService.runResumableLowPriorityCollectorBatch(
                     region = region,
                     targetPatch = targetPatch ?: lastCheckpoint?.targetPatch,
+                    seedPuuids = if (productiveBatchesCompleted == 0) seedPuuids else emptyList(),
                     maxPlayersPerBatch = batchSize,
                     maxGamesPerPlayer = CohortBenchmarkCellDto.DEFAULT_MAX_GAMES_PER_PLAYER,
                     maxSessionNetworkCalls = maxSessionNetworkCallsConfigured,
@@ -1158,7 +1195,8 @@ class OvernightCohortCollectorRunner(
     private fun buildInvalidParamStatus(
         region: String,
         targetPatch: String?,
-        note: String
+        note: String,
+        checkpoint: CohortCollectorCheckpointDto? = null
     ): CohortCollectorStatusDto {
         return CohortCollectorStatusDto(
             region = region,
@@ -1191,7 +1229,7 @@ class OvernightCohortCollectorRunner(
                 readyForLowPriorityNetworkCollection = false
             ),
             memoryHeadroom = cohortBenchmarkService.getMemoryHeadroomSnapshot(allowGcHintOnPressure = false),
-            checkpoint = null
+            checkpoint = checkpoint
         )
     }
 }

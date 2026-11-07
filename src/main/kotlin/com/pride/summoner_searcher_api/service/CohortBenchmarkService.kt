@@ -372,6 +372,8 @@ class CohortBenchmarkService(
         const val MAX_CHECKPOINT_PROCESSED_PUUIDS = 5_000
         const val MAX_CHECKPOINT_PROCESSED_MATCH_IDS = 10_000
         const val MAX_CHECKPOINT_PENDING_PUUIDS = 500
+        const val MAX_EXPLICIT_SEED_PUUIDS = 25
+        const val MAX_CANDIDATE_PUUID_LENGTH = 250
         const val DEFAULT_CONTAINER_MEMORY_LIMIT_BYTES = 536_870_912L // 512 MB Render container cap
         const val DEFAULT_MAX_MEMORY_UTILIZATION_RATIO = 0.78
         const val DEFAULT_MIN_FREE_MEMORY_BYTES = 67_108_864L // 64 MB minimum free headroom
@@ -1723,8 +1725,18 @@ class CohortBenchmarkService(
         }
 
         try {
+        if (seedPuuids.size > MAX_EXPLICIT_SEED_PUUIDS || seedPuuids.any { !isValidCandidatePuuid(it) }) {
+            throw IllegalArgumentException(
+                "Invalid seedPuuids (max $MAX_EXPLICIT_SEED_PUUIDS non-blank PUUIDs of length <= $MAX_CANDIDATE_PUUID_LENGTH without whitespace or commas)."
+            )
+        }
         val existingCheckpoint = getCollectorCheckpoint(normalizedRegion, cleanRequestedPatch)
             ?: if (cleanRequestedPatch != null) getCollectorCheckpoint(normalizedRegion, null) else null
+        if (seedPuuids.isNotEmpty() && wouldExceedPendingQueueCap(existingCheckpoint, seedPuuids)) {
+            throw IllegalArgumentException(
+                "Explicit seedPuuid list would exceed pending queue cap ($MAX_CHECKPOINT_PENDING_PUUIDS); refusing before mutation."
+            )
+        }
 
         // Pre-scan memory safety check: if memory is near the 512MB cap, yield BEFORE scanning Redis or making network calls!
         val preScanMem = getMemoryHeadroomSnapshot()
@@ -1789,6 +1801,11 @@ class CohortBenchmarkService(
         val checkpointStalePatchAdvance = existingCheckpoint?.targetPatch != null &&
             initialGroundedPatch != null &&
             patchComparator.compare(initialGroundedPatch, existingCheckpoint.targetPatch) > 0
+        if (seedPuuids.isNotEmpty() && wouldExceedPendingQueueCap(existingCheckpoint, seedPuuids, checkpointStalePatchAdvance)) {
+            throw IllegalArgumentException(
+                "Explicit seedPuuid list would exceed pending queue cap ($MAX_CHECKPOINT_PENDING_PUUIDS); refusing before mutation."
+            )
+        }
 
         var effectivePatch = when {
             cleanRequestedPatch != null -> cleanRequestedPatch
@@ -1827,7 +1844,7 @@ class CohortBenchmarkService(
             existingCheckpoint?.playerCellGameCounts?.toMutableMap() ?: mutableMapOf()
         }
         val pendingQueue = LinkedHashSet<String>()
-        seedPuuids.map { it.trim() }.filter { it.isNotBlank() && it !in processedPuuids }.forEach {
+        sanitizeSeedPuuids(seedPuuids).filter { it !in processedPuuids }.forEach {
             if (pendingQueue.size < MAX_CHECKPOINT_PENDING_PUUIDS) pendingQueue.add(it)
         }
         existingCheckpoint?.pendingCandidatePuuids?.filter { it !in processedPuuids }?.forEach {
@@ -2462,6 +2479,45 @@ class CohortBenchmarkService(
     fun isValidPatchOrNull(patch: String?): Boolean {
         val clean = patch?.trim()?.takeIf { it.isNotBlank() } ?: return true
         return PATCH_REGEX.matches(clean)
+    }
+
+    fun isValidCandidatePuuid(raw: String?): Boolean {
+        val clean = raw?.trim() ?: return false
+        return clean.isNotBlank() &&
+            clean.length <= MAX_CANDIDATE_PUUID_LENGTH &&
+            clean.none { it.isWhitespace() || it == ',' || it.isISOControl() }
+    }
+
+    fun sanitizeSeedPuuids(rawSeeds: List<String>): List<String> {
+        return rawSeeds
+            .asSequence()
+            .map { it.trim() }
+            .filter { isValidCandidatePuuid(it) }
+            .distinct()
+            .take(MAX_EXPLICIT_SEED_PUUIDS)
+            .toList()
+    }
+
+    fun wouldExceedPendingQueueCap(
+        existingCheckpoint: CohortCollectorCheckpointDto?,
+        seedPuuids: List<String>,
+        checkpointStalePatchAdvance: Boolean = false
+    ): Boolean {
+        val cleanSeeds = sanitizeSeedPuuids(seedPuuids)
+        if (cleanSeeds.isEmpty()) return false
+        val processedSet = if (checkpointStalePatchAdvance) {
+            emptySet()
+        } else {
+            existingCheckpoint?.processedPuuids?.take(MAX_CHECKPOINT_PROCESSED_PUUIDS)?.toSet().orEmpty()
+        }
+        val existingPending = LinkedHashSet<String>()
+        existingCheckpoint?.pendingCandidatePuuids?.forEach { candidate ->
+            if (candidate !in processedSet && existingPending.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
+                existingPending.add(candidate)
+            }
+        }
+        val netNewSeedCount = cleanSeeds.count { it !in processedSet && it !in existingPending }
+        return existingPending.size + netNewSeedCount > MAX_CHECKPOINT_PENDING_PUUIDS
     }
 
     fun getLiveRateLimitVerification(region: String): RateLimitVerificationSnapshotDto {

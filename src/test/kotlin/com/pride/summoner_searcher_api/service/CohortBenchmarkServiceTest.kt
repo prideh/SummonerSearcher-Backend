@@ -4263,6 +4263,636 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 probeService.getCollectorParticipantIndexingCounts()["collectorIndexedPlayersUpserted"] shouldBe 1L
             }
         }
+
+        When("starting the guarded collector with operator seedPuuid control through RiotApiController and OvernightCohortCollectorRunner") {
+            val clockMs = java.util.concurrent.atomic.AtomicLong(nowInstant.toEpochMilli())
+            val testClock = object : TimeProvider {
+                override fun now(): Long = clockMs.get()
+            }
+            val limiter = RiotApiRateLimiter(testClock)
+            for (ep in listOf("league-v4-entries-by-puuid", "match-v5-ids-by-puuid", "match-v5-match-by-id")) {
+                limiter.updateLimits(
+                    region = "euw1",
+                    limitHeader = "20:1,100:120",
+                    countHeader = "1:1,5:120",
+                    endpointKey = ep,
+                    methodLimitHeader = "500:10",
+                    methodCountHeader = "1:10"
+                )
+            }
+
+            val seedRedis = mockk<RedisCacheService>(relaxed = true)
+            val seedRiot = mockk<RiotApiService>(relaxed = true)
+            val seedCellRepo = mockk<CohortBenchmarkCellRepository>(relaxed = true)
+            val savedCheckpoints = mutableMapOf<String, CohortCollectorCheckpointDto>()
+            val savedMatches = mutableMapOf<String, MatchDto>()
+            val inMemoryIndexStore = java.util.concurrent.ConcurrentHashMap<String, com.pride.summoner_searcher_api.model.IndexedPlayer>()
+            var activeLockHeld = false
+            var lockAcquireCount = 0
+
+            val mockIndexedRepo = mockk<com.pride.summoner_searcher_api.repository.IndexedPlayerRepository>(relaxed = true)
+            every {
+                mockIndexedRepo.updatePlayerIfNewer(any(), any(), any(), any(), any(), any(), any())
+            } answers {
+                val pid = arg<String>(0)
+                val gName = arg<String>(1)
+                val tLine = arg<String>(2)
+                val reg = arg<String>(3)
+                val icon = arg<Int>(4)
+                val lvl = arg<Long>(5)
+                val seen = arg<Instant>(6)
+                val current = inMemoryIndexStore[pid]
+                if (current != null && !seen.isBefore(current.lastSeenAt)) {
+                    inMemoryIndexStore[pid] = com.pride.summoner_searcher_api.model.IndexedPlayer(
+                        puuid = pid,
+                        gameName = gName,
+                        tagLine = tLine,
+                        region = reg,
+                        profileIconId = icon,
+                        summonerLevel = lvl,
+                        lastSeenAt = seen
+                    )
+                    1
+                } else {
+                    0
+                }
+            }
+            every {
+                mockIndexedRepo.insertPlayerIfAbsent(any(), any(), any(), any(), any(), any(), any())
+            } answers {
+                val pid = arg<String>(0)
+                val gName = arg<String>(1)
+                val tLine = arg<String>(2)
+                val reg = arg<String>(3)
+                val icon = arg<Int>(4)
+                val lvl = arg<Long>(5)
+                val seen = arg<Instant>(6)
+                val inserted = inMemoryIndexStore.putIfAbsent(
+                    pid,
+                    com.pride.summoner_searcher_api.model.IndexedPlayer(
+                        puuid = pid,
+                        gameName = gName,
+                        tagLine = tLine,
+                        region = reg,
+                        profileIconId = icon,
+                        summonerLevel = lvl,
+                        lastSeenAt = seen
+                    )
+                )
+                if (inserted == null) 1 else 0
+            }
+
+            // Live EUW equivalent state: CHALLENGER:MIDDLE and CHALLENGER:BOTTOM pass (50 players, 200 games),
+            // while CHALLENGER:TOP fails at 192 games (< 200).
+            val dummyMetric = CohortPercentileDistributionDto(
+                metricKey = "laneCsAt10", unit = "lane_cs", includesJungleCamps = false,
+                theoreticalSupplyCeiling = 114, sampleGames = 200, distinctPlayers = 50,
+                p25 = 80.0, median = 86.0, p75 = 92.0, iqr = 12.0
+            )
+            val dummyBundle = CohortMetricsBundleDto(
+                laneCsAt10 = dummyMetric, laneOnlyCsPerMin = dummyMetric, totalCsPerMinWithCamps = dummyMetric,
+                timelineTotalCsAt10WithCamps = dummyMetric, goldPerMin = dummyMetric, damagePerMin = dummyMetric,
+                visionScorePerMin = dummyMetric, killParticipation = dummyMetric, deathsPerGame = dummyMetric,
+                timeSpentDeadShare = dummyMetric
+            )
+            val initialPersistedCells = listOf(
+                CohortBenchmarkCellDto(
+                    region = "euw1", patch = "16.7", patchSelectionSource = "GROUNDED_CURRENT_PATCH_STORE",
+                    queueId = 420, tier = "CHALLENGER", role = "TOP", distinctPlayers = 50, eligibleGames = 192,
+                    maxGamesPerPlayerCap = 10, excludedOverPlayerCapGames = 0, passesQualityGate = false,
+                    colorBandsEnabled = false, qualityGateStatus = "INSUFFICIENT_SAMPLE",
+                    earliestRankSnapshotAt = nowInstant, latestRankSnapshotAt = nowInstant, computedAt = nowInstant,
+                    metrics = dummyBundle
+                ),
+                CohortBenchmarkCellDto(
+                    region = "euw1", patch = "16.7", patchSelectionSource = "GROUNDED_CURRENT_PATCH_STORE",
+                    queueId = 420, tier = "CHALLENGER", role = "MIDDLE", distinctPlayers = 50, eligibleGames = 210,
+                    maxGamesPerPlayerCap = 10, excludedOverPlayerCapGames = 0, passesQualityGate = true,
+                    colorBandsEnabled = true, qualityGateStatus = "READY_FOR_COLOR_BANDS",
+                    earliestRankSnapshotAt = nowInstant, latestRankSnapshotAt = nowInstant, computedAt = nowInstant,
+                    metrics = dummyBundle
+                ),
+                CohortBenchmarkCellDto(
+                    region = "euw1", patch = "16.7", patchSelectionSource = "GROUNDED_CURRENT_PATCH_STORE",
+                    queueId = 420, tier = "CHALLENGER", role = "BOTTOM", distinctPlayers = 50, eligibleGames = 205,
+                    maxGamesPerPlayerCap = 10, excludedOverPlayerCapGames = 0, passesQualityGate = true,
+                    colorBandsEnabled = true, qualityGateStatus = "READY_FOR_COLOR_BANDS",
+                    earliestRankSnapshotAt = nowInstant, latestRankSnapshotAt = nowInstant, computedAt = nowInstant,
+                    metrics = dummyBundle
+                )
+            )
+
+            val freshLeaderboard = CachedLeaderboardDto(
+                lastRefreshed = nowInstant,
+                leaderboard = LeagueListDTO(
+                    tier = "CHALLENGER",
+                    leagueId = "euw-challenger",
+                    queue = "RANKED_SOLO_5x5",
+                    name = "Challenger",
+                    entries = listOf(
+                        LeagueEntryDto(
+                            puuid = "already-done-seed", leaguePoints = 1100, rank = "I", wins = 100, losses = 80,
+                            veteran = false, inactive = false, freshBlood = false, hotStreak = false,
+                            leagueId = "euw-challenger", queueType = "RANKED_SOLO_5x5", tier = "CHALLENGER", summonerName = "DoneSeed"
+                        ),
+                        LeagueEntryDto(
+                            puuid = "fresh-challenger-seed", leaguePoints = 1250, rank = "I", wins = 120, losses = 90,
+                            veteran = false, inactive = false, freshBlood = false, hotStreak = true,
+                            leagueId = "euw-challenger", queueType = "RANKED_SOLO_5x5", tier = "CHALLENGER", summonerName = "FreshChal"
+                        ),
+                        LeagueEntryDto(
+                            puuid = "manual-chunk-only-seed", leaguePoints = 1190, rank = "I", wins = 115, losses = 85,
+                            veteran = false, inactive = false, freshBlood = false, hotStreak = false,
+                            leagueId = "euw-challenger", queueType = "RANKED_SOLO_5x5", tier = "CHALLENGER", summonerName = "ManualOnly"
+                        ),
+                        LeagueEntryDto(
+                            puuid = "seed-429-test", leaguePoints = 1180, rank = "I", wins = 110, losses = 85,
+                            veteran = false, inactive = false, freshBlood = false, hotStreak = false,
+                            leagueId = "euw-challenger", queueType = "RANKED_SOLO_5x5", tier = "CHALLENGER", summonerName = "Seed429"
+                        ),
+                        LeagueEntryDto(
+                            puuid = "async-challenger-seed", leaguePoints = 1170, rank = "I", wins = 108, losses = 82,
+                            veteran = false, inactive = false, freshBlood = false, hotStreak = false,
+                            leagueId = "euw-challenger", queueType = "RANKED_SOLO_5x5", tier = "CHALLENGER", summonerName = "AsyncChal"
+                        )
+                    )
+                )
+            )
+
+            every { seedRedis.scanKeys(any(), any(), any()) } returns emptyList()
+            every { seedRedis.get(any(), CohortCollectorCheckpointDto::class.java) } answers {
+                savedCheckpoints[firstArg()]
+            }
+            every { seedRedis.get("cohort:benchmarks:euw1:16.7", Array<CohortBenchmarkCellDto>::class.java) } returns initialPersistedCells.toTypedArray()
+            every { seedRedis.get(match { it.startsWith("leaderboard:euw1:") }, CachedLeaderboardDto::class.java) } returns freshLeaderboard
+            every { seedRedis.get(any(), CohortRankSnapshotDto::class.java) } returns null
+            every { seedRedis.get(any(), SummonerProfileDto::class.java) } returns null
+            every { seedRedis.get(match { it.startsWith("match:euw1:") }, MatchDto::class.java) } answers {
+                savedMatches[firstArg()]
+            }
+            every { seedRedis.get("cohort:patch:external:ddragon", String::class.java) } returns "16.7"
+            every { seedRedis.setIfAbsent(match { it.startsWith("lock:cohort:collector:active:") }, any(), any()) } answers {
+                if (activeLockHeld) false else {
+                    activeLockHeld = true
+                    lockAcquireCount++
+                    true
+                }
+            }
+            every { seedRedis.delete(match { it.startsWith("lock:cohort:collector:active:") }) } answers {
+                activeLockHeld = false
+            }
+            every { seedRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                when (val value = secondArg<Any>()) {
+                    is CohortCollectorCheckpointDto -> savedCheckpoints[key] = value
+                    is MatchDto -> savedMatches[key] = value
+                }
+            }
+
+            fun buildNamedParticipant(puuid: String, role: String, gameName: String, tagLine: String): ParticipantDto {
+                return buildParticipant(puuid = puuid, role = role, laneCs10 = 90, totalMinions = 220, neutralMinions = 8).copy(
+                    riotIdGameName = gameName,
+                    riotIdTagline = tagLine,
+                    profileIcon = 42,
+                    summonerLevel = 400
+                )
+            }
+
+            val seedService = CohortBenchmarkService(
+                redisCacheService = seedRedis,
+                cohortBenchmarkCellRepository = seedCellRepo,
+                riotApiRateLimiter = limiter,
+                riotApiService = seedRiot,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = true,
+                timeProvider = testClock,
+                indexedPlayerRepository = mockIndexedRepo
+            )
+            val seedRunner = com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner(
+                cohortBenchmarkService = seedService,
+                configuredOperatorToken = "operator-secret-123",
+                timeProvider = testClock
+            )
+            val seedController = com.pride.summoner_searcher_api.controller.RiotApiController(
+                riotApiService = seedRiot,
+                challengerLeagueService = mockk(relaxed = true),
+                userService = mockk(relaxed = true),
+                summonerProfileService = mockk(relaxed = true),
+                redisCacheService = seedRedis,
+                cohortBenchmarkService = seedService,
+                overnightCohortCollectorRunner = seedRunner
+            )
+            val httpReq = org.springframework.mock.web.MockHttpServletRequest().apply {
+                remoteAddr = "203.0.113.10"
+            }
+
+            val tail499 = (1..499).map { "uncached-pending-$it" }
+            val baselineCheckpoint499 = CohortCollectorCheckpointDto(
+                region = "euw1",
+                targetPatch = "16.7",
+                patchSelectionSource = "GROUNDED_CURRENT_PATCH_STORE",
+                queueId = 420,
+                roles = listOf("TOP", "MIDDLE", "BOTTOM"),
+                maxGamesPerPlayerCap = 10,
+                targetPlayersPerCell = 50,
+                targetGamesPerCell = 200,
+                processedPuuids = setOf("already-done-seed"),
+                pendingCandidatePuuids = tail499,
+                processedMatchIds = setOf("EUW1_PREV_1"),
+                playerCellGameCounts = mapOf("CHALLENGER:TOP:already-done-seed" to 4),
+                cellProgress = emptyMap(),
+                cellsPassingQualityGate = 2,
+                targetCellsCount = 30,
+                totalNetworkCallsMade = 100,
+                startedAt = nowInstant,
+                updatedAt = nowInstant
+            )
+            savedCheckpoints["cohort:collector:checkpoint:euw1:16.7"] = baselineCheckpoint499
+            savedCheckpoints["cohort:collector:checkpoint:euw1:latest"] = baselineCheckpoint499
+
+            // 1. Auth guard on seeded start
+            val unauthorizedResp = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                maxBatches = 1,
+                batchSize = 1,
+                maxTotalProductiveBatches = 1,
+                maxTotalNetworkCalls = 15,
+                seedPuuids = listOf("fresh-challenger-seed"),
+                async = false,
+                operatorToken = "wrong-token",
+                httpRequest = httpReq
+            )
+
+            // 2. Named seed limits (25 max count, 250 max length, format checks) rejected before lock/mutation
+            val tooManySeedsResp = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                seedPuuids = (1..26).map { "seed-$it" },
+                async = false,
+                operatorToken = "operator-secret-123",
+                httpRequest = httpReq
+            ).body!!
+            val overLengthSeedResp = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                seedPuuids = listOf("x".repeat(251)),
+                async = false,
+                operatorToken = "operator-secret-123",
+                httpRequest = httpReq
+            ).body!!
+            val malformedSeedResp = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                seedPuuids = listOf("bad,seed"),
+                async = false,
+                operatorToken = "operator-secret-123",
+                httpRequest = httpReq
+            ).body!!
+            val lockAcquireCountAfterInvalidFormat = lockAcquireCount
+
+            // 3. Reject seeds exceeding 500 total queue BEFORE mutation (499 pending + 2 net-new seeds = 501 > 500)
+            val exceed500From499Resp = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                maxBatches = 1,
+                batchSize = 1,
+                maxTotalProductiveBatches = 1,
+                maxTotalNetworkCalls = 15,
+                seedPuuids = listOf("fresh-challenger-seed", "extra-new-seed-2"),
+                async = false,
+                operatorToken = "operator-secret-123",
+                httpRequest = httpReq
+            ).body!!
+
+            // Also test 500 full pending queue + 1 net-new seed (500 + 1 = 501 > 500) rejected before mutation
+            val tail500 = (1..500).map { "uncached-pending-$it" }
+            val full500Checkpoint = baselineCheckpoint499.copy(pendingCandidatePuuids = tail500)
+            savedCheckpoints["cohort:collector:checkpoint:euw1:16.7"] = full500Checkpoint
+            savedCheckpoints["cohort:collector:checkpoint:euw1:latest"] = full500Checkpoint
+            val exceed500From500Resp = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                maxBatches = 1,
+                batchSize = 1,
+                maxTotalProductiveBatches = 1,
+                maxTotalNetworkCalls = 15,
+                seedPuuids = listOf("fresh-challenger-seed"),
+                async = false,
+                operatorToken = "operator-secret-123",
+                httpRequest = httpReq
+            ).body!!
+            val checkpointAfterCapacityReject = savedCheckpoints["cohort:collector:checkpoint:euw1:16.7"]!!
+
+            // Restore 499 pending queue for the valid 499 + 1 net-new seed (== 500) + 1 already-processed seed (0 net-new) run
+            savedCheckpoints["cohort:collector:checkpoint:euw1:16.7"] = baselineCheckpoint499
+            savedCheckpoints["cohort:collector:checkpoint:euw1:latest"] = baselineCheckpoint499
+
+            // 4. Lock guard when Redis lock is already held
+            activeLockHeld = true
+            val lockedResp = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                maxBatches = 1,
+                batchSize = 1,
+                seedPuuids = listOf("fresh-challenger-seed"),
+                async = false,
+                operatorToken = "operator-secret-123",
+                httpRequest = httpReq
+            ).body!!
+            activeLockHeld = false
+
+            // 5. Seeded 1-batch / 15-call finite run with 1 initial pause retry:
+            //    - Attempt 1 pauses due to active foreground user request (verifies 500-entry queue has fresh-challenger-seed at index 0 and uncached-pending-499 at index 499 with zero tail loss).
+            //    - During pauseDelayMs, foreground request ends; Attempt 2 retains seedPuuids, ignores already-done-seed without erasing progress,
+            //      resolves fresh-challenger-seed tier from cached leaderboard (0 league-v4 calls), fetches 1 match list + 10 matches (11 <= 15 calls),
+            //      folds CHALLENGER:TOP samples, and triggers the normal collector DTO participant indexing hook.
+            var rankLookupCalls = 0
+            coEvery { seedRiot.fetchLeagueRankLowPriority(any(), any(), any(), any(), any()) } answers {
+                rankLookupCalls++
+                arg<java.util.concurrent.atomic.AtomicInteger>(3).incrementAndGet()
+                null
+            }
+            val matchIdsForFreshSeed = (1..10).map { "EUW1_SEED_M$it" }
+            coEvery {
+                seedRiot.getMatchIdsByPuuidLowPriority("fresh-challenger-seed", "euw1", 420, 10, 0, 0, any(), any())
+            } answers {
+                arg<java.util.concurrent.atomic.AtomicInteger>(6).incrementAndGet()
+                matchIdsForFreshSeed
+            }
+            var matchDetailCalls = 0
+            coEvery {
+                seedRiot.getMatchByIdLowPriority(match { it.startsWith("EUW1_SEED_M") }, "euw1", 0, any(), any())
+            } answers {
+                val mId = firstArg<String>()
+                val idx = mId.removePrefix("EUW1_SEED_M").toInt()
+                matchDetailCalls++
+                arg<java.util.concurrent.atomic.AtomicInteger>(3).incrementAndGet()
+                MatchDto(
+                    metadata = MatchMetadata(mId, listOf("fresh-challenger-seed", "co-part-$idx")),
+                    info = MatchInfo(
+                        gameCreation = clockMs.get() - idx * 1_000L,
+                        gameDuration = 1800L,
+                        gameId = 7000L + idx,
+                        queueId = 420,
+                        gameMode = "CLASSIC",
+                        gameVersion = "16.7.600.1000",
+                        participants = listOf(
+                            buildNamedParticipant("fresh-challenger-seed", "TOP", "FreshChal", "EUW"),
+                            buildNamedParticipant("co-part-$idx", "JUNGLE", "CoPart$idx", "EUW")
+                        )
+                    )
+                )
+            }
+
+            val initialChalTopSamples = LinkedHashMap<String, List<CohortBenchmarkService.DeidentifiedMetricSampleDto>>()
+            for (pIdx in 1..50) {
+                val pHash = seedService.hashIdentifier("player:euw1:existing-chal-top-$pIdx")
+                val gamesForPlayer = if (pIdx <= 42) 4 else 3 // 42*4 + 8*3 = 168 + 24 = 192 games across 50 players
+                initialChalTopSamples[pHash] = (1..gamesForPlayer).map { gIdx ->
+                    CohortBenchmarkService.DeidentifiedMetricSampleDto(
+                        matchIdHash = seedService.hashIdentifier("match:euw1:EUW1_INIT_${pIdx}_$gIdx"),
+                        playerHash = pHash,
+                        gameCreation = clockMs.get() - 50_000L - (pIdx * 100L + gIdx),
+                        rankSnapshotEpochMilli = clockMs.get() - 10_000L,
+                        laneCsAt10 = 88.0,
+                        laneOnlyCsPerMin = 8.2,
+                        totalCsPerMinWithCamps = 8.5,
+                        timelineTotalCsAt10WithCamps = 90.0,
+                        goldPerMin = 430.0,
+                        damagePerMin = 680.0,
+                        visionScorePerMin = 1.2,
+                        killParticipation = 0.58,
+                        deathsPerGame = 3.0,
+                        timeSpentDeadShare = 0.06
+                    )
+                }
+            }
+            val initialChalTopState = CohortBenchmarkService.DurableCellSampleStateDto(
+                region = "euw1",
+                patch = "16.7",
+                queueId = 420,
+                tier = "CHALLENGER",
+                role = "TOP",
+                maxGamesPerPlayerCap = 10,
+                samplesByPlayerHash = initialChalTopSamples,
+                updatedAtEpochMilli = clockMs.get()
+            )
+            seedService.putInMemoryDurableCellStateForTest(initialChalTopState)
+
+            // Trigger 1 pause cycle on Attempt 1, then clear foreground request when checkpoint is saved on pause
+            var pausedQueueSnapshotOnAttempt1: List<String>? = null
+            limiter.beginUserRequest("euw1")
+            every { seedRedis.set(any(), any<Any>(), any()) } answers {
+                val key = firstArg<String>()
+                when (val value = secondArg<Any>()) {
+                    is CohortCollectorCheckpointDto -> {
+                        savedCheckpoints[key] = value
+                        if (value.lastStopReason == "PAUSED_FOREGROUND_USER_REQUEST" && pausedQueueSnapshotOnAttempt1 == null) {
+                            pausedQueueSnapshotOnAttempt1 = value.pendingCandidatePuuids
+                            limiter.endUserRequest("euw1")
+                            clockMs.addAndGet(3_000L)
+                        }
+                    }
+                    is MatchDto -> savedMatches[key] = value
+                }
+            }
+
+            val seededRunStatus = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                maxBatches = 1,
+                batchSize = 1,
+                pauseDelayMs = 1L,
+                maxPauseCycles = 3,
+                maxTotalProductiveBatches = 1,
+                maxTotalNetworkCalls = 15,
+                seedPuuids = listOf("already-done-seed", "fresh-challenger-seed"),
+                async = false,
+                operatorToken = "operator-secret-123",
+                httpRequest = httpReq
+            ).body!!
+
+            // Restore CHALLENGER:TOP to 192 games so subsequent Challenger seeds in Steps 6-8 also enter Step C
+            seedService.putInMemoryDurableCellStateForTest(initialChalTopState)
+
+            // 6. First manual chunk only & no scheduled auto-resume replay:
+            //    Run manual chunk with maxBatches=1, maxTotalProductiveBatches=2 and seedPuuids=["manual-chunk-only-seed"].
+            //    Batch 1 processes "manual-chunk-only-seed" and leaves session armed (BATCH_BUDGET_REACHED_RESUMABLE).
+            //    Then remove "manual-chunk-only-seed" from processedPuuids in the saved checkpoint before calling checkAndAutoResumeOvernightSession
+            //    to prove scheduled auto-resume passes emptyList() and processes "uncached-pending-1" instead of replaying "manual-chunk-only-seed".
+            val processedInManualVsScheduled = mutableListOf<String>()
+            coEvery {
+                seedRiot.getMatchIdsByPuuidLowPriority("manual-chunk-only-seed", "euw1", 420, 10, 0, 0, any(), any())
+            } answers {
+                processedInManualVsScheduled.add("manual-chunk-only-seed")
+                arg<java.util.concurrent.atomic.AtomicInteger>(6).incrementAndGet()
+                emptyList()
+            }
+            coEvery {
+                seedRiot.fetchLeagueRankLowPriority("uncached-pending-1", "euw1", 0, any(), any())
+            } answers {
+                processedInManualVsScheduled.add("uncached-pending-1")
+                arg<java.util.concurrent.atomic.AtomicInteger>(3).incrementAndGet()
+                null
+            }
+            val manualChunk1Status = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                maxBatches = 1,
+                batchSize = 1,
+                pauseDelayMs = 1L,
+                maxPauseCycles = 2,
+                maxTotalProductiveBatches = 2,
+                maxTotalNetworkCalls = 15,
+                seedPuuids = listOf("manual-chunk-only-seed"),
+                async = false,
+                operatorToken = "operator-secret-123",
+                httpRequest = httpReq
+            ).body!!
+            // Remove manual-chunk-only-seed from processedPuuids in checkpoint so if scheduled auto-resume re-injected seedPuuids it would run again
+            val cpAfterManualChunk1 = savedCheckpoints["cohort:collector:checkpoint:euw1:16.7"]!!
+            val cpWithoutManualProcessed = cpAfterManualChunk1.copy(
+                processedPuuids = cpAfterManualChunk1.processedPuuids - "manual-chunk-only-seed"
+            )
+            savedCheckpoints["cohort:collector:checkpoint:euw1:16.7"] = cpWithoutManualProcessed
+            savedCheckpoints["cohort:collector:checkpoint:euw1:latest"] = cpWithoutManualProcessed
+            val autoResumedStatus = seedRunner.checkAndAutoResumeOvernightSession(async = false)!!
+
+            // 7. 429 Retry-After backoff on seeded run (maxPauseCycles=1 -> PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE)
+            coEvery {
+                seedRiot.getMatchIdsByPuuidLowPriority("seed-429-test", "euw1", 420, 10, 0, 0, any(), any())
+            } answers {
+                arg<java.util.concurrent.atomic.AtomicInteger>(6).incrementAndGet()
+                arg<java.util.concurrent.atomic.AtomicReference<String?>>(7).set("HTTP_429_TOO_MANY_REQUESTS")
+                limiter.recordRetryAfter("euw1", 5L, "application")
+                emptyList()
+            }
+            val status429 = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                maxBatches = 1,
+                batchSize = 1,
+                pauseDelayMs = 0L,
+                maxPauseCycles = 1,
+                maxTotalProductiveBatches = 1,
+                maxTotalNetworkCalls = 15,
+                seedPuuids = listOf("seed-429-test"),
+                async = false,
+                operatorToken = "operator-secret-123",
+                httpRequest = httpReq
+            ).body!!
+            seedRunner.requestStop(region = "euw1", targetPatch = "16.7")
+            clockMs.addAndGet(10_000L)
+
+            // 8. Async seeded run (async = true) retains seedPuuids and completes 1 batch cleanly
+            coEvery {
+                seedRiot.getMatchIdsByPuuidLowPriority("async-challenger-seed", "euw1", 420, 10, 0, 0, any(), any())
+            } answers {
+                arg<java.util.concurrent.atomic.AtomicInteger>(6).incrementAndGet()
+                emptyList()
+            }
+            val asyncStartResp = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                maxBatches = 1,
+                batchSize = 1,
+                pauseDelayMs = 0L,
+                maxPauseCycles = 1,
+                maxTotalProductiveBatches = 1,
+                maxTotalNetworkCalls = 15,
+                seedPuuids = listOf("async-challenger-seed"),
+                async = true,
+                operatorToken = "operator-secret-123",
+                httpRequest = httpReq
+            ).body!!
+            var waitLoops = 0
+            while (seedRunner.getStatus("euw1", "16.7").runningInProcess && waitLoops < 100) {
+                kotlinx.coroutines.delay(10L)
+                waitLoops++
+            }
+            val asyncFinalStatus = seedRunner.getStatus("euw1", "16.7")
+
+            Then("it should enforce auth/locks/25-250-500 bounds before mutation, preserve processed progress and all 499 tail entries, retain seeds across pause retry without scheduled replay, and execute the DTO hook within 1 batch and 15 calls") {
+                unauthorizedResp.statusCode shouldBe org.springframework.http.HttpStatus.FORBIDDEN
+
+                CohortBenchmarkService.MAX_EXPLICIT_SEED_PUUIDS shouldBe 25
+                CohortBenchmarkService.MAX_CANDIDATE_PUUID_LENGTH shouldBe 250
+                tooManySeedsResp.action shouldBe "INVALID_PARAMETERS"
+                overLengthSeedResp.action shouldBe "INVALID_PARAMETERS"
+                malformedSeedResp.action shouldBe "INVALID_PARAMETERS"
+                lockAcquireCountAfterInvalidFormat shouldBe 0
+
+                exceed500From499Resp.action shouldBe "INVALID_PARAMETERS"
+                exceed500From499Resp.runningInProcess shouldBe false
+                exceed500From499Resp.overnightSessionArmed shouldBe false
+                exceed500From499Resp.checkpoint?.pendingCandidatePuuids?.size shouldBe 499
+
+                exceed500From500Resp.action shouldBe "INVALID_PARAMETERS"
+                exceed500From500Resp.runningInProcess shouldBe false
+                exceed500From500Resp.overnightSessionArmed shouldBe false
+                checkpointAfterCapacityReject.pendingCandidatePuuids.size shouldBe 500
+                checkpointAfterCapacityReject.pendingCandidatePuuids.first() shouldBe "uncached-pending-1"
+                checkpointAfterCapacityReject.pendingCandidatePuuids.last() shouldBe "uncached-pending-500"
+
+                lockedResp.action shouldBe "LOCKED_BY_ANOTHER_INSTANCE"
+
+                // Attempt 1 paused with 500 queue entries (fresh-challenger-seed + 499 existing tail, zero tail loss)
+                pausedQueueSnapshotOnAttempt1 shouldNotBe null
+                pausedQueueSnapshotOnAttempt1!!.size shouldBe 500
+                pausedQueueSnapshotOnAttempt1!!.first() shouldBe "fresh-challenger-seed"
+                pausedQueueSnapshotOnAttempt1!!.last() shouldBe "uncached-pending-499"
+
+                // Attempt 2 completed in 1 productive batch and 11 Riot calls (<= 15 cap) with 0 league-v4 calls
+                seededRunStatus.action shouldBe "COMPLETED_SYNCHRONOUS_RUN"
+                seededRunStatus.runningInProcess shouldBe false
+                seededRunStatus.overnightSessionArmed shouldBe false
+                seededRunStatus.pauseCyclesCount shouldBe 1
+                seededRunStatus.productiveBatchesCompleted shouldBe 1
+                seededRunStatus.sessionProductiveBatchesCompleted shouldBe 1
+                seededRunStatus.sessionNetworkCallsMade shouldBe 11
+                rankLookupCalls shouldBe 0
+                matchDetailCalls shouldBe 10
+
+                val seededCp = seededRunStatus.checkpoint!!
+                seededCp.lastStopReason shouldBe "SESSION_BATCH_CAP_REACHED"
+                // Processed progress from prior runs is preserved, not reset
+                seededCp.processedPuuids.contains("already-done-seed") shouldBe true
+                seededCp.processedPuuids.contains("fresh-challenger-seed") shouldBe true
+                seededCp.processedMatchIds.contains("EUW1_PREV_1") shouldBe true
+                seededCp.playerCellGameCounts["CHALLENGER:TOP:already-done-seed"] shouldBe 4
+                seededCp.playerCellGameCounts["CHALLENGER:TOP:fresh-challenger-seed"] shouldBe 10
+                seededCp.cellProgress["CHALLENGER:TOP"]?.passesQualityGate shouldBe true
+                // All 499 existing pending entries remain preserved without tail loss
+                seededCp.pendingCandidatePuuids.size shouldBe 499
+                seededCp.pendingCandidatePuuids.first() shouldBe "uncached-pending-1"
+                seededCp.pendingCandidatePuuids.last() shouldBe "uncached-pending-499"
+
+                // Normal collector DTO hook indexed FreshChal + 10 co-participants (11 unique players across 10 matches)
+                inMemoryIndexStore["fresh-challenger-seed"]?.gameName shouldBe "FreshChal"
+                inMemoryIndexStore["co-part-1"]?.gameName shouldBe "CoPart1"
+                inMemoryIndexStore["co-part-10"]?.gameName shouldBe "CoPart10"
+                seedService.getCollectorParticipantIndexingCounts()["collectorIndexedPlayersUpserted"] shouldBe 11L
+
+                // First manual chunk only; scheduled auto-resume does NOT replay manual seedPuuids
+                manualChunk1Status.checkpoint?.lastStopReason shouldBe "BATCH_BUDGET_REACHED_RESUMABLE"
+                manualChunk1Status.overnightSessionArmed shouldBe true
+                autoResumedStatus.checkpoint?.lastStopReason shouldBe "SESSION_BATCH_CAP_REACHED"
+                autoResumedStatus.overnightSessionArmed shouldBe false
+                processedInManualVsScheduled shouldBe listOf("manual-chunk-only-seed", "uncached-pending-1")
+
+                // 429 backoff recorded cleanly with 0 retries
+                status429.checkpoint?.lastStopReason shouldBe "PAUSED_COOLDOWN_BUDGET_REACHED_RESUMABLE"
+                status429.checkpoint?.pausedForRetryAfterCount shouldBe 1
+
+                // Async run retained seedPuuids and completed cleanly
+                asyncStartResp.action shouldBe "STARTED_OR_RESUMED_IN_PROCESS"
+                asyncFinalStatus.runningInProcess shouldBe false
+                asyncFinalStatus.overnightSessionArmed shouldBe false
+                asyncFinalStatus.checkpoint?.processedPuuids?.contains("async-challenger-seed") shouldBe true
+                asyncFinalStatus.checkpoint?.lastStopReason shouldBe "SESSION_BATCH_CAP_REACHED"
+            }
+        }
     }
 })
 

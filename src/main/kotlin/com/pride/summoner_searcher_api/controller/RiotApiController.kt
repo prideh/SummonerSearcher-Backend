@@ -229,6 +229,7 @@ class RiotApiController(
         @org.springframework.web.bind.annotation.RequestParam(defaultValue = "240") maxPauseCycles: Int = 240,
         @org.springframework.web.bind.annotation.RequestParam(defaultValue = "4") maxTotalProductiveBatches: Int = 4,
         @org.springframework.web.bind.annotation.RequestParam(defaultValue = "60") maxTotalNetworkCalls: Int = 60,
+        @org.springframework.web.bind.annotation.RequestParam(name = "seedPuuid", required = false) seedPuuids: List<String>? = null,
         @org.springframework.web.bind.annotation.RequestParam(defaultValue = "true") async: Boolean = true,
         @org.springframework.web.bind.annotation.RequestHeader(name = "X-Cohort-Operator-Token", required = false) operatorToken: String? = null,
         httpRequest: jakarta.servlet.http.HttpServletRequest
@@ -246,6 +247,7 @@ class RiotApiController(
             maxPauseCycles = maxPauseCycles,
             maxTotalProductiveBatches = maxTotalProductiveBatches,
             maxTotalNetworkCalls = maxTotalNetworkCalls,
+            seedPuuids = seedPuuids.orEmpty(),
             async = async
         )
         return ResponseEntity.ok(status)
