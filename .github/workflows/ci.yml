@@ -5,36 +5,83 @@ on:
     branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates, feat/collector-session-memory-series, feat/scalar-patch-metadata-queries, feat/cached-player-exact-ingestion ]
   pull_request:
     branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   backend-tests:
+    if: github.event.repository.private == false && github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
-    - name: Set up JDK 21
+      with:
+        fetch-depth: 0
+    - name: Verify public repo free-runner invariant and exact 87d5f44 + c450410 + 089ac61 + e683777 commit SHAs
+      run: |
+        test "${{ github.event.repository.private }}" = "false"
+        test "${{ github.event.repository.visibility }}" = "public"
+        git cat-file -e 87d5f4406ef641edf5a2d14413f4027af43e0a14^{commit}
+        git cat-file -e c450410ba48df1b5bb24759c62ac3e4d8d8c737a^{commit}
+        git cat-file -e 089ac61cd1691e853e491d720cf4a4b23dd5bc01^{commit}
+        git cat-file -e e683777087025941ca3387855fa064ea0bd9d0e8^{commit}
+    - name: Set up JDK 21 for exact 87d5f44 unit test verification
       uses: actions/setup-java@v4
       with:
         java-version: '21'
         distribution: 'temurin'
         cache: 'gradle'
-    - name: Grant execute permission for gradlew and preflight script
-      run: chmod +x gradlew scripts/preflight.sh
-    - name: Run shared preflight (compileKotlin compileTestKotlin + full test)
-      run: ./scripts/preflight.sh
-    - name: Run Real 512 MB Container Proof on Exact Repo Dockerfile (--memory=512m --memory-swap=512m) [Strict <78% Gate]
-      if: github.ref == 'refs/heads/feat/collector-session-memory-series' || github.ref == 'refs/heads/feat/durable-cohort-cell-aggregates' || github.ref == 'refs/heads/fix/collector-session-hard-cap' || github.ref == 'refs/heads/mem/candidate-512m'
+    - name: Build exact Candidate (87d5f44) and Base (e683777) Docker images and capture 75-test JDK 21 XML/exit evidence from detached worktrees
       run: |
-        PG_FIXTURE_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
-        test "${#PG_FIXTURE_PASSWORD}" -eq 48
-        POSTGRES_PASSWORD="$PG_FIXTURE_PASSWORD" docker run -d --name ss-postgres -p 5432:5432 -e POSTGRES_PASSWORD -e POSTGRES_DB=summoner_searcher postgres:16-alpine
-        docker run -d --name ss-redis -p 6379:6379 redis:7-alpine
-        docker build -f Dockerfile -t ss-backend:512m-proof .
+        git worktree add --detach /tmp/wt-87d5f44 87d5f4406ef641edf5a2d14413f4027af43e0a14
+        docker build -f /tmp/wt-87d5f44/Dockerfile -t ss-backend:cand-87d5f44 /tmp/wt-87d5f44
+        docker tag ss-backend:cand-87d5f44 ss-backend:512m-proof
+
+        mkdir -p /tmp/collector-seed-control-512m-proof-artifacts/jdk21-test-87d5f44/xml-results
+        chmod +x /tmp/wt-87d5f44/gradlew
+        set +e
+        (cd /tmp/wt-87d5f44 && ./gradlew compileKotlin compileTestKotlin test --no-daemon --console=plain) > /tmp/collector-seed-control-512m-proof-artifacts/jdk21-test-87d5f44/test.log 2>&1
+        TEST_EXIT=$?
+        set -e
+        echo "$TEST_EXIT" > /tmp/collector-seed-control-512m-proof-artifacts/jdk21-test-87d5f44/test.exit
+        cp /tmp/wt-87d5f44/build/test-results/test/TEST-*.xml /tmp/collector-seed-control-512m-proof-artifacts/jdk21-test-87d5f44/xml-results/
+        test "$TEST_EXIT" -eq 0
+        python3 -c '
+        import glob, xml.etree.ElementTree as ET
+        files = sorted(glob.glob("/tmp/collector-seed-control-512m-proof-artifacts/jdk21-test-87d5f44/xml-results/TEST-*.xml"))
+        assert len(files) == 13, f"Expected 13 XML suites, got {len(files)}"
+        tests = sum(int(ET.parse(f).getroot().attrib["tests"]) for f in files)
+        failures = sum(int(ET.parse(f).getroot().attrib["failures"]) for f in files)
+        errors = sum(int(ET.parse(f).getroot().attrib["errors"]) for f in files)
+        assert tests == 75 and failures == 0 and errors == 0, f"Unexpected counts: tests={tests}, failures={failures}, errors={errors}"
+        '
+        git worktree remove --force /tmp/wt-87d5f44
+
+        git worktree add --detach /tmp/wt-e683777 e683777087025941ca3387855fa064ea0bd9d0e8
+        docker build -f /tmp/wt-e683777/Dockerfile -t ss-backend:base-e683777 /tmp/wt-e683777
+        git worktree remove --force /tmp/wt-e683777
+    - name: Prepare local Mock Riot TLS certificate and container truststore
+      run: |
         openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/mockriot.key -out /tmp/mockriot.crt -days 1 \
           -subj "/CN=api.riotgames.com" \
           -addext "subjectAltName=DNS:euw1.api.riotgames.com,DNS:na1.api.riotgames.com,DNS:kr.api.riotgames.com,DNS:europe.api.riotgames.com,DNS:americas.api.riotgames.com,DNS:asia.api.riotgames.com,DNS:ddragon.leagueoflegends.com"
-        cid=$(docker create ss-backend:512m-proof)
+        cid=$(docker create ss-backend:cand-87d5f44)
         docker cp "$cid:/opt/java/openjdk/lib/security/cacerts" /tmp/cacerts
         docker rm "$cid"
         keytool -importcert -noprompt -trustcacerts -alias mockriot -file /tmp/mockriot.crt -keystore /tmp/cacerts -storepass changeit
         chmod 644 /tmp/cacerts
-        PROOF_MODE=10_CYCLE ENABLE_NMT=0 DB_PASS="$PG_FIXTURE_PASSWORD" sudo --preserve-env=PROOF_MODE,ENABLE_NMT,DB_PASS python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
+    - name: Run Real 512 MB Container Collector Operator Seed-Control + Identity + Season-Stats Acceptance Proof (87d5f44 + e683777 Rollback)
+      run: |
+        chmod +x scripts/verify_512m_container.py
+        CAND_IMAGE="ss-backend:cand-87d5f44" BASE_IMAGE="ss-backend:base-e683777" ARTIFACT_DIR="/tmp/collector-seed-control-512m-proof-artifacts" \
+          sudo --preserve-env=CAND_IMAGE,BASE_IMAGE,ARTIFACT_DIR python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
+    - name: Upload Sanitized 512 MiB Collector Seed-Control Proof & 75-Test XML/Exit Evidence Artifacts
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: collector-seed-control-512m-proof-87d5f44
+        path: /tmp/collector-seed-control-512m-proof-artifacts
+        if-no-files-found: error
+        retention-days: 7
