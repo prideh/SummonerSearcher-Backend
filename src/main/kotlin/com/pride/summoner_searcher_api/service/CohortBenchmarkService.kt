@@ -1732,7 +1732,14 @@ class CohortBenchmarkService(
         }
         val existingCheckpoint = getCollectorCheckpoint(normalizedRegion, cleanRequestedPatch)
             ?: if (cleanRequestedPatch != null) getCollectorCheckpoint(normalizedRegion, null) else null
-        if (seedPuuids.isNotEmpty() && wouldExceedPendingQueueCap(existingCheckpoint, seedPuuids)) {
+        val preScanStalePatchAdvance = isCheckpointStalePatchAdvance(
+            region = normalizedRegion,
+            existingCheckpoint = existingCheckpoint,
+            requestedPatch = cleanRequestedPatch
+        )
+        if (seedPuuids.isNotEmpty() &&
+            wouldExceedPendingQueueCap(existingCheckpoint, seedPuuids, preScanStalePatchAdvance)
+        ) {
             throw IllegalArgumentException(
                 "Explicit seedPuuid list would exceed pending queue cap ($MAX_CHECKPOINT_PENDING_PUUIDS); refusing before mutation."
             )
@@ -2498,6 +2505,24 @@ class CohortBenchmarkService(
             .toList()
     }
 
+    fun isCheckpointStalePatchAdvance(
+        region: String,
+        existingCheckpoint: CohortCollectorCheckpointDto?,
+        requestedPatch: String? = null
+    ): Boolean {
+        val cpPatch = existingCheckpoint?.targetPatch ?: return false
+        val cleanRequested = cleanPatchCandidate(requestedPatch)
+        val grounded = resolveGroundedCurrentPatch(
+            region = region.lowercase().trim(),
+            allowLightRedisMatchProbe = false,
+            allowExternalNetworkLookup = false
+        ) ?: cleanRequested ?: return false
+        if (cleanRequested != null && grounded != cleanRequested) {
+            return false
+        }
+        return patchComparator.compare(grounded, cpPatch) > 0
+    }
+
     fun wouldExceedPendingQueueCap(
         existingCheckpoint: CohortCollectorCheckpointDto?,
         seedPuuids: List<String>,
@@ -2514,6 +2539,13 @@ class CohortBenchmarkService(
         existingCheckpoint?.pendingCandidatePuuids?.forEach { candidate ->
             if (candidate !in processedSet && existingPending.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
                 existingPending.add(candidate)
+            }
+        }
+        if (checkpointStalePatchAdvance) {
+            existingCheckpoint?.processedPuuids?.forEach { candidate ->
+                if (candidate !in processedSet && existingPending.size < MAX_CHECKPOINT_PENDING_PUUIDS) {
+                    existingPending.add(candidate)
+                }
             }
         }
         val netNewSeedCount = cleanSeeds.count { it !in processedSet && it !in existingPending }

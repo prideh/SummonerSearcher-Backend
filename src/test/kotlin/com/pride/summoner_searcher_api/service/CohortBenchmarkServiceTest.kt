@@ -4584,6 +4584,64 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
             ).body!!
             val checkpointAfterCapacityReject = savedCheckpoints["cohort:collector:checkpoint:euw1:16.7"]!!
 
+            // 3b. Stale-patch advance (16.6 -> 16.7) capacity test + seed-only runner latest fallback:
+            //     Checkpoint on 16.6 (stored only at "latest", with "16.7" key absent) has 490 pending + 10 processedPuuids.
+            //     On patch advance to 16.7, all 10 old processedPuuids are requeued into pendingQueue (490 + 10 = 500).
+            //     Adding 1 net-new seed ("fresh-challenger-seed") would make 501 > 500 and truncate "old-proc-10", so both
+            //     wouldExceedPendingQueueCap(..., checkpointStalePatchAdvance = true) and startOrResumeCohortCollector MUST refuse before mutation.
+            val staleAdvancePending490 = (1..490).map { "uncached-pending-$it" }
+            val staleAdvanceProcessed10 = (1..10).map { "old-proc-$it" }.toSet()
+            val stalePatch166Checkpoint = baselineCheckpoint499.copy(
+                targetPatch = "16.6",
+                pendingCandidatePuuids = staleAdvancePending490,
+                processedPuuids = staleAdvanceProcessed10,
+                totalNetworkCallsMade = 42
+            )
+            savedCheckpoints.remove("cohort:collector:checkpoint:euw1:16.7")
+            savedCheckpoints["cohort:collector:checkpoint:euw1:16.6"] = stalePatch166Checkpoint
+            savedCheckpoints["cohort:collector:checkpoint:euw1:latest"] = stalePatch166Checkpoint
+
+            val directStaleCapExceedsWithNetNew = seedService.wouldExceedPendingQueueCap(
+                existingCheckpoint = stalePatch166Checkpoint,
+                seedPuuids = listOf("fresh-challenger-seed"),
+                checkpointStalePatchAdvance = true
+            )
+            val directStaleCapFitsWithExistingOldProcessed = seedService.wouldExceedPendingQueueCap(
+                existingCheckpoint = stalePatch166Checkpoint,
+                seedPuuids = listOf("old-proc-1"),
+                checkpointStalePatchAdvance = true
+            )
+            val exceed500OnStalePatchAdvanceResp = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                maxBatches = 1,
+                batchSize = 1,
+                maxTotalProductiveBatches = 1,
+                maxTotalNetworkCalls = 15,
+                seedPuuids = listOf("fresh-challenger-seed"),
+                async = false,
+                operatorToken = "operator-secret-123",
+                httpRequest = httpReq
+            ).body!!
+            val patch167CheckpointStillAbsentAfterStaleReject = !savedCheckpoints.containsKey("cohort:collector:checkpoint:euw1:16.7")
+
+            // Verify unseeded startOrResumeGuarded does NOT use the latest fallback in startOrResumeInternal when patch="16.7" is absent:
+            // Because existingCheckpoint for ("euw1", "16.7") is null, sessionBaselineNetworkCalls is set to 0 (not 42 from "latest"),
+            // so when runResumableLowPriorityCollectorBatch loads "latest" (totalNetworkCallsMade = 42) with maxTotalNetworkCalls = 10,
+            // currentSessionNetworkCalls() is 42 - 0 = 42 >= 10 -> immediately stops with SESSION_NETWORK_CALL_CAP_REACHED and 0 new Riot calls.
+            val unseededNoLatestFallbackResp = seedController.startOrResumeCohortCollector(
+                region = "euw1",
+                patch = "16.7",
+                maxBatches = 1,
+                batchSize = 1,
+                maxTotalProductiveBatches = 1,
+                maxTotalNetworkCalls = 10,
+                seedPuuids = emptyList(),
+                async = false,
+                operatorToken = "operator-secret-123",
+                httpRequest = httpReq
+            ).body!!
+
             // Restore 499 pending queue for the valid 499 + 1 net-new seed (== 500) + 1 already-processed seed (0 net-new) run
             savedCheckpoints["cohort:collector:checkpoint:euw1:16.7"] = baselineCheckpoint499
             savedCheckpoints["cohort:collector:checkpoint:euw1:latest"] = baselineCheckpoint499
@@ -4834,6 +4892,19 @@ class CohortBenchmarkServiceTest : BehaviorSpec({
                 checkpointAfterCapacityReject.pendingCandidatePuuids.size shouldBe 500
                 checkpointAfterCapacityReject.pendingCandidatePuuids.first() shouldBe "uncached-pending-1"
                 checkpointAfterCapacityReject.pendingCandidatePuuids.last() shouldBe "uncached-pending-500"
+
+                directStaleCapExceedsWithNetNew shouldBe true
+                directStaleCapFitsWithExistingOldProcessed shouldBe false
+                exceed500OnStalePatchAdvanceResp.action shouldBe "INVALID_PARAMETERS"
+                exceed500OnStalePatchAdvanceResp.runningInProcess shouldBe false
+                exceed500OnStalePatchAdvanceResp.overnightSessionArmed shouldBe false
+                exceed500OnStalePatchAdvanceResp.checkpoint?.pendingCandidatePuuids?.size shouldBe 490
+                exceed500OnStalePatchAdvanceResp.checkpoint?.processedPuuids?.size shouldBe 10
+                patch167CheckpointStillAbsentAfterStaleReject shouldBe true
+
+                unseededNoLatestFallbackResp.checkpoint?.lastStopReason shouldBe "SESSION_NETWORK_CALL_CAP_REACHED"
+                unseededNoLatestFallbackResp.sessionNetworkCallsMade shouldBe 42
+                unseededNoLatestFallbackResp.overnightSessionArmed shouldBe false
 
                 lockedResp.action shouldBe "LOCKED_BY_ANOTHER_INSTANCE"
 
