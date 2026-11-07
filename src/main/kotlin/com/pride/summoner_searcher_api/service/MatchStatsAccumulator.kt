@@ -69,28 +69,21 @@ class MatchStatsAccumulator(private val puuid: String) {
      * participant data for [puuid] and was folded into the additive counters.
      */
     fun addMatchIfEligible(match: MatchDto): Boolean {
-        val info = match.info ?: return false
-        if ((info.gameDuration ?: 0L) <= 0L) return false
+        return addMatchAndExtractDelta("", match) != null
+    }
+
+    /**
+     * Extracts a compact, DTO-free [SingleMatchAdditiveDelta] for [puuid] from [match] without
+     * retaining any reference to [MatchDto], [MatchInfo], or [ParticipantDto].
+     */
+    fun extractDelta(matchId: String, match: MatchDto): SingleMatchAdditiveDelta? {
+        val info = match.info ?: return null
+        if ((info.gameDuration ?: 0L) <= 0L) return null
 
         val participants = info.participants
-        val player = participants.find { it.puuid == puuid } ?: return false
+        val player = participants.find { it.puuid == puuid } ?: return null
 
-        totalGames++
-        if (player.win == true) totalWins++
-
-        // Side Stats
-        if (player.teamId == 100) {
-            blueSideGames++
-            if (player.win == true) blueSideWins++
-        } else if (player.teamId == 200) {
-            redSideGames++
-            if (player.win == true) redSideWins++
-        }
-
-        // Team stats for KP
         val teamKills = participants.filter { it.teamId == player.teamId }.sumOf { it.kills ?: 0 }
-
-        // Find opponent
         val opponent = participants.find {
             it.teamPosition == player.teamPosition && it.teamId != player.teamId && player.teamPosition != "NONE"
         }
@@ -98,62 +91,110 @@ class MatchStatsAccumulator(private val puuid: String) {
             participants.filter { it.teamId == opponent.teamId }.sumOf { it.kills ?: 0 }
         } else 0
 
-        // Accumulate Player Stats
         val kills = player.kills ?: 0
         val deaths = player.deaths ?: 0
         val assists = player.assists ?: 0
         val cs = (player.totalMinionsKilled ?: 0) + (player.neutralMinionsKilled ?: 0)
         val soloKills = player.challenges?.soloKills ?: 0
-        val turretPlates = player.challenges?.turretPlatesTaken ?: 0
+        val turretPlates = (player.challenges?.turretPlatesTaken ?: 0).toInt()
         val visionScore = player.visionScore ?: 0
         val durationMin = (info.gameDuration ?: 0L) / 60.0
+        val kp = if (teamKills > 0) (kills + assists).toDouble() / teamKills else 0.0
 
-        totalKills += kills
-        totalDeaths += deaths
-        totalAssists += assists
-        totalCs += cs
-        totalSoloKills += soloKills
-        totalTurretPlates += turretPlates.toInt()
-        totalVisionScore += visionScore
-        totalDurationInMinutes += durationMin
+        val oppKills = opponent?.kills ?: 0
+        val oppDeaths = opponent?.deaths ?: 0
+        val oppAssists = opponent?.assists ?: 0
+        val oppCs = if (opponent != null) {
+            (opponent.totalMinionsKilled ?: 0) + (opponent.neutralMinionsKilled ?: 0)
+        } else 0
+        val oppSoloKills = opponent?.challenges?.soloKills ?: 0
+        val oppTurretPlates = (opponent?.challenges?.turretPlatesTaken ?: 0).toInt()
+        val oppVisionScore = opponent?.visionScore ?: 0
+        val oppKp = if (opponent != null && oppTeamKills > 0) {
+            (oppKills + oppAssists).toDouble() / oppTeamKills
+        } else 0.0
 
-        if (teamKills > 0) {
-            totalKillParticipation += (kills + assists).toDouble() / teamKills
+        return SingleMatchAdditiveDelta(
+            matchId = matchId,
+            championName = player.championName ?: "Unknown",
+            win = player.win == true,
+            teamId = player.teamId ?: 0,
+            kills = kills,
+            deaths = deaths,
+            assists = assists,
+            cs = cs,
+            durationMinutes = durationMin,
+            killParticipation = kp,
+            soloKills = soloKills,
+            turretPlates = turretPlates,
+            visionScore = visionScore,
+            hasOpponent = opponent != null,
+            oppKills = oppKills,
+            oppDeaths = oppDeaths,
+            oppAssists = oppAssists,
+            oppCs = oppCs,
+            oppSoloKills = oppSoloKills,
+            oppTurretPlates = oppTurretPlates,
+            oppVisionScore = oppVisionScore,
+            oppKillParticipation = oppKp
+        )
+    }
+
+    /**
+     * Folds a pre-extracted [SingleMatchAdditiveDelta] into the accumulator.
+     */
+    fun addDelta(delta: SingleMatchAdditiveDelta) {
+        totalGames++
+        if (delta.win) totalWins++
+
+        if (delta.teamId == 100) {
+            blueSideGames++
+            if (delta.win) blueSideWins++
+        } else if (delta.teamId == 200) {
+            redSideGames++
+            if (delta.win) redSideWins++
         }
 
-        // Accumulate Opponent Stats
-        if (opponent != null) {
-            val oppKills = opponent.kills ?: 0
-            val oppDeaths = opponent.deaths ?: 0
-            val oppAssists = opponent.assists ?: 0
-            val oppCs = (opponent.totalMinionsKilled ?: 0) + (opponent.neutralMinionsKilled ?: 0)
+        totalKills += delta.kills
+        totalDeaths += delta.deaths
+        totalAssists += delta.assists
+        totalCs += delta.cs
+        totalSoloKills += delta.soloKills
+        totalTurretPlates += delta.turretPlates
+        totalVisionScore += delta.visionScore
+        totalDurationInMinutes += delta.durationMinutes
+        totalKillParticipation += delta.killParticipation
 
-            oppTotalKills += oppKills
-            oppTotalDeaths += oppDeaths
-            oppTotalAssists += oppAssists
-            oppTotalCs += oppCs
-            oppTotalSoloKills += (opponent.challenges?.soloKills ?: 0)
-            oppTotalTurretPlates += (opponent.challenges?.turretPlatesTaken ?: 0).toInt()
-            oppTotalVisionScore += (opponent.visionScore ?: 0)
-
-            if (oppTeamKills > 0) {
-                oppTotalKillParticipation += (oppKills + oppAssists).toDouble() / oppTeamKills
-            }
+        if (delta.hasOpponent) {
+            oppTotalKills += delta.oppKills
+            oppTotalDeaths += delta.oppDeaths
+            oppTotalAssists += delta.oppAssists
+            oppTotalCs += delta.oppCs
+            oppTotalSoloKills += delta.oppSoloKills
+            oppTotalTurretPlates += delta.oppTurretPlates
+            oppTotalVisionScore += delta.oppVisionScore
+            oppTotalKillParticipation += delta.oppKillParticipation
         }
 
-        // Champion Stats
-        val champName = player.championName ?: "Unknown"
-        val champStats = championStatsMap.getOrPut(champName) { MutableChampionStats(champName) }
+        val champStats = championStatsMap.getOrPut(delta.championName) { MutableChampionStats(delta.championName) }
         champStats.games++
-        if (player.win == true) champStats.wins++ else champStats.losses++
-        champStats.kills += kills
-        champStats.deaths += deaths
-        champStats.assists += assists
-        champStats.soloKills += soloKills
-        champStats.turretPlates += turretPlates.toInt()
-        champStats.cs += cs
-        champStats.durationMinutes += durationMin
-        return true
+        if (delta.win) champStats.wins++ else champStats.losses++
+        champStats.kills += delta.kills
+        champStats.deaths += delta.deaths
+        champStats.assists += delta.assists
+        champStats.soloKills += delta.soloKills
+        champStats.turretPlates += delta.turretPlates
+        champStats.cs += delta.cs
+        champStats.durationMinutes += delta.durationMinutes
+    }
+
+    /**
+     * Extracts and immediately folds a compact [SingleMatchAdditiveDelta] for [match] if eligible.
+     */
+    fun addMatchAndExtractDelta(matchId: String, match: MatchDto): SingleMatchAdditiveDelta? {
+        val delta = extractDelta(matchId, match) ?: return null
+        addDelta(delta)
+        return delta
     }
 
     fun getTotalGames(): Int = totalGames
@@ -360,6 +401,31 @@ data class ChampionAdditiveCountersSnapshot(
     val durationMinutes: Double = 0.0
 )
 
+data class SingleMatchAdditiveDelta(
+    val matchId: String,
+    val championName: String,
+    val win: Boolean,
+    val teamId: Int,
+    val kills: Int,
+    val deaths: Int,
+    val assists: Int,
+    val cs: Int,
+    val durationMinutes: Double,
+    val killParticipation: Double,
+    val soloKills: Int,
+    val turretPlates: Int,
+    val visionScore: Int,
+    val hasOpponent: Boolean,
+    val oppKills: Int = 0,
+    val oppDeaths: Int = 0,
+    val oppAssists: Int = 0,
+    val oppCs: Int = 0,
+    val oppSoloKills: Int = 0,
+    val oppTurretPlates: Int = 0,
+    val oppVisionScore: Int = 0,
+    val oppKillParticipation: Double = 0.0
+)
+
 data class DurablePlayerSeasonStatsDto(
     val schemaVersion: Int = CURRENT_SCHEMA_VERSION,
     val region: String = "",
@@ -379,8 +445,12 @@ data class DurablePlayerSeasonStatsDto(
 ) {
     companion object {
         const val CURRENT_SCHEMA_VERSION = 1
-        const val MAX_TRACKED_SEASON_MATCH_IDS = 2_000
+        /** Matches `RiotApiService.fetchMatchIdsSince` safety break threshold (`if (allMatchIds.size > 2000) break`). */
+        const val RIOT_MATCH_IDS_SAFETY_THRESHOLD = 2_000
+        /** Preserves full 21-page (`21 * 100 = 2,100`) coverage returned by `RiotApiService.fetchMatchIdsSince`. */
+        const val MAX_TRACKED_SEASON_MATCH_IDS = 2_100
         const val MAX_EXCLUDED_MATCH_IDS = 500
     }
 }
+
 

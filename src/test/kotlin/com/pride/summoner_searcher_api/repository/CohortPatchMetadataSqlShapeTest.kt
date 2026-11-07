@@ -740,11 +740,58 @@ class CohortPatchMetadataSqlShapeTest {
             io.mockk.coEvery { springWiredRiotApiService.getMatchById("EUW1_ANCIENT_500", "euw1") } returns
                 makeMatchWithParticipant("EUW1_ANCIENT_500", ancientCreationMs, "AncientRiotName", "ANC1", 300, 5)
 
-            kotlinx.coroutines.runBlocking {
-                unwiredTxCacheService.getPlayerProfile("h2-season-puuid", "euw1", "MainPlayer", "EUW", explicitRefresh = true)
-            }
-            // Missing TransactionTemplate MUST fail closed for durable season stats persistence
+            val unwiredError = runCatching {
+                kotlinx.coroutines.runBlocking {
+                    unwiredTxCacheService.getPlayerProfile("h2-season-puuid", "euw1", "MainPlayer", "EUW", explicitRefresh = true)
+                }
+            }.exceptionOrNull()
+            // Missing TransactionTemplate MUST fail closed (never hide durability failure or write uncommitted Redis profile)
+            (unwiredError is IllegalStateException) shouldBe true
             playerSeasonStatsRepository.findByRegionAndPuuidAndSeasonYearAndQueueId("euw1", "h2-season-puuid", 2026, 420) shouldBe null
+            verify(exactly = 0) {
+                springWiredRedisCacheService.set(
+                    "player:profile:euw1:h2-season-puuid",
+                    any<com.pride.summoner_searcher_api.dto.SummonerProfileDto>(),
+                    any()
+                )
+            }
+
+            // 2. Seed an actual stale-schema row (schemaVersion = 0) for h2-season-puuid in H2 before refreshing,
+            //    proving that a stale-schema row is atomically rebuilt and replaced in-place without merge rejection!
+            val seededStaleRow = playerSeasonStatsRepository.saveAndFlush(
+                com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity(
+                    region = "euw1",
+                    puuid = "h2-season-puuid",
+                    seasonYear = 2026,
+                    queueId = 420,
+                    schemaVersion = 0,
+                    historyCapped = false,
+                    historyComplete = false,
+                    foldedGamesCount = 99,
+                    pendingGamesCount = 4,
+                    stateJson = """{"schemaVersion":0,"corrupt":true}""",
+                    updatedAt = fixedNow.minusSeconds(3600)
+                )
+            )
+            val staleRowId = seededStaleRow.id
+            val staleRowInitialVersion = seededStaleRow.version
+
+            val wiredCacheService = com.pride.summoner_searcher_api.service.PlayerCacheService(
+                redisCacheService = springWiredRedisCacheService,
+                riotApiService = springWiredRiotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = playerSeasonStatsRepository,
+                transactionTemplate = transactionTemplate,
+                objectMapper = objectMapper
+            )
+            io.mockk.coEvery { springWiredRiotApiService.fetchMatchIdsSince("h2-season-puuid", "euw1", any()) } returns
+                listOf("EUW1_NEW_2000", "EUW1_OLD_1000")
+
+            val firstWiredProfile = kotlinx.coroutines.runBlocking {
+                wiredCacheService.getPlayerProfile("h2-season-puuid", "euw1", "MainPlayer", "EUW", explicitRefresh = true)
+            }
+            firstWiredProfile?.totalMatches shouldBe 2
 
             // Verify within-batch monotonic lastSeenAt participant indexing in H2:
             // Both EUW1_NEW_2000 and EUW1_OLD_1000 were indexed in the same batch; H2 MUST hold "NewRiotName#NEW1" (newerCreationMs)
@@ -756,16 +803,22 @@ class CohortPatchMetadataSqlShapeTest {
             indexedCoPlayerAfterBatch1.profileIconId shouldBe 99
             indexedCoPlayerAfterBatch1.lastSeenAt shouldBe Instant.ofEpochMilli(newerCreationMs)
 
-            // 2. Wire real TransactionTemplate and run with an even older backfilled match ("EUW1_ANCIENT_500")
-            val wiredCacheService = com.pride.summoner_searcher_api.service.PlayerCacheService(
-                redisCacheService = springWiredRedisCacheService,
-                riotApiService = springWiredRiotApiService,
-                indexedPlayerRepository = indexedPlayerRepository,
-                timeProvider = clock,
-                playerSeasonStatsRepository = playerSeasonStatsRepository,
-                transactionTemplate = transactionTemplate,
-                objectMapper = objectMapper
+            // Verify the stale-schema row was atomically replaced in-place (same row ID, incremented @Version, schemaVersion = 1)
+            val replacedStaleRow = playerSeasonStatsRepository.findByRegionAndPuuidAndSeasonYearAndQueueId(
+                "euw1",
+                "h2-season-puuid",
+                2026,
+                420
             )
+            (replacedStaleRow != null) shouldBe true
+            replacedStaleRow!!.id shouldBe staleRowId
+            replacedStaleRow.schemaVersion shouldBe com.pride.summoner_searcher_api.service.DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION
+            replacedStaleRow.foldedGamesCount shouldBe 2
+            replacedStaleRow.pendingGamesCount shouldBe 0
+            replacedStaleRow.historyComplete shouldBe true
+            (replacedStaleRow.version > staleRowInitialVersion) shouldBe true
+
+            // 3. Incrementally add an even older backfilled match ("EUW1_ANCIENT_500")
             io.mockk.coEvery { springWiredRiotApiService.fetchMatchIdsSince("h2-season-puuid", "euw1", any()) } returns
                 listOf("EUW1_NEW_2000", "EUW1_OLD_1000", "EUW1_ANCIENT_500")
 
@@ -780,6 +833,50 @@ class CohortPatchMetadataSqlShapeTest {
             indexedCoPlayerAfterAncientMatch.tagLine shouldBe "NEW1"
             indexedCoPlayerAfterAncientMatch.lastSeenAt shouldBe Instant.ofEpochMilli(newerCreationMs)
 
+            // 4. Test concurrent transactions racing newer vs older lastSeenAt upserts for the same PUUID in H2
+            val racePuuid = "concurrent-race-puuid"
+            val threadCount = 6
+            val startBarrier = java.util.concurrent.CyclicBarrier(threadCount)
+            val executor = java.util.concurrent.Executors.newFixedThreadPool(threadCount)
+            val newestRaceTs = Instant.ofEpochMilli(newerCreationMs + 60_000L)
+            try {
+                val futures = (0 until threadCount).map { workerIdx ->
+                    executor.submit<Int> {
+                        val isNewestWorker = workerIdx == 2
+                        val candidateTs = if (isNewestWorker) {
+                            newestRaceTs
+                        } else {
+                            Instant.ofEpochMilli(ancientCreationMs + workerIdx * 1_000L)
+                        }
+                        val candidateName = if (isNewestWorker) "WinnerNewestName" else "StaleWorker_$workerIdx"
+                        val candidateTag = if (isNewestWorker) "WIN1" else "OLD$workerIdx"
+                        startBarrier.await(5, java.util.concurrent.TimeUnit.SECONDS)
+                        transactionTemplate.execute {
+                            indexedPlayerRepository.upsertPlayerIfNewer(
+                                puuid = racePuuid,
+                                gameName = candidateName,
+                                tagLine = candidateTag,
+                                region = "euw1",
+                                profileIconId = if (isNewestWorker) 888 else 10 + workerIdx,
+                                summonerLevel = if (isNewestWorker) 777L else 100L + workerIdx,
+                                lastSeenAt = candidateTs
+                            )
+                        } ?: 0
+                    }
+                }
+                futures.forEach { it.get(5, java.util.concurrent.TimeUnit.SECONDS) }
+            } finally {
+                executor.shutdownNow()
+            }
+
+            val raceWinner = indexedPlayerRepository.findById(racePuuid).orElse(null)
+            (raceWinner != null) shouldBe true
+            raceWinner!!.gameName shouldBe "WinnerNewestName"
+            raceWinner.tagLine shouldBe "WIN1"
+            raceWinner.profileIconId shouldBe 888
+            raceWinner.summonerLevel shouldBe 777L
+            raceWinner.lastSeenAt shouldBe newestRaceTs
+
             // Verify H2 player_season_stats row committed atomically with @Version
             val savedSeasonRow = playerSeasonStatsRepository.findByRegionAndPuuidAndSeasonYearAndQueueId(
                 "euw1",
@@ -792,7 +889,7 @@ class CohortPatchMetadataSqlShapeTest {
             savedSeasonRow.historyComplete shouldBe true
             savedSeasonRow.pendingGamesCount shouldBe 0
 
-            // 3. Seed partial-history, capped-history, and stale-schema player rows in H2 and verify scalar SQL shape + operator coverage summary
+            // 5. Seed partial-history, capped-history, and stale-schema player rows in H2 and verify scalar SQL shape + operator coverage summary
             playerSeasonStatsRepository.saveAllAndFlush(
                 listOf(
                     com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity(
@@ -816,7 +913,7 @@ class CohortPatchMetadataSqlShapeTest {
                         schemaVersion = 1,
                         historyCapped = true,
                         historyComplete = false,
-                        foldedGamesCount = 2000,
+                        foldedGamesCount = 2100,
                         pendingGamesCount = 0,
                         stateJson = "{}",
                         updatedAt = fixedNow
@@ -845,14 +942,14 @@ class CohortPatchMetadataSqlShapeTest {
             val seasonSummarySql = coverageSql.single { it.contains("player_season_stats", ignoreCase = true) }
             seasonSummarySql shouldNotContainIgnoringCase "state_json"
 
-            coverageSummary.identityIndexCoverage.totalIndexedPlayersGlobal shouldBe 2L
-            coverageSummary.identityIndexCoverage.targetRegionIndexedPlayers shouldBe 2L
+            coverageSummary.identityIndexCoverage.totalIndexedPlayersGlobal shouldBe 3L
+            coverageSummary.identityIndexCoverage.targetRegionIndexedPlayers shouldBe 3L
             coverageSummary.seasonHistoryCompleteness.targetRegionStats.trackedViewedPlayers shouldBe 4L
             coverageSummary.seasonHistoryCompleteness.targetRegionStats.completeHistoryPlayers shouldBe 1L
             coverageSummary.seasonHistoryCompleteness.targetRegionStats.partialHistoryPlayers shouldBe 2L
             coverageSummary.seasonHistoryCompleteness.targetRegionStats.cappedHistoryPlayers shouldBe 1L
             coverageSummary.seasonHistoryCompleteness.targetRegionStats.staleSchemaVersionPlayers shouldBe 1L
-            coverageSummary.seasonHistoryCompleteness.targetRegionStats.totalFoldedSeasonGames shouldBe 2055L
+            coverageSummary.seasonHistoryCompleteness.targetRegionStats.totalFoldedSeasonGames shouldBe 2155L
             coverageSummary.seasonHistoryCompleteness.targetRegionStats.totalPendingGapGames shouldBe 5L
         } finally {
             playerSeasonStatsRepository.deleteAll()

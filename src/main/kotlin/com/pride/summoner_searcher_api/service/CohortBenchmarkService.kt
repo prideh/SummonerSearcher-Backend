@@ -4851,70 +4851,62 @@ class CohortBenchmarkService(
         val effectiveSeasonYear = seasonYear
             ?: nowInstant.atZone(java.time.ZoneOffset.UTC).year
 
-        val regionCounts = try {
-            indexedPlayerRepository?.countPlayersGroupedByRegion().orEmpty().mapNotNull { row ->
-                val reg = (row.getOrNull(0) as? String)?.lowercase()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                val cnt = (row.getOrNull(1) as? Number)?.toLong() ?: 0L
-                val latestSeen = when (val rawSeen = row.getOrNull(2)) {
-                    is Instant -> rawSeen
-                    is Number -> rawSeen.toLong().takeIf { it > 0L }?.let { Instant.ofEpochMilli(it) }
-                    else -> null
-                }
-                RegionIndexedPlayerCountDto(
-                    region = reg,
-                    indexedPlayerCount = cnt,
-                    latestSeenAt = latestSeen
-                )
+        val regionCounts = indexedPlayerRepository?.countPlayersGroupedByRegion().orEmpty().mapNotNull { row ->
+            val reg = (row.getOrNull(0) as? String)?.lowercase()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val cnt = (row.getOrNull(1) as? Number)?.toLong() ?: 0L
+            val latestSeen = when (val rawSeen = row.getOrNull(2)) {
+                is Instant -> rawSeen
+                is Number -> rawSeen.toLong().takeIf { it > 0L }?.let { Instant.ofEpochMilli(it) }
+                else -> null
             }
-        } catch (e: Exception) {
-            logger.warn("Failed to query indexed_players aggregate counts: {}", e.message)
-            emptyList()
+            RegionIndexedPlayerCountDto(
+                region = reg,
+                indexedPlayerCount = cnt,
+                latestSeenAt = latestSeen
+            )
         }
 
         val totalIndexedGlobal = regionCounts.sumOf { it.indexedPlayerCount }
         val targetIndexedCount = regionCounts.firstOrNull { it.region == normalizedRegion }?.indexedPlayerCount ?: 0L
 
-        val seasonByRegion = try {
-            playerSeasonStatsRepository?.summarizeByRegionForSeasonYear(
+        val seasonByRegion = playerSeasonStatsRepository?.summarizeByRegionForSeasonYear(
+            seasonYear = effectiveSeasonYear,
+            queueId = SOLO_QUEUE_ID,
+            currentSchemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION
+        ).orEmpty().mapNotNull { row ->
+            val reg = (row.getOrNull(0) as? String)?.lowercase()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val tracked = (row.getOrNull(1) as? Number)?.toLong() ?: 0L
+            val complete = (row.getOrNull(2) as? Number)?.toLong() ?: 0L
+            val partial = (row.getOrNull(3) as? Number)?.toLong() ?: 0L
+            val capped = (row.getOrNull(4) as? Number)?.toLong() ?: 0L
+            val staleSchema = (row.getOrNull(5) as? Number)?.toLong() ?: 0L
+            val foldedGames = (row.getOrNull(6) as? Number)?.toLong() ?: 0L
+            val pendingGames = (row.getOrNull(7) as? Number)?.toLong() ?: 0L
+            val maxUpdated = row.getOrNull(8) as? Instant
+            RegionSeasonStatsCompletenessDto(
+                region = reg,
                 seasonYear = effectiveSeasonYear,
                 queueId = SOLO_QUEUE_ID,
-                currentSchemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION
-            ).orEmpty().mapNotNull { row ->
-                val reg = (row.getOrNull(0) as? String)?.lowercase()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
-                val tracked = (row.getOrNull(1) as? Number)?.toLong() ?: 0L
-                val complete = (row.getOrNull(2) as? Number)?.toLong() ?: 0L
-                val partial = (row.getOrNull(3) as? Number)?.toLong() ?: 0L
-                val capped = (row.getOrNull(4) as? Number)?.toLong() ?: 0L
-                val staleSchema = (row.getOrNull(5) as? Number)?.toLong() ?: 0L
-                val foldedGames = (row.getOrNull(6) as? Number)?.toLong() ?: 0L
-                val pendingGames = (row.getOrNull(7) as? Number)?.toLong() ?: 0L
-                val maxUpdated = row.getOrNull(8) as? Instant
-                RegionSeasonStatsCompletenessDto(
-                    region = reg,
-                    seasonYear = effectiveSeasonYear,
-                    queueId = SOLO_QUEUE_ID,
-                    currentSchemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION,
-                    maxTrackedMatchIdsCapPerPlayer = DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS,
-                    trackedViewedPlayers = tracked,
-                    completeHistoryPlayers = complete,
-                    partialHistoryPlayers = partial,
-                    cappedHistoryPlayers = capped,
-                    staleSchemaVersionPlayers = staleSchema,
-                    totalFoldedSeasonGames = foldedGames,
-                    totalPendingGapGames = pendingGames,
-                    latestUpdatedAt = maxUpdated
-                )
-            }
-        } catch (e: Exception) {
-            logger.warn("Failed to query player_season_stats aggregate summary: {}", e.message)
-            emptyList()
+                currentSchemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION,
+                maxTrackedMatchIdsCapPerPlayer = DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS,
+                trackedViewedPlayers = tracked,
+                completeHistoryPlayers = complete,
+                partialHistoryPlayers = partial,
+                cappedHistoryPlayers = capped,
+                staleSchemaVersionPlayers = staleSchema,
+                totalFoldedSeasonGames = foldedGames,
+                totalPendingGapGames = pendingGames,
+                latestUpdatedAt = maxUpdated
+            )
         }
 
         val targetSeasonStats = seasonByRegion.firstOrNull { it.region == normalizedRegion }
             ?: RegionSeasonStatsCompletenessDto(
                 region = normalizedRegion,
                 seasonYear = effectiveSeasonYear,
-                queueId = SOLO_QUEUE_ID
+                queueId = SOLO_QUEUE_ID,
+                currentSchemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION,
+                maxTrackedMatchIdsCapPerPlayer = DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS
             )
 
         val targetPatch = resolveGroundedCurrentPatch(

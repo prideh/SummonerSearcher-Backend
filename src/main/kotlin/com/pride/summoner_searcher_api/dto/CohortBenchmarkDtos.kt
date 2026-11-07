@@ -458,7 +458,7 @@ data class RegionSeasonStatsCompletenessDto(
     val seasonYear: Int,
     val queueId: Int = 420,
     val currentSchemaVersion: Int = 1,
-    val maxTrackedMatchIdsCapPerPlayer: Int = 2_000,
+    val maxTrackedMatchIdsCapPerPlayer: Int = 2_100,
     val trackedViewedPlayers: Long = 0L,
     val completeHistoryPlayers: Long = 0L,
     val partialHistoryPlayers: Long = 0L,
