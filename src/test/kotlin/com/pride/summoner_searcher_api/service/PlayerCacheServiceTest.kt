@@ -1376,17 +1376,40 @@ class PlayerCacheServiceTest : BehaviorSpec({
             val capPuuid = "durable-2100-cap-puuid"
 
             fun buildMatch(id: String, idx: Int, forPuuid: String = capPuuid): MatchDto {
+                val isTailLoss = (forPuuid == capPuuid && idx in 1..3)
+                val isNewAboveCapWin = (forPuuid == capPuuid && idx > 2100)
+                val champ = when {
+                    isTailLoss -> "Aatrox"
+                    isNewAboveCapWin -> "Ahri"
+                    else -> "Orianna"
+                }
+                val isWin = !isTailLoss
+                val k = when {
+                    isTailLoss -> 1
+                    isNewAboveCapWin -> 16
+                    else -> 8
+                }
+                val d = when {
+                    isTailLoss -> 7
+                    isNewAboveCapWin -> 1
+                    else -> 2
+                }
+                val a = when {
+                    isTailLoss -> 2
+                    isNewAboveCapWin -> 12
+                    else -> 9
+                }
                 val p = mapper.readValue(
                     """
                     {
                       "puuid": "$forPuuid",
-                      "championName": "Orianna",
+                      "championName": "$champ",
                       "teamId": 100,
                       "teamPosition": "MIDDLE",
-                      "win": true,
-                      "kills": 8,
-                      "deaths": 2,
-                      "assists": 9,
+                      "win": $isWin,
+                      "kills": $k,
+                      "deaths": $d,
+                      "assists": $a,
                       "totalMinionsKilled": 210,
                       "neutralMinionsKilled": 10,
                       "visionScore": 25
@@ -1397,7 +1420,7 @@ class PlayerCacheServiceTest : BehaviorSpec({
                 return MatchDto(
                     metadata = MatchMetadata(id, listOf(forPuuid)),
                     info = MatchInfo(
-                        gameCreation = clockMs.get() - idx * 60_000L,
+                        gameCreation = clockMs.get() - (3000 - idx).coerceAtLeast(1) * 60_000L,
                         gameDuration = 1800L,
                         gameId = idx.toLong(),
                         queueId = 420,
@@ -1469,16 +1492,36 @@ class PlayerCacheServiceTest : BehaviorSpec({
 
             val profile2100 = capService.getPlayerProfile(capPuuid, region, summonerName, tagLine, explicitRefresh = true)
             val state2100 = mapper.readValue(storedCapEntity!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
-            val peakRetainedMatchDtosDuring2100 = capService.getDiscoveryAndSeasonWriteTelemetry()["lastRefreshPeakRetainedMatchDtos"] ?: 0L
-            val retainedDeltasDuring2100 = capService.getLastRefreshRetainedDeltasForTest()
+            val telemetryAfter2100 = capService.getDiscoveryAndSeasonWriteTelemetry()
+            val peakLiveMatchDtosDuring2100 = telemetryAfter2100["lastRefreshPeakLiveMatchDtos"] ?: 0L
+            val peakCrossChunkMatchDtosDuring2100 = telemetryAfter2100["lastRefreshPeakCrossChunkRetainedMatchDtos"] ?: 0L
             val deltaFieldTypes = SingleMatchAdditiveDelta::class.java.declaredFields.map { it.type }
 
-            // 2. Rollforward past 2,100 cap (3 brand new matches arrive: 2103, 2102, 2101)
+            // 2a. Capped player plays 1 NEW game (EUW1_2101): moving 2,100 window advances to EUW1_2101..EUW1_2 (evicting EUW1_1)
+            clockMs.addAndGet(120_000L)
+            val idsAfter1NewGame = (2101 downTo 2).map { "EUW1_$it" }
+            coEvery { riotApiService.fetchMatchIdsSince(capPuuid, region, any()) } returns idsAfter1NewGame
+            val profileAfter2101 = capService.getPlayerProfile(capPuuid, region, summonerName, tagLine, explicitRefresh = true)
+            val stateAfter2101 = mapper.readValue(storedCapEntity!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+            val expectedAcc2101 = MatchStatsAccumulator(capPuuid).also { acc ->
+                for (idx in 2101 downTo 2) {
+                    acc.add(buildMatch("EUW1_$idx", idx, capPuuid))
+                }
+            }
+            val (expectedOverall2101, expectedChamps2101) = expectedAcc2101.toAdditiveSnapshots()
+
+            // 2b. Capped player plays 2 more new games (EUW1_2103, EUW1_2102): moving 2,100 window advances to EUW1_2103..EUW1_4 (evicting EUW1_3, EUW1_2)
             clockMs.addAndGet(120_000L)
             val idsRollforward = ((2103 downTo 4).map { "EUW1_$it" })
             coEvery { riotApiService.fetchMatchIdsSince(capPuuid, region, any()) } returns idsRollforward
             val profileAfterRollforward = capService.getPlayerProfile(capPuuid, region, summonerName, tagLine, explicitRefresh = true)
             val stateAfterRollforward = mapper.readValue(storedCapEntity!!.stateJson, DurablePlayerSeasonStatsDto::class.java)
+            val expectedAcc2103 = MatchStatsAccumulator(capPuuid).also { acc ->
+                for (idx in 2103 downTo 4) {
+                    acc.add(buildMatch("EUW1_$idx", idx, capPuuid))
+                }
+            }
+            val (expectedOverall2103, expectedChamps2103) = expectedAcc2103.toAdditiveSnapshots()
 
             // 3. Concurrent writer merge: verify returned profile AND Redis profile reflect COMMITTED MERGED state (4 games), not stale local totals (3 games)
             val mergePuuid = "concurrent-merge-redis-puuid"
@@ -1731,30 +1774,64 @@ class PlayerCacheServiceTest : BehaviorSpec({
             val brokenMemoryGuardResult = brokenMemoryService.hasMemoryHeadroomForSeasonBackfill()
             val zeroLimitMemoryGuardResult = zeroLimitMemoryService.hasMemoryHeadroomForSeasonBackfill()
 
-            Then("it preserves 2100 coverage with historyCapped=true/historyComplete=false, bounds retained MatchDto instances to <=40, keeps counters equal to processedMatchIds ledger, returns committed merged state for Redis, and fails closed on DB/pagination/memory errors") {
+            Then("it preserves 2100 coverage with historyCapped=true/historyComplete=false, advances the 2100 moving window on new games without drift or archive expansion, bounds live MatchDto peak (including 50-match chunk) to <=70, returns committed merged state for Redis, and fails closed on DB/pagination/memory errors") {
                 // 1. 2,100-match fetch preserves all 2,100 matches while marking historyCapped=true and historyComplete=false
                 profile2100?.totalMatches shouldBe 2100
+                profile2100?.allMatchIds?.first() shouldBe "EUW1_2100"
+                profile2100?.allMatchIds?.last() shouldBe "EUW1_1"
+                profile2100?.recentMatches?.first()?.metadata?.matchId shouldBe "EUW1_2100"
                 state2100.processedMatchIds.size shouldBe 2100
                 state2100.overallCounters.totalGames shouldBe 2100
+                state2100.overallCounters.totalWins shouldBe 2097 // matches 1..3 are losses, 4..2100 are wins
                 state2100.historyCapped shouldBe true
                 state2100.historyComplete shouldBe false
 
-                // 2. Prove retained MatchDto bound: <= 40 MatchDto instances retained across 2,100 matches (20 recent cards + 20 participant index)
-                //    and SingleMatchAdditiveDelta holds zero MatchDto/MatchInfo/ParticipantDto fields
-                (peakRetainedMatchDtosDuring2100 in 1L..40L) shouldBe true
-                retainedDeltasDuring2100.size shouldBe 2100
+                // 2. Prove actual live MatchDto bound:
+                //    - <= 70 distinct live MatchDto instances at peak across 2,100 matches (50 in current chunk + 20 cross-chunk cards/index)
+                //    - <= 20 distinct MatchDto instances retained across chunk boundaries
+                //    - SingleMatchAdditiveDelta holds zero MatchDto/MatchInfo/ParticipantDto fields
+                peakLiveMatchDtosDuring2100 shouldBe 70L
+                peakCrossChunkMatchDtosDuring2100 shouldBe 20L
                 deltaFieldTypes.none {
                     it == MatchDto::class.java ||
                         it == MatchInfo::class.java ||
                         it == com.pride.summoner_searcher_api.dto.ParticipantDto::class.java
                 } shouldBe true
 
-                // 3. Rollforward past 2,100 cap: counters NEVER outgrow saved processedMatchIds ledger (both stay 2,100)
+                // 3a. Capped player plays 1 NEW game (EUW1_2101): newest cards and totals update to EUW1_2101..EUW1_2 (evicting EUW1_1)
+                profileAfter2101?.totalMatches shouldBe 2100
+                profileAfter2101?.allMatchIds?.size shouldBe 2100
+                profileAfter2101?.allMatchIds?.first() shouldBe "EUW1_2101"
+                profileAfter2101?.allMatchIds?.last() shouldBe "EUW1_2"
+                profileAfter2101?.recentMatches?.first()?.metadata?.matchId shouldBe "EUW1_2101"
+                stateAfter2101.processedMatchIds.size shouldBe 2100
+                stateAfter2101.processedMatchIds.first() shouldBe "EUW1_2101"
+                stateAfter2101.processedMatchIds.last() shouldBe "EUW1_2"
+                stateAfter2101.pendingMatchIds shouldBe emptyList()
+                stateAfter2101.overallCounters.totalGames shouldBe 2100
+                stateAfter2101.overallCounters.totalWins shouldBe 2098 // +1 win (EUW1_2101) and -1 loss (evicted EUW1_1)
+                stateAfter2101.overallCounters shouldBe expectedOverall2101
+                stateAfter2101.championCounters shouldBe expectedChamps2101
+                stateAfter2101.historyCapped shouldBe true
+                stateAfter2101.historyComplete shouldBe false
+                capService.isValidDurableSeasonState(stateAfter2101, region, capPuuid, 2026) shouldBe true
+
+                // 3b. Rollforward past 2,100 cap (EUW1_2103..EUW1_4): all 3 tail losses on Aatrox (1..3) evicted, 3 new wins on Ahri (2101..2103) folded
                 stateAfterRollforward.processedMatchIds.size shouldBe 2100
+                stateAfterRollforward.processedMatchIds.first() shouldBe "EUW1_2103"
+                stateAfterRollforward.processedMatchIds.last() shouldBe "EUW1_4"
+                stateAfterRollforward.pendingMatchIds shouldBe emptyList()
                 stateAfterRollforward.overallCounters.totalGames shouldBe 2100
+                stateAfterRollforward.overallCounters.totalWins shouldBe 2100
+                stateAfterRollforward.overallCounters shouldBe expectedOverall2103
+                stateAfterRollforward.championCounters shouldBe expectedChamps2103
+                stateAfterRollforward.championCounters.none { it.championName == "Aatrox" } shouldBe true
+                stateAfterRollforward.championCounters.single { it.championName == "Ahri" }.games shouldBe 3
                 stateAfterRollforward.historyCapped shouldBe true
                 stateAfterRollforward.historyComplete shouldBe false
                 profileAfterRollforward?.totalMatches shouldBe 2100
+                profileAfterRollforward?.allMatchIds?.first() shouldBe "EUW1_2103"
+                profileAfterRollforward?.recentMatches?.first()?.metadata?.matchId shouldBe "EUW1_2103"
                 capService.isValidDurableSeasonState(stateAfterRollforward, region, capPuuid, 2026) shouldBe true
 
                 // 4. Concurrent merge: both returned profile and Redis cached profile reflect committed 4-game merged state (not 3-game local state)

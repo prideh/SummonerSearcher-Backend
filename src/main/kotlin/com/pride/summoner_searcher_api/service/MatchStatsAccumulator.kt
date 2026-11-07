@@ -189,6 +189,73 @@ class MatchStatsAccumulator(private val puuid: String) {
     }
 
     /**
+     * Subtracts a pre-extracted [SingleMatchAdditiveDelta] from the accumulator when evicting
+     * the oldest match from the capped 2,100-match moving window so counters never drift from
+     * `processedMatchIds`.
+     */
+    fun subtractDelta(delta: SingleMatchAdditiveDelta) {
+        if (totalGames <= 0) return
+        totalGames = (totalGames - 1).coerceAtLeast(0)
+        if (delta.win) {
+            totalWins = (totalWins - 1).coerceAtLeast(0)
+        }
+
+        if (delta.teamId == 100) {
+            blueSideGames = (blueSideGames - 1).coerceAtLeast(0)
+            if (delta.win) {
+                blueSideWins = (blueSideWins - 1).coerceAtLeast(0)
+            }
+        } else if (delta.teamId == 200) {
+            redSideGames = (redSideGames - 1).coerceAtLeast(0)
+            if (delta.win) {
+                redSideWins = (redSideWins - 1).coerceAtLeast(0)
+            }
+        }
+
+        totalKills = (totalKills - delta.kills).coerceAtLeast(0)
+        totalDeaths = (totalDeaths - delta.deaths).coerceAtLeast(0)
+        totalAssists = (totalAssists - delta.assists).coerceAtLeast(0)
+        totalCs = (totalCs - delta.cs).coerceAtLeast(0)
+        totalSoloKills = (totalSoloKills - delta.soloKills).coerceAtLeast(0)
+        totalTurretPlates = (totalTurretPlates - delta.turretPlates).coerceAtLeast(0)
+        totalVisionScore = (totalVisionScore - delta.visionScore).coerceAtLeast(0)
+        totalDurationInMinutes = if (totalGames == 0) 0.0 else (totalDurationInMinutes - delta.durationMinutes).coerceAtLeast(0.0)
+        totalKillParticipation = if (totalGames == 0) 0.0 else (totalKillParticipation - delta.killParticipation).coerceAtLeast(0.0)
+
+        if (delta.hasOpponent) {
+            oppTotalKills = (oppTotalKills - delta.oppKills).coerceAtLeast(0)
+            oppTotalDeaths = (oppTotalDeaths - delta.oppDeaths).coerceAtLeast(0)
+            oppTotalAssists = (oppTotalAssists - delta.oppAssists).coerceAtLeast(0)
+            oppTotalCs = (oppTotalCs - delta.oppCs).coerceAtLeast(0)
+            oppTotalSoloKills = (oppTotalSoloKills - delta.oppSoloKills).coerceAtLeast(0)
+            oppTotalTurretPlates = (oppTotalTurretPlates - delta.oppTurretPlates).coerceAtLeast(0)
+            oppTotalVisionScore = (oppTotalVisionScore - delta.oppVisionScore).coerceAtLeast(0)
+            oppTotalKillParticipation = if (totalGames == 0) 0.0 else (oppTotalKillParticipation - delta.oppKillParticipation).coerceAtLeast(0.0)
+        }
+
+        val champStats = championStatsMap[delta.championName]
+        if (champStats != null) {
+            champStats.games = (champStats.games - 1).coerceAtLeast(0)
+            if (champStats.games <= 0) {
+                championStatsMap.remove(delta.championName)
+            } else {
+                if (delta.win) {
+                    champStats.wins = (champStats.wins - 1).coerceAtLeast(0)
+                } else {
+                    champStats.losses = (champStats.losses - 1).coerceAtLeast(0)
+                }
+                champStats.kills = (champStats.kills - delta.kills).coerceAtLeast(0)
+                champStats.deaths = (champStats.deaths - delta.deaths).coerceAtLeast(0)
+                champStats.assists = (champStats.assists - delta.assists).coerceAtLeast(0)
+                champStats.soloKills = (champStats.soloKills - delta.soloKills).coerceAtLeast(0)
+                champStats.turretPlates = (champStats.turretPlates - delta.turretPlates).coerceAtLeast(0)
+                champStats.cs = (champStats.cs - delta.cs).coerceAtLeast(0)
+                champStats.durationMinutes = (champStats.durationMinutes - delta.durationMinutes).coerceAtLeast(0.0)
+            }
+        }
+    }
+
+    /**
      * Extracts and immediately folds a compact [SingleMatchAdditiveDelta] for [match] if eligible.
      */
     fun addMatchAndExtractDelta(matchId: String, match: MatchDto): SingleMatchAdditiveDelta? {

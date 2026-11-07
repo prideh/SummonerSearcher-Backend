@@ -62,7 +62,7 @@ class PlayerCacheService(
     private val seasonStatsDbSavesCounter = java.util.concurrent.atomic.AtomicLong(0L)
     private val seasonStatsDbFailuresCounter = java.util.concurrent.atomic.AtomicLong(0L)
     private val lastRefreshPeakRetainedMatchDtos = java.util.concurrent.atomic.AtomicInteger(0)
-    private val lastRefreshRetainedDeltas = java.util.concurrent.atomic.AtomicReference<List<SingleMatchAdditiveDelta>>(emptyList())
+    private val lastRefreshPeakCrossChunkRetainedMatchDtos = java.util.concurrent.atomic.AtomicInteger(0)
 
     companion object {
         private const val RECENT_MATCHES_LIMIT = 20
@@ -84,11 +84,23 @@ class PlayerCacheService(
         "indexedPlayersStaleSkipped" to indexedPlayersStaleSkippedCounter.get(),
         "seasonStatsDbSaves" to seasonStatsDbSavesCounter.get(),
         "seasonStatsDbFailures" to seasonStatsDbFailuresCounter.get(),
-        "lastRefreshPeakRetainedMatchDtos" to lastRefreshPeakRetainedMatchDtos.get().toLong()
+        "lastRefreshPeakRetainedMatchDtos" to lastRefreshPeakRetainedMatchDtos.get().toLong(),
+        "lastRefreshPeakLiveMatchDtos" to lastRefreshPeakRetainedMatchDtos.get().toLong(),
+        "lastRefreshPeakCrossChunkRetainedMatchDtos" to lastRefreshPeakCrossChunkRetainedMatchDtos.get().toLong()
     )
 
-    internal fun getLastRefreshRetainedDeltasForTest(): List<SingleMatchAdditiveDelta> =
-        lastRefreshRetainedDeltas.get()
+    private fun countDistinctLiveMatchDtos(vararg collections: Iterable<MatchDto?>?): Int {
+        val identitySet = java.util.Collections.newSetFromMap(java.util.IdentityHashMap<MatchDto, Boolean>())
+        for (collection in collections) {
+            if (collection == null) continue
+            for (dto in collection) {
+                if (dto != null) {
+                    identitySet.add(dto)
+                }
+            }
+        }
+        return identitySet.size
+    }
 
     internal fun hasMemoryHeadroomForSeasonBackfill(): Boolean {
         return try {
@@ -202,6 +214,7 @@ class PlayerCacheService(
         expectedPreviousVersion: Long?,
         isFullRebuild: Boolean = false,
         newlyFoldedDeltas: List<SingleMatchAdditiveDelta> = emptyList(),
+        evictedDeltas: List<SingleMatchAdditiveDelta> = emptyList(),
         effectiveSeasonalWindowIds: List<String> = emptyList(),
         rawFetchHitSafetyLimit: Boolean = false,
         rawFetchTruncatedByLedgerCap: Boolean = false,
@@ -247,7 +260,7 @@ class PlayerCacheService(
                                 state
                             }
                             else -> {
-                                if (attempt == 0 && newlyFoldedDeltas.isEmpty()) {
+                                if (attempt == 0 && newlyFoldedDeltas.isEmpty() && evictedDeltas.isEmpty()) {
                                     throw IllegalStateException(
                                         "Optimistic version mismatch on player_season_stats for ${state.puuid} ($normalizedRegion): expected=$expectedPreviousVersion, actual=${existing.version}"
                                     )
@@ -258,6 +271,7 @@ class PlayerCacheService(
                                     ),
                                     candidateState = state,
                                     newlyFoldedDeltas = newlyFoldedDeltas,
+                                    evictedDeltas = evictedDeltas,
                                     effectiveSeasonalWindowIds = effectiveSeasonalWindowIds,
                                     rawFetchHitSafetyLimit = rawFetchHitSafetyLimit,
                                     rawFetchTruncatedByLedgerCap = rawFetchTruncatedByLedgerCap,
@@ -306,7 +320,8 @@ class PlayerCacheService(
                 }
             } catch (e: Exception) {
                 lastError = e
-                val canRetryConflict = attempt < MAX_OPTIMISTIC_LOCK_RETRIES && (newlyFoldedDeltas.isNotEmpty() || isFullRebuild)
+                val canRetryConflict = attempt < MAX_OPTIMISTIC_LOCK_RETRIES &&
+                    (newlyFoldedDeltas.isNotEmpty() || evictedDeltas.isNotEmpty() || isFullRebuild)
                 if (canRetryConflict) {
                     logger.info(
                         "Retrying durable season stats persistence for {} ({}) after version conflict on attempt {}/{}: {}",
@@ -328,6 +343,7 @@ class PlayerCacheService(
         existingDto: DurablePlayerSeasonStatsDto,
         candidateState: DurablePlayerSeasonStatsDto,
         newlyFoldedDeltas: List<SingleMatchAdditiveDelta>,
+        evictedDeltas: List<SingleMatchAdditiveDelta>,
         effectiveSeasonalWindowIds: List<String>,
         rawFetchHitSafetyLimit: Boolean,
         rawFetchTruncatedByLedgerCap: Boolean,
@@ -339,17 +355,12 @@ class PlayerCacheService(
         val mergedAcc = MatchStatsAccumulator(candidateState.puuid)
         mergedAcc.restoreFromAdditiveSnapshots(existingDto.overallCounters, existingDto.championCounters)
         val mergedFoldedSet = LinkedHashSet<String>(existingDto.processedMatchIds)
-        val cappedOutDuringMergeSet = HashSet<String>()
-        var hitLedgerCapDuringMerge = false
+        val addedDeltasDuringMerge = ArrayList<SingleMatchAdditiveDelta>()
         for (delta in newlyFoldedDeltas) {
             if (delta.matchId !in mergedFoldedSet) {
-                if (mergedFoldedSet.size >= DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
-                    hitLedgerCapDuringMerge = true
-                    cappedOutDuringMergeSet.add(delta.matchId)
-                } else {
-                    mergedFoldedSet.add(delta.matchId)
-                    mergedAcc.addDelta(delta)
-                }
+                mergedFoldedSet.add(delta.matchId)
+                mergedAcc.addDelta(delta)
+                addedDeltasDuringMerge.add(delta)
             }
         }
 
@@ -366,14 +377,53 @@ class PlayerCacheService(
             (candidateState.processedMatchIds + existingDto.processedMatchIds).distinct()
         }
         val windowSet = windowList.toHashSet()
-        val orderedProcessed = ArrayList<String>(mergedFoldedSet.size)
+        val allOrderedMerged = ArrayList<String>(mergedFoldedSet.size)
         for (id in windowList) {
-            if (id in mergedFoldedSet && orderedProcessed.size < DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
-                orderedProcessed.add(id)
+            if (id in mergedFoldedSet) {
+                allOrderedMerged.add(id)
             }
         }
         for (id in mergedFoldedSet) {
-            if (id !in windowSet && orderedProcessed.size < DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
+            if (id !in windowSet) {
+                allOrderedMerged.add(id)
+            }
+        }
+
+        val evictedDuringMergeSet = HashSet<String>()
+        val rolledBackToPendingSet = LinkedHashSet<String>()
+        var hitLedgerCapDuringMerge = false
+        if (allOrderedMerged.size > DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
+            hitLedgerCapDuringMerge = true
+            val knownDeltasById = LinkedHashMap<String, SingleMatchAdditiveDelta>()
+            for (d in evictedDeltas) knownDeltasById[d.matchId] = d
+            for (d in newlyFoldedDeltas) knownDeltasById[d.matchId] = d
+
+            val overflowTailIds = allOrderedMerged.drop(DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS)
+            for (tailId in overflowTailIds) {
+                if (mergedFoldedSet.size <= DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) break
+                val knownDelta = knownDeltasById[tailId]
+                if (knownDelta != null && tailId in mergedFoldedSet) {
+                    mergedAcc.subtractDelta(knownDelta)
+                    mergedFoldedSet.remove(tailId)
+                    evictedDuringMergeSet.add(tailId)
+                }
+            }
+            while (mergedFoldedSet.size > DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS &&
+                addedDeltasDuringMerge.isNotEmpty()
+            ) {
+                val rolledBack = addedDeltasDuringMerge.removeAt(addedDeltasDuringMerge.lastIndex)
+                if (mergedFoldedSet.remove(rolledBack.matchId)) {
+                    mergedAcc.subtractDelta(rolledBack)
+                    rolledBackToPendingSet.add(rolledBack.matchId)
+                }
+            }
+        }
+
+        val orderedProcessed = ArrayList<String>(
+            mergedFoldedSet.size.coerceAtMost(DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS)
+        )
+        for (id in allOrderedMerged) {
+            if (id in mergedFoldedSet && orderedProcessed.size < DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
                 orderedProcessed.add(id)
             }
         }
@@ -382,8 +432,9 @@ class PlayerCacheService(
         val candidatePendingUnion = LinkedHashSet<String>()
         candidatePendingUnion.addAll(existingDto.pendingMatchIds)
         candidatePendingUnion.addAll(candidateState.pendingMatchIds)
+        candidatePendingUnion.addAll(rolledBackToPendingSet)
         for (id in windowList) {
-            if (id !in mergedFoldedSet && id !in mergedExcludedSet && id !in cappedOutDuringMergeSet) {
+            if (id !in mergedFoldedSet && id !in mergedExcludedSet && id !in evictedDuringMergeSet) {
                 candidatePendingUnion.add(id)
             }
         }
@@ -392,7 +443,7 @@ class PlayerCacheService(
             if (id in candidatePendingUnion &&
                 id !in mergedFoldedSet &&
                 id !in mergedExcludedSet &&
-                id !in cappedOutDuringMergeSet &&
+                id !in evictedDuringMergeSet &&
                 orderedPending.size < DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS
             ) {
                 orderedPending.add(id)
@@ -402,7 +453,7 @@ class PlayerCacheService(
             if (id !in windowSet &&
                 id !in mergedFoldedSet &&
                 id !in mergedExcludedSet &&
-                id !in cappedOutDuringMergeSet &&
+                id !in evictedDuringMergeSet &&
                 orderedPending.size < DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS
             ) {
                 orderedPending.add(id)
@@ -869,7 +920,8 @@ class PlayerCacheService(
             var missingSeasonFetchCount = 0
             var recent20BackfillCount = 0
             var skippedOlderBackfillCount = 0
-            var peakRetainedMatchDtos = 0
+            var peakLiveMatchDtos = countDistinctLiveMatchDtos(cachedProfile?.recentMatches)
+            var peakCrossChunkRetainedMatchDtos = countDistinctLiveMatchDtos(cachedProfile?.recentMatches)
             val alreadyFetchedIds = mutableSetOf<String>()
             val resolvedMatchesById = LinkedHashMap<String, MatchDto>()
             val newlyFoldedDeltasInRefresh = ArrayList<SingleMatchAdditiveDelta>()
@@ -945,14 +997,12 @@ class PlayerCacheService(
                     }
                 }.awaitAll().filterNotNull()
 
-                val validFetchedMatches = fetchedMatches.filter { match ->
+                for (match in fetchedMatches) {
                     val creation = match.info?.gameCreation ?: 0
-                    match.metadata?.matchId != null && creation >= startOfYearMs
-                }
-
-                validFetchedMatches.forEach { match ->
-                    val matchId = match.metadata!!.matchId!!
-                    redisCacheService.set(getMatchCacheKey(matchId, region), match, MATCH_CACHE_TTL)
+                    val matchId = match.metadata?.matchId
+                    if (matchId != null && creation >= startOfYearMs) {
+                        redisCacheService.set(getMatchCacheKey(matchId, region), match, MATCH_CACHE_TTL)
+                    }
                 }
 
                 val fetchedById = fetchedMatches.associateBy { it.metadata?.matchId }
@@ -988,7 +1038,7 @@ class PlayerCacheService(
                         continue
                     }
                     if (canonicalId !in foldedSet) {
-                        if (foldedSet.size >= DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
+                        if (newlyFoldedDeltasInRefresh.size >= DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
                             hitLedgerCapDuringRefresh = true
                             cappedOutMatchIds.add(canonicalId)
                         } else {
@@ -1017,10 +1067,26 @@ class PlayerCacheService(
                     ) {
                         resolvedMatchesById[canonicalId] = match
                     }
-                    val currentRetained = resolvedMatchesById.size + matchesForParticipantIndexing.size
-                    if (currentRetained > peakRetainedMatchDtos) {
-                        peakRetainedMatchDtos = currentRetained
-                    }
+                }
+
+                val currentLiveDtos = countDistinctLiveMatchDtos(
+                    cachedMatchesMap.values,
+                    fetchedMatches,
+                    fetchedById.values,
+                    resolvedMatchesById.values,
+                    matchesForParticipantIndexing,
+                    cachedProfile?.recentMatches
+                )
+                if (currentLiveDtos > peakLiveMatchDtos) {
+                    peakLiveMatchDtos = currentLiveDtos
+                }
+                val currentCrossChunkDtos = countDistinctLiveMatchDtos(
+                    resolvedMatchesById.values,
+                    matchesForParticipantIndexing,
+                    cachedProfile?.recentMatches
+                )
+                if (currentCrossChunkDtos > peakCrossChunkRetainedMatchDtos) {
+                    peakCrossChunkRetainedMatchDtos = currentCrossChunkDtos
                 }
 
                 processedCount += chunk.size
@@ -1031,15 +1097,12 @@ class PlayerCacheService(
                 }
             }
 
-            lastRefreshPeakRetainedMatchDtos.set(peakRetainedMatchDtos)
-            lastRefreshRetainedDeltas.set(newlyFoldedDeltasInRefresh.toList())
-
             if (matchesForParticipantIndexing.isNotEmpty()) {
                 indexPlayersFromMatches(matchesForParticipantIndexing, region)
                 matchesForParticipantIndexing.clear()
             }
 
-            // Build ordered validMatchIds preserving Riot's newest-first ordering across newly + previously folded IDs
+            // Build ordered candidate folded list preserving Riot's newest-first ordering across newly + previously folded IDs
             val effectiveBoundaryIdx = if (hitPreSeasonBoundary && firstPreSeasonMatchId != null) {
                 distinctAllMatchIds.indexOf(firstPreSeasonMatchId)
             } else {
@@ -1051,14 +1114,112 @@ class PlayerCacheService(
                 distinctAllMatchIds
             }
             val windowIdSet = effectiveSeasonalWindowIds.toHashSet()
-            val validMatchIds = ArrayList<String>(foldedSet.size)
+            val allOrderedFoldedIds = ArrayList<String>(foldedSet.size)
             for (id in effectiveSeasonalWindowIds) {
-                if (id in foldedSet && validMatchIds.size < DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
-                    validMatchIds.add(id)
+                if (id in foldedSet) {
+                    allOrderedFoldedIds.add(id)
                 }
             }
             for (id in foldedSet) {
-                if (id !in windowIdSet && validMatchIds.size < DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
+                if (id !in windowIdSet) {
+                    allOrderedFoldedIds.add(id)
+                }
+            }
+
+            // If folding new matches onto a capped player's 2,100-ID ledger pushes total folded IDs past 2,100,
+            // slide the 2,100-match moving window forward by evicting the oldest tail match IDs and subtracting
+            // their exact SingleMatchAdditiveDelta so newest cards and totals update without counter drift or archive expansion.
+            val evictedDeltasInRefresh = ArrayList<SingleMatchAdditiveDelta>()
+            if (allOrderedFoldedIds.size > DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
+                hitLedgerCapDuringRefresh = true
+                val overflowTailIds = allOrderedFoldedIds.drop(DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS)
+                val newlyFoldedById = newlyFoldedDeltasInRefresh.associateBy { it.matchId }
+                val resolvedEvictionDeltas = LinkedHashMap<String, SingleMatchAdditiveDelta>()
+                val missingEvictionIds = ArrayList<String>()
+
+                for (evictId in overflowTailIds) {
+                    val inMemoryDelta = newlyFoldedById[evictId]
+                        ?: resolvedMatchesById[evictId]?.let { accumulator.extractDelta(evictId, it) }
+                    if (inMemoryDelta != null) {
+                        resolvedEvictionDeltas[evictId] = inMemoryDelta
+                    } else {
+                        missingEvictionIds.add(evictId)
+                    }
+                }
+
+                if (missingEvictionIds.isNotEmpty()) {
+                    for (evictChunk in missingEvictionIds.chunked(CHUNK_SIZE)) {
+                        val evictKeys = evictChunk.map { getMatchCacheKey(it, region) }
+                        val evictCachedMap = redisCacheService.multiGet(evictKeys, MatchDto::class.java)
+                        val toFetchFromRiot = ArrayList<String>()
+                        for (evictId in evictChunk) {
+                            val cachedMatch = evictCachedMap[getMatchCacheKey(evictId, region)]
+                            val delta = cachedMatch?.let { accumulator.extractDelta(evictId, it) }
+                            if (delta != null) {
+                                resolvedEvictionDeltas[evictId] = delta
+                            } else {
+                                toFetchFromRiot.add(evictId)
+                            }
+                        }
+                        val evictFetched = if (toFetchFromRiot.isNotEmpty()) {
+                            toFetchFromRiot.map { matchId ->
+                                async {
+                                    try {
+                                        riotApiService.getMatchById(matchId, region)
+                                    } catch (e: Exception) {
+                                        null
+                                    }
+                                }
+                            }.awaitAll().filterNotNull()
+                        } else {
+                            emptyList()
+                        }
+                        val evictLiveDtos = countDistinctLiveMatchDtos(
+                            evictCachedMap.values,
+                            evictFetched,
+                            resolvedMatchesById.values,
+                            matchesForParticipantIndexing,
+                            cachedProfile?.recentMatches
+                        )
+                        if (evictLiveDtos > peakLiveMatchDtos) {
+                            peakLiveMatchDtos = evictLiveDtos
+                        }
+                        for (fetchedMatch in evictFetched) {
+                            val mid = fetchedMatch.metadata?.matchId?.trim()?.takeIf { it.isNotBlank() } ?: continue
+                            redisCacheService.set(getMatchCacheKey(mid, region), fetchedMatch, MATCH_CACHE_TTL)
+                            val delta = accumulator.extractDelta(mid, fetchedMatch)
+                            if (delta != null) {
+                                resolvedEvictionDeltas[mid] = delta
+                            }
+                        }
+                    }
+                }
+
+                for (evictId in overflowTailIds) {
+                    val evictDelta = resolvedEvictionDeltas[evictId]
+                    if (evictDelta != null) {
+                        accumulator.subtractDelta(evictDelta)
+                        foldedSet.remove(evictId)
+                        newlyFoldedDeltasInRefresh.removeIf { it.matchId == evictId }
+                        evictedDeltasInRefresh.add(evictDelta)
+                        cappedOutMatchIds.add(evictId)
+                    } else if (newlyFoldedDeltasInRefresh.isNotEmpty()) {
+                        val rolledBack = newlyFoldedDeltasInRefresh.removeAt(newlyFoldedDeltasInRefresh.lastIndex)
+                        accumulator.subtractDelta(rolledBack)
+                        foldedSet.remove(rolledBack.matchId)
+                        newPendingSet.add(rolledBack.matchId)
+                    }
+                }
+            }
+
+            lastRefreshPeakRetainedMatchDtos.set(peakLiveMatchDtos)
+            lastRefreshPeakCrossChunkRetainedMatchDtos.set(peakCrossChunkRetainedMatchDtos)
+
+            val validMatchIds = ArrayList<String>(
+                foldedSet.size.coerceAtMost(DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS)
+            )
+            for (id in allOrderedFoldedIds) {
+                if (id in foldedSet && validMatchIds.size < DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
                     validMatchIds.add(id)
                 }
             }
@@ -1129,6 +1290,7 @@ class PlayerCacheService(
                     expectedPreviousVersion = loadedDurable?.entityVersion,
                     isFullRebuild = durableState == null,
                     newlyFoldedDeltas = newlyFoldedDeltasInRefresh,
+                    evictedDeltas = evictedDeltasInRefresh,
                     effectiveSeasonalWindowIds = effectiveSeasonalWindowIds,
                     rawFetchHitSafetyLimit = rawFetchHitSafetyLimit,
                     rawFetchTruncatedByLedgerCap = rawFetchTruncatedByLedgerCap,
