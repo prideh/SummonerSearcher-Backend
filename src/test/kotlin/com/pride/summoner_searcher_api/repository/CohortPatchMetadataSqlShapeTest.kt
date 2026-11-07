@@ -17,10 +17,16 @@ import io.kotest.matchers.string.shouldNotContainIgnoringCase
 import io.mockk.every
 import io.mockk.mockk
 import jakarta.persistence.EntityManager
+import io.mockk.Called
+import io.mockk.clearMocks
+import io.mockk.verify
 import org.hibernate.resource.jdbc.spi.StatementInspector
 import org.junit.jupiter.api.Test
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest
+import org.springframework.boot.test.context.TestConfiguration
+import org.springframework.context.annotation.Bean
+import org.springframework.context.annotation.Import
 import org.springframework.test.context.TestPropertySource
 import java.time.Instant
 import java.util.concurrent.CopyOnWriteArrayList
@@ -41,12 +47,36 @@ class CapturingStatementInspector : StatementInspector {
 }
 
 @DataJpaTest
+@Import(
+    CohortBenchmarkService::class,
+    com.pride.summoner_searcher_api.service.SystemMemoryStatsProvider::class,
+    RiotApiRateLimiter::class,
+    CohortPatchMetadataSqlShapeTest.SpringWiringTestConfig::class
+)
 @TestPropertySource(
     properties = [
         "spring.jpa.properties.hibernate.session_factory.statement_inspector=com.pride.summoner_searcher_api.repository.CapturingStatementInspector"
     ]
 )
 class CohortPatchMetadataSqlShapeTest {
+
+    @TestConfiguration
+    class SpringWiringTestConfig {
+        @Bean
+        fun timeProvider(): com.pride.summoner_searcher_api.service.TimeProvider =
+            object : com.pride.summoner_searcher_api.service.TimeProvider {
+                override fun now(): Long = Instant.parse("2026-11-06T12:00:00Z").toEpochMilli()
+            }
+
+        @Bean
+        fun redisCacheService(): RedisCacheService = mockk(relaxed = true)
+
+        @Bean
+        fun riotApiService(): RiotApiService = mockk(relaxed = true)
+
+        @Bean
+        fun objectMapper(): ObjectMapper = ObjectMapper().findAndRegisterModules()
+    }
 
     @Autowired
     private lateinit var sampleStateRepository: CohortCellSampleStateRepository
@@ -59,6 +89,18 @@ class CohortPatchMetadataSqlShapeTest {
 
     @Autowired
     private lateinit var entityManager: EntityManager
+
+    @Autowired
+    private lateinit var transactionTemplate: org.springframework.transaction.support.TransactionTemplate
+
+    @Autowired
+    private lateinit var springWiredCohortBenchmarkService: CohortBenchmarkService
+
+    @Autowired
+    private lateinit var springWiredRedisCacheService: RedisCacheService
+
+    @Autowired
+    private lateinit var springWiredRiotApiService: RiotApiService
 
     @Test
     fun `resolveGroundedCurrentPatch executes scalar patch SQL without selecting samples_json or metrics_json and preserves exact region-only equivalence`() {
@@ -262,4 +304,323 @@ class CohortPatchMetadataSqlShapeTest {
         benchmarkSql shouldNotContainIgnoringCase "passes_quality_gate"
         benchmarkSql shouldNotContainIgnoringCase "queue_id"
     }
+
+    @Test
+    @org.springframework.transaction.annotation.Transactional(
+        propagation = org.springframework.transaction.annotation.Propagation.NOT_SUPPORTED
+    )
+    fun `ingestCachedPlayerByExactIds rolls back first table in real H2 when second table save fails and commits both atomically on success`() {
+        sampleStateRepository.deleteAll()
+        benchmarkCellRepository.deleteAll()
+        checkpointRepository.deleteAll()
+
+        try {
+            val objectMapper = ObjectMapper().findAndRegisterModules()
+            val fixedNow = Instant.parse("2026-11-06T12:00:00Z")
+            val timeProvider = object : com.pride.summoner_searcher_api.service.TimeProvider {
+                override fun now(): Long = fixedNow.toEpochMilli()
+            }
+
+            val redisCacheService = mockk<RedisCacheService>(relaxed = true)
+            every { redisCacheService.get(any(), any<Class<Any>>()) } returns null
+            every {
+                redisCacheService.get("cohort:patch:external:ddragon", String::class.java)
+            } returns "16.22"
+            every { redisCacheService.setIfAbsent("lock:cohort:collector:active:euw1", "ACTIVE", any()) } returns true
+            every {
+                redisCacheService.get(
+                    "cohort:rank:snapshot:euw1:test-h2-puuid",
+                    com.pride.summoner_searcher_api.dto.CohortRankSnapshotDto::class.java
+                )
+            } returns com.pride.summoner_searcher_api.dto.CohortRankSnapshotDto(
+                puuid = "test-h2-puuid",
+                region = "euw1",
+                tier = "CHALLENGER",
+                rank = "I",
+                leaguePoints = 1100,
+                queueType = "RANKED_SOLO_5x5",
+                snapshotAt = fixedNow.minusSeconds(600)
+            )
+
+            val matchJson = """
+                {
+                  "metadata": {
+                    "matchId": "EUW1_H2_TX_1",
+                    "participants": ["test-h2-puuid"]
+                  },
+                  "info": {
+                    "gameCreation": ${fixedNow.minusSeconds(1800).toEpochMilli()},
+                    "gameDuration": 1800,
+                    "gameId": 777001,
+                    "queueId": 420,
+                    "gameMode": "CLASSIC",
+                    "gameVersion": "16.22.615.1111",
+                    "participants": [
+                      {
+                        "puuid": "test-h2-puuid",
+                        "teamId": 100,
+                        "teamPosition": "TOP",
+                        "individualPosition": "TOP",
+                        "kills": 8,
+                        "deaths": 2,
+                        "assists": 5,
+                        "totalMinionsKilled": 240,
+                        "neutralMinionsKilled": 12,
+                        "goldEarned": 14500,
+                        "totalDamageDealtToChampions": 28000,
+                        "visionScore": 32,
+                        "totalTimeSpentDead": 45,
+                        "win": true,
+                        "challenges": {
+                          "laneMinionsFirst10Minutes": 88,
+                          "jungleCsBefore10Minutes": 4.0,
+                          "goldPerMinute": 483.3,
+                          "damagePerMinute": 933.3,
+                          "visionScorePerMinute": 1.06,
+                          "killParticipation": 0.65
+                        }
+                      }
+                    ]
+                  }
+                }
+            """.trimIndent()
+            val matchDto = objectMapper.readValue(matchJson, com.pride.summoner_searcher_api.dto.MatchDto::class.java)
+            every {
+                redisCacheService.get("match:euw1:EUW1_H2_TX_1", com.pride.summoner_searcher_api.dto.MatchDto::class.java)
+            } returns matchDto
+
+            val riotApiService = mockk<RiotApiService>(relaxed = true)
+
+            val failBenchmarkSave = java.util.concurrent.atomic.AtomicBoolean(true)
+            val faultInjectingBenchmarkRepo = java.lang.reflect.Proxy.newProxyInstance(
+                CohortBenchmarkCellRepository::class.java.classLoader,
+                arrayOf(CohortBenchmarkCellRepository::class.java)
+            ) { _, method, args ->
+                if (method.name == "save" && failBenchmarkSave.get()) {
+                    sampleStateRepository.flush()
+                    throw org.springframework.dao.DataIntegrityViolationException("Simulated second-table failure in cohort_benchmark_cells")
+                }
+                if (args == null) {
+                    method.invoke(benchmarkCellRepository)
+                } else {
+                    method.invoke(benchmarkCellRepository, *args)
+                }
+            } as CohortBenchmarkCellRepository
+
+            val service = CohortBenchmarkService(
+                redisCacheService = redisCacheService,
+                cohortBenchmarkCellRepository = faultInjectingBenchmarkRepo,
+                riotApiRateLimiter = RiotApiRateLimiter(timeProvider),
+                riotApiService = riotApiService,
+                objectMapper = objectMapper,
+                networkCollectionEnabled = false,
+                timeProvider = timeProvider,
+                cohortCollectorCheckpointRepository = checkpointRepository,
+                cohortCellSampleStateRepository = sampleStateRepository,
+                transactionTemplate = transactionTemplate
+            )
+
+            CapturingStatementInspector.clear()
+
+            // 1. First attempt: sampleStateRepository.save executes INSERT into H2, then benchmarkCellRepository.save throws.
+            //    Real H2 TransactionTemplate MUST roll back the first-table INSERT!
+            val failedResult = service.ingestCachedPlayerByExactIds(
+                region = "euw1",
+                puuid = "test-h2-puuid",
+                targetPatch = "16.22",
+                explicitMatchIds = listOf("EUW1_H2_TX_1")
+            )
+            val sqlDuringFailedTx = CapturingStatementInspector.executedSql.toList()
+
+            failedResult.status shouldBe "PERSISTENCE_ERROR"
+            failedResult.netNewSamplesPersisted shouldBe 0
+            // Confirm INSERT into cohort_cell_sample_states actually ran inside the transaction before rollback
+            sqlDuringFailedTx.any {
+                it.contains("insert", ignoreCase = true) && it.contains("cohort_cell_sample_states", ignoreCase = true)
+            } shouldBe true
+
+            // Verify in H2 after transaction rollback: BOTH tables have 0 rows!
+            sampleStateRepository.findByRegionAndPatchAndQueueIdAndTierAndRole(
+                region = "euw1",
+                patch = "16.22",
+                queueId = 420,
+                tier = "CHALLENGER",
+                role = "TOP"
+            ) shouldBe null
+            benchmarkCellRepository.findByRegionAndPatchAndQueueIdAndTierAndRole(
+                region = "euw1",
+                patch = "16.22",
+                queueId = 420,
+                tier = "CHALLENGER",
+                role = "TOP"
+            ) shouldBe null
+            service.getInMemoryDurableCellStateForTest("euw1", "16.22", "CHALLENGER", "TOP") shouldBe null
+            service.getDurableDbWriteCounts()["cohortCellSampleStatesWrites"] shouldBe 0L
+            service.getDurableDbWriteCounts()["cohortBenchmarkCellsWrites"] shouldBe 0L
+
+            // 2. Second attempt with second-table failure cleared: both tables commit atomically in H2!
+            failBenchmarkSave.set(false)
+            val successResult = service.ingestCachedPlayerByExactIds(
+                region = "euw1",
+                puuid = "test-h2-puuid",
+                targetPatch = "16.22",
+                explicitMatchIds = listOf("EUW1_H2_TX_1")
+            )
+
+            successResult.status shouldBe "COMPLETED"
+            successResult.netNewSamplesPersisted shouldBe 1
+            successResult.updatedCells.size shouldBe 1
+            verify { riotApiService wasNot Called }
+
+            val committedSampleRow = sampleStateRepository.findByRegionAndPatchAndQueueIdAndTierAndRole(
+                region = "euw1",
+                patch = "16.22",
+                queueId = 420,
+                tier = "CHALLENGER",
+                role = "TOP"
+            )
+            val committedBenchmarkRow = benchmarkCellRepository.findByRegionAndPatchAndQueueIdAndTierAndRole(
+                region = "euw1",
+                patch = "16.22",
+                queueId = 420,
+                tier = "CHALLENGER",
+                role = "TOP"
+            )
+            (committedSampleRow != null) shouldBe true
+            committedSampleRow!!.eligibleGames shouldBe 1
+            committedSampleRow.distinctPlayers shouldBe 1
+            (committedBenchmarkRow != null) shouldBe true
+            committedBenchmarkRow!!.eligibleGames shouldBe 1
+            committedBenchmarkRow.distinctPlayers shouldBe 1
+            service.getDurableDbWriteCounts()["cohortCellSampleStatesWrites"] shouldBe 1L
+            service.getDurableDbWriteCounts()["cohortBenchmarkCellsWrites"] shouldBe 1L
+        } finally {
+            sampleStateRepository.deleteAll()
+            benchmarkCellRepository.deleteAll()
+            checkpointRepository.deleteAll()
+        }
+    }
+
+    @Test
+    @org.springframework.transaction.annotation.Transactional(
+        propagation = org.springframework.transaction.annotation.Propagation.NOT_SUPPORTED
+    )
+    fun `production Spring DI wires CohortBenchmarkService with usable TransactionTemplate and JPA repositories and commits exact cached player ingestion atomically`() {
+        sampleStateRepository.deleteAll()
+        benchmarkCellRepository.deleteAll()
+        checkpointRepository.deleteAll()
+        clearMocks(springWiredRedisCacheService, springWiredRiotApiService)
+
+        try {
+            val objectMapper = ObjectMapper().findAndRegisterModules()
+            val fixedNow = Instant.parse("2026-11-06T12:00:00Z")
+
+            every { springWiredRedisCacheService.get(any(), any<Class<Any>>()) } returns null
+            every {
+                springWiredRedisCacheService.get("cohort:patch:external:ddragon", String::class.java)
+            } returns "16.22"
+            every {
+                springWiredRedisCacheService.setIfAbsent("lock:cohort:collector:active:euw1", "ACTIVE", any())
+            } returns true
+            every {
+                springWiredRedisCacheService.get(
+                    "cohort:rank:snapshot:euw1:spring-di-puuid",
+                    com.pride.summoner_searcher_api.dto.CohortRankSnapshotDto::class.java
+                )
+            } returns com.pride.summoner_searcher_api.dto.CohortRankSnapshotDto(
+                puuid = "spring-di-puuid",
+                region = "euw1",
+                tier = "CHALLENGER",
+                rank = "I",
+                leaguePoints = 1200,
+                queueType = "RANKED_SOLO_5x5",
+                snapshotAt = fixedNow.minusSeconds(300)
+            )
+
+            val matchJson = """
+                {
+                  "metadata": {
+                    "matchId": "EUW1_SPRING_DI_1",
+                    "participants": ["spring-di-puuid"]
+                  },
+                  "info": {
+                    "gameCreation": ${fixedNow.minusSeconds(1200).toEpochMilli()},
+                    "gameDuration": 1800,
+                    "gameId": 888001,
+                    "queueId": 420,
+                    "gameMode": "CLASSIC",
+                    "gameVersion": "16.22.615.1111",
+                    "participants": [
+                      {
+                        "puuid": "spring-di-puuid",
+                        "teamId": 100,
+                        "teamPosition": "TOP",
+                        "individualPosition": "TOP",
+                        "kills": 10,
+                        "deaths": 1,
+                        "assists": 6,
+                        "totalMinionsKilled": 255,
+                        "neutralMinionsKilled": 10,
+                        "goldEarned": 15200,
+                        "totalDamageDealtToChampions": 31000,
+                        "visionScore": 35,
+                        "totalTimeSpentDead": 20,
+                        "win": true,
+                        "challenges": {
+                          "laneMinionsFirst10Minutes": 92,
+                          "jungleCsBefore10Minutes": 4.0,
+                          "goldPerMinute": 506.6,
+                          "damagePerMinute": 1033.3,
+                          "visionScorePerMinute": 1.16,
+                          "killParticipation": 0.70
+                        }
+                      }
+                    ]
+                  }
+                }
+            """.trimIndent()
+            val matchDto = objectMapper.readValue(matchJson, com.pride.summoner_searcher_api.dto.MatchDto::class.java)
+            every {
+                springWiredRedisCacheService.get("match:euw1:EUW1_SPRING_DI_1", com.pride.summoner_searcher_api.dto.MatchDto::class.java)
+            } returns matchDto
+
+            val result = springWiredCohortBenchmarkService.ingestCachedPlayerByExactIds(
+                region = "euw1",
+                puuid = "spring-di-puuid",
+                targetPatch = "16.22",
+                explicitMatchIds = listOf("EUW1_SPRING_DI_1")
+            )
+
+            // Proves Spring's constructor injection wired both CohortCellSampleStateRepository and a usable
+            // TransactionTemplate (with non-null PlatformTransactionManager) into CohortBenchmarkService
+            result.status shouldBe "COMPLETED"
+            result.netNewSamplesPersisted shouldBe 1
+            result.updatedCells.size shouldBe 1
+            verify { springWiredRiotApiService wasNot Called }
+
+            val sampleRow = sampleStateRepository.findByRegionAndPatchAndQueueIdAndTierAndRole(
+                region = "euw1",
+                patch = "16.22",
+                queueId = 420,
+                tier = "CHALLENGER",
+                role = "TOP"
+            )
+            val benchmarkRow = benchmarkCellRepository.findByRegionAndPatchAndQueueIdAndTierAndRole(
+                region = "euw1",
+                patch = "16.22",
+                queueId = 420,
+                tier = "CHALLENGER",
+                role = "TOP"
+            )
+            (sampleRow != null) shouldBe true
+            sampleRow!!.eligibleGames shouldBe 1
+            (benchmarkRow != null) shouldBe true
+            benchmarkRow!!.eligibleGames shouldBe 1
+        } finally {
+            sampleStateRepository.deleteAll()
+            benchmarkCellRepository.deleteAll()
+            checkpointRepository.deleteAll()
+        }
+    }
 }
+

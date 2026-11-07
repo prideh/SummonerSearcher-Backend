@@ -271,6 +271,34 @@ class RiotApiController(
         return ResponseEntity.ok(runner.requestStop(region = region, targetPatch = patch))
     }
 
+    /**
+     * Dedicated POST-only operator-authenticated endpoint for bounded, cache-only cohort ingestion
+     * of a single cached player ([puuid]) and at most 10 exact cached match IDs ([matchIds]).
+     * Makes zero Riot API calls, zero Redis SCANs, and zero checkpoint/queue modifications.
+     */
+    @org.springframework.web.bind.annotation.PostMapping("/cohorts/{region}/collector/ingest-cached")
+    fun ingestCachedPlayerForCohort(
+        @PathVariable region: String,
+        @org.springframework.web.bind.annotation.RequestParam puuid: String,
+        @org.springframework.web.bind.annotation.RequestParam(required = false) patch: String? = null,
+        @org.springframework.web.bind.annotation.RequestParam(name = "matchId", required = false) matchIds: List<String>? = null,
+        @org.springframework.web.bind.annotation.RequestHeader(name = "X-Cohort-Operator-Token", required = false) operatorToken: String? = null,
+        httpRequest: jakarta.servlet.http.HttpServletRequest
+    ): ResponseEntity<com.pride.summoner_searcher_api.dto.CohortCachedPlayerIngestionResultDto?> {
+        val runner = overnightCohortCollectorRunner ?: return ResponseEntity.notFound().build()
+        val benchmarkService = cohortBenchmarkService ?: return ResponseEntity.notFound().build()
+        if (!isAuthorizedCollectorOperator(runner, httpRequest, operatorToken)) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.FORBIDDEN).build()
+        }
+        val result = benchmarkService.ingestCachedPlayerByExactIds(
+            region = region,
+            puuid = puuid,
+            targetPatch = patch,
+            explicitMatchIds = matchIds.orEmpty()
+        )
+        return ResponseEntity.ok(result)
+    }
+
     private fun isAuthorizedCollectorOperator(
         runner: com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner,
         httpRequest: jakarta.servlet.http.HttpServletRequest,
@@ -285,5 +313,6 @@ class RiotApiController(
         )
     }
 }
+
 
 
