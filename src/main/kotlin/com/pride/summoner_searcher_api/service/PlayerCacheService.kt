@@ -31,8 +31,22 @@ class PlayerCacheService(
     private val riotApiService: RiotApiService,
     private val indexedPlayerRepository: com.pride.summoner_searcher_api.repository.IndexedPlayerRepository,
     private val timeProvider: TimeProvider = SystemTimeProvider(),
+    @org.springframework.beans.factory.annotation.Value("\${player.cache.lock-poll-interval-ms:250}")
     private val lockPollIntervalMs: Long = LOCK_POLL_INTERVAL_MS,
-    private val lockMaxPollAttempts: Int = LOCK_MAX_POLL_ATTEMPTS
+    @org.springframework.beans.factory.annotation.Value("\${player.cache.lock-max-poll-attempts:240}")
+    private val lockMaxPollAttempts: Int = LOCK_MAX_POLL_ATTEMPTS,
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private val playerSeasonStatsRepository: com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository? = null,
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private val transactionTemplate: org.springframework.transaction.support.TransactionTemplate? = null,
+    private val objectMapper: com.fasterxml.jackson.databind.ObjectMapper = com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules(),
+    private val memoryStatsProvider: MemoryStatsProvider = SystemMemoryStatsProvider(),
+    @org.springframework.beans.factory.annotation.Value("\${cohort.collector.container-memory-limit-bytes:536870912}")
+    private val configuredContainerLimitBytes: Long = 536_870_912L,
+    @org.springframework.beans.factory.annotation.Value("\${cohort.collector.max-memory-utilization-ratio:0.78}")
+    private val maxMemoryUtilizationRatio: Double = 0.78,
+    @org.springframework.beans.factory.annotation.Value("\${cohort.collector.min-free-memory-bytes:67108864}")
+    private val minFreeMemoryBytes: Long = 67_108_864L
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
@@ -42,9 +56,16 @@ class PlayerCacheService(
     private val lastBackgroundRefreshAtMs = ConcurrentHashMap<String, Long>()
     private val backgroundRefreshScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
+    private val indexedPlayersUpsertedCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val indexedPlayersStaleSkippedCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val seasonStatsDbSavesCounter = java.util.concurrent.atomic.AtomicLong(0L)
+
     companion object {
         private const val RECENT_MATCHES_LIMIT = 20
         private const val CHUNK_SIZE = 50
+        private const val MAX_MATCHES_FOR_PARTICIPANT_INDEXING = 20
+        private const val MAX_INDEXED_PLAYERS_PER_BATCH = 200
+        private const val MAX_OPTIMISTIC_LOCK_RETRIES = 2
         private val PROFILE_CACHE_TTL = Duration.ofDays(14)
         private val MATCH_CACHE_TTL = Duration.ofDays(60)
         val PROFILE_FRESHNESS_WINDOW: Duration = Duration.ofMinutes(5)
@@ -52,6 +73,286 @@ class PlayerCacheService(
         val PROFILE_LOCK_TTL: Duration = Duration.ofSeconds(60)
         const val LOCK_POLL_INTERVAL_MS = 250L
         const val LOCK_MAX_POLL_ATTEMPTS = 240 // Full 60s wait matching PROFILE_LOCK_TTL (240 * 250ms = 60s)
+    }
+
+    fun getDiscoveryAndSeasonWriteTelemetry(): Map<String, Long> = mapOf(
+        "indexedPlayersUpserted" to indexedPlayersUpsertedCounter.get(),
+        "indexedPlayersStaleSkipped" to indexedPlayersStaleSkippedCounter.get(),
+        "seasonStatsDbSaves" to seasonStatsDbSavesCounter.get()
+    )
+
+    internal fun hasMemoryHeadroomForSeasonBackfill(): Boolean {
+        return try {
+            val raw = memoryStatsProvider.sample()
+            val safeContainerCap = configuredContainerLimitBytes.coerceAtLeast(1L)
+            val safeHeapMax = raw.jvmHeapMaxBytes.coerceAtLeast(1L)
+            val safeHeapUsed = raw.jvmHeapUsedBytes.coerceAtLeast(0L)
+            val isBoundedContainerCgroup = raw.cgroupMemoryMaxBytes != null &&
+                raw.cgroupMemoryMaxBytes in 1L..2_147_483_648L &&
+                raw.cgroupMemoryCurrentBytes != null &&
+                raw.cgroupMemoryCurrentBytes > 0L
+            val effectiveLimit = if (isBoundedContainerCgroup) {
+                minOf(safeContainerCap, raw.cgroupMemoryMaxBytes!!)
+            } else {
+                safeHeapMax
+            }
+            val effectiveUsed = if (isBoundedContainerCgroup) {
+                maxOf(raw.cgroupMemoryCurrentBytes!!, safeHeapUsed)
+            } else {
+                safeHeapUsed
+            }
+            val freeBytes = (effectiveLimit - effectiveUsed).coerceAtLeast(0L)
+            val ratio = effectiveUsed.toDouble() / effectiveLimit.toDouble()
+            ratio < maxMemoryUtilizationRatio && freeBytes >= minFreeMemoryBytes
+        } catch (_: Exception) {
+            true
+        }
+    }
+
+    private data class LoadedDurableSeasonState(
+        val entityVersion: Long,
+        val state: DurablePlayerSeasonStatsDto
+    )
+
+    internal fun isValidDurableSeasonState(
+        dto: DurablePlayerSeasonStatsDto?,
+        expectedRegion: String,
+        expectedPuuid: String,
+        expectedSeasonYear: Int
+    ): Boolean {
+        if (dto == null) return false
+        if (dto.schemaVersion != DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION) return false
+        if (!dto.region.equals(expectedRegion, ignoreCase = true)) return false
+        if (dto.puuid != expectedPuuid) return false
+        if (dto.seasonYear != expectedSeasonYear || dto.queueId != 420) return false
+        if (dto.processedMatchIds.size > DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) return false
+        if (dto.processedMatchIds.distinct().size != dto.processedMatchIds.size) return false
+        if (dto.overallCounters.totalGames < 0 || dto.overallCounters.totalGames > dto.processedMatchIds.size) return false
+        if (dto.overallCounters.totalWins < 0 || dto.overallCounters.totalWins > dto.overallCounters.totalGames) return false
+        if (dto.overallCounters.blueSideGames < 0 || dto.overallCounters.redSideGames < 0) return false
+        if (dto.overallCounters.blueSideGames + dto.overallCounters.redSideGames > dto.overallCounters.totalGames) return false
+        val champGamesSum = dto.championCounters.sumOf { it.games }
+        if (champGamesSum != dto.overallCounters.totalGames) return false
+        if (dto.pendingMatchIds.isNotEmpty() && dto.historyComplete) return false
+        if (dto.historyCapped && dto.historyComplete) return false
+        return true
+    }
+
+    private fun loadValidDurableSeasonState(
+        region: String,
+        puuid: String,
+        seasonYear: Int
+    ): LoadedDurableSeasonState? {
+        val repo = playerSeasonStatsRepository ?: return null
+        val normalizedRegion = region.lowercase().trim()
+        return try {
+            val entity = repo.findByRegionAndPuuidAndSeasonYearAndQueueId(normalizedRegion, puuid, seasonYear, 420)
+                ?: return null
+            if (entity.schemaVersion != DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION) {
+                logger.info("Ignoring durable season stats for {} ({}) due to schemaVersion={} != {}", puuid, normalizedRegion, entity.schemaVersion, DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION)
+                return null
+            }
+            val dto = objectMapper.readValue(entity.stateJson, DurablePlayerSeasonStatsDto::class.java)
+            if (!isValidDurableSeasonState(dto, normalizedRegion, puuid, seasonYear)) {
+                logger.warn("Discarding invalid durable season stats state for {} ({}) year={}", puuid, normalizedRegion, seasonYear)
+                return null
+            }
+            LoadedDurableSeasonState(entityVersion = entity.version, state = dto)
+        } catch (e: Exception) {
+            logger.warn("Failed to load durable season stats for {} ({}): {}", puuid, normalizedRegion, e.message)
+            null
+        }
+    }
+
+    /**
+     * Atomically persists [state] to `player_season_stats` with `@Version` optimistic locking and
+     * bounded version-conflict retry (`0..MAX_OPTIMISTIC_LOCK_RETRIES`, up to 3 total DB attempts).
+     *
+     * Executes ZERO HTTP or Redis calls inside the database transaction. If a concurrent writer
+     * incremented the row's `@Version` after [expectedPreviousVersion] was read, the retry reloads
+     * the committed DB row inside the transaction, folds only the [newlyFoldedMatches] from this
+     * refresh that are not yet in `existing.processedMatchIds`, reconciles `pendingMatchIds` /
+     * `excludedMatchIds` / `historyCapped` / `historyComplete`, and commits via `saveAndFlush`.
+     */
+    private fun persistDurableSeasonState(
+        state: DurablePlayerSeasonStatsDto,
+        expectedPreviousVersion: Long?,
+        newlyFoldedMatches: List<Pair<String, MatchDto>> = emptyList(),
+        effectiveSeasonalWindowIds: List<String> = emptyList(),
+        stoppedForMemoryHeadroom: Boolean = false
+    ): Boolean {
+        val repo = playerSeasonStatsRepository ?: return false
+        val tx = transactionTemplate
+        if (tx == null) {
+            logger.warn("Refusing to persist durable season stats for {} ({}) without wired TransactionTemplate", state.puuid, state.region)
+            return false
+        }
+        val normalizedRegion = state.region.lowercase().trim()
+
+        for (attempt in 0..MAX_OPTIMISTIC_LOCK_RETRIES) {
+            try {
+                val saved = tx.execute {
+                    val existing = repo.findByRegionAndPuuidAndSeasonYearAndQueueId(
+                        region = normalizedRegion,
+                        puuid = state.puuid,
+                        seasonYear = state.seasonYear,
+                        queueId = state.queueId
+                    )
+                    if (existing != null) {
+                        val stateToPersist = if (attempt == 0 && expectedPreviousVersion != null && existing.version == expectedPreviousVersion) {
+                            state
+                        } else {
+                            if (attempt == 0 && newlyFoldedMatches.isEmpty()) {
+                                throw IllegalStateException(
+                                    "Optimistic version mismatch on player_season_stats for ${state.puuid} ($normalizedRegion): expected=$expectedPreviousVersion, actual=${existing.version}"
+                                )
+                            }
+                            mergeRefreshDeltaOntoExistingDbState(
+                                existingEntity = existing,
+                                candidateState = state,
+                                newlyFoldedMatches = newlyFoldedMatches,
+                                effectiveSeasonalWindowIds = effectiveSeasonalWindowIds,
+                                stoppedForMemoryHeadroom = stoppedForMemoryHeadroom
+                            ) ?: throw IllegalStateException(
+                                "Cannot merge refresh delta onto invalid or incompatible concurrent DB state for ${state.puuid} ($normalizedRegion)"
+                            )
+                        }
+                        val nowInstant = Instant.ofEpochMilli(stateToPersist.updatedAtEpochMilli.takeIf { it > 0L } ?: timeProvider.now())
+                        existing.schemaVersion = stateToPersist.schemaVersion
+                        existing.foldedGamesCount = stateToPersist.processedMatchIds.size
+                        existing.pendingGamesCount = stateToPersist.pendingMatchIds.size
+                        existing.historyCapped = stateToPersist.historyCapped
+                        existing.historyComplete = stateToPersist.historyComplete
+                        existing.stateJson = objectMapper.writeValueAsString(stateToPersist)
+                        existing.updatedAt = nowInstant
+                        repo.saveAndFlush(existing)
+                    } else {
+                        if (attempt == 0 && expectedPreviousVersion != null) {
+                            throw IllegalStateException(
+                                "Expected existing player_season_stats version=$expectedPreviousVersion for ${state.puuid} ($normalizedRegion), but row was absent"
+                            )
+                        }
+                        val nowInstant = Instant.ofEpochMilli(state.updatedAtEpochMilli.takeIf { it > 0L } ?: timeProvider.now())
+                        val created = com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity(
+                            region = normalizedRegion,
+                            puuid = state.puuid,
+                            seasonYear = state.seasonYear,
+                            queueId = state.queueId,
+                            schemaVersion = state.schemaVersion,
+                            foldedGamesCount = state.processedMatchIds.size,
+                            pendingGamesCount = state.pendingMatchIds.size,
+                            historyCapped = state.historyCapped,
+                            historyComplete = state.historyComplete,
+                            stateJson = objectMapper.writeValueAsString(state),
+                            updatedAt = nowInstant
+                        )
+                        repo.saveAndFlush(created)
+                    }
+                    true
+                } == true
+                if (saved) {
+                    seasonStatsDbSavesCounter.incrementAndGet()
+                    return true
+                }
+            } catch (e: Exception) {
+                if (attempt < MAX_OPTIMISTIC_LOCK_RETRIES && newlyFoldedMatches.isNotEmpty()) {
+                    logger.info(
+                        "Retrying durable season stats persistence for {} ({}) after version conflict on attempt {}/{}: {}",
+                        state.puuid, normalizedRegion, attempt + 1, MAX_OPTIMISTIC_LOCK_RETRIES + 1, e.message
+                    )
+                    continue
+                }
+                logger.warn("Failed to persist durable season stats for {} ({}) year={}: {}", state.puuid, normalizedRegion, state.seasonYear, e.message)
+                return false
+            }
+        }
+        return false
+    }
+
+    private fun mergeRefreshDeltaOntoExistingDbState(
+        existingEntity: com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity,
+        candidateState: DurablePlayerSeasonStatsDto,
+        newlyFoldedMatches: List<Pair<String, MatchDto>>,
+        effectiveSeasonalWindowIds: List<String>,
+        stoppedForMemoryHeadroom: Boolean
+    ): DurablePlayerSeasonStatsDto? {
+        val normalizedRegion = candidateState.region.lowercase().trim()
+        if (existingEntity.schemaVersion != DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION) return null
+        val existingDto = runCatching {
+            objectMapper.readValue(existingEntity.stateJson, DurablePlayerSeasonStatsDto::class.java)
+        }.getOrNull() ?: return null
+        if (!isValidDurableSeasonState(existingDto, normalizedRegion, candidateState.puuid, candidateState.seasonYear)) {
+            return null
+        }
+
+        val mergedAcc = MatchStatsAccumulator(candidateState.puuid)
+        mergedAcc.restoreFromAdditiveSnapshots(existingDto.overallCounters, existingDto.championCounters)
+        val mergedFoldedSet = LinkedHashSet<String>(existingDto.processedMatchIds)
+        for ((canonicalId, matchDto) in newlyFoldedMatches) {
+            if (mergedFoldedSet.add(canonicalId)) {
+                mergedAcc.add(matchDto)
+            }
+        }
+
+        val mergedExcludedSet = LinkedHashSet<String>(existingDto.excludedMatchIds)
+        for (exId in candidateState.excludedMatchIds) {
+            if (exId !in mergedFoldedSet && mergedExcludedSet.size < DurablePlayerSeasonStatsDto.MAX_EXCLUDED_MATCH_IDS) {
+                mergedExcludedSet.add(exId)
+            }
+        }
+
+        val windowList = if (effectiveSeasonalWindowIds.isNotEmpty()) {
+            effectiveSeasonalWindowIds
+        } else {
+            (candidateState.processedMatchIds + existingDto.processedMatchIds).distinct()
+        }
+        val windowSet = windowList.toHashSet()
+        val orderedProcessed = ArrayList<String>(mergedFoldedSet.size)
+        for (id in windowList) {
+            if (id in mergedFoldedSet && orderedProcessed.size < DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
+                orderedProcessed.add(id)
+            }
+        }
+        for (id in mergedFoldedSet) {
+            if (id !in windowSet && orderedProcessed.size < DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
+                orderedProcessed.add(id)
+            }
+        }
+
+        val candidatePendingSet = (existingDto.pendingMatchIds + candidateState.pendingMatchIds).toHashSet()
+        val orderedPending = windowList.filter { id ->
+            (id in candidatePendingSet || id !in mergedFoldedSet) && id !in mergedFoldedSet && id !in mergedExcludedSet
+        }.take(DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS)
+
+        val mergedHitBoundary = existingDto.hitPreSeasonBoundary || candidateState.hitPreSeasonBoundary
+        val mergedBoundaryId = candidateState.firstPreSeasonMatchId ?: existingDto.firstPreSeasonMatchId
+        val isCapped = existingDto.historyCapped ||
+            candidateState.historyCapped ||
+            mergedFoldedSet.size > DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS ||
+            (!mergedHitBoundary && windowList.size > DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS)
+        val isComplete = !isCapped &&
+            !stoppedForMemoryHeadroom &&
+            orderedPending.isEmpty() &&
+            windowList.all { it in mergedFoldedSet || it in mergedExcludedSet }
+
+        val (overallSnap, champSnaps) = mergedAcc.toAdditiveSnapshots()
+        return DurablePlayerSeasonStatsDto(
+            schemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION,
+            region = normalizedRegion,
+            puuid = candidateState.puuid,
+            seasonYear = candidateState.seasonYear,
+            queueId = candidateState.queueId,
+            processedMatchIds = orderedProcessed,
+            pendingMatchIds = orderedPending,
+            excludedMatchIds = mergedExcludedSet.take(DurablePlayerSeasonStatsDto.MAX_EXCLUDED_MATCH_IDS),
+            hitPreSeasonBoundary = mergedHitBoundary,
+            firstPreSeasonMatchId = mergedBoundaryId,
+            historyCapped = isCapped,
+            historyComplete = isComplete,
+            overallCounters = overallSnap,
+            championCounters = champSnaps,
+            updatedAtEpochMilli = timeProvider.now()
+        )
     }
 
     /**
@@ -299,6 +600,7 @@ class PlayerCacheService(
 
         try {
             val refreshStartMs = timeProvider.now()
+            val normalizedRegion = region.lowercase().trim()
             val cachedProfile = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
 
             if (cachedProfile != null) {
@@ -307,8 +609,10 @@ class PlayerCacheService(
                 logger.info("Cache miss for $summonerName#$tagLine ($region) - Fetching from API")
             }
 
-            // Calculate Start of Year (Jan 1st) in Epoch Seconds
-            val startOfYear = java.time.Year.now().atDay(1).atStartOfDay(java.time.ZoneOffset.UTC).toEpochSecond()
+            // Calculate current season year & Start of Year (Jan 1st 00:00 UTC) from timeProvider for deterministic rollover
+            val currentYear = Instant.ofEpochMilli(refreshStartMs).atZone(java.time.ZoneOffset.UTC).year
+            val startOfYear = java.time.Year.of(currentYear).atDay(1).atStartOfDay(java.time.ZoneOffset.UTC).toEpochSecond()
+            val startOfYearMs = startOfYear * 1000L
 
             // 1. Verify summoner exists on this regional shard and fetch fresh level & icon
             val metaStartMs = timeProvider.now()
@@ -327,16 +631,49 @@ class PlayerCacheService(
             val rankDeferred = async { riotApiService.fetchLeagueRank(puuid, region) }
             val matchIdsDeferred = async { riotApiService.fetchMatchIdsSince(puuid, region, startOfYear) }
             val freshRank = rankDeferred.await()
-            val allMatchIds = matchIdsDeferred.await()
+            val rawAllMatchIds = matchIdsDeferred.await()
+            val distinctAllMatchIds = rawAllMatchIds
+                .asSequence()
+                .map { it.trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .take(DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS)
+                .toList()
             val metadataAndIdsMs = timeProvider.now() - metaStartMs
 
-            // Fast-path: if we already have a cached profile, no new matches have been played,
-            // and all served recentMatches already have info.gameVersion and info.teams populated,
+            val loadedDurable = loadValidDurableSeasonState(normalizedRegion, puuid, currentYear)
+            val durableState = loadedDurable?.state
+
+            val candidateWindowIds = if (durableState != null && durableState.hitPreSeasonBoundary && durableState.firstPreSeasonMatchId != null) {
+                val boundaryIdx = distinctAllMatchIds.indexOf(durableState.firstPreSeasonMatchId)
+                if (boundaryIdx >= 0) distinctAllMatchIds.subList(0, boundaryIdx) else distinctAllMatchIds
+            } else {
+                distinctAllMatchIds
+            }
+
+            // Check whether durable state (if repo is wired) is already complete with zero unfolded or pending match IDs
+            val durableCompleteAndUpToDate = if (playerSeasonStatsRepository != null) {
+                if (durableState == null || !durableState.historyComplete || durableState.pendingMatchIds.isNotEmpty()) {
+                    false
+                } else {
+                    val foldedLookup = durableState.processedMatchIds.toHashSet()
+                    val excludedLookup = durableState.excludedMatchIds.toHashSet()
+                    candidateWindowIds.all { it in foldedLookup || it in excludedLookup }
+                }
+            } else {
+                true
+            }
+
+            // Fast-path: if we already have a cached profile, no new or out-of-order/pending matches exist,
+            // durable state (when wired) is complete, and all served recentMatches have gameVersion + teams populated,
             // skip re-streaming and re-accumulating all matches from Redis while updating rank, level, and icon.
             val recentMatchesComplete = cachedProfile?.recentMatches?.none { needsMatchBackfill(it) } ?: true
-            if (cachedProfile != null && recentMatchesComplete && (
-                (allMatchIds.isEmpty() && cachedProfile.allMatchIds.isEmpty()) ||
-                (cachedProfile.allMatchIds.isNotEmpty() && allMatchIds.firstOrNull() == cachedProfile.allMatchIds.first() && cachedProfile.overallStats != null)
+            if (cachedProfile != null && recentMatchesComplete && durableCompleteAndUpToDate && (
+                (distinctAllMatchIds.isEmpty() && cachedProfile.allMatchIds.isEmpty()) ||
+                (cachedProfile.allMatchIds.isNotEmpty() &&
+                    distinctAllMatchIds.firstOrNull() == cachedProfile.allMatchIds.first() &&
+                    distinctAllMatchIds.size == cachedProfile.allMatchIds.size &&
+                    cachedProfile.overallStats != null)
             )) {
                 val fastImprovementStats = cachedProfile.improvementStats
                     ?: timelineAnalysisService.computeImprovementStats(emptyList(), puuid, cachedProfile.recentMatches ?: emptyList())
@@ -358,19 +695,41 @@ class PlayerCacheService(
                 )
                 return@coroutineScope fastUpdatedProfile
             }
-            
-            // 3. Process matches in chunks to calculate full-season stats without holding everything in memory.
-            // Recent-20-only enrichment:
-            // - Matches in the recent 20 (first 20 valid seasonal matches) are fetched if missing OR if they lack gameVersion/teams.
-            // - Matches beyond the recent 20 (index >= 20) are fetched ONLY if genuinely missing from Redis (cached?.info == null),
-            //   avoiding re-fetching hundreds of older cached matches just for gameVersion/teams while preserving full-season stats accuracy.
+
             val matchProcessingStartMs = timeProvider.now()
             val accumulator = MatchStatsAccumulator(puuid)
-            val recentMatches = mutableListOf<MatchDto>()
-            val validMatchIds = mutableListOf<String>()
-            val startOfYearMs = startOfYear * 1000
-            
-            val chunks = allMatchIds.chunked(CHUNK_SIZE)
+            val foldedSet = LinkedHashSet<String>()
+            val excludedSet = LinkedHashSet<String>()
+            val newPendingSet = LinkedHashSet<String>()
+            var hitPreSeasonBoundary = false
+            var firstPreSeasonMatchId: String? = null
+            var stoppedForMemoryHeadroom = false
+
+            if (durableState != null) {
+                accumulator.restoreFromAdditiveSnapshots(durableState.overallCounters, durableState.championCounters)
+                foldedSet.addAll(durableState.processedMatchIds)
+                excludedSet.addAll(durableState.excludedMatchIds)
+                hitPreSeasonBoundary = durableState.hitPreSeasonBoundary
+                firstPreSeasonMatchId = durableState.firstPreSeasonMatchId
+            }
+
+            // Determine which match IDs actually require Redis decode or Riot fetch:
+            // - When durableState != null: ONLY unfolded candidate match IDs (not in foldedSet and not in excludedSet).
+            //   Already-folded matches (e.g. 900 old games) are NEVER re-decoded from Redis or re-fetched from Riot.
+            // - When durableState == null: all distinctAllMatchIds in chunks of 50.
+            val idsToProcess = if (durableState != null) {
+                candidateWindowIds.filter { it !in foldedSet && it !in excludedSet }
+            } else {
+                distinctAllMatchIds
+            }
+
+            val projectedTop20Set = candidateWindowIds
+                .asSequence()
+                .filter { it !in excludedSet }
+                .take(RECENT_MATCHES_LIMIT)
+                .toHashSet()
+
+            val chunks = idsToProcess.chunked(CHUNK_SIZE)
             var processedCount = 0
             var projectedRecentCount = 0
             var cacheHitsCount = 0
@@ -378,26 +737,50 @@ class PlayerCacheService(
             var recent20BackfillCount = 0
             var skippedOlderBackfillCount = 0
             val alreadyFetchedIds = mutableSetOf<String>()
-            
-            for (chunk in chunks) {
+            val resolvedMatchesById = LinkedHashMap<String, MatchDto>()
+            val newlyFoldedMatchesInRefresh = ArrayList<Pair<String, MatchDto>>()
+            val matchesForParticipantIndexing = mutableListOf<MatchDto>()
+
+            for ((chunkIndex, chunk) in chunks.withIndex()) {
+                if (chunkIndex > 0 && !hasMemoryHeadroomForSeasonBackfill()) {
+                    stoppedForMemoryHeadroom = true
+                    for (remIdx in chunkIndex until chunks.size) {
+                        for (remId in chunks[remIdx]) {
+                            if (remId !in foldedSet && remId !in excludedSet) {
+                                newPendingSet.add(remId)
+                            }
+                        }
+                    }
+                    logger.warn(
+                        "Paused seasonal backfill for {}#{} ({}) at chunk {}/{} due to memory headroom guard; {} match IDs recorded as pending.",
+                        summonerName, tagLine, region, chunkIndex + 1, chunks.size, newPendingSet.size
+                    )
+                    break
+                }
+
                 val redisKeys = chunk.map { getMatchCacheKey(it, region) }
                 val cachedMatchesMap = redisCacheService.multiGet(redisKeys, MatchDto::class.java)
-                
+
                 val missingIds = mutableListOf<String>()
                 for (id in chunk) {
                     val cached = cachedMatchesMap[getMatchCacheKey(id, region)]
+                    val isRecentSlot = if (durableState != null) {
+                        id in projectedTop20Set
+                    } else {
+                        projectedRecentCount < RECENT_MATCHES_LIMIT
+                    }
                     if (isMissingForSeasonStats(cached)) {
                         missingIds.add(id)
                         missingSeasonFetchCount++
-                        if (projectedRecentCount < RECENT_MATCHES_LIMIT) {
+                        if (durableState == null && projectedRecentCount < RECENT_MATCHES_LIMIT) {
                             projectedRecentCount++
                         }
                     } else {
                         cacheHitsCount++
                         val creation = cached?.info?.gameCreation ?: 0L
                         if (creation >= startOfYearMs) {
-                            if (projectedRecentCount < RECENT_MATCHES_LIMIT) {
-                                projectedRecentCount++
+                            if (isRecentSlot) {
+                                if (durableState == null) projectedRecentCount++
                                 if (needsMatchBackfill(cached)) {
                                     missingIds.add(id)
                                     recent20BackfillCount++
@@ -408,7 +791,7 @@ class PlayerCacheService(
                         }
                     }
                 }
-                
+
                 if (missingIds.isNotEmpty()) {
                     alreadyFetchedIds.addAll(missingIds)
                     logger.info(
@@ -417,9 +800,9 @@ class PlayerCacheService(
                         missingSeasonFetchCount, recent20BackfillCount, skippedOlderBackfillCount
                     )
                 }
-                
+
                 val fetchedMatches = missingIds.map { matchId ->
-                    async { 
+                    async {
                         try {
                             riotApiService.getMatchById(matchId, region)
                         } catch (e: Exception) {
@@ -437,35 +820,107 @@ class PlayerCacheService(
                     val matchId = match.metadata!!.matchId!!
                     redisCacheService.set(getMatchCacheKey(matchId, region), match, MATCH_CACHE_TTL)
                 }
-                
+
                 val fetchedById = fetchedMatches.associateBy { it.metadata?.matchId }
-                val chunkMatches = chunk.mapNotNull { id ->
-                    fetchedById[id] ?: cachedMatchesMap[getMatchCacheKey(id, region)]
-                }
-                
-                val validChunkMatches = chunkMatches.filter { (it.info?.gameCreation ?: 0) >= startOfYearMs }
-                
-                if (validChunkMatches.isNotEmpty() && processedCount < 10) {
-                    val remainingToIndex = (10 - processedCount).coerceAtMost(validChunkMatches.size)
-                    indexPlayersFromMatches(validChunkMatches.take(remainingToIndex), region)
+                var chunkHitPreSeason = false
+
+                for (id in chunk) {
+                    val match = fetchedById[id] ?: cachedMatchesMap[getMatchCacheKey(id, region)]
+                    val info = match?.info
+                    if (info == null) {
+                        newPendingSet.add(id)
+                        continue
+                    }
+                    val creation = info.gameCreation ?: 0L
+                    if (creation < startOfYearMs) {
+                        hitPreSeasonBoundary = true
+                        if (firstPreSeasonMatchId == null) {
+                            firstPreSeasonMatchId = id
+                        }
+                        if (excludedSet.size < DurablePlayerSeasonStatsDto.MAX_EXCLUDED_MATCH_IDS) {
+                            excludedSet.add(id)
+                        }
+                        chunkHitPreSeason = true
+                        break
+                    }
+                    val canonicalId = match.metadata?.matchId?.trim()?.takeIf { it.isNotBlank() } ?: id
+                    if ((info.gameDuration ?: 0L) <= 0L) {
+                        if (excludedSet.size < DurablePlayerSeasonStatsDto.MAX_EXCLUDED_MATCH_IDS) {
+                            excludedSet.add(canonicalId)
+                        }
+                        continue
+                    }
+                    if (foldedSet.add(canonicalId)) {
+                        accumulator.add(match)
+                        newlyFoldedMatchesInRefresh.add(canonicalId to match)
+                        newPendingSet.remove(canonicalId)
+                        if (matchesForParticipantIndexing.size < MAX_MATCHES_FOR_PARTICIPANT_INDEXING) {
+                            matchesForParticipantIndexing.add(match)
+                        }
+                    }
+                    if (canonicalId in projectedTop20Set || resolvedMatchesById.size < RECENT_MATCHES_LIMIT) {
+                        resolvedMatchesById[canonicalId] = match
+                    }
                 }
 
-                validChunkMatches.forEach { match -> 
-                    match.metadata?.matchId?.let { validMatchIds.add(it) }
-                }
-
-                validChunkMatches.forEach { accumulator.add(it) }
-                
-                if (recentMatches.size < RECENT_MATCHES_LIMIT) {
-                    val needed = RECENT_MATCHES_LIMIT - recentMatches.size
-                    recentMatches.addAll(validChunkMatches.take(needed))
-                }
-                
                 processedCount += chunk.size
-                
-                if (validChunkMatches.size < chunkMatches.size) {
+
+                if (chunkHitPreSeason) {
                     logger.info("Hit match time boundary (start of year). Stopping fetch early.")
                     break
+                }
+            }
+
+            if (matchesForParticipantIndexing.isNotEmpty()) {
+                indexPlayersFromMatches(matchesForParticipantIndexing, region)
+            }
+
+            // Build ordered validMatchIds preserving Riot's newest-first ordering across newly + previously folded IDs
+            val effectiveBoundaryIdx = if (hitPreSeasonBoundary && firstPreSeasonMatchId != null) {
+                distinctAllMatchIds.indexOf(firstPreSeasonMatchId)
+            } else {
+                -1
+            }
+            val effectiveSeasonalWindowIds = if (effectiveBoundaryIdx >= 0) {
+                distinctAllMatchIds.subList(0, effectiveBoundaryIdx)
+            } else {
+                distinctAllMatchIds
+            }
+            val windowIdSet = effectiveSeasonalWindowIds.toHashSet()
+            val validMatchIds = ArrayList<String>(foldedSet.size)
+            for (id in effectiveSeasonalWindowIds) {
+                if (id in foldedSet) {
+                    validMatchIds.add(id)
+                }
+            }
+            for (id in foldedSet) {
+                if (id !in windowIdSet && validMatchIds.size < DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS) {
+                    validMatchIds.add(id)
+                }
+            }
+
+            // Assemble recentMatches (up to 20 newest valid seasonal matches) from newly resolved matches + cachedProfile.recentMatches
+            // without decoding already-folded historical matches from Redis.
+            val priorRecentById = cachedProfile?.recentMatches.orEmpty()
+                .mapNotNull { m -> m.metadata?.matchId?.trim()?.takeIf { it.isNotBlank() }?.let { it to m } }
+                .toMap()
+            val top20ValidIds = validMatchIds.take(RECENT_MATCHES_LIMIT)
+            val missingRecentCardIds = top20ValidIds.filter { id ->
+                !resolvedMatchesById.containsKey(id) && !priorRecentById.containsKey(id)
+            }
+            val hydratedRecentCardById = if (missingRecentCardIds.isNotEmpty()) {
+                alreadyFetchedIds.addAll(missingRecentCardIds)
+                getMatchesByIds(missingRecentCardIds, region)
+                    .mapNotNull { m -> m.metadata?.matchId?.trim()?.takeIf { it.isNotBlank() }?.let { it to m } }
+                    .toMap()
+            } else {
+                emptyMap()
+            }
+            val recentMatches = mutableListOf<MatchDto>()
+            for (id in top20ValidIds) {
+                val m = resolvedMatchesById[id] ?: priorRecentById[id] ?: hydratedRecentCardById[id]
+                if (m != null) {
+                    recentMatches.add(m)
                 }
             }
 
@@ -501,6 +956,57 @@ class PlayerCacheService(
                     }
                 }
             }
+
+            // Carry over any prior pending IDs that remain in the current seasonal window and were not resolved
+            if (durableState != null) {
+                for (priorPending in durableState.pendingMatchIds) {
+                    if (priorPending in windowIdSet && priorPending !in foldedSet && priorPending !in excludedSet) {
+                        newPendingSet.add(priorPending)
+                    }
+                }
+            }
+            for (id in effectiveSeasonalWindowIds) {
+                if (id !in foldedSet && id !in excludedSet) {
+                    newPendingSet.add(id)
+                }
+            }
+
+            val orderedPendingIds = effectiveSeasonalWindowIds.filter { it in newPendingSet }
+            val isHistoryCapped = (durableState?.historyCapped == true) ||
+                validMatchIds.size > DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS ||
+                (!hitPreSeasonBoundary && effectiveSeasonalWindowIds.size > DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS)
+            val isHistoryComplete = !isHistoryCapped &&
+                orderedPendingIds.isEmpty() &&
+                !stoppedForMemoryHeadroom &&
+                effectiveSeasonalWindowIds.all { it in foldedSet || it in excludedSet }
+
+            if (playerSeasonStatsRepository != null) {
+                val (overallSnap, champSnaps) = accumulator.toAdditiveSnapshots()
+                val newDurableDto = DurablePlayerSeasonStatsDto(
+                    schemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION,
+                    region = normalizedRegion,
+                    puuid = puuid,
+                    seasonYear = currentYear,
+                    queueId = 420,
+                    processedMatchIds = validMatchIds.take(DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS),
+                    pendingMatchIds = orderedPendingIds.take(DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS),
+                    excludedMatchIds = excludedSet.take(DurablePlayerSeasonStatsDto.MAX_EXCLUDED_MATCH_IDS),
+                    hitPreSeasonBoundary = hitPreSeasonBoundary,
+                    firstPreSeasonMatchId = firstPreSeasonMatchId,
+                    historyCapped = isHistoryCapped,
+                    historyComplete = isHistoryComplete,
+                    overallCounters = overallSnap,
+                    championCounters = champSnaps,
+                    updatedAtEpochMilli = timeProvider.now()
+                )
+                persistDurableSeasonState(
+                    state = newDurableDto,
+                    expectedPreviousVersion = loadedDurable?.entityVersion,
+                    newlyFoldedMatches = newlyFoldedMatchesInRefresh,
+                    effectiveSeasonalWindowIds = effectiveSeasonalWindowIds,
+                    stoppedForMemoryHeadroom = stoppedForMemoryHeadroom
+                )
+            }
             
             val (championStats, overallStats) = accumulator.getResult()
             val matchOnlyImprovementStats = timelineAnalysisService.computeImprovementStats(
@@ -529,10 +1035,10 @@ class PlayerCacheService(
             val matchProcessingMs = timeProvider.now() - matchProcessingStartMs
             val totalRefreshMs = timeProvider.now() - refreshStartMs
             logger.info(
-                "Refreshed profile for {}#{} ({}): totalMs={}, metadataAndIdsMs={}, matchProcessingMs={}, validMatches={}/{}, cacheHits={}, missingFetches={}, recent20Backfills={}, skippedOlderBackfills={}",
+                "Refreshed profile for {}#{} ({}): totalMs={}, metadataAndIdsMs={}, matchProcessingMs={}, validMatches={}/{}, pendingGaps={}, historyComplete={}, cacheHits={}, missingFetches={}, recent20Backfills={}, skippedOlderBackfills={}",
                 summonerName, tagLine, region, totalRefreshMs, metadataAndIdsMs, matchProcessingMs,
-                validMatchIds.size, allMatchIds.size, cacheHitsCount, missingSeasonFetchCount,
-                recent20BackfillCount, skippedOlderBackfillCount
+                validMatchIds.size, distinctAllMatchIds.size, orderedPendingIds.size, isHistoryComplete,
+                cacheHitsCount, missingSeasonFetchCount, recent20BackfillCount, skippedOlderBackfillCount
             )
             
             return@coroutineScope updatedProfile
@@ -591,43 +1097,83 @@ class PlayerCacheService(
         }
     }
 
-    private fun indexPlayersFromMatches(matches: List<com.pride.summoner_searcher_api.dto.MatchDto>, region: String) {
-        val playersToIndex = matches.flatMap { it.info?.participants ?: emptyList() }
-            // Filter out players with missing essential Riot ID info
-            .filter { !it.puuid.isNullOrBlank() && !it.riotIdGameName.isNullOrBlank() && !it.riotIdTagline.isNullOrBlank() }
-            .map { p ->
-                com.pride.summoner_searcher_api.model.IndexedPlayer(
-                    puuid = p.puuid!!,
-                    gameName = p.riotIdGameName!!,
-                    tagLine = p.riotIdTagline!!,
-                    region = region,
-                    profileIconId = p.profileIcon ?: 0,
-                    summonerLevel = p.summonerLevel?.toLong() ?: 0L,
-                    lastSeenAt = java.time.Instant.now()
-                )
-            }
-            // If the same player appears in multiple matches in this batch, keep only the latest object.
-            .distinctBy { it.puuid }
-            // Limit to a maximum of 200 players per batch to prevent massive database write loads
-            // when fullly refreshing a user's seasonal match history (>200 matches * 10 players)
-            .take(200)
+    /**
+     * Upserts searchable participant identities from already-fetched matches while strictly preserving
+     * each player's newest observed Riot ID (`gameName#tagLine`), `profileIconId`, `summonerLevel`, and `lastSeenAt`.
+     *
+     * - Uses each match's `info.gameCreation` timestamp as `lastSeenAt` (falling back to `timeProvider.now()` only if `<= 0`).
+     * - Deduplicates within the batch by keeping the participant entry from the newest match (`max(lastSeenAt)`).
+     * - Executes `findAllById` + monotonic `lastSeenAt` comparison + `saveAll` atomically inside a single DB transaction
+     *   (when [transactionTemplate] is wired) so historic/backfilled matches can never overwrite a newer Riot ID or level.
+     */
+    internal fun indexPlayersFromMatches(matches: List<com.pride.summoner_searcher_api.dto.MatchDto>, region: String) {
+        val normalizedRegion = region.lowercase().trim()
+        val latestByPuuid = LinkedHashMap<String, com.pride.summoner_searcher_api.model.IndexedPlayer>()
 
-        if (playersToIndex.isNotEmpty()) {
-            try {
-                // To avoid blocking the main thread significantly if there are many matches, we launch a coroutine on the IO dispatcher.
-                CoroutineScope(Dispatchers.IO).launch {
-                    try {
-                        // Chunk inserts to prevent exceeding parameter limits or causing long write locks
-                        playersToIndex.chunked(100).forEach { batch ->
-                            indexedPlayerRepository.saveAll(batch)
-                        }
-                    } catch (e: Exception) {
-                        logger.error("Error saving indexed players: ${e.message}")
-                    }
+        for (match in matches.take(MAX_MATCHES_FOR_PARTICIPANT_INDEXING)) {
+            val info = match.info ?: continue
+            val matchPlayedAtMs = (info.gameCreation ?: 0L).takeIf { it > 0L } ?: timeProvider.now()
+            val matchPlayedAt = Instant.ofEpochMilli(matchPlayedAtMs)
+
+            for (p in info.participants) {
+                val cleanPuuid = p.puuid?.trim()?.takeIf { it.isNotBlank() } ?: continue
+                val cleanGameName = p.riotIdGameName?.trim()?.takeIf { it.isNotBlank() } ?: continue
+                val cleanTagLine = p.riotIdTagline?.trim()?.takeIf { it.isNotBlank() } ?: continue
+
+                val existingInBatch = latestByPuuid[cleanPuuid]
+                if (existingInBatch == null || !matchPlayedAt.isBefore(existingInBatch.lastSeenAt)) {
+                    latestByPuuid[cleanPuuid] = com.pride.summoner_searcher_api.model.IndexedPlayer(
+                        puuid = cleanPuuid,
+                        gameName = cleanGameName,
+                        tagLine = cleanTagLine,
+                        region = normalizedRegion,
+                        profileIconId = p.profileIcon ?: 0,
+                        summonerLevel = p.summonerLevel?.toLong() ?: 0L,
+                        lastSeenAt = matchPlayedAt
+                    )
                 }
-            } catch (e: Exception) {
-                logger.error("Error dispatching players to index: ${e.message}")
             }
+        }
+
+        if (latestByPuuid.isEmpty()) return
+
+        val boundedCandidates = latestByPuuid.values
+            .sortedByDescending { it.lastSeenAt }
+            .take(MAX_INDEXED_PLAYERS_PER_BATCH)
+
+        val upsertBlock = {
+            val candidateIds = boundedCandidates.map { it.puuid }
+            val existingInDbByPuuid = runCatching {
+                indexedPlayerRepository.findAllById(candidateIds).associateBy { it.puuid }
+            }.getOrDefault(emptyMap())
+
+            val rowsToSave = ArrayList<com.pride.summoner_searcher_api.model.IndexedPlayer>(boundedCandidates.size)
+            for (candidate in boundedCandidates) {
+                val existingDb = existingInDbByPuuid[candidate.puuid]
+                if (existingDb != null && candidate.lastSeenAt.isBefore(existingDb.lastSeenAt)) {
+                    indexedPlayersStaleSkippedCounter.incrementAndGet()
+                    continue
+                }
+                rowsToSave.add(candidate)
+            }
+
+            if (rowsToSave.isNotEmpty()) {
+                rowsToSave.chunked(100).forEach { batch ->
+                    indexedPlayerRepository.saveAll(batch)
+                }
+                indexedPlayersUpsertedCounter.addAndGet(rowsToSave.size.toLong())
+            }
+        }
+
+        try {
+            val tx = transactionTemplate
+            if (tx != null) {
+                tx.executeWithoutResult { upsertBlock() }
+            } else {
+                upsertBlock()
+            }
+        } catch (e: Exception) {
+            logger.error("Error saving indexed players: ${e.message}")
         }
     }
 }

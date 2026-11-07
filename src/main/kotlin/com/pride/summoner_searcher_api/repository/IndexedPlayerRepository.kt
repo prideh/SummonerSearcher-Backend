@@ -20,4 +20,15 @@ interface IndexedPlayerRepository : JpaRepository<IndexedPlayer, String> {
      * Retrieves the top 5,000 most recently seen indexed players for dynamic XML sitemap generation.
      */
     fun findTop5000ByOrderByLastSeenAtDesc(): List<IndexedPlayer>
+
+    /**
+     * Read-only O(rows) aggregate of searchable identity rows grouped by normalized region.
+     * Because `puuid` is the `@Id` primary key of `indexed_players`, `COUNT(p)` equals distinct PUUIDs.
+     * Each row contains: `[normalizedRegion, playerCount, maxLastSeenAt]`.
+     */
+    @org.springframework.data.jpa.repository.Query(
+        "SELECT LOWER(TRIM(p.region)), COUNT(p), MAX(p.lastSeenAt) FROM IndexedPlayer p GROUP BY LOWER(TRIM(p.region))"
+    )
+    fun countPlayersGroupedByRegion(): List<Array<Any?>>
 }
+

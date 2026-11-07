@@ -299,6 +299,32 @@ class RiotApiController(
         return ResponseEntity.ok(result)
     }
 
+    /**
+     * Operator-authenticated read-only aggregate summary separating:
+     * 1. Broad searchable player identity index counts (`indexed_players`),
+     * 2. Durable current-year Ranked Solo (`queueId = 420`) history completeness for viewed players (`player_season_stats`),
+     * 3. Current-patch cohort benchmark cell quality (`cohort_benchmark_cells`).
+     */
+    @GetMapping("/cohorts/{region}/collector/coverage-summary")
+    fun getCohortDiscoveryAndSeasonCoverageSummary(
+        @PathVariable region: String,
+        @org.springframework.web.bind.annotation.RequestParam(required = false) seasonYear: Int? = null,
+        @org.springframework.web.bind.annotation.RequestHeader(name = "X-Cohort-Operator-Token", required = false) operatorToken: String? = null,
+        httpRequest: jakarta.servlet.http.HttpServletRequest
+    ): ResponseEntity<com.pride.summoner_searcher_api.dto.CohortDiscoveryAndSeasonCoverageDto?> {
+        val runner = overnightCohortCollectorRunner ?: return ResponseEntity.notFound().build()
+        val benchmarkService = cohortBenchmarkService ?: return ResponseEntity.notFound().build()
+        if (!isAuthorizedCollectorOperator(runner, httpRequest, operatorToken)) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.FORBIDDEN).build()
+        }
+        return ResponseEntity.ok(
+            benchmarkService.getDiscoveryAndSeasonCoverageSummary(
+                region = region,
+                seasonYear = seasonYear
+            )
+        )
+    }
+
     private fun isAuthorizedCollectorOperator(
         runner: com.pride.summoner_searcher_api.scheduler.OvernightCohortCollectorRunner,
         httpRequest: jakarta.servlet.http.HttpServletRequest,

@@ -8,6 +8,8 @@ import com.pride.summoner_searcher_api.model.CohortCollectorCheckpointEntity
 import com.pride.summoner_searcher_api.repository.CohortBenchmarkCellRepository
 import com.pride.summoner_searcher_api.repository.CohortCellSampleStateRepository
 import com.pride.summoner_searcher_api.repository.CohortCollectorCheckpointRepository
+import com.pride.summoner_searcher_api.repository.IndexedPlayerRepository
+import com.pride.summoner_searcher_api.repository.PlayerSeasonStatsRepository
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Value
@@ -228,7 +230,11 @@ class CohortBenchmarkService(
     @Autowired(required = false)
     private val cohortCellSampleStateRepository: CohortCellSampleStateRepository? = null,
     @Autowired(required = false)
-    private val transactionTemplate: org.springframework.transaction.support.TransactionTemplate? = null
+    private val transactionTemplate: org.springframework.transaction.support.TransactionTemplate? = null,
+    @Autowired(required = false)
+    private val indexedPlayerRepository: IndexedPlayerRepository? = null,
+    @Autowired(required = false)
+    private val playerSeasonStatsRepository: PlayerSeasonStatsRepository? = null
 ) {
     private val logger = LoggerFactory.getLogger(javaClass)
     private val lastGcHintAtMs = java.util.concurrent.atomic.AtomicLong(0L)
@@ -4826,4 +4832,129 @@ class CohortBenchmarkService(
         val majorCmp = (aParts.getOrElse(0) { 0 }).compareTo(bParts.getOrElse(0) { 0 })
         if (majorCmp != 0) majorCmp else (aParts.getOrElse(1) { 0 }).compareTo(bParts.getOrElse(1) { 0 })
     }
+
+    /**
+     * Operator read-only aggregate coverage report separating:
+     * 1. Broad searchable player identity index counts (`indexed_players`),
+     * 2. Durable current-year Ranked Solo (`queueId = 420`) history completeness for viewed players (`player_season_stats`),
+     * 3. Current-patch cohort benchmark cell quality (`cohort_benchmark_cells`).
+     *
+     * Executes scalar SQL aggregates only (`O(rows)` DB scan, zero candidate list materialization,
+     * zero Riot API calls, zero Redis SCANs).
+     */
+    fun getDiscoveryAndSeasonCoverageSummary(
+        region: String,
+        seasonYear: Int? = null
+    ): CohortDiscoveryAndSeasonCoverageDto {
+        val normalizedRegion = region.lowercase().trim()
+        val nowInstant = Instant.ofEpochMilli(timeProvider.now())
+        val effectiveSeasonYear = seasonYear
+            ?: nowInstant.atZone(java.time.ZoneOffset.UTC).year
+
+        val regionCounts = try {
+            indexedPlayerRepository?.countPlayersGroupedByRegion().orEmpty().mapNotNull { row ->
+                val reg = (row.getOrNull(0) as? String)?.lowercase()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val cnt = (row.getOrNull(1) as? Number)?.toLong() ?: 0L
+                val latestSeen = when (val rawSeen = row.getOrNull(2)) {
+                    is Instant -> rawSeen
+                    is Number -> rawSeen.toLong().takeIf { it > 0L }?.let { Instant.ofEpochMilli(it) }
+                    else -> null
+                }
+                RegionIndexedPlayerCountDto(
+                    region = reg,
+                    indexedPlayerCount = cnt,
+                    latestSeenAt = latestSeen
+                )
+            }
+        } catch (e: Exception) {
+            logger.warn("Failed to query indexed_players aggregate counts: {}", e.message)
+            emptyList()
+        }
+
+        val totalIndexedGlobal = regionCounts.sumOf { it.indexedPlayerCount }
+        val targetIndexedCount = regionCounts.firstOrNull { it.region == normalizedRegion }?.indexedPlayerCount ?: 0L
+
+        val seasonByRegion = try {
+            playerSeasonStatsRepository?.summarizeByRegionForSeasonYear(
+                seasonYear = effectiveSeasonYear,
+                queueId = SOLO_QUEUE_ID,
+                currentSchemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION
+            ).orEmpty().mapNotNull { row ->
+                val reg = (row.getOrNull(0) as? String)?.lowercase()?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val tracked = (row.getOrNull(1) as? Number)?.toLong() ?: 0L
+                val complete = (row.getOrNull(2) as? Number)?.toLong() ?: 0L
+                val partial = (row.getOrNull(3) as? Number)?.toLong() ?: 0L
+                val capped = (row.getOrNull(4) as? Number)?.toLong() ?: 0L
+                val staleSchema = (row.getOrNull(5) as? Number)?.toLong() ?: 0L
+                val foldedGames = (row.getOrNull(6) as? Number)?.toLong() ?: 0L
+                val pendingGames = (row.getOrNull(7) as? Number)?.toLong() ?: 0L
+                val maxUpdated = row.getOrNull(8) as? Instant
+                RegionSeasonStatsCompletenessDto(
+                    region = reg,
+                    seasonYear = effectiveSeasonYear,
+                    queueId = SOLO_QUEUE_ID,
+                    currentSchemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION,
+                    maxTrackedMatchIdsCapPerPlayer = DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS,
+                    trackedViewedPlayers = tracked,
+                    completeHistoryPlayers = complete,
+                    partialHistoryPlayers = partial,
+                    cappedHistoryPlayers = capped,
+                    staleSchemaVersionPlayers = staleSchema,
+                    totalFoldedSeasonGames = foldedGames,
+                    totalPendingGapGames = pendingGames,
+                    latestUpdatedAt = maxUpdated
+                )
+            }
+        } catch (e: Exception) {
+            logger.warn("Failed to query player_season_stats aggregate summary: {}", e.message)
+            emptyList()
+        }
+
+        val targetSeasonStats = seasonByRegion.firstOrNull { it.region == normalizedRegion }
+            ?: RegionSeasonStatsCompletenessDto(
+                region = normalizedRegion,
+                seasonYear = effectiveSeasonYear,
+                queueId = SOLO_QUEUE_ID
+            )
+
+        val targetPatch = resolveGroundedCurrentPatch(
+            normalizedRegion,
+            allowLightRedisMatchProbe = false,
+            allowExternalNetworkLookup = false
+        )
+        val persistedCells = if (normalizedRegion in ALLOWED_REGIONS) {
+            getPersistedCohortCellsInternal(
+                normalizedRegion,
+                targetPatch,
+                holdsRegionGate = false
+            )
+        } else {
+            emptyList()
+        }
+
+        return CohortDiscoveryAndSeasonCoverageDto(
+            region = normalizedRegion,
+            measuredAt = nowInstant,
+            identityIndexCoverage = IdentityIndexCoverageSummaryDto(
+                totalIndexedPlayersGlobal = totalIndexedGlobal,
+                targetRegionIndexedPlayers = targetIndexedCount,
+                byRegion = regionCounts
+            ),
+            seasonHistoryCompleteness = SeasonHistoryCompletenessSummaryDto(
+                seasonYear = effectiveSeasonYear,
+                queueId = SOLO_QUEUE_ID,
+                targetRegionStats = targetSeasonStats,
+                byRegion = seasonByRegion
+            ),
+            benchmarkQualitySummary = BenchmarkQualitySummaryDto(
+                region = normalizedRegion,
+                targetPatch = targetPatch ?: persistedCells.firstOrNull()?.patch,
+                persistedCellsCount = persistedCells.size,
+                cellsPassingQualityGate = persistedCells.count { it.passesQualityGate },
+                targetCellsCount = 30
+            ),
+            memoryHeadroom = getMemoryHeadroomSnapshot(allowGcHintOnPressure = false)
+        )
+    }
 }
+

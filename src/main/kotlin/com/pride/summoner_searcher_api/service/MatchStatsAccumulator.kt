@@ -61,11 +61,19 @@ class MatchStatsAccumulator(private val puuid: String) {
      * Process a single match and update internal counters.
      */
     fun add(match: MatchDto) {
-        val info = match.info ?: return
-        if (info.gameDuration == 0L) return
+        addMatchIfEligible(match)
+    }
+
+    /**
+     * Processes a single match and returns `true` iff the match contained valid non-zero duration
+     * participant data for [puuid] and was folded into the additive counters.
+     */
+    fun addMatchIfEligible(match: MatchDto): Boolean {
+        val info = match.info ?: return false
+        if ((info.gameDuration ?: 0L) <= 0L) return false
 
         val participants = info.participants
-        val player = participants.find { it.puuid == puuid } ?: return
+        val player = participants.find { it.puuid == puuid } ?: return false
 
         totalGames++
         if (player.win == true) totalWins++
@@ -145,6 +153,109 @@ class MatchStatsAccumulator(private val puuid: String) {
         champStats.turretPlates += turretPlates.toInt()
         champStats.cs += cs
         champStats.durationMinutes += durationMin
+        return true
+    }
+
+    fun getTotalGames(): Int = totalGames
+
+    /**
+     * Exports exact unrounded additive counters for durable persistence.
+     * Never derives counters from rounded DTO averages.
+     */
+    fun toAdditiveSnapshots(): Pair<OverallAdditiveCountersSnapshot, List<ChampionAdditiveCountersSnapshot>> {
+        val overall = OverallAdditiveCountersSnapshot(
+            totalGames = totalGames,
+            totalWins = totalWins,
+            totalKills = totalKills,
+            totalDeaths = totalDeaths,
+            totalAssists = totalAssists,
+            totalCs = totalCs,
+            totalDurationInMinutes = totalDurationInMinutes,
+            totalKillParticipation = totalKillParticipation,
+            totalSoloKills = totalSoloKills,
+            totalTurretPlates = totalTurretPlates,
+            totalVisionScore = totalVisionScore,
+            oppTotalKills = oppTotalKills,
+            oppTotalDeaths = oppTotalDeaths,
+            oppTotalAssists = oppTotalAssists,
+            oppTotalCs = oppTotalCs,
+            oppTotalSoloKills = oppTotalSoloKills,
+            oppTotalTurretPlates = oppTotalTurretPlates,
+            oppTotalVisionScore = oppTotalVisionScore,
+            oppTotalKillParticipation = oppTotalKillParticipation,
+            blueSideGames = blueSideGames,
+            blueSideWins = blueSideWins,
+            redSideGames = redSideGames,
+            redSideWins = redSideWins
+        )
+        val champions = championStatsMap.values
+            .sortedByDescending { it.games }
+            .map {
+                ChampionAdditiveCountersSnapshot(
+                    championName = it.championName,
+                    games = it.games,
+                    wins = it.wins,
+                    losses = it.losses,
+                    kills = it.kills,
+                    deaths = it.deaths,
+                    assists = it.assists,
+                    soloKills = it.soloKills,
+                    turretPlates = it.turretPlates,
+                    cs = it.cs,
+                    durationMinutes = it.durationMinutes
+                )
+            }
+        return overall to champions
+    }
+
+    /**
+     * Restores exact unrounded additive counters from a validated durable snapshot.
+     */
+    fun restoreFromAdditiveSnapshots(
+        overall: OverallAdditiveCountersSnapshot,
+        champions: List<ChampionAdditiveCountersSnapshot>
+    ) {
+        totalGames = overall.totalGames
+        totalWins = overall.totalWins
+        totalKills = overall.totalKills
+        totalDeaths = overall.totalDeaths
+        totalAssists = overall.totalAssists
+        totalCs = overall.totalCs
+        totalDurationInMinutes = overall.totalDurationInMinutes
+        totalKillParticipation = overall.totalKillParticipation
+        totalSoloKills = overall.totalSoloKills
+        totalTurretPlates = overall.totalTurretPlates
+        totalVisionScore = overall.totalVisionScore
+        oppTotalKills = overall.oppTotalKills
+        oppTotalDeaths = overall.oppTotalDeaths
+        oppTotalAssists = overall.oppTotalAssists
+        oppTotalCs = overall.oppTotalCs
+        oppTotalSoloKills = overall.oppTotalSoloKills
+        oppTotalTurretPlates = overall.oppTotalTurretPlates
+        oppTotalVisionScore = overall.oppTotalVisionScore
+        oppTotalKillParticipation = overall.oppTotalKillParticipation
+        blueSideGames = overall.blueSideGames
+        blueSideWins = overall.blueSideWins
+        redSideGames = overall.redSideGames
+        redSideWins = overall.redSideWins
+
+        championStatsMap.clear()
+        for (c in champions) {
+            if (c.championName.isBlank() || c.games <= 0) continue
+            championStatsMap[c.championName] = MutableChampionStats(
+                championName = c.championName,
+                games = c.games,
+                wins = c.wins,
+                losses = c.losses,
+                kills = c.kills,
+                deaths = c.deaths,
+                assists = c.assists,
+                soloKills = c.soloKills,
+                turretPlates = c.turretPlates,
+                cs = c.cs,
+                durationMinutes = c.durationMinutes
+            )
+        }
     }
 
     /**
@@ -208,3 +319,68 @@ class MatchStatsAccumulator(private val puuid: String) {
         return Pair(championStatsList, overallStats)
     }
 }
+
+data class OverallAdditiveCountersSnapshot(
+    val totalGames: Int = 0,
+    val totalWins: Int = 0,
+    val totalKills: Int = 0,
+    val totalDeaths: Int = 0,
+    val totalAssists: Int = 0,
+    val totalCs: Int = 0,
+    val totalDurationInMinutes: Double = 0.0,
+    val totalKillParticipation: Double = 0.0,
+    val totalSoloKills: Int = 0,
+    val totalTurretPlates: Int = 0,
+    val totalVisionScore: Int = 0,
+    val oppTotalKills: Int = 0,
+    val oppTotalDeaths: Int = 0,
+    val oppTotalAssists: Int = 0,
+    val oppTotalCs: Int = 0,
+    val oppTotalSoloKills: Int = 0,
+    val oppTotalTurretPlates: Int = 0,
+    val oppTotalVisionScore: Int = 0,
+    val oppTotalKillParticipation: Double = 0.0,
+    val blueSideGames: Int = 0,
+    val blueSideWins: Int = 0,
+    val redSideGames: Int = 0,
+    val redSideWins: Int = 0
+)
+
+data class ChampionAdditiveCountersSnapshot(
+    val championName: String = "",
+    val games: Int = 0,
+    val wins: Int = 0,
+    val losses: Int = 0,
+    val kills: Int = 0,
+    val deaths: Int = 0,
+    val assists: Int = 0,
+    val soloKills: Int = 0,
+    val turretPlates: Int = 0,
+    val cs: Int = 0,
+    val durationMinutes: Double = 0.0
+)
+
+data class DurablePlayerSeasonStatsDto(
+    val schemaVersion: Int = CURRENT_SCHEMA_VERSION,
+    val region: String = "",
+    val puuid: String = "",
+    val seasonYear: Int = 0,
+    val queueId: Int = 420,
+    val processedMatchIds: List<String> = emptyList(),
+    val pendingMatchIds: List<String> = emptyList(),
+    val excludedMatchIds: List<String> = emptyList(),
+    val hitPreSeasonBoundary: Boolean = false,
+    val firstPreSeasonMatchId: String? = null,
+    val historyCapped: Boolean = false,
+    val historyComplete: Boolean = false,
+    val overallCounters: OverallAdditiveCountersSnapshot = OverallAdditiveCountersSnapshot(),
+    val championCounters: List<ChampionAdditiveCountersSnapshot> = emptyList(),
+    val updatedAtEpochMilli: Long = 0L
+) {
+    companion object {
+        const val CURRENT_SCHEMA_VERSION = 1
+        const val MAX_TRACKED_SEASON_MATCH_IDS = 2_000
+        const val MAX_EXCLUDED_MATCH_IDS = 500
+    }
+}
+

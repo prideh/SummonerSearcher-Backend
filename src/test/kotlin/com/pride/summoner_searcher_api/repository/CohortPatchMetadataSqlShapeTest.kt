@@ -102,6 +102,12 @@ class CohortPatchMetadataSqlShapeTest {
     @Autowired
     private lateinit var springWiredRiotApiService: RiotApiService
 
+    @Autowired
+    private lateinit var indexedPlayerRepository: IndexedPlayerRepository
+
+    @Autowired
+    private lateinit var playerSeasonStatsRepository: PlayerSeasonStatsRepository
+
     @Test
     fun `resolveGroundedCurrentPatch executes scalar patch SQL without selecting samples_json or metrics_json and preserves exact region-only equivalence`() {
         val objectMapper = ObjectMapper().findAndRegisterModules()
@@ -622,5 +628,237 @@ class CohortPatchMetadataSqlShapeTest {
             checkpointRepository.deleteAll()
         }
     }
+
+    @Test
+    @org.springframework.transaction.annotation.Transactional(
+        propagation = org.springframework.transaction.annotation.Propagation.NOT_SUPPORTED
+    )
+    fun `real H2 PlayerSeasonStatsRepository and IndexedPlayerRepository enforce monotonic lastSeenAt identity indexing, optimistic locking, and scalar coverage summaries`() {
+        playerSeasonStatsRepository.deleteAll()
+        indexedPlayerRepository.deleteAll()
+        clearMocks(springWiredRedisCacheService, springWiredRiotApiService)
+
+        try {
+            val objectMapper = ObjectMapper().findAndRegisterModules()
+            val fixedNow = Instant.parse("2026-11-06T12:00:00Z")
+            val clock = object : com.pride.summoner_searcher_api.service.TimeProvider {
+                override fun now(): Long = fixedNow.toEpochMilli()
+            }
+
+            // 1. Verify fail-closed when TransactionTemplate is missing: no rows written to player_season_stats
+            val unwiredTxCacheService = com.pride.summoner_searcher_api.service.PlayerCacheService(
+                redisCacheService = springWiredRedisCacheService,
+                riotApiService = springWiredRiotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = playerSeasonStatsRepository,
+                transactionTemplate = null,
+                objectMapper = objectMapper
+            )
+            every { springWiredRedisCacheService.setIfAbsent(any(), any(), any()) } returns true
+            every { springWiredRedisCacheService.get(any(), com.pride.summoner_searcher_api.dto.SummonerProfileDto::class.java) } returns null
+            io.mockk.coEvery { springWiredRiotApiService.getSummonerByPuuid("h2-season-puuid", "euw1") } returns
+                com.pride.summoner_searcher_api.dto.SummonerDto("id", "h2-season-puuid", 400L, 77)
+            io.mockk.coEvery { springWiredRiotApiService.fetchLeagueRank("h2-season-puuid", "euw1") } returns null
+            io.mockk.coEvery { springWiredRiotApiService.fetchMatchIdsSince("h2-season-puuid", "euw1", any()) } returns listOf("EUW1_NEW_2000", "EUW1_OLD_1000")
+            every { springWiredRedisCacheService.multiGet(any(), com.pride.summoner_searcher_api.dto.MatchDto::class.java) } answers {
+                firstArg<List<String>>().associateWith { null }
+            }
+
+            fun makeMatchWithParticipant(
+                matchId: String,
+                creationMs: Long,
+                coPlayerGameName: String,
+                coPlayerTag: String,
+                coPlayerLevel: Int,
+                coPlayerIcon: Int
+            ): com.pride.summoner_searcher_api.dto.MatchDto {
+                val json = """
+                    {
+                      "metadata": {
+                        "matchId": "$matchId",
+                        "participants": ["h2-season-puuid", "co-player-puuid"]
+                      },
+                      "info": {
+                        "gameCreation": $creationMs,
+                        "gameDuration": 1800,
+                        "gameId": ${matchId.hashCode().toLong()},
+                        "queueId": 420,
+                        "gameMode": "CLASSIC",
+                        "gameVersion": "16.22.1",
+                        "teams": [],
+                        "participants": [
+                          {
+                            "puuid": "h2-season-puuid",
+                            "riotIdGameName": "MainPlayer",
+                            "riotIdTagline": "EUW",
+                            "summonerLevel": 400,
+                            "profileIcon": 77,
+                            "championName": "Orianna",
+                            "teamId": 100,
+                            "teamPosition": "MIDDLE",
+                            "win": true,
+                            "kills": 9,
+                            "deaths": 2,
+                            "assists": 8,
+                            "totalMinionsKilled": 225,
+                            "neutralMinionsKilled": 10,
+                            "visionScore": 28
+                          },
+                          {
+                            "puuid": "co-player-puuid",
+                            "riotIdGameName": "$coPlayerGameName",
+                            "riotIdTagline": "$coPlayerTag",
+                            "summonerLevel": $coPlayerLevel,
+                            "profileIcon": $coPlayerIcon,
+                            "championName": "LeeSin",
+                            "teamId": 100,
+                            "teamPosition": "JUNGLE",
+                            "win": true,
+                            "kills": 6,
+                            "deaths": 3,
+                            "assists": 12,
+                            "totalMinionsKilled": 40,
+                            "neutralMinionsKilled": 165,
+                            "visionScore": 31
+                          }
+                        ]
+                      }
+                    }
+                """.trimIndent()
+                return objectMapper.readValue(json, com.pride.summoner_searcher_api.dto.MatchDto::class.java)
+            }
+
+            val newerCreationMs = fixedNow.minusSeconds(1_000).toEpochMilli()
+            val olderCreationMs = fixedNow.minusSeconds(50_000).toEpochMilli()
+            val ancientCreationMs = fixedNow.minusSeconds(200_000).toEpochMilli()
+
+            io.mockk.coEvery { springWiredRiotApiService.getMatchById("EUW1_NEW_2000", "euw1") } returns
+                makeMatchWithParticipant("EUW1_NEW_2000", newerCreationMs, "NewRiotName", "NEW1", 350, 99)
+            io.mockk.coEvery { springWiredRiotApiService.getMatchById("EUW1_OLD_1000", "euw1") } returns
+                makeMatchWithParticipant("EUW1_OLD_1000", olderCreationMs, "OldRiotName", "OLD1", 340, 11)
+            io.mockk.coEvery { springWiredRiotApiService.getMatchById("EUW1_ANCIENT_500", "euw1") } returns
+                makeMatchWithParticipant("EUW1_ANCIENT_500", ancientCreationMs, "AncientRiotName", "ANC1", 300, 5)
+
+            kotlinx.coroutines.runBlocking {
+                unwiredTxCacheService.getPlayerProfile("h2-season-puuid", "euw1", "MainPlayer", "EUW", explicitRefresh = true)
+            }
+            // Missing TransactionTemplate MUST fail closed for durable season stats persistence
+            playerSeasonStatsRepository.findByRegionAndPuuidAndSeasonYearAndQueueId("euw1", "h2-season-puuid", 2026, 420) shouldBe null
+
+            // Verify within-batch monotonic lastSeenAt participant indexing in H2:
+            // Both EUW1_NEW_2000 and EUW1_OLD_1000 were indexed in the same batch; H2 MUST hold "NewRiotName#NEW1" (newerCreationMs)
+            val indexedCoPlayerAfterBatch1 = indexedPlayerRepository.findById("co-player-puuid").orElse(null)
+            (indexedCoPlayerAfterBatch1 != null) shouldBe true
+            indexedCoPlayerAfterBatch1!!.gameName shouldBe "NewRiotName"
+            indexedCoPlayerAfterBatch1.tagLine shouldBe "NEW1"
+            indexedCoPlayerAfterBatch1.summonerLevel shouldBe 350L
+            indexedCoPlayerAfterBatch1.profileIconId shouldBe 99
+            indexedCoPlayerAfterBatch1.lastSeenAt shouldBe Instant.ofEpochMilli(newerCreationMs)
+
+            // 2. Wire real TransactionTemplate and run with an even older backfilled match ("EUW1_ANCIENT_500")
+            val wiredCacheService = com.pride.summoner_searcher_api.service.PlayerCacheService(
+                redisCacheService = springWiredRedisCacheService,
+                riotApiService = springWiredRiotApiService,
+                indexedPlayerRepository = indexedPlayerRepository,
+                timeProvider = clock,
+                playerSeasonStatsRepository = playerSeasonStatsRepository,
+                transactionTemplate = transactionTemplate,
+                objectMapper = objectMapper
+            )
+            io.mockk.coEvery { springWiredRiotApiService.fetchMatchIdsSince("h2-season-puuid", "euw1", any()) } returns
+                listOf("EUW1_NEW_2000", "EUW1_OLD_1000", "EUW1_ANCIENT_500")
+
+            val wiredProfile = kotlinx.coroutines.runBlocking {
+                wiredCacheService.getPlayerProfile("h2-season-puuid", "euw1", "MainPlayer", "EUW", explicitRefresh = true)
+            }
+            wiredProfile?.totalMatches shouldBe 3
+
+            // Verify H2 indexed_players row was NOT overwritten by EUW1_ANCIENT_500 ("AncientRiotName#ANC1")
+            val indexedCoPlayerAfterAncientMatch = indexedPlayerRepository.findById("co-player-puuid").orElse(null)
+            indexedCoPlayerAfterAncientMatch!!.gameName shouldBe "NewRiotName"
+            indexedCoPlayerAfterAncientMatch.tagLine shouldBe "NEW1"
+            indexedCoPlayerAfterAncientMatch.lastSeenAt shouldBe Instant.ofEpochMilli(newerCreationMs)
+
+            // Verify H2 player_season_stats row committed atomically with @Version
+            val savedSeasonRow = playerSeasonStatsRepository.findByRegionAndPuuidAndSeasonYearAndQueueId(
+                "euw1",
+                "h2-season-puuid",
+                2026,
+                420
+            )
+            (savedSeasonRow != null) shouldBe true
+            savedSeasonRow!!.foldedGamesCount shouldBe 3
+            savedSeasonRow.historyComplete shouldBe true
+            savedSeasonRow.pendingGamesCount shouldBe 0
+
+            // 3. Seed partial-history, capped-history, and stale-schema player rows in H2 and verify scalar SQL shape + operator coverage summary
+            playerSeasonStatsRepository.saveAllAndFlush(
+                listOf(
+                    com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity(
+                        region = "euw1",
+                        puuid = "h2-partial-puuid",
+                        seasonYear = 2026,
+                        queueId = 420,
+                        schemaVersion = 1,
+                        historyCapped = false,
+                        historyComplete = false,
+                        foldedGamesCount = 40,
+                        pendingGamesCount = 5,
+                        stateJson = "{}",
+                        updatedAt = fixedNow
+                    ),
+                    com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity(
+                        region = "euw1",
+                        puuid = "h2-capped-puuid",
+                        seasonYear = 2026,
+                        queueId = 420,
+                        schemaVersion = 1,
+                        historyCapped = true,
+                        historyComplete = false,
+                        foldedGamesCount = 2000,
+                        pendingGamesCount = 0,
+                        stateJson = "{}",
+                        updatedAt = fixedNow
+                    ),
+                    com.pride.summoner_searcher_api.model.PlayerSeasonStatsEntity(
+                        region = "euw1",
+                        puuid = "h2-stale-schema-puuid",
+                        seasonYear = 2026,
+                        queueId = 420,
+                        schemaVersion = 0,
+                        historyCapped = false,
+                        historyComplete = true,
+                        foldedGamesCount = 12,
+                        pendingGamesCount = 0,
+                        stateJson = "{}",
+                        updatedAt = fixedNow
+                    )
+                )
+            )
+
+            CapturingStatementInspector.clear()
+            val coverageSummary = springWiredCohortBenchmarkService.getDiscoveryAndSeasonCoverageSummary("euw1", 2026)
+            val coverageSql = CapturingStatementInspector.executedSql.toList()
+
+            // Verify scalar aggregate SQL does NOT select state_json
+            val seasonSummarySql = coverageSql.single { it.contains("player_season_stats", ignoreCase = true) }
+            seasonSummarySql shouldNotContainIgnoringCase "state_json"
+
+            coverageSummary.identityIndexCoverage.totalIndexedPlayersGlobal shouldBe 2L
+            coverageSummary.identityIndexCoverage.targetRegionIndexedPlayers shouldBe 2L
+            coverageSummary.seasonHistoryCompleteness.targetRegionStats.trackedViewedPlayers shouldBe 4L
+            coverageSummary.seasonHistoryCompleteness.targetRegionStats.completeHistoryPlayers shouldBe 1L
+            coverageSummary.seasonHistoryCompleteness.targetRegionStats.partialHistoryPlayers shouldBe 2L
+            coverageSummary.seasonHistoryCompleteness.targetRegionStats.cappedHistoryPlayers shouldBe 1L
+            coverageSummary.seasonHistoryCompleteness.targetRegionStats.staleSchemaVersionPlayers shouldBe 1L
+            coverageSummary.seasonHistoryCompleteness.targetRegionStats.totalFoldedSeasonGames shouldBe 2055L
+            coverageSummary.seasonHistoryCompleteness.targetRegionStats.totalPendingGapGames shouldBe 5L
+        } finally {
+            playerSeasonStatsRepository.deleteAll()
+            indexedPlayerRepository.deleteAll()
+        }
+    }
 }
+
 

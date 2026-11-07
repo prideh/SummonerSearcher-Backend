@@ -437,3 +437,70 @@ data class CohortCachedPlayerIngestionResultDto(
     val notes: List<String> = emptyList()
 )
 
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class RegionIndexedPlayerCountDto(
+    val region: String,
+    val indexedPlayerCount: Long,
+    val latestSeenAt: Instant? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class IdentityIndexCoverageSummaryDto(
+    val totalIndexedPlayersGlobal: Long = 0L,
+    val targetRegionIndexedPlayers: Long = 0L,
+    val byRegion: List<RegionIndexedPlayerCountDto> = emptyList(),
+    val queryComplexityNote: String = "O(rows) SQL aggregate GROUP BY LOWER(TRIM(region)); no candidate list materialized."
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class RegionSeasonStatsCompletenessDto(
+    val region: String,
+    val seasonYear: Int,
+    val queueId: Int = 420,
+    val currentSchemaVersion: Int = 1,
+    val maxTrackedMatchIdsCapPerPlayer: Int = 2_000,
+    val trackedViewedPlayers: Long = 0L,
+    val completeHistoryPlayers: Long = 0L,
+    val partialHistoryPlayers: Long = 0L,
+    val cappedHistoryPlayers: Long = 0L,
+    val staleSchemaVersionPlayers: Long = 0L,
+    val totalFoldedSeasonGames: Long = 0L,
+    val totalPendingGapGames: Long = 0L,
+    val latestUpdatedAt: Instant? = null
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class SeasonHistoryCompletenessSummaryDto(
+    val seasonYear: Int,
+    val queueId: Int = 420,
+    val targetRegionStats: RegionSeasonStatsCompletenessDto,
+    val byRegion: List<RegionSeasonStatsCompletenessDto> = emptyList()
+)
+
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class BenchmarkQualitySummaryDto(
+    val region: String,
+    val targetPatch: String?,
+    val persistedCellsCount: Int = 0,
+    val cellsPassingQualityGate: Int = 0,
+    val targetCellsCount: Int = 30
+)
+
+/**
+ * Operator read-only aggregate coverage report separating:
+ * 1. Broad searchable player identity discovery (`indexed_players`),
+ * 2. Durable current-year Ranked Solo (`queueId = 420`) history completeness for viewed players (`player_season_stats`),
+ * 3. Current-patch cohort benchmark cell quality (`cohort_benchmark_cells`).
+ *
+ * Returns scalar aggregates only (zero candidate list materialization, zero Riot API calls, zero Redis SCANs).
+ */
+@JsonIgnoreProperties(ignoreUnknown = true)
+data class CohortDiscoveryAndSeasonCoverageDto(
+    val region: String,
+    val measuredAt: Instant,
+    val identityIndexCoverage: IdentityIndexCoverageSummaryDto,
+    val seasonHistoryCompleteness: SeasonHistoryCompletenessSummaryDto,
+    val benchmarkQualitySummary: BenchmarkQualitySummaryDto,
+    val memoryHeadroom: MemoryHeadroomSnapshotDto? = null
+)
+
