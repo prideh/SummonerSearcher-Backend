@@ -1340,12 +1340,8 @@ class CohortPatchMetadataSqlShapeTest {
             raceWinner.tagLine shouldBe "T16000000"
 
             // 5. Failure isolation & cancellation preservation:
-            //    5a. Non-cancellation DB failure in indexedPlayerRepository MUST NOT fail benchmark cells, checkpoints, or collector session
-            val failingIdentityRepo = io.mockk.mockk<IndexedPlayerRepository>()
-            io.mockk.every {
-                failingIdentityRepo.updatePlayerIfNewer(any(), any(), any(), any(), any(), any(), any())
-            } throws org.springframework.dao.DataAccessResourceFailureException("Simulated indexed_players write outage")
-
+            //    5a. Real SQL failure on indexed_players (where updatePlayerIfNewer/insertPlayerIfAbsent use Propagation.REQUIRES_NEW)
+            //        MUST NOT fail or roll back actual cohort_cell_sample_states, cohort_benchmark_cells, or cohort_collector_checkpoints DB rows!
             redisStore["cohort:rank:snapshot:euw1:m1-mid-puuid"] = com.pride.summoner_searcher_api.dto.CohortRankSnapshotDto(
                 puuid = "m1-mid-puuid",
                 region = "euw1",
@@ -1371,33 +1367,40 @@ class CohortPatchMetadataSqlShapeTest {
                 listOf("EUW1_COLL_1")
             }
 
-            val isolatedCollectorService = CohortBenchmarkService(
-                redisCacheService = springWiredRedisCacheService,
-                cohortBenchmarkCellRepository = benchmarkCellRepository,
-                riotApiRateLimiter = rateLimiter,
-                riotApiService = springWiredRiotApiService,
-                objectMapper = objectMapper,
-                networkCollectionEnabled = true,
-                timeProvider = clock,
-                cohortCollectorCheckpointRepository = checkpointRepository,
-                cohortCellSampleStateRepository = sampleStateRepository,
-                transactionTemplate = transactionTemplate,
-                indexedPlayerRepository = failingIdentityRepo,
-                playerSeasonStatsRepository = playerSeasonStatsRepository
-            )
-
-            val isolatedCheckpoint = kotlinx.coroutines.runBlocking {
-                isolatedCollectorService.runResumableLowPriorityCollectorBatch(
-                    region = "euw1",
-                    targetPatch = "16.22",
-                    seedPuuids = listOf("m1-mid-puuid"),
-                    maxPlayersPerBatch = 1,
-                    maxGamesPerPlayer = 10
-                )
+            transactionTemplate.executeWithoutResult {
+                entityManager.createNativeQuery("ALTER TABLE indexed_players RENAME TO indexed_players_offline_test").executeUpdate()
             }
+            val isolatedCheckpoint = try {
+                kotlinx.coroutines.runBlocking {
+                    collectorService.runResumableLowPriorityCollectorBatch(
+                        region = "euw1",
+                        targetPatch = "16.22",
+                        seedPuuids = listOf("m1-mid-puuid"),
+                        maxPlayersPerBatch = 1,
+                        maxGamesPerPlayer = 10
+                    )
+                }
+            } finally {
+                transactionTemplate.executeWithoutResult {
+                    entityManager.createNativeQuery("ALTER TABLE indexed_players_offline_test RENAME TO indexed_players").executeUpdate()
+                }
+            }
+
             isolatedCheckpoint.lastStopReason shouldBe "BATCH_BUDGET_REACHED_RESUMABLE"
-            isolatedCollectorService.getCollectorParticipantIndexingCounts()["collectorIndexedPlayersFailures"] shouldBe 1L
-            // Verify EMERALD:MIDDLE benchmark cell & checkpoint persisted despite indexed_players failure!
+            collectorService.getCollectorParticipantIndexingCounts()["collectorIndexedPlayersFailures"] shouldBe 1L
+
+            // Verify actual H2 rows in cohort_cell_sample_states, cohort_benchmark_cells, AND cohort_collector_checkpoints committed!
+            val emeraldMidSample = sampleStateRepository.findByRegionAndPatchAndQueueIdAndTierAndRole(
+                region = "euw1",
+                patch = "16.22",
+                queueId = 420,
+                tier = "EMERALD",
+                role = "MIDDLE"
+            )
+            (emeraldMidSample != null) shouldBe true
+            emeraldMidSample!!.eligibleGames shouldBe 1
+            emeraldMidSample.distinctPlayers shouldBe 1
+
             val emeraldMidCell = benchmarkCellRepository.findByRegionAndPatchAndQueueIdAndTierAndRole(
                 region = "euw1",
                 patch = "16.22",
@@ -1407,6 +1410,30 @@ class CohortPatchMetadataSqlShapeTest {
             )
             (emeraldMidCell != null) shouldBe true
             emeraldMidCell!!.eligibleGames shouldBe 1
+            emeraldMidCell.distinctPlayers shouldBe 1
+
+            val persistedPatchCheckpoint = checkpointRepository.findByRegionAndTargetPatchAndQueueId(
+                region = "euw1",
+                targetPatch = "16.22",
+                queueId = 420
+            )
+            val persistedLatestCheckpoint = checkpointRepository.findByRegionAndTargetPatchAndQueueId(
+                region = "euw1",
+                targetPatch = "latest",
+                queueId = 420
+            )
+            (persistedPatchCheckpoint != null) shouldBe true
+            (persistedLatestCheckpoint != null) shouldBe true
+            persistedPatchCheckpoint!!.lastStopReason shouldBe "BATCH_BUDGET_REACHED_RESUMABLE"
+            persistedPatchCheckpoint.processedPuuidsCount shouldBe 2
+            persistedPatchCheckpoint.totalNetworkCallsMade shouldBe 3
+            val persistedCheckpointDto = objectMapper.readValue(
+                persistedPatchCheckpoint.checkpointJson,
+                CohortCollectorCheckpointDto::class.java
+            )
+            persistedCheckpointDto.lastStopReason shouldBe "BATCH_BUDGET_REACHED_RESUMABLE"
+            persistedCheckpointDto.processedPuuids.containsAll(listOf("seed-top-puuid", "m1-mid-puuid")) shouldBe true
+            persistedCheckpointDto.totalNetworkCallsMade shouldBe 3
 
             //    5b. CancellationException MUST be rethrown and never swallowed
             val cancellingIdentityRepo = io.mockk.mockk<IndexedPlayerRepository>()

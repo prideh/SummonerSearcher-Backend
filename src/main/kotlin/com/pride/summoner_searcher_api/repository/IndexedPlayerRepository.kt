@@ -162,8 +162,10 @@ data class ParticipantBatchIndexingOutcome(
  * - Deduplicates participants across all inspected matches by `puuid`, keeping only the newest
  *   `lastSeenAt` (`match.info.gameCreation`, falling back to [fallbackNowEpochMilli] only if `<= 0L`).
  * - Sorts deduplicated candidates by `lastSeenAt` descending and caps upserts at [maxPlayersPerBatch] (`200`).
- * - Executes [upsertPlayerIfNewer] inside [transactionTemplate] when provided, with zero `findAllById`
- *   read-before-write races and zero `emptyMap()` fallback overwrites.
+ * - Preserves exact profile transaction semantics: when [transactionTemplate] is non-null, executes `upsertBlock()`
+ *   via `transactionTemplate.executeWithoutResult` (with zero catch/untransactional-replay fallback); when null,
+ *   executes `upsertBlock()` directly. Each underlying [updatePlayerIfNewer] / [insertPlayerIfAbsent] statement runs in
+ *   its own `@Transactional(propagation = Propagation.REQUIRES_NEW)` scope.
  */
 fun IndexedPlayerRepository.indexParticipantsFromMatchesBounded(
     matches: List<com.pride.summoner_searcher_api.dto.MatchDto>,
@@ -237,16 +239,9 @@ fun IndexedPlayerRepository.indexParticipantsFromMatchesBounded(
         }
     }
 
-    if (transactionTemplate != null && transactionTemplate.transactionManager != null) {
-        transactionTemplate.executeWithoutResult { upsertBlock() }
-    } else if (transactionTemplate != null) {
-        try {
-            transactionTemplate.executeWithoutResult { upsertBlock() }
-        } catch (_: IllegalStateException) {
-            upsertBlock()
-        } catch (_: IllegalArgumentException) {
-            upsertBlock()
-        }
+    val tx = transactionTemplate
+    if (tx != null) {
+        tx.executeWithoutResult { upsertBlock() }
     } else {
         upsertBlock()
     }
@@ -258,5 +253,6 @@ fun IndexedPlayerRepository.indexParticipantsFromMatchesBounded(
         uniqueCandidatesCount = boundedCandidates.size
     )
 }
+
 
 
