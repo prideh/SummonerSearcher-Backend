@@ -39,14 +39,20 @@ jobs:
         docker build -f /tmp/wt-87d5f44/Dockerfile -t ss-backend:cand-87d5f44 /tmp/wt-87d5f44
         docker tag ss-backend:cand-87d5f44 ss-backend:512m-proof
 
+        mkdir -p /tmp/collector-seed-control-512m-proof-raw/jdk21-test-87d5f44/xml-results
         mkdir -p /tmp/collector-seed-control-512m-proof-artifacts/jdk21-test-87d5f44/xml-results
         chmod +x /tmp/wt-87d5f44/gradlew
         set +e
-        (cd /tmp/wt-87d5f44 && ./gradlew compileKotlin compileTestKotlin test --no-daemon --console=plain) > /tmp/collector-seed-control-512m-proof-artifacts/jdk21-test-87d5f44/test.log 2>&1
+        (cd /tmp/wt-87d5f44 && ./gradlew compileKotlin compileTestKotlin test --no-daemon --console=plain) > /tmp/collector-seed-control-512m-proof-raw/jdk21-test-87d5f44/test.log 2>&1
         TEST_EXIT=$?
         set -e
-        echo "$TEST_EXIT" > /tmp/collector-seed-control-512m-proof-artifacts/jdk21-test-87d5f44/test.exit
-        cp /tmp/wt-87d5f44/build/test-results/test/TEST-*.xml /tmp/collector-seed-control-512m-proof-artifacts/jdk21-test-87d5f44/xml-results/
+        echo "$TEST_EXIT" > /tmp/collector-seed-control-512m-proof-raw/jdk21-test-87d5f44/test.exit
+        cp /tmp/wt-87d5f44/build/test-results/test/TEST-*.xml /tmp/collector-seed-control-512m-proof-raw/jdk21-test-87d5f44/xml-results/ || true
+        cp /tmp/collector-seed-control-512m-proof-raw/jdk21-test-87d5f44/test.exit /tmp/collector-seed-control-512m-proof-artifacts/jdk21-test-87d5f44/test.exit
+        cp /tmp/collector-seed-control-512m-proof-raw/jdk21-test-87d5f44/test.log /tmp/collector-seed-control-512m-proof-artifacts/jdk21-test-87d5f44/test.log
+        cp /tmp/collector-seed-control-512m-proof-raw/jdk21-test-87d5f44/xml-results/TEST-*.xml /tmp/collector-seed-control-512m-proof-artifacts/jdk21-test-87d5f44/xml-results/ || true
+        git worktree remove --force /tmp/wt-87d5f44
+
         test "$TEST_EXIT" -eq 0
         python3 -c '
         import glob, xml.etree.ElementTree as ET
@@ -57,7 +63,6 @@ jobs:
         errors = sum(int(ET.parse(f).getroot().attrib["errors"]) for f in files)
         assert tests == 75 and failures == 0 and errors == 0, f"Unexpected counts: tests={tests}, failures={failures}, errors={errors}"
         '
-        git worktree remove --force /tmp/wt-87d5f44
 
         git worktree add --detach /tmp/wt-e683777 e683777087025941ca3387855fa064ea0bd9d0e8
         docker build -f /tmp/wt-e683777/Dockerfile -t ss-backend:base-e683777 /tmp/wt-e683777
@@ -75,10 +80,73 @@ jobs:
     - name: Run Real 512 MB Container Collector Operator Seed-Control + Identity + Season-Stats Acceptance Proof (87d5f44 + e683777 Rollback)
       run: |
         chmod +x scripts/verify_512m_container.py
-        CAND_IMAGE="ss-backend:cand-87d5f44" BASE_IMAGE="ss-backend:base-e683777" ARTIFACT_DIR="/tmp/collector-seed-control-512m-proof-artifacts" \
-          sudo --preserve-env=CAND_IMAGE,BASE_IMAGE,ARTIFACT_DIR python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
-    - name: Upload Sanitized 512 MiB Collector Seed-Control Proof & 75-Test XML/Exit Evidence Artifacts
+        CAND_IMAGE="ss-backend:cand-87d5f44" BASE_IMAGE="ss-backend:base-e683777" \
+        RAW_ARTIFACT_DIR="/tmp/collector-seed-control-512m-proof-raw" \
+        ARTIFACT_DIR="/tmp/collector-seed-control-512m-proof-artifacts" \
+          sudo --preserve-env=CAND_IMAGE,BASE_IMAGE,RAW_ARTIFACT_DIR,ARTIFACT_DIR python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
+    - name: Sanitize and verify zero secrets in upload directory on all paths
+      id: artifact_gate
       if: always()
+      run: |
+        sudo python3 -c '
+        import json, os, re, shutil, sys
+        raw_dir = "/tmp/collector-seed-control-512m-proof-raw"
+        upload_dir = "/tmp/collector-seed-control-512m-proof-artifacts"
+        if not os.path.isdir(upload_dir):
+            print("Upload directory does not exist; failing closed.", file=sys.stderr)
+            sys.exit(1)
+        forbidden_tokens = []
+        secrets_manifest = os.path.join(raw_dir, ".ephemeral_secrets.json")
+        if os.path.isfile(secrets_manifest):
+            forbidden_tokens = [t for t in json.load(open(secrets_manifest, "r", encoding="utf-8")) if t]
+        redact_patterns = [
+            re.compile(r"RGAPI-[0-9a-fA-F-]{16,}"),
+            re.compile(r"\bre_[0-9a-zA-Z_]{16,}\b"),
+            re.compile(r"\bgh[pousr]_[0-9a-zA-Z]{20,}\b"),
+            re.compile(r"\bgithub_pat_[0-9a-zA-Z_]{20,}\b"),
+            re.compile(r"(?i)((?:db_pass|postgres_password|jwt_secret_key|twofa_secret_key|cohort_operator_token|riot_api_key|resend_api_key)\s*[=:]\s*)(?!\[REDACTED\])\S+"),
+        ]
+        # Sanitize staged JDK 21 test logs/XMLs in upload_dir while keeping raw_dir untouched
+        jdk_upload_dir = os.path.join(upload_dir, "jdk21-test-87d5f44")
+        if os.path.isdir(jdk_upload_dir):
+            for root, _dirs, files in os.walk(jdk_upload_dir):
+                for fname in files:
+                    fpath = os.path.join(root, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    text = open(fpath, "r", encoding="utf-8", errors="replace").read()
+                    orig = text
+                    for tok in forbidden_tokens:
+                        text = text.replace(tok, "[REDACTED]")
+                    for pat in redact_patterns[:4]:
+                        text = pat.sub("[REDACTED]", text)
+                    text = redact_patterns[4].sub(r"\1[REDACTED]", text)
+                    if text != orig:
+                        open(fpath, "w", encoding="utf-8").write(text)
+        # Strict post-sanitization leak scan across EVERY file in upload_dir
+        file_count = 0
+        for root, _dirs, files in os.walk(upload_dir):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                file_count += 1
+                text = open(fpath, "r", encoding="utf-8", errors="replace").read()
+                for tok in forbidden_tokens:
+                    if tok in text:
+                        shutil.rmtree(upload_dir, ignore_errors=True)
+                        raise RuntimeError(f"SECRET_TOKEN_SCAN_GATE_FAILED in {fpath}")
+                for pat in redact_patterns:
+                    if pat.search(text):
+                        shutil.rmtree(upload_dir, ignore_errors=True)
+                        raise RuntimeError(f"SECRET_REGEX_SCAN_GATE_FAILED in {fpath} matching {pat.pattern}")
+        if file_count == 0:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            raise RuntimeError("EMPTY_UPLOAD_DIRECTORY")
+        print(f"Verified {file_count} sanitized artifact files with 0 secret leaks.")
+        '
+    - name: Upload Sanitized 512 MiB Collector Seed-Control Proof & 75-Test XML/Exit Evidence Artifacts
+      if: always() && steps.artifact_gate.outcome == 'success'
       uses: actions/upload-artifact@v4
       with:
         name: collector-seed-control-512m-proof-87d5f44

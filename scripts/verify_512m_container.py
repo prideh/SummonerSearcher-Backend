@@ -45,6 +45,7 @@ import json
 import math
 import os
 import secrets
+import shutil
 import socket
 import socketserver
 import ssl
@@ -1089,6 +1090,8 @@ def sanitize_text(text: str) -> str:
 
 
 def capture_sanitized_container_log(artifact_dir: str, container_name: str, log_filename: str):
+    raw_dir = os.environ.get("RAW_ARTIFACT_DIR", "/tmp/collector-seed-control-512m-proof-raw")
+    os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(artifact_dir, exist_ok=True)
     proc = subprocess.run(
         ["docker", "logs", container_name],
@@ -1098,19 +1101,28 @@ def capture_sanitized_container_log(artifact_dir: str, container_name: str, log_
         check=False
     )
     raw_log = proc.stdout.decode("utf-8", errors="replace")
+    with open(os.path.join(raw_dir, log_filename), "w", encoding="utf-8") as f:
+        f.write(raw_log)
     sanitized_log = sanitize_text(raw_log)
     with open(os.path.join(artifact_dir, log_filename), "w", encoding="utf-8") as f:
         f.write(sanitized_log)
 
 
 def write_sanitized_artifacts(artifact_dir: str, summary: dict, cgroup_samples: list):
+    raw_dir = os.environ.get("RAW_ARTIFACT_DIR", "/tmp/collector-seed-control-512m-proof-raw")
+    os.makedirs(raw_dir, exist_ok=True)
     os.makedirs(artifact_dir, exist_ok=True)
+    with open(os.path.join(raw_dir, "acceptance_summary.json"), "w", encoding="utf-8") as f:
+        json.dump(summary, f, indent=2)
+    with open(os.path.join(raw_dir, "cgroup_samples_2s.json"), "w", encoding="utf-8") as f:
+        json.dump(cgroup_samples, f, indent=2)
+
     summary_path = os.path.join(artifact_dir, "acceptance_summary.json")
     samples_path = os.path.join(artifact_dir, "cgroup_samples_2s.json")
     with open(summary_path, "w", encoding="utf-8") as f:
-        json.dump(summary, f, indent=2)
+        f.write(sanitize_text(json.dumps(summary, indent=2)))
     with open(samples_path, "w", encoding="utf-8") as f:
-        json.dump(cgroup_samples, f, indent=2)
+        f.write(sanitize_text(json.dumps(cgroup_samples, indent=2)))
 
     # Fail-closed secret-leak check across all written artifact files (logs + metrics + test XMLs)
     forbidden_secrets = (
@@ -1121,6 +1133,13 @@ def write_sanitized_artifacts(artifact_dir: str, summary: dict, cgroup_samples: 
         EPHEMERAL_RESEND_TOKEN,
         EPHEMERAL_OP_TOKEN,
     )
+    secret_patterns = (
+        re.compile(r"RGAPI-[0-9a-fA-F-]{16,}"),
+        re.compile(r"\bre_[0-9a-zA-Z_]{16,}\b"),
+        re.compile(r"\bgh[pousr]_[0-9a-zA-Z]{20,}\b"),
+        re.compile(r"\bgithub_pat_[0-9a-zA-Z_]{20,}\b"),
+        re.compile(r"(?i)(?:db_pass|postgres_password|jwt_secret_key|twofa_secret_key|cohort_operator_token|riot_api_key|resend_api_key)\s*[=:]\s*(?!\[REDACTED\])\S+"),
+    )
     for root_dir, _dirs, files in os.walk(artifact_dir):
         for fname in files:
             fpath = os.path.join(root_dir, fname)
@@ -1128,17 +1147,37 @@ def write_sanitized_artifacts(artifact_dir: str, summary: dict, cgroup_samples: 
                 content = open(fpath, "r", encoding="utf-8", errors="replace").read()
                 for tok in forbidden_secrets:
                     if tok and tok in content:
+                        shutil.rmtree(artifact_dir, ignore_errors=True)
                         raise RuntimeError(f"SECRET_LEAK_IN_ARTIFACT: {fpath}")
+                for pat in secret_patterns:
+                    if pat.search(content):
+                        shutil.rmtree(artifact_dir, ignore_errors=True)
+                        raise RuntimeError(f"SECRET_PATTERN_LEAK_IN_ARTIFACT: {fpath} ({pat.pattern})")
 
 
 def main():
     global CONCURRENT_HOOK_FN
     db_pass = os.environ.get("DB_PASS", "").strip() or EPHEMERAL_DB_PASS
-    cand_image = os.environ.get("CAND_IMAGE", "ss-backend:cand-089ac61")
+    cand_image = os.environ.get("CAND_IMAGE", "ss-backend:cand-87d5f44")
     base_image = os.environ.get("BASE_IMAGE", "ss-backend:base-e683777")
-    artifact_dir = os.environ.get("ARTIFACT_DIR", "/tmp/season-stats-512m-proof-artifacts")
+    raw_dir = os.environ.get("RAW_ARTIFACT_DIR", "/tmp/collector-seed-control-512m-proof-raw")
+    artifact_dir = os.environ.get("ARTIFACT_DIR", "/tmp/collector-seed-control-512m-proof-artifacts")
     cert_file = sys.argv[1]
     key_file = sys.argv[2]
+
+    os.makedirs(raw_dir, exist_ok=True)
+    secrets_manifest_path = os.path.join(raw_dir, ".ephemeral_secrets.json")
+    with open(secrets_manifest_path, "w", encoding="utf-8") as sf:
+        json.dump([
+            db_pass,
+            EPHEMERAL_DB_PASS,
+            EPHEMERAL_JWT_SECRET,
+            EPHEMERAL_TWOFA_SECRET,
+            EPHEMERAL_RIOT_TOKEN,
+            EPHEMERAL_RESEND_TOKEN,
+            EPHEMERAL_OP_TOKEN,
+        ], sf)
+    os.chmod(secrets_manifest_path, 0o600)
 
     sampler_samples = []
     summary = {"status": "IN_PROGRESS"}
@@ -1738,7 +1777,7 @@ def main():
         assert pre_b1_cp["processedPuuids"] == [COLL_ALREADY_PROCESSED_SEED], f"Unexpected pre-B1 processedPuuids: {pre_b1_cp['processedPuuids']}"
         assert pre_b1_cp["pendingCandidatePuuids"] == COLL_TAIL_PUUIDS, f"Unexpected pre-B1 pendingCandidatePuuids len={len(pre_b1_cp['pendingCandidatePuuids'])}"
 
-        # Verify pre-mutation validation (>25 seeds, malformed seed with comma, and >500 pending queue cap) with 0 Riot calls and untouched checkpoint
+        # Verify pre-mutation validation (>25 seeds, malformed seed with whitespace bad%20seed, and >500 pending queue cap) with 0 Riot calls and untouched checkpoint
         reset_riot_call_counts()
         over25_qs = "&".join(f"seedPuuid=puuid-over-{i}" for i in range(1, 27))
         over25_status = http_json(
@@ -1748,14 +1787,28 @@ def main():
         )
         assert over25_status["action"] == "INVALID_PARAMETERS", f"Expected INVALID_PARAMETERS for >25 seeds, got {over25_status['action']}"
         assert over25_status["overnightSessionArmed"] is False
+        post_over25_cp = http_json(
+            f"{BASE_URL}/api/riot/cohorts/euw1/collector/status?patch=16.7",
+            headers=OP_HEADERS,
+            timeout=15,
+        )["checkpoint"]
+        assert post_over25_cp["processedPuuids"] == [COLL_ALREADY_PROCESSED_SEED], f">25 seed refusal mutated processedPuuids: {post_over25_cp['processedPuuids']}"
+        assert post_over25_cp["pendingCandidatePuuids"] == COLL_TAIL_PUUIDS, ">25 seed refusal mutated pendingCandidatePuuids!"
 
         bad_seed_status = http_json(
-            f"{BASE_URL}/api/riot/cohorts/euw1/collector/start?patch=16.7&async=false&seedPuuid=bad,seed",
+            f"{BASE_URL}/api/riot/cohorts/euw1/collector/start?patch=16.7&async=false&seedPuuid=bad%20seed",
             headers=OP_HEADERS,
             timeout=15,
         )
-        assert bad_seed_status["action"] == "INVALID_PARAMETERS", f"Expected INVALID_PARAMETERS for malformed seed, got {bad_seed_status['action']}"
+        assert bad_seed_status["action"] == "INVALID_PARAMETERS", f"Expected INVALID_PARAMETERS for malformed whitespace seed, got {bad_seed_status['action']}"
         assert bad_seed_status["overnightSessionArmed"] is False
+        post_bad_seed_cp = http_json(
+            f"{BASE_URL}/api/riot/cohorts/euw1/collector/status?patch=16.7",
+            headers=OP_HEADERS,
+            timeout=15,
+        )["checkpoint"]
+        assert post_bad_seed_cp["processedPuuids"] == [COLL_ALREADY_PROCESSED_SEED], f"Malformed seed refusal mutated processedPuuids: {post_bad_seed_cp['processedPuuids']}"
+        assert post_bad_seed_cp["pendingCandidatePuuids"] == COLL_TAIL_PUUIDS, "Malformed seed refusal mutated pendingCandidatePuuids!"
 
         cap_overflow_qs = "&".join(f"seedPuuid=puuid-cap-overflow-{i}" for i in range(1, 6))
         cap_overflow_status = http_json(
@@ -1765,6 +1818,7 @@ def main():
         )
         assert cap_overflow_status["action"] == "INVALID_PARAMETERS", f"Expected INVALID_PARAMETERS for 496+5=501 > 500 queue cap, got {cap_overflow_status['action']}"
         assert cap_overflow_status["overnightSessionArmed"] is False
+        assert cap_overflow_status["checkpoint"]["processedPuuids"] == [COLL_ALREADY_PROCESSED_SEED], "Queue cap refusal mutated processedPuuids!"
         assert cap_overflow_status["checkpoint"]["pendingCandidatePuuids"] == COLL_TAIL_PUUIDS, "Queue cap refusal mutated pendingCandidatePuuids!"
         calls_validation_refusal = snapshot_riot_call_counts()
         assert (
@@ -2108,7 +2162,9 @@ def main():
                 "disposableDbSyntheticCheckpointTailCount": len(COLL_TAIL_PUUIDS),
                 "preMutationValidation": {
                     "over25SeedsAction": over25_status["action"],
+                    "malformedSeedQueryParam": "seedPuuid=bad%20seed",
                     "malformedSeedAction": bad_seed_status["action"],
+                    "postMalformedSeedPendingQueueCount": len(post_bad_seed_cp["pendingCandidatePuuids"]),
                     "queueCap501RefusalAction": cap_overflow_status["action"],
                     "riotCallsDuringValidationRefusals": 0,
                     "pendingQueueCountUnchangedAt496": len(cap_overflow_status["checkpoint"]["pendingCandidatePuuids"]),
@@ -2188,13 +2244,17 @@ def main():
         print(json.dumps(summary, indent=2), flush=True)
         print("=== ALL COLLECTOR SEED-CONTROL + IDENTITY + SEASON STATS 512 MB ACCEPTANCE PROOFS PASSED ===", flush=True)
     finally:
+        teardown_Err = None
         if summary.get("status") != "PASSED":
             try:
                 capture_sanitized_container_log(artifact_dir, "ss-backend-512m", "failure_ss_backend_512m.log")
                 write_sanitized_artifacts(artifact_dir, summary, sampler_samples)
-            except Exception:
-                pass
+            except Exception as e:
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+                teardown_Err = e
         teardown_isolated_network()
+        if teardown_Err is not None:
+            raise teardown_Err
 
 
 if __name__ == "__main__":
