@@ -387,7 +387,7 @@ class AiAnalysisService(
             - **Deaths & Assist Attribution:** Treat "assisted" deaths as multi-enemy kill participation only—assisted deaths are not necessarily jungle ganks (lane 2v2s, support roams, and skirmishes/teamfights produce assists too). Treat "unassisted" deaths as single-enemy kill credit with zero recorded assists—never equate unassisted deaths with 1v1 duels (solo picks, roam catches, or delayed finishes after assist timers expire also record zero assists). Describe recorded enemy involvement rather than inferring how the fight started.
             - **Observed Facts vs. Hypotheses & Conditional Recommendations:** Death events do **not** prove bad trades, overextension, greed, or mechanical misplays. Always separate **observed facts** (timestamps, approximate zones, killers, recorded assistants, gold/XP/CS diffs, items built) from **hypotheses** about why they happened, and frame all coaching recommendations **conditionally** (e.g., *"If this death happened while pushing without river vision, consider...; if it happened rotating to a skirmish, instead..."*).
             - **No Stale Mythic-Era or Unsupported Build-Effect Claims (Including `---SUGGESTIONS---`):** The Mythic item system was removed in Season 14. NEVER propose or mention "Mythic items", "Mythic passives", "Mythic paths/rushes", or removed Mythic-era items (e.g., Divine Sunderer, Everfrost, Galeforce, Goredrinker, Duskblade, Prowler's Claw, Crown of the Shattered Queen, Night Harvester, Radiant Virtue). Do not claim specific patch-dependent item stats, gold costs, or build-effect numbers unless the supplied patch/context data explicitly supports them; anchor build discussion to the items present in context (`items`, `opponentDetails.items`, `itemSpikes`) and their functional purpose. Apply this same rule to the 3 `---SUGGESTIONS---` follow-up questions.
-            - **Early Lane CS Target (`cs10.target`, `cs10.targetLabel`, `avgLaneCsAt10`, `missingLaneCsAt10Matches`):** `cs10.target` (114 for Top/Bot, 120 for Mid on verified patch 26.1+ games only; `null` for `JUNGLE`, `UTILITY`/`SUPPORT`, short `<600s` games, or pre-26.1 patches) is a role-specific 10:00 lane benchmark definition, **not** farmable supply or a missed-CS counter. NEVER subtract `actual` from `target` to claim exact "missed CS" or "missed last-hits", and never resurrect obsolete `spawnedSupply` claims. Keep `actual` (`laneCs@10`), benchmark definition (`cs10.target` / `cs10.targetLabel`), `patch`, `role`, denominator (`matchCount` vs `targetMatchCount`), and missingness (`missingLaneCsAt10Matches`, `null`) distinct (`avgTarget` is `null` on mixed-patch samples where `targetMatchCount < matchCount`).
+            - **Early Lane CS Theoretical Maximum (`cs10.target` / `cs10.theoreticalMax`, `cs10.targetLabel`, `avgLaneCsAt10`, `missingLaneCsAt10Matches`):** `cs10.target` (114 for Top/Bot, 120 for Mid on verified patch 26.1+ games only; `null` for `JUNGLE`, `UTILITY`/`SUPPORT`, short `<600s` games, or pre-26.1 patches) is a role-specific 10:00 **theoretical maximum** passive wave spawn ceiling—**not** an empirical rank/role benchmark, realistic performance target, farmable supply, or proof of poor farming. Label 114/120 as a "theoretical maximum" (never a "benchmark" or "performance target"), never invent a realistic target or alter 114/120 without grounded evidence, NEVER subtract `actual` from `target` to claim exact "missed CS" or "missed last-hits", and never resurrect obsolete `spawnedSupply` claims. Keep `actual` (`laneCs@10`), theoretical maximum (`cs10.target` / `cs10.targetLabel`), `patch`, `role`, denominator (`matchCount` vs `targetMatchCount`), missingness (`missingLaneCsAt10Matches`, `null`), and any separate empirical rank/role benchmark sample distinct (`avgTarget` is `null` on mixed-patch samples where `targetMatchCount < matchCount`).
             - **5-Stat Improvement Evidence (`phaseFarming`, `leadRetention`, `deathCost`, `unspentGold`, `teamObjectives`):** Cite exact denominators (`eligibleGames`, `eligibleGamesAt10` vs `eligibleGamesAt20`, `eligibleTimeDeadGames`, `eligibleTimelineGames`, `eligibleTeamObjectiveGames`) and exclusions (`shortGames`, `excludedMissingTimeline`, `missingOpponentGames`). Never claim missed CS in `phaseFarming`; treat `10-20m` objective/tower events in `leadRetention` as temporal association only (never proof of a throw or solo credit); never infer lost farm or death avoidability from `deathCost`; treat `>=1600g` 1-minute `currentGold` snapshots in `unspentGold` as descriptive balance checkpoints (never a mistake score or recall event); and keep team objective outcomes (`firstRate`, `teamAvg` vs `enemyAvg`) strictly separate from personal `personalLastHits`/`personalTakedowns`/`timelineInvolved`.
             - **Incomplete Legacy Cache Fields:** When any stat or timeline breakdown (such as `assistedDeaths`, `unassistedDeaths`, `wardsByTimeBucket`, or `cs10.target`) is `null` or marked `incomplete`, treat it as unavailable/incomplete data—never treat `null` or `incomplete` fields as `0`.
             
@@ -945,22 +945,23 @@ class AiAnalysisService(
             }
         }
 
-        // Aggregate Early Lane CS@10 summary (actual, benchmark definition, role breakdown, denominators, missingness)
+        // Aggregate Early Lane CS@10 summary (actual, theoretical maximum definition, role breakdown, denominators, missingness)
         val avgLaneCsAt10 = context["avgLaneCsAt10"] as? Map<*, *>
         if (avgLaneCsAt10 != null) {
             val avgActual = avgLaneCsAt10["avgActual"] ?: "null"
             val matchCount = avgLaneCsAt10["matchCount"] ?: 0
-            val avgTarget = avgLaneCsAt10["avgTarget"] ?: "null"
-            val targetMatchCount = avgLaneCsAt10["targetMatchCount"] ?: 0
+            val avgTarget = avgLaneCsAt10["avgTheoreticalMax"] ?: avgLaneCsAt10["avgTarget"] ?: "null"
+            val targetMatchCount = avgLaneCsAt10["theoreticalMaxMatchCount"] ?: avgLaneCsAt10["targetMatchCount"] ?: 0
             val avgSupportedActual = avgLaneCsAt10["avgSupportedActual"] ?: "null"
-            val targetLabel = avgLaneCsAt10["targetLabel"] ?: "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
+            val targetLabel = avgLaneCsAt10["theoreticalMaxLabel"] ?: avgLaneCsAt10["targetLabel"]
+                ?: "Patch 26.1+ theoretical maximum passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
             val roleBreakdownList = (avgLaneCsAt10["roleBreakdown"] as? List<*>)?.mapNotNull { entry ->
                 val rm = entry as? Map<*, *> ?: return@mapNotNull null
                 val r = rm["role"] ?: return@mapNotNull null
                 val mc = rm["matchCount"] ?: 0
                 val aa = rm["avgActual"] ?: "null"
-                val at = rm["avgTarget"] ?: "null"
-                val tmc = rm["targetMatchCount"] ?: 0
+                val at = rm["avgTheoreticalMax"] ?: rm["avgTarget"] ?: "null"
+                val tmc = rm["theoreticalMaxMatchCount"] ?: rm["targetMatchCount"] ?: 0
                 val asa = rm["avgSupportedActual"] ?: "null"
                 "$r(actual=$aa in ${mc}g, target=$at in ${tmc}g, supportedActual=$asa)"
             } ?: emptyList()
@@ -1369,8 +1370,8 @@ class AiAnalysisService(
         val cs10Map = (m["laneCsAt10"] ?: m["cs10"]) as? Map<String, Any?>
         if (cs10Map != null) {
             val actual = cs10Map["actual"]
-            val target = cs10Map["target"]
-            val targetLabel = cs10Map["targetLabel"]
+            val target = cs10Map["theoreticalMax"] ?: cs10Map["target"]
+            val targetLabel = cs10Map["theoreticalMaxLabel"] ?: cs10Map["targetLabel"]
             if (m["laneMinionsFirst10Minutes"] == null && actual != null) {
                 advStats.add("laneCs@10=$actual")
             }

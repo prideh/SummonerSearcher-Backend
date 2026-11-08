@@ -1243,6 +1243,89 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 @Suppress("UNCHECKED_CAST")
                 val genConfig = buildConfigMethod.invoke(service, 0.7) as Map<String, Any>
                 genConfig["maxOutputTokens"] shouldBe 4096
+
+                // 7. Issue #39: CS@10 114/120 is a theoretical maximum passive wave spawn ceiling, NOT an empirical benchmark or target
+                // Preserves Spear Shot observed sample (actual 72.9 across 14 eligible games, 114.0 theoretical maximum) and supports both target and theoreticalMax input keys
+                val spearShotCs10Context = spearShotScopedContext + mapOf(
+                    "avgLaneCsAt10" to mapOf(
+                        "avgActual" to 72.9,
+                        "matchCount" to 14,
+                        "avgTheoreticalMax" to 114.0,
+                        "theoreticalMaxMatchCount" to 14,
+                        "avgSupportedActual" to 72.9,
+                        "roleBreakdown" to listOf(
+                            mapOf(
+                                "role" to "TOP",
+                                "matchCount" to 14,
+                                "avgActual" to 72.9,
+                                "avgTheoreticalMax" to 114.0,
+                                "theoreticalMaxMatchCount" to 14,
+                                "avgSupportedActual" to 72.9
+                            ),
+                            mapOf(
+                                "role" to "JUNGLE",
+                                "matchCount" to 4,
+                                "avgActual" to 6.5,
+                                "avgTheoreticalMax" to null,
+                                "theoreticalMaxMatchCount" to 0,
+                                "avgSupportedActual" to null
+                            )
+                        )
+                    ),
+                    "missingLaneCsAt10Matches" to 2,
+                    "recentMatches" to listOf(
+                        mapOf(
+                            "matchId" to "EUW1_70001",
+                            "win" to true,
+                            "champion" to "Pantheon",
+                            "role" to "TOP",
+                            "patch" to "16.1",
+                            "gameDuration" to 28,
+                            "kda" to "8/3/7",
+                            "csPerMin" to "7.4",
+                            "laneCsAt10" to mapOf(
+                                "actual" to 73,
+                                "theoreticalMax" to 114,
+                                "theoreticalMaxLabel" to "Patch 26.1+ theoretical maximum passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
+                            )
+                        ),
+                        mapOf(
+                            "matchId" to "EUW1_70002",
+                            "win" to false,
+                            "champion" to "Pantheon",
+                            "role" to "JUNGLE",
+                            "patch" to "16.1",
+                            "gameDuration" to 25,
+                            "kda" to "4/5/6",
+                            "csPerMin" to "5.8",
+                            "laneCsAt10" to mapOf(
+                                "actual" to 6,
+                                "theoreticalMax" to null,
+                                "theoreticalMaxLabel" to null
+                            )
+                        )
+                    )
+                )
+
+                val cs10Prompt = constructPromptMethod.invoke(
+                    service,
+                    spearShotCs10Context,
+                    emptyList<Map<String, String>>(),
+                    "How is my early lane CS at 10 minutes on Pantheon?",
+                    null,
+                    null
+                ) as String
+
+                cs10Prompt shouldNotContain "role-specific 10:00 lane benchmark definition"
+                cs10Prompt shouldContain "Early Lane CS Theoretical Maximum (`cs10.target` / `cs10.theoreticalMax`, `cs10.targetLabel`, `avgLaneCsAt10`, `missingLaneCsAt10Matches`)"
+                cs10Prompt shouldContain "is a role-specific 10:00 **theoretical maximum** passive wave spawn ceiling—**not** an empirical rank/role benchmark, realistic performance target, farmable supply, or proof of poor farming"
+                cs10Prompt shouldContain "Label 114/120 as a \"theoretical maximum\" (never a \"benchmark\" or \"performance target\"), never invent a realistic target or alter 114/120 without grounded evidence"
+                cs10Prompt shouldContain "and any separate empirical rank/role benchmark sample distinct"
+                cs10Prompt shouldContain "avgLaneCsAt10: {avgActual=72.9 (matchCount=14), avgTarget=114.0 (targetMatchCount=14, avgSupportedActual=72.9), targetLabel=\"Patch 26.1+ theoretical maximum passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)\", roleBreakdown=[TOP(actual=72.9 in 14g, target=114.0 in 14g, supportedActual=72.9); JUNGLE(actual=6.5 in 4g, target=null in 0g, supportedActual=null)]}"
+                cs10Prompt shouldContain "missingLaneCsAt10Matches: 2"
+                cs10Prompt shouldContain "laneCs@10=73, cs10.target=114, cs10.targetLabel=Patch 26.1+ theoretical maximum passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
+                cs10Prompt shouldContain "laneCs@10=6, cs10.target=null"
+                (AiAnalysisService.utf8ByteSize(cs10Prompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
             }
         }
     }
