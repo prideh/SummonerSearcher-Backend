@@ -1243,6 +1243,26 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 @Suppress("UNCHECKED_CAST")
                 val genConfig = buildConfigMethod.invoke(service, 0.7) as Map<String, Any>
                 genConfig["maxOutputTokens"] shouldBe 4096
+
+                // 7. Issue #38: Preserve #34 denominator separation while requiring natural plain-language sample names
+                // across normal coaching, win-rate comparisons, missing timelines, and suggested follow-ups
+                val normalCoachingPrompt = constructPromptMethod.invoke(
+                    service,
+                    spearShotScopedContext,
+                    emptyList<Map<String, String>>(),
+                    "Give me two practical Pantheon improvement habits for my next five games.",
+                    null,
+                    null
+                ) as String
+
+                for (p in listOf(prompt, normalCoachingPrompt, legacyPrompt, edgePrompt)) {
+                    p shouldNotContain "Always cite the exact sample name and denominator"
+                    p shouldContain "(1) `rankedRecord` (\"your ranked record\": Solo/Duo W/L, games, and win rate)"
+                    p shouldContain "(2) `savedHistory` (\"your saved matches\": saved-match W/L, games, win rate"
+                    p shouldContain "(3) `recentMatchSample` (\"your last N detailed matches\":"
+                    p shouldContain "Express sample scopes in natural plain language (\"your ranked record\", \"your saved matches\" with the saved-match count, \"your last N detailed matches\") with each sample's own games and win rate—never expose internal keys (`rankedRecord`, `savedHistory`, `recentMatchSample`, `savedHistoryAverages`, `recentMatchSummary`, `timelineStatus`, `NOT_ANALYZED`) or backticked labels in prose or `---SUGGESTIONS---`"
+                    (AiAnalysisService.utf8ByteSize(p) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+                }
             }
         }
     }
