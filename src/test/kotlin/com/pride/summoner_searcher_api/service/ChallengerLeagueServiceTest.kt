@@ -6,12 +6,9 @@ import com.pride.summoner_searcher_api.controller.RiotApiController
 import com.pride.summoner_searcher_api.dto.CachedLeaderboardDto
 import com.pride.summoner_searcher_api.dto.LeagueEntryDto
 import com.pride.summoner_searcher_api.dto.LeagueListDTO
-import com.pride.summoner_searcher_api.model.IndexedPlayer
-import com.pride.summoner_searcher_api.repository.IndexedPlayerRepository
 import com.sun.net.httpserver.HttpServer
 import io.mockk.every
 import io.mockk.mockk
-import io.mockk.verify
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -19,6 +16,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import org.h2.jdbcx.JdbcDataSource
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
@@ -27,12 +25,10 @@ import org.junit.jupiter.api.Test
 import org.springframework.http.HttpStatus
 import java.net.InetSocketAddress
 import java.nio.charset.StandardCharsets
-import java.time.Duration
 import java.time.Instant
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -97,7 +93,7 @@ class ChallengerLeagueServiceTest {
     }
 
     @Test
-    fun `absent or evicted EUW and KR Redis keys self-heal via single league call with local DB identity reuse and zero 300-account fanout`() = runBlocking {
+    fun `absent or evicted EUW and KR Redis keys self-heal via single league call with bounded JDBC local DB identity reuse and zero 300-account fanout`() = runBlocking {
         val leagueRequestsByRegion = ConcurrentHashMap<String, AtomicInteger>()
         val accountFanoutRequests = AtomicInteger(0)
 
@@ -177,45 +173,49 @@ class ChallengerLeagueServiceTest {
                 redisStore[firstArg()] = secondArg()
             }
 
-            val dbFindAllCount = AtomicInteger(0)
-            val indexedPlayerRepository = mockk<IndexedPlayerRepository>()
-            every { indexedPlayerRepository.findAllById(any()) } answers {
-                dbFindAllCount.incrementAndGet()
-                val ids = firstArg<Iterable<String>>().toList()
-                val isEuw = ids.firstOrNull()?.startsWith("euw1-") == true
-                if (isEuw) {
-                    // Full 300/300 local DB identity coverage for EUW1
-                    ids.mapIndexed { index, puuid ->
-                        IndexedPlayer(
-                            puuid = puuid,
-                            gameName = "LocalDbPlayer${index + 1}",
-                            tagLine = "EUW",
-                            region = "euw1",
-                            profileIconId = 10,
-                            summonerLevel = 500L,
-                            lastSeenAt = Instant.ofEpochMilli(clock.now())
+            // Real H2 JDBC DataSource with indexed_players table (300/300 EUW1 rows, 5/300 KR rows)
+            val dbName = "challenger_identity_${UUID.randomUUID().toString().replace("-", "")}"
+            val h2DataSource = JdbcDataSource().apply {
+                setURL("jdbc:h2:mem:$dbName;MODE=PostgreSQL;DB_CLOSE_DELAY=-1")
+                user = "sa"
+                password = ""
+            }
+            h2DataSource.connection.use { conn ->
+                conn.createStatement().use { stmt ->
+                    stmt.execute(
+                        """
+                        CREATE TABLE indexed_players (
+                            puuid VARCHAR(128) PRIMARY KEY,
+                            game_name VARCHAR(128) NOT NULL,
+                            tag_line VARCHAR(64) NOT NULL,
+                            region VARCHAR(32) NOT NULL
                         )
+                        """.trimIndent()
+                    )
+                }
+                conn.prepareStatement("INSERT INTO indexed_players (puuid, game_name, tag_line, region) VALUES (?, ?, ?, ?)").use { ps ->
+                    for (idx in 1..300) {
+                        ps.setString(1, "euw1-puuid-$idx")
+                        ps.setString(2, "LocalDbPlayer$idx")
+                        ps.setString(3, "EUW")
+                        ps.setString(4, "euw1")
+                        ps.addBatch()
                     }
-                } else {
-                    // Partial 5/300 local DB identity coverage for KR
-                    ids.take(5).mapIndexed { index, puuid ->
-                        IndexedPlayer(
-                            puuid = puuid,
-                            gameName = "KrIndexedPlayer${index + 1}",
-                            tagLine = "KR1",
-                            region = "kr",
-                            profileIconId = 10,
-                            summonerLevel = 500L,
-                            lastSeenAt = Instant.ofEpochMilli(clock.now())
-                        )
+                    for (idx in 1..5) {
+                        ps.setString(1, "kr-puuid-$idx")
+                        ps.setString(2, "KrIndexedPlayer$idx")
+                        ps.setString(3, "KR1")
+                        ps.setString(4, "kr")
+                        ps.addBatch()
                     }
+                    ps.executeBatch()
                 }
             }
 
             val service = ChallengerLeagueService(
                 redisCacheService = redisCacheService,
                 riotApiService = riotApiService,
-                indexedPlayerRepository = indexedPlayerRepository,
+                dataSource = h2DataSource,
                 timeProvider = clock,
                 memoryStatsProvider = memoryProvider
             )
@@ -234,7 +234,7 @@ class ChallengerLeagueServiceTest {
             assertEquals("NAOne", naResponse.body?.entries?.first()?.gameName)
             assertEquals(0, leagueRequestsByRegion.values.sumOf { it.get() })
 
-            // 2. EUW1 key is absent in Redis -> self-heals with ONE league call, 0 account fanout, and 300/300 local DB identity coverage
+            // 2. EUW1 key is absent in Redis -> self-heals with ONE league call, 0 account fanout, and 300/300 real JDBC identity coverage
             val euwResponse = controller.getChallengerLeague("euw1")
             assertEquals(HttpStatus.OK, euwResponse.statusCode)
             val euwBody = euwResponse.body
@@ -251,15 +251,13 @@ class ChallengerLeagueServiceTest {
             assertEquals(300, euwCoverage.dbResolvedCount)
             assertEquals(1, leagueRequestsByRegion.values.sumOf { it.get() })
             assertEquals(0, accountFanoutRequests.get(), "Must never perform 300-account getAccountByPuuid fanout")
-            assertEquals(1, dbFindAllCount.get(), "Should batch local DB lookup in a single findAllById call")
             assertNotNull(redisStore["leaderboard:euw1::RANKED_SOLO_5x5"])
 
-            // 3. Subsequent EUW1 call is served from re-populated Redis cache with 0 extra Riot calls and 0 extra DB calls
+            // 3. Subsequent EUW1 call is served from re-populated Redis cache with 0 extra Riot calls
             val euwSecond = controller.getChallengerLeague("euw1")
             assertEquals(HttpStatus.OK, euwSecond.statusCode)
             assertEquals(300, euwSecond.body?.entries?.size)
             assertEquals(1, leagueRequestsByRegion.values.sumOf { it.get() })
-            assertEquals(1, dbFindAllCount.get())
 
             // 4. KR key is absent in Redis with only 5/300 local DB identities -> explicitly tracks 295 missing identities (unclickable on Dashboard until indexed) with 0 account fanout
             val krResponse = controller.getChallengerLeague("kr")
@@ -282,7 +280,7 @@ class ChallengerLeagueServiceTest {
     }
 
     @Test
-    fun `malformed or empty Redis payload is rejected and self-healed preserving complete 300-entry fresh response while bounding 3-region last-known-good fallback`() = runBlocking {
+    fun `malformed or empty Redis payload is rejected and self-healed retaining only complete 300-entry fallback snapshots and rejecting oversized whole with HTTP 503`() = runBlocking {
         val clock = MutableClock()
         val memoryProvider = MutableMemoryProvider()
         val redisStore = ConcurrentHashMap<String, CachedLeaderboardDto?>()
@@ -349,66 +347,83 @@ class ChallengerLeagueServiceTest {
             }
         }
 
-        val service = ChallengerLeagueService(
+        // Part A: Default production byte caps (128 KiB per region, 384 KiB total) retain the COMPLETE 300-entry snapshot for all 3 regions
+        val serviceWithDefaultCaps = ChallengerLeagueService(
             redisCacheService = redisCacheService,
             riotApiService = riotApiService,
-            indexedPlayerRepository = null,
+            dataSource = null,
             timeProvider = clock,
             memoryStatsProvider = memoryProvider,
-            maxEntriesPerRegion = 300,
-            maxLastKnownGoodRegionBytes = 24_576, // 24 KiB strict per-region byte cap for fallback
-            maxLastKnownGoodTotalBytes = 65_536   // 64 KiB strict 3-region total byte cap for fallback
+            maxEntriesPerRegion = 300
         )
 
-        // 1. Seed malformed empty-entries payload in Redis for euw1 -> service rejects empty payload and self-heals
-        // Fresh response and Redis cache MUST preserve all 300 entries (never silently truncated to fallback size!)
         redisStore["leaderboard:euw1::RANKED_SOLO_5x5"] = CachedLeaderboardDto(
             lastRefreshed = Instant.ofEpochMilli(clock.now()),
             leaderboard = LeagueListDTO("CHALLENGER", "id", "RANKED_SOLO_5x5", "Empty", emptyList())
         )
-        val euwRecovered = service.getChallengerLeagueFromCache("euw1", "RANKED_SOLO_5x5")
+        val euwRecovered = serviceWithDefaultCaps.getChallengerLeagueFromCache("euw1", "RANKED_SOLO_5x5")
         assertNotNull(euwRecovered)
         assertEquals(300, euwRecovered!!.entries.size, "Fresh normal response must preserve complete 300-entry leaderboard")
-        assertEquals(300, redisStore["leaderboard:euw1::RANKED_SOLO_5x5"]?.leaderboard?.entries?.size, "Redis cache must store complete 300-entry leaderboard")
+        assertEquals(300, redisStore["leaderboard:euw1::RANKED_SOLO_5x5"]?.leaderboard?.entries?.size)
         assertEquals(1, leagueCallCounter.get())
 
-        // Subsequent fresh cache hit must also return all 300 entries (not the byte-shrunk fallback snapshot)
-        val euwCacheHit = service.getChallengerLeagueFromCache("euw1", "RANKED_SOLO_5x5")
-        assertEquals(300, euwCacheHit?.entries?.size, "Fresh Redis cache hit must preserve complete 300-entry leaderboard")
-
-        // 2. Populate na1 and kr as well; verify 3-region cap, complete 300-entry fresh responses, and strict byte bounds on last-known-good
-        val naFresh = service.getChallengerLeagueFromCache("na1", "RANKED_SOLO_5x5")
-        val krFresh = service.getChallengerLeagueFromCache("kr", "RANKED_SOLO_5x5")
+        val naFresh = serviceWithDefaultCaps.getChallengerLeagueFromCache("na1", "RANKED_SOLO_5x5")
+        val krFresh = serviceWithDefaultCaps.getChallengerLeagueFromCache("kr", "RANKED_SOLO_5x5")
         assertEquals(300, naFresh?.entries?.size)
         assertEquals(300, krFresh?.entries?.size)
-        assertNull(service.getChallengerLeagueFromCache("br1", "RANKED_SOLO_5x5"), "Unsupported 4th region must not be stored")
-        assertEquals(3, service.getLastKnownGoodRegionCount())
-        assertTrue(service.getLastKnownGoodRegionBytes("euw1") in 1..24_576)
-        assertTrue(service.getLastKnownGoodRegionBytes("na1") in 1..24_576)
-        assertTrue(service.getLastKnownGoodRegionBytes("kr") in 1..24_576)
-        assertTrue(service.getLastKnownGoodTotalBytes() <= 65_536)
+        assertNull(serviceWithDefaultCaps.getChallengerLeagueFromCache("br1", "RANKED_SOLO_5x5"), "Unsupported 4th region must not be stored")
+        assertEquals(3, serviceWithDefaultCaps.getLastKnownGoodRegionCount())
+        assertTrue(serviceWithDefaultCaps.getLastKnownGoodRegionBytes("euw1") in 1..ChallengerLeagueService.MAX_LAST_KNOWN_GOOD_REGION_BYTES)
+        assertTrue(serviceWithDefaultCaps.getLastKnownGoodRegionBytes("na1") in 1..ChallengerLeagueService.MAX_LAST_KNOWN_GOOD_REGION_BYTES)
+        assertTrue(serviceWithDefaultCaps.getLastKnownGoodRegionBytes("kr") in 1..ChallengerLeagueService.MAX_LAST_KNOWN_GOOD_REGION_BYTES)
+        assertTrue(serviceWithDefaultCaps.getLastKnownGoodTotalBytes() <= ChallengerLeagueService.MAX_LAST_KNOWN_GOOD_TOTAL_BYTES)
 
-        // 3. Evict euw1 from Redis AND make upstream fail -> serves bounded last-known-good snapshot and marks re-seeded truncated entry stale (Instant.EPOCH)
+        // Evict euw1 from Redis AND make upstream fail -> serves COMPLETE 300-entry last-known-good snapshot and re-seeds Redis
         redisStore.remove("leaderboard:euw1::RANKED_SOLO_5x5")
         shouldFailUpstream.set(true)
-        val euwFromLastGood = service.getChallengerLeagueFromCache("euw1", "RANKED_SOLO_5x5")
+        val euwFromLastGood = serviceWithDefaultCaps.getChallengerLeagueFromCache("euw1", "RANKED_SOLO_5x5")
         assertNotNull(euwFromLastGood)
-        assertTrue(euwFromLastGood!!.entries.isNotEmpty())
-        assertTrue(euwFromLastGood.entries.size < 300)
+        assertEquals(300, euwFromLastGood!!.entries.size, "Fallback snapshot must be complete (all 300 ranks, never truncated)")
         assertEquals("euw1-puuid-1", euwFromLastGood.entries.first().puuid)
-        val reseededDto = redisStore["leaderboard:euw1::RANKED_SOLO_5x5"]
-        assertNotNull(reseededDto, "Should re-seed Redis from last-known-good")
-        assertEquals(Instant.EPOCH, reseededDto?.lastRefreshed, "Truncated fallback re-seeded into Redis must be marked stale so it refreshes once backoff expires")
+        assertEquals(300, redisStore["leaderboard:euw1::RANKED_SOLO_5x5"]?.leaderboard?.entries?.size)
 
-        // 4. Once backoff expires and upstream recovers, the stale truncated Redis entry automatically self-heals back to 300 entries
-        clock.advanceBy(31_000L)
+        // Part B: When a snapshot exceeds the byte cap (e.g. 24 KiB cap < ~85 KiB 300-entry payload), storeLastKnownGoodBounded
+        // rejects the oversized whole (no partial rank fallback stored), while still returning the complete 300-entry fresh response.
+        // If Redis is later evicted and upstream fails, absent snapshot yields null (HTTP 503).
+        redisStore.clear()
         shouldFailUpstream.set(false)
-        val euwRestoredFull = service.getChallengerLeagueFromCache("euw1", "RANKED_SOLO_5x5")
-        assertEquals(300, euwRestoredFull?.entries?.size, "Stale truncated fallback must self-heal back to full 300 entries")
+        val serviceWithTightCap = ChallengerLeagueService(
+            redisCacheService = redisCacheService,
+            riotApiService = riotApiService,
+            dataSource = null,
+            timeProvider = clock,
+            memoryStatsProvider = memoryProvider,
+            maxEntriesPerRegion = 300,
+            maxLastKnownGoodRegionBytes = 24_576,
+            maxLastKnownGoodTotalBytes = 65_536
+        )
+        val controllerWithTightCap = RiotApiController(
+            riotApiService = riotApiService,
+            challengerLeagueService = serviceWithTightCap,
+            userService = mockk(relaxed = true),
+            summonerProfileService = mockk(relaxed = true),
+            redisCacheService = redisCacheService
+        )
+
+        val freshUnderTightCap = controllerWithTightCap.getChallengerLeague("euw1")
+        assertEquals(HttpStatus.OK, freshUnderTightCap.statusCode)
+        assertEquals(300, freshUnderTightCap.body?.entries?.size, "Fresh response must still return all 300 entries")
+        assertEquals(0, serviceWithTightCap.getLastKnownGoodRegionBytes("euw1"), "Oversized whole snapshot must be rejected rather than storing partial ranks")
+
+        redisStore.remove("leaderboard:euw1::RANKED_SOLO_5x5")
+        shouldFailUpstream.set(true)
+        val evictedUnderTightCap = controllerWithTightCap.getChallengerLeague("euw1")
+        assertEquals(HttpStatus.SERVICE_UNAVAILABLE, evictedUnderTightCap.statusCode, "Absent fallback snapshot must return HTTP 503 rather than partial rank list")
+        assertNull(evictedUnderTightCap.body)
     }
 
     @Test
-    fun `storeLastKnownGoodBounded rejects oversized single entry and atomically enforces total byte cap across concurrent multi-region updates`() = runBlocking {
+    fun `storeLastKnownGoodBounded rejects oversized single entry and atomically enforces total byte cap across concurrent multi-region updates without partial snapshots`() = runBlocking {
         val clock = MutableClock()
         val memoryProvider = MutableMemoryProvider()
         val redisCacheService = mockk<RedisCacheService>(relaxed = true)
@@ -454,7 +469,7 @@ class ChallengerLeagueServiceTest {
                             leagueId = "challenger-$region",
                             queueType = "RANKED_SOLO_5x5",
                             tier = "CHALLENGER",
-                            summonerName = "X".repeat(12_000),
+                            summonerName = "X".repeat(100_000),
                             gameName = "Player1",
                             tagLine = "EUW"
                         )
@@ -489,25 +504,27 @@ class ChallengerLeagueServiceTest {
             }
         }
 
+        // Each 300-entry region is ~84 KiB. With 90 KiB per-region cap and 180 KiB custom total cap,
+        // at most 2 complete 300-entry regions (~168 KiB) can fit in lastKnownGood at once; the 3rd is rejected as a whole.
         val service = ChallengerLeagueService(
             redisCacheService = redisCacheService,
             riotApiService = riotApiService,
-            indexedPlayerRepository = null,
+            dataSource = null,
             timeProvider = clock,
             memoryStatsProvider = memoryProvider,
             maxEntriesPerRegion = 300,
-            maxLastKnownGoodRegionBytes = 8_192,  // 8 KiB per-region cap
-            maxLastKnownGoodTotalBytes = 14_336   // 14 KiB total cap across 3 regions (< 3 * 8 KiB)
+            maxLastKnownGoodRegionBytes = 92_160,  // 90 KiB per-region cap
+            maxLastKnownGoodTotalBytes = 184_320   // 180 KiB custom total cap (2 * ~84 KiB fits, 3 * ~84 KiB rejected)
         )
 
-        // 1. Single entry (~12 KiB) exceeds 8 KiB per-region cap -> must be rejected from lastKnownGood (0 bytes stored), while fresh response still returns the entry
+        // 1. Single entry (~100 KiB) exceeds 90 KiB per-region cap -> rejected from lastKnownGood (0 bytes stored), while fresh response returns the entry
         val singleEntryResponse = service.getOrRefreshChallengerLeague("euw1", "RANKED_SOLO_5x5")
         assertNotNull(singleEntryResponse)
         assertEquals(1, singleEntryResponse!!.entries.size)
         assertEquals(0, service.getLastKnownGoodRegionBytes("euw1"), "Oversized single entry must never violate hard per-region byte cap")
         assertEquals(0, service.getLastKnownGoodTotalBytes(), "Oversized single entry must leave total last-known-good bytes at 0")
 
-        // 2. Concurrent updates across euw1, na1, kr with custom tight total budget (14 KiB < 3 * 8 KiB)
+        // 2. Concurrent updates across euw1, na1, kr with custom tight total budget (180 KiB)
         serveOversizedSingleEntry.set(false)
         val regions = listOf("euw1", "na1", "kr")
         val concurrentUpdates = (1..18).map { idx ->
@@ -515,19 +532,20 @@ class ChallengerLeagueServiceTest {
                 val region = regions[idx % regions.size]
                 val response = service.getOrRefreshChallengerLeague(region, "RANKED_SOLO_5x5")
                 assertEquals(300, response?.entries?.size, "Fresh response for $region must preserve all 300 entries")
-                assertTrue(service.getLastKnownGoodRegionBytes(region) <= 8_192)
+                assertTrue(service.getLastKnownGoodRegionBytes(region) <= 92_160)
                 assertTrue(
-                    service.getLastKnownGoodTotalBytes() <= 14_336,
-                    "Concurrent cross-region updates must never exceed maxLastKnownGoodTotalBytes (14336)"
+                    service.getLastKnownGoodTotalBytes() <= 184_320,
+                    "Concurrent cross-region updates must never exceed maxLastKnownGoodTotalBytes (184320)"
                 )
             }
         }
         concurrentUpdates.awaitAll()
-        assertTrue(service.getLastKnownGoodTotalBytes() in 1..14_336)
+        assertEquals(2, service.getLastKnownGoodRegionCount(), "Only 2 complete ~84 KiB regions fit within 180 KiB total cap; 3rd oversized whole is rejected")
+        assertTrue(service.getLastKnownGoodTotalBytes() in 1..184_320)
     }
 
     @Test
-    fun `stalled IndexedPlayerRepository findAllById times out within deadline without hanging refresh or retaining singleflight`() = runBlocking {
+    fun `stalled JDBC query on real H2 DataSource is cancelled via Statement cancel and queryTimeout within deadline without stranding worker or retaining singleflight`() = runBlocking {
         val clock = MutableClock()
         val memoryProvider = MutableMemoryProvider()
         val redisCacheService = mockk<RedisCacheService>(relaxed = true)
@@ -576,24 +594,36 @@ class ChallengerLeagueServiceTest {
             )
         }
 
-        val dbInterruptedLatch = CountDownLatch(1)
-        val stalledRepo = mockk<IndexedPlayerRepository>()
-        every { stalledRepo.findAllById(any()) } answers {
-            try {
-                Thread.sleep(10_000L)
-            } catch (_: InterruptedException) {
-                dbInterruptedLatch.countDown()
+        // Create a real H2 JDBC DataSource where querying `indexed_players` runs a massive CPU-bound SQL cross-join
+        // (no Thread.sleep!) that only terminates promptly when JDBC Statement.cancel() / setQueryTimeout aborts H2's SQL engine.
+        val dbName = "challenger_stalled_sql_${UUID.randomUUID().toString().replace("-", "")}"
+        val stalledH2DataSource = JdbcDataSource().apply {
+            setURL("jdbc:h2:mem:$dbName;MODE=PostgreSQL;DB_CLOSE_DELAY=-1")
+            user = "sa"
+            password = ""
+        }
+        stalledH2DataSource.connection.use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute(
+                    """
+                    CREATE VIEW indexed_players AS
+                    SELECT CAST(a.x + b.x AS VARCHAR) AS puuid,
+                           'SlowGameName' AS game_name,
+                           'SlowTag' AS tag_line
+                    FROM SYSTEM_RANGE(1, 50000000) a
+                    CROSS JOIN SYSTEM_RANGE(1, 50000000) b
+                    """.trimIndent()
+                )
             }
-            emptyList()
         }
 
         val service = ChallengerLeagueService(
             redisCacheService = redisCacheService,
             riotApiService = riotApiService,
-            indexedPlayerRepository = stalledRepo,
+            dataSource = stalledH2DataSource,
             timeProvider = clock,
             memoryStatsProvider = memoryProvider,
-            refreshDeadlineMs = 600L,
+            refreshDeadlineMs = 800L,
             dbLookupTimeoutMs = 200L
         )
 
@@ -601,16 +631,15 @@ class ChallengerLeagueServiceTest {
         val result = service.getOrRefreshChallengerLeague("euw1", "RANKED_SOLO_5x5")
         val elapsedWall = System.currentTimeMillis() - startWall
 
-        assertNotNull(result, "Refresh should still return the fresh league entries when optional local DB enrichment times out")
+        assertNotNull(result, "Refresh should still return the fresh league entries when optional JDBC enrichment is cancelled on timeout")
         assertEquals(1, result!!.entries.size)
-        assertTrue(elapsedWall < 1_500L, "Stalled DB findAllById must time out near 200ms without hanging for 10s, took ${elapsedWall}ms")
-        assertTrue(dbInterruptedLatch.await(1L, TimeUnit.SECONDS), "Stalled DB worker thread should be interrupted on timeout")
+        assertTrue(elapsedWall < 1_500L, "Real JDBC Statement.cancel() must abort CPU-bound SQL query near 200ms, took ${elapsedWall}ms")
         assertEquals(0, service.getInFlightRefreshCount(), "Singleflight entry must be cleaned up promptly after DB timeout")
-        assertEquals(0, service.getActiveDbLookupWorkers(), "DB lookup worker count must return to 0 after interrupt")
+        assertEquals(0, service.getActiveDbLookupWorkers(), "JDBC worker thread must be freed by Statement.cancel() and not stranded")
     }
 
     @Test
-    fun `singleflight coalesces concurrent cache misses into one league call, cleans up on waiter cancellation, and enforces failure backoff`() = runBlocking {
+    fun `singleflight coalesces concurrent cache misses, retains active singleflight across waiter timeout to prevent overlap, and enforces failure backoff`() = runBlocking {
         val clock = MutableClock()
         val memoryProvider = MutableMemoryProvider()
         val redisCacheService = mockk<RedisCacheService>(relaxed = true)
@@ -619,6 +648,7 @@ class ChallengerLeagueServiceTest {
         val riotApiService = mockk<RiotApiService>()
         val upstreamCalls = AtomicInteger(0)
         val shouldFail = AtomicBoolean(false)
+        val upstreamDelayMs = AtomicLong(120L)
 
         io.mockk.coEvery {
             riotApiService.fetchChallengerLeagueBounded(
@@ -639,7 +669,7 @@ class ChallengerLeagueServiceTest {
             val failureHolder = arg<AtomicReference<String?>?>(9)
             upstreamCalls.incrementAndGet()
             attemptCounter?.incrementAndGet()
-            delay(120L)
+            delay(upstreamDelayMs.get())
             if (shouldFail.get()) {
                 failureHolder?.set("HTTP_429_TOO_MANY_REQUESTS")
                 null
@@ -675,9 +705,10 @@ class ChallengerLeagueServiceTest {
         val service = ChallengerLeagueService(
             redisCacheService = redisCacheService,
             riotApiService = riotApiService,
-            indexedPlayerRepository = null,
+            dataSource = null,
             timeProvider = clock,
             memoryStatsProvider = memoryProvider,
+            refreshDeadlineMs = 200L,
             failureBackoffMs = 30_000L
         )
         val controller = RiotApiController(
@@ -705,12 +736,49 @@ class ChallengerLeagueServiceTest {
         assertTrue(results.all { it != null && it.entries.size == 1 && it.entries.first().gameName == "TopOne" })
         assertEquals(0, service.getInFlightRefreshCount(), "Singleflight map must be empty after completion")
 
-        // 2. Cold region (kr) with upstream failure -> returns 503 Service Unavailable, records failure backoff, and suppresses retries
+        // 2. Waiter timeout while leader job is still active must NOT remove the in-flight deferred or allow overlapping upstream call
+        upstreamDelayMs.set(350L) // > waiter waitBudgetMs (100 + 150 = 250ms), < leader outer timeout (100 + 350 = 450ms)
+        val shortDeadlineService = ChallengerLeagueService(
+            redisCacheService = redisCacheService,
+            riotApiService = riotApiService,
+            dataSource = null,
+            timeProvider = clock,
+            memoryStatsProvider = memoryProvider,
+            refreshDeadlineMs = 100L, // waiter timeout = 250ms, leader outer timeout = 450ms
+            failureBackoffMs = 30_000L
+        )
+        val callsBeforeOverlapCheck = upstreamCalls.get()
+        val firstWaiter = async(Dispatchers.Default) {
+            shortDeadlineService.getOrRefreshChallengerLeague("na1", "RANKED_SOLO_5x5")
+        }
+        // Wait for firstWaiter to hit waiter timeout (250ms) and return while the leader (350ms) is still active
+        val firstWaiterResult = firstWaiter.await()
+        assertNull(firstWaiterResult, "First waiter should time out before the 350ms leader finishes")
+        assertEquals(
+            1,
+            shortDeadlineService.getInFlightRefreshCount(),
+            "Timed-out waiter must NOT remove active leader from inFlightRefreshes"
+        )
+        val secondWaiterDuringActiveLeader = async(Dispatchers.Default) {
+            shortDeadlineService.getOrRefreshChallengerLeague("na1", "RANKED_SOLO_5x5")
+        }
+        val secondWaiterResult = secondWaiterDuringActiveLeader.await()
+        assertNotNull(secondWaiterResult, "Second waiter coalescing onto active leader should receive leader result")
+        assertEquals(
+            callsBeforeOverlapCheck + 1,
+            upstreamCalls.get(),
+            "Must not start a second overlapping refresh after waiter timeout while leader is still active"
+        )
+        assertEquals(0, shortDeadlineService.getInFlightRefreshCount(), "Leader cleans up singleflight entry once finished")
+        upstreamDelayMs.set(120L)
+
+        // 3. Cold region (kr) with upstream failure -> returns 503 Service Unavailable, records failure backoff, and suppresses retries
+        val callsBeforeKr = upstreamCalls.get()
         shouldFail.set(true)
         val krFirst = controller.getChallengerLeague("kr")
         assertEquals(HttpStatus.SERVICE_UNAVAILABLE, krFirst.statusCode)
         assertNull(krFirst.body)
-        assertEquals(2, upstreamCalls.get())
+        assertEquals(callsBeforeKr + 1, upstreamCalls.get())
         assertTrue(service.getRemainingBackoffMs("kr") > 0L)
         assertEquals("HTTP_429_TOO_MANY_REQUESTS", service.getLastRefreshFailureReason("kr"))
         assertEquals(0, service.getInFlightRefreshCount())
@@ -718,7 +786,7 @@ class ChallengerLeagueServiceTest {
         // Subsequent KR calls during 30s backoff must make 0 additional upstream calls and return 503 immediately
         val krDuringBackoff = controller.getChallengerLeague("kr")
         assertEquals(HttpStatus.SERVICE_UNAVAILABLE, krDuringBackoff.statusCode)
-        assertEquals(2, upstreamCalls.get(), "Must not call Riot API while region is in failure backoff")
+        assertEquals(callsBeforeKr + 1, upstreamCalls.get(), "Must not call Riot API while region is in failure backoff")
 
         // Advance clock past 30s backoff and allow upstream recovery -> self-heals to 200 OK
         clock.advanceBy(31_000L)
@@ -726,7 +794,7 @@ class ChallengerLeagueServiceTest {
         val krRecovered = controller.getChallengerLeague("kr")
         assertEquals(HttpStatus.OK, krRecovered.statusCode)
         assertEquals(1, krRecovered.body?.entries?.size)
-        assertEquals(3, upstreamCalls.get())
+        assertEquals(callsBeforeKr + 2, upstreamCalls.get())
         assertEquals(0L, service.getRemainingBackoffMs("kr"))
     }
 

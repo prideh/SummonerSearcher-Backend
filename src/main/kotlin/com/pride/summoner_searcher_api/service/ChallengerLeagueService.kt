@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.pride.summoner_searcher_api.dto.CachedLeaderboardDto
 import com.pride.summoner_searcher_api.dto.LeagueEntryDto
 import com.pride.summoner_searcher_api.dto.LeagueListDTO
-import com.pride.summoner_searcher_api.repository.IndexedPlayerRepository
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -19,26 +18,33 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Value
 import org.springframework.stereotype.Service
 import java.nio.charset.StandardCharsets
+import java.sql.Connection
+import java.sql.PreparedStatement
 import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
+import javax.sql.DataSource
 
 /**
  * Manages Challenger leaderboard retrieval and cache warming with:
  * - Bounded in-memory last-known-good fallback strictly capped to the 3 supported regions (`euw1`, `na1`, `kr`),
- *   bounded by both entry count (`<= 300`) and serialized byte size (`<= 128 KiB` per region, `<= 384 KiB` total).
+ *   retaining ONLY complete snapshots that fit within both entry count (`<= 300`) and hard serialized byte caps
+ *   (`<= 128 KiB` per region, `<= 384 KiB` total). Oversized snapshots are rejected as a whole (never serving partial rank lists).
  * - On-demand singleflight self-healing with failure backoff when Redis keys are absent/evicted or malformed.
  * - Single bounded Riot League-V4 call (`fetchChallengerLeagueBounded`) with zero 300-account fanout.
- * - Local identity enrichment from `IndexedPlayerRepository` (`indexed_players`) and previous cached/last-good snapshots.
+ * - Local identity enrichment from `indexed_players` via a bounded JDBC `PreparedStatement` with `setQueryTimeout`,
+ *   `setNetworkTimeout`, and active `Statement.cancel()` / `Connection.abort()` on deadline, or omitted when a bounded
+ *   JDBC `DataSource` is not available.
  */
 @Service
 class ChallengerLeagueService @Autowired constructor(
     private val redisCacheService: RedisCacheService,
     private val riotApiService: RiotApiService,
     @Autowired(required = false)
-    private val indexedPlayerRepository: IndexedPlayerRepository? = null,
+    private val dataSource: DataSource? = null,
     private val timeProvider: TimeProvider = SystemTimeProvider(),
     private val memoryStatsProvider: MemoryStatsProvider = SystemMemoryStatsProvider(),
     @Value("\${cohort.collector.container-memory-limit-bytes:536870912}")
@@ -71,13 +77,14 @@ class ChallengerLeagueService @Autowired constructor(
     private val lastIdentityCoverageByRegion = ConcurrentHashMap<String, IdentityCoverageStats>()
     private val refreshScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val activeDbLookupWorkers = AtomicInteger(0)
+    private val dbLookupPermits = Semaphore(MAX_CONCURRENT_DB_LOOKUPS)
     private val dbLookupThreadCounter = AtomicInteger(0)
     private val dbLookupExecutor = java.util.concurrent.ThreadPoolExecutor(
-        3,
-        3,
+        MAX_CONCURRENT_DB_LOOKUPS,
+        MAX_CONCURRENT_DB_LOOKUPS,
         30L,
         java.util.concurrent.TimeUnit.SECONDS,
-        java.util.concurrent.LinkedBlockingQueue(6),
+        java.util.concurrent.SynchronousQueue(),
         java.util.concurrent.ThreadFactory { runnable ->
             Thread(runnable, "challenger-db-lookup-${dbLookupThreadCounter.incrementAndGet()}").apply {
                 isDaemon = true
@@ -87,13 +94,17 @@ class ChallengerLeagueService @Autowired constructor(
     ).apply {
         allowCoreThreadTimeOut(true)
     }
+    private val dbAbortExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "challenger-db-abort").apply {
+            isDaemon = true
+        }
+    }
 
     internal data class BoundedLeaderboardSnapshot(
         val region: String,
         val queue: String,
         val cachedDto: CachedLeaderboardDto,
-        val serializedBytes: Int,
-        val isComplete: Boolean = true
+        val serializedBytes: Int
     )
 
     internal data class IdentityCoverageStats(
@@ -114,6 +125,7 @@ class ChallengerLeagueService @Autowired constructor(
         const val DEFAULT_DB_LOOKUP_TIMEOUT_MS = 1_500L
         const val DEFAULT_FAILURE_BACKOFF_MS = 30_000L
         const val CACHE_STALE_HOURS = 24L
+        const val MAX_CONCURRENT_DB_LOOKUPS = 3
     }
 
     private fun normalizeRegion(region: String): String = region.trim().lowercase()
@@ -204,9 +216,9 @@ class ChallengerLeagueService @Autowired constructor(
      * 1. Returns fresh valid Redis cached data immediately while updating the bounded 3-region last-known-good store.
      * 2. On missing/evicted, malformed/empty, or stale Redis data, executes a singleflight bounded refresh
      *    (1 League-V4 call, 0 account fanout, local DB + snapshot identity reuse).
-     * 3. Falls back to the bounded last-known-good snapshot if upstream refresh is in backoff or blocked by
+     * 3. Falls back to the complete bounded last-known-good snapshot if upstream refresh is in backoff or blocked by
      *    deadline, rate-limit, network error, or memory headroom guard.
-     * 4. Returns `null` when no valid leaderboard exists anywhere so the controller responds with explicit HTTP 503.
+     * 4. Returns `null` when no valid complete leaderboard exists anywhere so the controller responds with explicit HTTP 503.
      */
     fun getChallengerLeagueFromCache(region: String, queue: String): LeagueListDTO? = runBlocking {
         getOrRefreshChallengerLeague(region, queue)
@@ -371,7 +383,7 @@ class ChallengerLeagueService @Autowired constructor(
         if (isLeader) {
             refreshScope.launch {
                 try {
-                    val result = withTimeoutOrNull(safeRefreshDeadlineMs + 200L) {
+                    val result = withTimeoutOrNull(safeRefreshDeadlineMs + 350L) {
                         executeBoundedLeaderRefresh(
                             normalizedRegion = normalizedRegion,
                             queue = queue,
@@ -397,16 +409,15 @@ class ChallengerLeagueService @Autowired constructor(
             }
         }
 
-        val waitBudgetMs = safeRefreshDeadlineMs + 250L
+        val waitBudgetMs = safeRefreshDeadlineMs + 150L
         val awaited = withTimeoutOrNull(waitBudgetMs) {
             deferred.await()
         }
         if (awaited != null) {
             return awaited
         }
-        if (!deferred.isCompleted) {
-            inFlightRefreshes.remove(cacheKey, deferred)
-        }
+        // Do NOT remove `deferred` from `inFlightRefreshes` on waiter timeout while the leader job is still active;
+        // keeping `deferred` registered prevents overlapping duplicate refreshes until the leader job completes and cleans up.
         return reseedAndReturnLastKnownGood(cacheKey, normalizedRegion, previousLeaderboard)
     }
 
@@ -419,15 +430,8 @@ class ChallengerLeagueService @Autowired constructor(
             lastKnownGoodByRegion[normalizedRegion]
         }
         if (snapshot != null && isValidLeaderboard(snapshot.cachedDto.leaderboard)) {
-            val dtoToReseed = if (snapshot.isComplete) {
-                snapshot.cachedDto
-            } else {
-                // Mark truncated fallback snapshot as stale in Redis so that once failure backoff expires,
-                // the next request refreshes the full 300-entry leaderboard rather than serving a truncated list as fresh.
-                snapshot.cachedDto.copy(lastRefreshed = Instant.EPOCH)
-            }
             runCatching {
-                redisCacheService.set(cacheKey, dtoToReseed, Duration.ZERO)
+                redisCacheService.set(cacheKey, snapshot.cachedDto, Duration.ZERO)
             }
             return snapshot.cachedDto.leaderboard
         }
@@ -525,7 +529,9 @@ class ChallengerLeagueService @Autowired constructor(
 
     /**
      * Enriches [rawLeague] entries with `(gameName, tagLine)` using ONLY:
-     * 1. Local DB `indexed_players` rows via a single batched `findAllById` lookup (`<= 300` PUUIDs) bounded by deadline, and
+     * 1. Local DB `indexed_players` rows via a single batched JDBC `PreparedStatement` (`<= 300` PUUIDs) bounded by
+     *    `setQueryTimeout`, `setNetworkTimeout`, and active `Statement.cancel()` / `Connection.abort()` (or omitted if
+     *    no bounded JDBC [DataSource] is available), and
      * 2. Previously cached / last-known-good leaderboard entries for the region.
      * Makes ZERO Riot Account-V1 API calls and records [IdentityCoverageStats] for observability.
      */
@@ -564,18 +570,11 @@ class ChallengerLeagueService @Autowired constructor(
                 .mapNotNull { it.puuid?.trim()?.takeIf { id -> id.isNotBlank() } }
                 .distinct()
         }
-        val dbIdentityByPuuid = HashMap<String, Pair<String, String>>()
-        val repo = indexedPlayerRepository
-        if (candidatePuuidsForDb.isNotEmpty() && repo != null) {
-            val dbPlayers = fetchDbIdentitiesBounded(normalizedRegion, repo, candidatePuuidsForDb, deadlineAtMs)
-            for (player in dbPlayers) {
-                val p = player.puuid.trim()
-                val gn = player.gameName.trim()
-                val tl = player.tagLine.trim()
-                if (p.isNotBlank() && gn.isNotBlank() && tl.isNotBlank()) {
-                    dbIdentityByPuuid[p] = gn to tl
-                }
-            }
+        val ds = dataSource
+        val dbIdentityByPuuid: Map<String, Pair<String, String>> = if (candidatePuuidsForDb.isNotEmpty() && ds != null) {
+            fetchDbIdentitiesBounded(normalizedRegion, ds, candidatePuuidsForDb, deadlineAtMs)
+        } else {
+            emptyMap()
         }
 
         var resolvedCount = 0
@@ -652,10 +651,10 @@ class ChallengerLeagueService @Autowired constructor(
 
     private fun fetchDbIdentitiesBounded(
         normalizedRegion: String,
-        repo: IndexedPlayerRepository,
+        ds: DataSource,
         candidatePuuids: List<String>,
         deadlineAtMs: Long?
-    ): List<com.pride.summoner_searcher_api.model.IndexedPlayer> {
+    ): Map<String, Pair<String, String>> {
         val safeDbTimeoutMs = dbLookupTimeoutMs.coerceAtLeast(50L)
         val remainingDeadlineMs = if (deadlineAtMs != null) {
             deadlineAtMs - timeProvider.now()
@@ -665,65 +664,128 @@ class ChallengerLeagueService @Autowired constructor(
         val effectiveTimeoutMs = minOf(safeDbTimeoutMs, remainingDeadlineMs)
         if (effectiveTimeoutMs <= 0L) {
             logger.warn("[ChallengerLeaderboard] Skipping DB identity lookup for {} because deadline already expired.", normalizedRegion)
-            return emptyList()
+            return emptyMap()
+        }
+        if (!dbLookupPermits.tryAcquire()) {
+            logger.warn("[ChallengerLeaderboard] Skipping DB identity lookup for {} because all {} DB lookup permits are in use.", normalizedRegion, MAX_CONCURRENT_DB_LOOKUPS)
+            return emptyMap()
         }
 
         val taskClaimedOrCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
-        val workerThreadRef = java.util.concurrent.atomic.AtomicReference<Thread?>(null)
+        val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val activeConnectionRef = AtomicReference<Connection?>(null)
+        val activeStatementRef = AtomicReference<PreparedStatement?>(null)
+        val workerThreadRef = AtomicReference<Thread?>(null)
         val workerDoneLatch = java.util.concurrent.CountDownLatch(1)
+
         val future = try {
-            dbLookupExecutor.submit(java.util.concurrent.Callable<List<com.pride.summoner_searcher_api.model.IndexedPlayer>> {
+            dbLookupExecutor.submit(java.util.concurrent.Callable<Map<String, Pair<String, String>>> {
                 if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
+                    dbLookupPermits.release()
                     workerDoneLatch.countDown()
-                    return@Callable emptyList()
+                    return@Callable emptyMap()
                 }
                 activeDbLookupWorkers.incrementAndGet()
                 workerThreadRef.set(Thread.currentThread())
                 try {
-                    if (Thread.currentThread().isInterrupted) {
-                        emptyList()
-                    } else {
-                        repo.findAllById(candidatePuuids).toList()
+                    if (cancelled.get() || Thread.currentThread().isInterrupted) {
+                        return@Callable emptyMap()
                     }
+                    val queryTimeoutSeconds = ((effectiveTimeoutMs + 999L) / 1000L).toInt().coerceAtLeast(1)
+                    val placeholders = candidatePuuids.joinToString(",") { "?" }
+                    val sql = "SELECT puuid, game_name, tag_line FROM indexed_players WHERE puuid IN ($placeholders)"
+                    val resolved = HashMap<String, Pair<String, String>>()
+
+                    ds.connection.use { conn ->
+                        activeConnectionRef.set(conn)
+                        if (cancelled.get() || Thread.currentThread().isInterrupted) {
+                            return@Callable emptyMap()
+                        }
+                        runCatching { conn.isReadOnly = true }
+                        runCatching { conn.setNetworkTimeout(dbAbortExecutor, effectiveTimeoutMs.toInt().coerceAtLeast(1)) }
+                        conn.prepareStatement(sql).use { stmt ->
+                            activeStatementRef.set(stmt)
+                            stmt.maxRows = candidatePuuids.size.coerceAtMost(MAX_LEADERBOARD_ENTRIES)
+                            stmt.queryTimeout = queryTimeoutSeconds
+                            for (i in candidatePuuids.indices) {
+                                stmt.setString(i + 1, candidatePuuids[i])
+                            }
+                            if (cancelled.get() || Thread.currentThread().isInterrupted) {
+                                return@Callable emptyMap()
+                            }
+                            stmt.executeQuery().use { rs ->
+                                while (rs.next()) {
+                                    if (cancelled.get() || Thread.currentThread().isInterrupted) {
+                                        break
+                                    }
+                                    val p = rs.getString(1)?.trim().orEmpty()
+                                    val gn = rs.getString(2)?.trim().orEmpty()
+                                    val tl = rs.getString(3)?.trim().orEmpty()
+                                    if (p.isNotBlank() && gn.isNotBlank() && tl.isNotBlank()) {
+                                        resolved[p] = gn to tl
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    resolved
                 } finally {
+                    activeStatementRef.set(null)
+                    activeConnectionRef.set(null)
                     workerThreadRef.set(null)
                     activeDbLookupWorkers.decrementAndGet()
+                    dbLookupPermits.release()
                     Thread.interrupted()
                     workerDoneLatch.countDown()
                 }
             })
         } catch (e: java.util.concurrent.RejectedExecutionException) {
+            dbLookupPermits.release()
             logger.warn("[ChallengerLeaderboard] DB lookup executor saturated for {}; continuing without DB enrichment.", normalizedRegion)
-            return emptyList()
+            return emptyMap()
         }
 
         return try {
             val rows = future.get(effectiveTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
             if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
-                workerDoneLatch.await(100L, java.util.concurrent.TimeUnit.MILLISECONDS)
+                workerDoneLatch.await(250L, java.util.concurrent.TimeUnit.MILLISECONDS)
             }
             rows
         } catch (e: java.util.concurrent.TimeoutException) {
+            cancelled.set(true)
             val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            if (cancelledBeforeStart) {
+                dbLookupPermits.release()
+            }
+            runCatching { activeStatementRef.get()?.cancel() }
+            runCatching { activeConnectionRef.get()?.abort(dbAbortExecutor) }
+            runCatching { activeConnectionRef.get()?.close() }
             workerThreadRef.get()?.interrupt()
             future.cancel(true)
             if (!cancelledBeforeStart) {
-                workerDoneLatch.await(100L, java.util.concurrent.TimeUnit.MILLISECONDS)
+                workerDoneLatch.await(250L, java.util.concurrent.TimeUnit.MILLISECONDS)
             }
             logger.warn(
-                "[ChallengerLeaderboard] Local DB identity lookup timed out after {}ms for {}; continuing with snapshot identities.",
+                "[ChallengerLeaderboard] Local DB identity lookup timed out after {}ms for {} (JDBC Statement.cancel invoked); continuing with snapshot identities.",
                 effectiveTimeoutMs, normalizedRegion
             )
-            emptyList()
+            emptyMap()
         } catch (e: Exception) {
+            cancelled.set(true)
             val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            if (cancelledBeforeStart) {
+                dbLookupPermits.release()
+            }
+            runCatching { activeStatementRef.get()?.cancel() }
+            runCatching { activeConnectionRef.get()?.abort(dbAbortExecutor) }
+            runCatching { activeConnectionRef.get()?.close() }
             workerThreadRef.get()?.interrupt()
             future.cancel(true)
             if (!cancelledBeforeStart) {
-                workerDoneLatch.await(100L, java.util.concurrent.TimeUnit.MILLISECONDS)
+                workerDoneLatch.await(250L, java.util.concurrent.TimeUnit.MILLISECONDS)
             }
             logger.warn("[ChallengerLeaderboard] Local DB identity lookup failed for {}: {}", normalizedRegion, e.message)
-            emptyList()
+            emptyMap()
         }
     }
 
@@ -733,7 +795,8 @@ class ChallengerLeagueService @Autowired constructor(
      * 2. Entry count cap (`<= maxEntriesPerRegion`, max 300),
      * 3. Per-region serialized UTF-8 byte cap (`<= maxLastKnownGoodRegionBytes`), and
      * 4. Total 3-region serialized UTF-8 byte cap (`<= maxLastKnownGoodTotalBytes`).
-     * Never accepts an oversized entry even when `currentEntries.size == 1`.
+     * Retains ONLY a complete snapshot that fits within the byte caps; rejects an oversized whole
+     * without storing partial rank lists (so an absent/rejected snapshot yields HTTP 503 on upstream failure).
      */
     private fun storeLastKnownGoodBounded(
         normalizedRegion: String,
@@ -756,34 +819,33 @@ class ChallengerLeagueService @Autowired constructor(
             }
 
             val fullBoundedEntries = leaderboard.entries.take(maxEntriesPerRegion.coerceIn(1, MAX_LEADERBOARD_ENTRIES))
-            var currentEntries = fullBoundedEntries
-            while (currentEntries.isNotEmpty()) {
-                val candidateDto = CachedLeaderboardDto(
-                    lastRefreshed = lastRefreshed,
-                    leaderboard = leaderboard.copy(entries = currentEntries)
-                )
-                val serializedBytes = objectMapper.writeValueAsString(candidateDto)
-                    .toByteArray(StandardCharsets.UTF_8)
-                    .size
-                if (serializedBytes <= effectiveByteBudget) {
-                    val snapshot = BoundedLeaderboardSnapshot(
-                        region = normalizedRegion,
-                        queue = queue,
-                        cachedDto = candidateDto,
-                        serializedBytes = serializedBytes,
-                        isComplete = currentEntries.size == fullBoundedEntries.size
-                    )
-                    lastKnownGoodByRegion[normalizedRegion] = snapshot
-                    return snapshot
-                }
-                if (currentEntries.size == 1) {
-                    break
-                }
-                val nextSize = (currentEntries.size * 3 / 4).coerceAtLeast(1).let {
-                    if (it >= currentEntries.size) currentEntries.size - 1 else it
-                }
-                currentEntries = currentEntries.take(nextSize)
+            if (fullBoundedEntries.isEmpty()) {
+                lastKnownGoodByRegion.remove(normalizedRegion)
+                return null
             }
+
+            val candidateDto = CachedLeaderboardDto(
+                lastRefreshed = lastRefreshed,
+                leaderboard = leaderboard.copy(entries = fullBoundedEntries)
+            )
+            val serializedBytes = objectMapper.writeValueAsString(candidateDto)
+                .toByteArray(StandardCharsets.UTF_8)
+                .size
+            if (serializedBytes <= effectiveByteBudget) {
+                val snapshot = BoundedLeaderboardSnapshot(
+                    region = normalizedRegion,
+                    queue = queue,
+                    cachedDto = candidateDto,
+                    serializedBytes = serializedBytes
+                )
+                lastKnownGoodByRegion[normalizedRegion] = snapshot
+                return snapshot
+            }
+
+            logger.warn(
+                "[ChallengerLeaderboard] Rejecting oversized last-known-good snapshot for {} (serializedBytes={} > effectiveByteBudget={}, entries={}); no partial rank fallback stored.",
+                normalizedRegion, serializedBytes, effectiveByteBudget, fullBoundedEntries.size
+            )
             lastKnownGoodByRegion.remove(normalizedRegion)
             return null
         }
