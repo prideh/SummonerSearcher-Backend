@@ -420,6 +420,38 @@ class ChallengerLeagueServiceTest {
         val evictedUnderTightCap = controllerWithTightCap.getChallengerLeague("euw1")
         assertEquals(HttpStatus.SERVICE_UNAVAILABLE, evictedUnderTightCap.statusCode, "Absent fallback snapshot must return HTTP 503 rather than partial rank list")
         assertNull(evictedUnderTightCap.body)
+
+        // Part C: When custom maxEntriesPerRegion < 300 (e.g. 100), a 300-entry leaderboard is still returned complete (300 entries)
+        // on fresh response, while storeLastKnownGoodBounded rejects the whole snapshot (entries=300 > maxEntriesPerRegion=100)
+        // rather than truncating to 100 entries and storing a partial fallback.
+        redisStore.clear()
+        shouldFailUpstream.set(false)
+        val serviceWithSmallEntryCap = ChallengerLeagueService(
+            redisCacheService = redisCacheService,
+            riotApiService = riotApiService,
+            dataSource = null,
+            timeProvider = clock,
+            memoryStatsProvider = memoryProvider,
+            maxEntriesPerRegion = 100
+        )
+        val controllerWithSmallEntryCap = RiotApiController(
+            riotApiService = riotApiService,
+            challengerLeagueService = serviceWithSmallEntryCap,
+            userService = mockk(relaxed = true),
+            summonerProfileService = mockk(relaxed = true),
+            redisCacheService = redisCacheService
+        )
+        val freshUnderSmallEntryCap = controllerWithSmallEntryCap.getChallengerLeague("euw1")
+        assertEquals(HttpStatus.OK, freshUnderSmallEntryCap.statusCode)
+        assertEquals(300, freshUnderSmallEntryCap.body?.entries?.size, "Fresh response must still return all 300 entries")
+        assertEquals(0, serviceWithSmallEntryCap.getLastKnownGoodRegionCount(), "Snapshot exceeding maxEntriesPerRegion must be rejected as a whole")
+        assertEquals(0, serviceWithSmallEntryCap.getLastKnownGoodRegionBytes("euw1"))
+
+        redisStore.remove("leaderboard:euw1::RANKED_SOLO_5x5")
+        shouldFailUpstream.set(true)
+        val evictedUnderSmallEntryCap = controllerWithSmallEntryCap.getChallengerLeague("euw1")
+        assertEquals(HttpStatus.SERVICE_UNAVAILABLE, evictedUnderSmallEntryCap.statusCode)
+        assertNull(evictedUnderSmallEntryCap.body)
     }
 
     @Test
@@ -545,7 +577,7 @@ class ChallengerLeagueServiceTest {
     }
 
     @Test
-    fun `stalled JDBC query on real H2 DataSource is cancelled via Statement cancel and queryTimeout within deadline without stranding worker or retaining singleflight`() = runBlocking {
+    fun `stalled JDBC query on real H2 DataSource, stall-in-cancel and close fixture, and fail-closed unbounded driver guard protect leader refresh and permits`() = runBlocking {
         val clock = MutableClock()
         val memoryProvider = MutableMemoryProvider()
         val redisCacheService = mockk<RedisCacheService>(relaxed = true)
@@ -594,8 +626,8 @@ class ChallengerLeagueServiceTest {
             )
         }
 
-        // Create a real H2 JDBC DataSource where querying `indexed_players` runs a massive CPU-bound SQL cross-join
-        // (no Thread.sleep!) that only terminates promptly when JDBC Statement.cancel() / setQueryTimeout aborts H2's SQL engine.
+        // Part 1: Real H2 JDBC DataSource where querying `indexed_players` runs a massive CPU-bound SQL cross-join
+        // (no Thread.sleep!) that only terminates promptly when off-thread JDBC Statement.cancel() / setQueryTimeout aborts H2's SQL engine.
         val dbName = "challenger_stalled_sql_${UUID.randomUUID().toString().replace("-", "")}"
         val stalledH2DataSource = JdbcDataSource().apply {
             setURL("jdbc:h2:mem:$dbName;MODE=PostgreSQL;DB_CLOSE_DELAY=-1")
@@ -635,7 +667,129 @@ class ChallengerLeagueServiceTest {
         assertEquals(1, result!!.entries.size)
         assertTrue(elapsedWall < 1_500L, "Real JDBC Statement.cancel() must abort CPU-bound SQL query near 200ms, took ${elapsedWall}ms")
         assertEquals(0, service.getInFlightRefreshCount(), "Singleflight entry must be cleaned up promptly after DB timeout")
+        for (attempt in 1..20) {
+            if (service.getActiveDbLookupWorkers() == 0 && service.getActiveDbCancelWorkers() == 0) break
+            delay(15L)
+        }
         assertEquals(0, service.getActiveDbLookupWorkers(), "JDBC worker thread must be freed by Statement.cancel() and not stranded")
+        assertEquals(0, service.getActiveDbCancelWorkers(), "JDBC cancel worker thread must complete cleanly")
+        assertEquals(3, service.getAvailableDbLookupPermits(), "All 3 DB permits must be restored after worker and cancel termination")
+
+        // Part 2: Stall-in-cancel() and stall-in-close() PostgreSQL/Hikari fixture:
+        // Proves the refresh leader thread NEVER blocks on stmt.cancel(), conn.abort(), or conn.close(),
+        // singleflight cleans up with zero overlap, and the DB permit remains held until actual worker + cancel termination.
+        val cancelEnteredLatch = CountDownLatch(1)
+        val releaseCancelAndCloseLatch = CountDownLatch(1)
+        val stalledCancelDataSource = mockk<javax.sql.DataSource>(relaxed = true)
+        val stalledConnection = mockk<java.sql.Connection>(relaxed = true)
+        val stalledMetaData = mockk<java.sql.DatabaseMetaData>(relaxed = true)
+        val stalledStatement = mockk<java.sql.PreparedStatement>(relaxed = true)
+        val queryTimeoutRef = AtomicInteger(0)
+
+        every { stalledCancelDataSource.connection } returns stalledConnection
+        every { stalledConnection.metaData } returns stalledMetaData
+        every { stalledMetaData.url } returns "jdbc:postgresql://127.0.0.1:5432/summonersearcher"
+        every { stalledConnection.setNetworkTimeout(any(), any()) } returns Unit
+        every { stalledConnection.prepareStatement(any()) } returns stalledStatement
+        every { stalledStatement.setQueryTimeout(any()) } answers { queryTimeoutRef.set(arg(0)) }
+        every { stalledStatement.queryTimeout } answers { queryTimeoutRef.get() }
+        every { stalledStatement.executeQuery() } answers {
+            // Uninterruptible wait until releaseCancelAndCloseLatch is released
+            var waited = 0L
+            while (!releaseCancelAndCloseLatch.await(20L, TimeUnit.MILLISECONDS) && waited < 5_000L) {
+                waited += 20L
+            }
+            throw java.sql.SQLTimeoutException("Simulated query cancelled after stall")
+        }
+        every { stalledStatement.cancel() } answers {
+            cancelEnteredLatch.countDown()
+            var waited = 0L
+            while (!releaseCancelAndCloseLatch.await(20L, TimeUnit.MILLISECONDS) && waited < 5_000L) {
+                waited += 20L
+            }
+        }
+        every { stalledConnection.abort(any()) } answers {
+            var waited = 0L
+            while (!releaseCancelAndCloseLatch.await(20L, TimeUnit.MILLISECONDS) && waited < 5_000L) {
+                waited += 20L
+            }
+        }
+        every { stalledConnection.close() } answers {
+            var waited = 0L
+            while (!releaseCancelAndCloseLatch.await(20L, TimeUnit.MILLISECONDS) && waited < 5_000L) {
+                waited += 20L
+            }
+        }
+
+        val serviceWithStalledCancel = ChallengerLeagueService(
+            redisCacheService = redisCacheService,
+            riotApiService = riotApiService,
+            dataSource = stalledCancelDataSource,
+            timeProvider = clock,
+            memoryStatsProvider = memoryProvider,
+            refreshDeadlineMs = 600L,
+            dbLookupTimeoutMs = 150L
+        )
+
+        val startStalledCancelMs = System.currentTimeMillis()
+        val stalledCancelResult = serviceWithStalledCancel.getOrRefreshChallengerLeague("euw1", "RANKED_SOLO_5x5")
+        val elapsedStalledCancelMs = System.currentTimeMillis() - startStalledCancelMs
+
+        assertNotNull(stalledCancelResult, "Refresh thread must return valid leaderboard without blocking on stuck stmt.cancel()/conn.close()")
+        assertEquals(1, stalledCancelResult!!.entries.size)
+        assertTrue(elapsedStalledCancelMs < 550L, "Leader refresh must not block on stalled cancel()/close(), took ${elapsedStalledCancelMs}ms")
+        assertEquals(0, serviceWithStalledCancel.getInFlightRefreshCount(), "Leader refresh must finish and clear singleflight despite stalled cancel/close")
+        assertTrue(cancelEnteredLatch.await(300L, TimeUnit.MILLISECONDS), "Off-thread dbCancelExecutor must invoke stmt.cancel()")
+        assertEquals(2, serviceWithStalledCancel.getAvailableDbLookupPermits(), "DB permit must remain held while lookup/cancel workers are still stalled in cancel/close")
+        assertEquals(1, serviceWithStalledCancel.getActiveDbLookupWorkers(), "Lookup worker is still blocked in executeQuery/close")
+        assertEquals(1, serviceWithStalledCancel.getActiveDbCancelWorkers(), "Cancel worker is still blocked in cancel/abort/close")
+
+        // Release the stalled cancel/close latch -> workers terminate and release the DB permit back to 3
+        releaseCancelAndCloseLatch.countDown()
+        for (attempt in 1..40) {
+            if (serviceWithStalledCancel.getAvailableDbLookupPermits() == 3 &&
+                serviceWithStalledCancel.getActiveDbLookupWorkers() == 0 &&
+                serviceWithStalledCancel.getActiveDbCancelWorkers() == 0
+            ) {
+                break
+            }
+            delay(15L)
+        }
+        assertEquals(0, serviceWithStalledCancel.getActiveDbLookupWorkers(), "Lookup worker must terminate once close() unblocks")
+        assertEquals(0, serviceWithStalledCancel.getActiveDbCancelWorkers(), "Cancel worker must terminate once cancel()/close() unblocks")
+        assertEquals(3, serviceWithStalledCancel.getAvailableDbLookupPermits(), "DB permit must be released once both worker and cancel task terminate")
+
+        // Part 3: Fail-closed when JDBC driver does not support bounded setNetworkTimeout or setQueryTimeout
+        val executeQueryCalledOnUnboundedDriver = AtomicInteger(0)
+        val unboundedDriverDataSource = mockk<javax.sql.DataSource>(relaxed = true)
+        val unboundedConnection = mockk<java.sql.Connection>(relaxed = true)
+        val unboundedMetaData = mockk<java.sql.DatabaseMetaData>(relaxed = true)
+        val unboundedStatement = mockk<java.sql.PreparedStatement>(relaxed = true)
+
+        every { unboundedDriverDataSource.connection } returns unboundedConnection
+        every { unboundedConnection.metaData } returns unboundedMetaData
+        every { unboundedMetaData.url } returns "jdbc:postgresql://127.0.0.1:5432/summonersearcher"
+        every { unboundedConnection.setNetworkTimeout(any(), any()) } throws java.sql.SQLFeatureNotSupportedException("setNetworkTimeout unsupported")
+        every { unboundedConnection.prepareStatement(any()) } returns unboundedStatement
+        every { unboundedStatement.executeQuery() } answers {
+            executeQueryCalledOnUnboundedDriver.incrementAndGet()
+            throw AssertionError("executeQuery must never be called when JDBC driver fails bounded timeout check")
+        }
+
+        val serviceWithUnboundedDriver = ChallengerLeagueService(
+            redisCacheService = redisCacheService,
+            riotApiService = riotApiService,
+            dataSource = unboundedDriverDataSource,
+            timeProvider = clock,
+            memoryStatsProvider = memoryProvider,
+            refreshDeadlineMs = 600L,
+            dbLookupTimeoutMs = 150L
+        )
+        val unboundedDriverResult = serviceWithUnboundedDriver.getOrRefreshChallengerLeague("na1", "RANKED_SOLO_5x5")
+        assertNotNull(unboundedDriverResult)
+        assertEquals(1, unboundedDriverResult!!.entries.size)
+        assertEquals(0, executeQueryCalledOnUnboundedDriver.get(), "Must fail closed and skip executeQuery when driver cannot be safely bounded")
+        assertEquals(3, serviceWithUnboundedDriver.getAvailableDbLookupPermits(), "Permit must be released immediately after fail-closed driver check")
     }
 
     @Test

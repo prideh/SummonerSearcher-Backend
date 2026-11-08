@@ -77,8 +77,11 @@ class ChallengerLeagueService @Autowired constructor(
     private val lastIdentityCoverageByRegion = ConcurrentHashMap<String, IdentityCoverageStats>()
     private val refreshScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val activeDbLookupWorkers = AtomicInteger(0)
+    private val activeDbCancelWorkers = AtomicInteger(0)
     private val dbLookupPermits = Semaphore(MAX_CONCURRENT_DB_LOOKUPS)
     private val dbLookupThreadCounter = AtomicInteger(0)
+    private val dbCancelThreadCounter = AtomicInteger(0)
+    private val dbAbortThreadCounter = AtomicInteger(0)
     private val dbLookupExecutor = java.util.concurrent.ThreadPoolExecutor(
         MAX_CONCURRENT_DB_LOOKUPS,
         MAX_CONCURRENT_DB_LOOKUPS,
@@ -94,10 +97,35 @@ class ChallengerLeagueService @Autowired constructor(
     ).apply {
         allowCoreThreadTimeOut(true)
     }
-    private val dbAbortExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
-        Thread(runnable, "challenger-db-abort").apply {
-            isDaemon = true
-        }
+    private val dbCancelExecutor = java.util.concurrent.ThreadPoolExecutor(
+        MAX_CONCURRENT_DB_LOOKUPS,
+        MAX_CONCURRENT_DB_LOOKUPS,
+        30L,
+        java.util.concurrent.TimeUnit.SECONDS,
+        java.util.concurrent.SynchronousQueue(),
+        java.util.concurrent.ThreadFactory { runnable ->
+            Thread(runnable, "challenger-db-cancel-${dbCancelThreadCounter.incrementAndGet()}").apply {
+                isDaemon = true
+            }
+        },
+        java.util.concurrent.ThreadPoolExecutor.AbortPolicy()
+    ).apply {
+        allowCoreThreadTimeOut(true)
+    }
+    private val dbAbortExecutor = java.util.concurrent.ThreadPoolExecutor(
+        MAX_CONCURRENT_DB_LOOKUPS,
+        MAX_CONCURRENT_DB_LOOKUPS,
+        30L,
+        java.util.concurrent.TimeUnit.SECONDS,
+        java.util.concurrent.ArrayBlockingQueue(MAX_CONCURRENT_DB_LOOKUPS),
+        java.util.concurrent.ThreadFactory { runnable ->
+            Thread(runnable, "challenger-db-abort-${dbAbortThreadCounter.incrementAndGet()}").apply {
+                isDaemon = true
+            }
+        },
+        java.util.concurrent.ThreadPoolExecutor.DiscardPolicy()
+    ).apply {
+        allowCoreThreadTimeOut(true)
     }
 
     internal data class BoundedLeaderboardSnapshot(
@@ -154,6 +182,10 @@ class ChallengerLeagueService @Autowired constructor(
     internal fun getInFlightRefreshCount(): Int = inFlightRefreshes.size
 
     internal fun getActiveDbLookupWorkers(): Int = activeDbLookupWorkers.get()
+
+    internal fun getActiveDbCancelWorkers(): Int = activeDbCancelWorkers.get()
+
+    internal fun getAvailableDbLookupPermits(): Int = dbLookupPermits.availablePermits()
 
     internal fun getLastIdentityCoverage(region: String): IdentityCoverageStats? =
         lastIdentityCoverageByRegion[normalizeRegion(region)]
@@ -462,7 +494,7 @@ class ChallengerLeagueService @Autowired constructor(
                 maxRetries = 0,
                 deadlineAtMs = deadlineAtMs,
                 maxResponseBytes = maxResponseBytes,
-                maxEntries = maxEntriesPerRegion.coerceIn(1, MAX_LEADERBOARD_ENTRIES),
+                maxEntries = MAX_LEADERBOARD_ENTRIES,
                 headroomGuard = ::hasMemoryHeadroomForLeaderboardRefresh,
                 httpAttemptCounter = httpAttempts,
                 failureReasonHolder = failureReasonHolder
@@ -530,8 +562,8 @@ class ChallengerLeagueService @Autowired constructor(
     /**
      * Enriches [rawLeague] entries with `(gameName, tagLine)` using ONLY:
      * 1. Local DB `indexed_players` rows via a single batched JDBC `PreparedStatement` (`<= 300` PUUIDs) bounded by
-     *    `setQueryTimeout`, `setNetworkTimeout`, and active `Statement.cancel()` / `Connection.abort()` (or omitted if
-     *    no bounded JDBC [DataSource] is available), and
+     *    `setQueryTimeout`, `setNetworkTimeout`, and off-thread `Statement.cancel()` / `Connection.abort()` on
+     *    [dbCancelExecutor] (or omitted / failed closed if no bounded JDBC [DataSource] is available), and
      * 2. Previously cached / last-known-good leaderboard entries for the region.
      * Makes ZERO Riot Account-V1 API calls and records [IdentityCoverageStats] for observability.
      */
@@ -542,12 +574,11 @@ class ChallengerLeagueService @Autowired constructor(
         onlyMissingDbIdentities: Boolean = false,
         deadlineAtMs: Long? = null
     ): LeagueListDTO {
-        val safeMaxEntries = maxEntriesPerRegion.coerceIn(1, MAX_LEADERBOARD_ENTRIES)
         val sortedBoundedEntries = rawLeague.entries
             .asSequence()
             .filter { !it.puuid.isNullOrBlank() }
             .sortedByDescending { it.leaguePoints ?: Int.MIN_VALUE }
-            .take(safeMaxEntries)
+            .take(MAX_LEADERBOARD_ENTRIES)
             .toList()
 
         val previousIdentityByPuuid = HashMap<String, Pair<String, String>>()
@@ -673,20 +704,61 @@ class ChallengerLeagueService @Autowired constructor(
 
         val taskClaimedOrCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
         val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val cancelScheduled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val permitHolders = AtomicInteger(1)
+        val permitReleased = java.util.concurrent.atomic.AtomicBoolean(false)
         val activeConnectionRef = AtomicReference<Connection?>(null)
         val activeStatementRef = AtomicReference<PreparedStatement?>(null)
         val workerThreadRef = AtomicReference<Thread?>(null)
         val workerDoneLatch = java.util.concurrent.CountDownLatch(1)
 
+        fun releasePermitParticipant() {
+            if (permitHolders.decrementAndGet() <= 0 && permitReleased.compareAndSet(false, true)) {
+                dbLookupPermits.release()
+            }
+        }
+
+        fun scheduleBoundedJdbcCancel() {
+            val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            workerThreadRef.get()?.interrupt()
+            if (cancelledBeforeStart) {
+                if (permitReleased.compareAndSet(false, true)) {
+                    dbLookupPermits.release()
+                }
+                return
+            }
+            if (cancelScheduled.compareAndSet(false, true)) {
+                permitHolders.incrementAndGet()
+                try {
+                    dbCancelExecutor.execute {
+                        activeDbCancelWorkers.incrementAndGet()
+                        try {
+                            runCatching { activeStatementRef.get()?.cancel() }
+                            runCatching { activeConnectionRef.get()?.abort(dbAbortExecutor) }
+                            runCatching { activeConnectionRef.get()?.close() }
+                            workerThreadRef.get()?.interrupt()
+                        } finally {
+                            activeDbCancelWorkers.decrementAndGet()
+                            releasePermitParticipant()
+                        }
+                    }
+                } catch (rejected: java.util.concurrent.RejectedExecutionException) {
+                    releasePermitParticipant()
+                }
+            }
+        }
+
         val future = try {
             dbLookupExecutor.submit(java.util.concurrent.Callable<Map<String, Pair<String, String>>> {
                 if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
-                    dbLookupPermits.release()
                     workerDoneLatch.countDown()
+                    releasePermitParticipant()
                     return@Callable emptyMap()
                 }
                 activeDbLookupWorkers.incrementAndGet()
                 workerThreadRef.set(Thread.currentThread())
+                var conn: Connection? = null
+                var stmt: PreparedStatement? = null
                 try {
                     if (cancelled.get() || Thread.currentThread().isInterrupted) {
                         return@Callable emptyMap()
@@ -696,51 +768,86 @@ class ChallengerLeagueService @Autowired constructor(
                     val sql = "SELECT puuid, game_name, tag_line FROM indexed_players WHERE puuid IN ($placeholders)"
                     val resolved = HashMap<String, Pair<String, String>>()
 
-                    ds.connection.use { conn ->
-                        activeConnectionRef.set(conn)
-                        if (cancelled.get() || Thread.currentThread().isInterrupted) {
-                            return@Callable emptyMap()
+                    runCatching {
+                        if (ds.loginTimeout <= 0) {
+                            ds.loginTimeout = queryTimeoutSeconds
                         }
-                        runCatching { conn.isReadOnly = true }
-                        runCatching { conn.setNetworkTimeout(dbAbortExecutor, effectiveTimeoutMs.toInt().coerceAtLeast(1)) }
-                        conn.prepareStatement(sql).use { stmt ->
-                            activeStatementRef.set(stmt)
-                            stmt.maxRows = candidatePuuids.size.coerceAtMost(MAX_LEADERBOARD_ENTRIES)
-                            stmt.queryTimeout = queryTimeoutSeconds
-                            for (i in candidatePuuids.indices) {
-                                stmt.setString(i + 1, candidatePuuids[i])
-                            }
+                    }
+                    conn = ds.connection
+                    activeConnectionRef.set(conn)
+                    if (cancelled.get() || Thread.currentThread().isInterrupted) {
+                        return@Callable emptyMap()
+                    }
+                    runCatching { conn.isReadOnly = true }
+
+                    val jdbcUrl = runCatching { conn.metaData?.url?.lowercase().orEmpty() }.getOrDefault("")
+                    val isEmbeddedInMemoryH2 = jdbcUrl.startsWith("jdbc:h2:mem:")
+                    val networkTimeoutSupported = runCatching {
+                        conn.setNetworkTimeout(dbAbortExecutor, effectiveTimeoutMs.toInt().coerceAtLeast(1))
+                        true
+                    }.getOrElse { false }
+                    if (!networkTimeoutSupported && !isEmbeddedInMemoryH2) {
+                        logger.warn(
+                            "[ChallengerLeaderboard] JDBC Connection for {} does not support bounded setNetworkTimeout; failing closed and skipping optional DB lookup.",
+                            normalizedRegion
+                        )
+                        return@Callable emptyMap()
+                    }
+
+                    stmt = conn.prepareStatement(sql)
+                    activeStatementRef.set(stmt)
+                    val queryTimeoutSupported = runCatching {
+                        stmt.maxRows = candidatePuuids.size.coerceAtMost(MAX_LEADERBOARD_ENTRIES)
+                        stmt.queryTimeout = queryTimeoutSeconds
+                        stmt.queryTimeout == queryTimeoutSeconds
+                    }.getOrElse { false }
+                    if (!queryTimeoutSupported) {
+                        logger.warn(
+                            "[ChallengerLeaderboard] JDBC PreparedStatement for {} does not support bounded setQueryTimeout; failing closed and skipping optional DB lookup.",
+                            normalizedRegion
+                        )
+                        return@Callable emptyMap()
+                    }
+
+                    for (i in candidatePuuids.indices) {
+                        stmt.setString(i + 1, candidatePuuids[i])
+                    }
+                    if (cancelled.get() || Thread.currentThread().isInterrupted) {
+                        return@Callable emptyMap()
+                    }
+                    stmt.executeQuery().use { rs ->
+                        while (rs.next()) {
                             if (cancelled.get() || Thread.currentThread().isInterrupted) {
-                                return@Callable emptyMap()
+                                break
                             }
-                            stmt.executeQuery().use { rs ->
-                                while (rs.next()) {
-                                    if (cancelled.get() || Thread.currentThread().isInterrupted) {
-                                        break
-                                    }
-                                    val p = rs.getString(1)?.trim().orEmpty()
-                                    val gn = rs.getString(2)?.trim().orEmpty()
-                                    val tl = rs.getString(3)?.trim().orEmpty()
-                                    if (p.isNotBlank() && gn.isNotBlank() && tl.isNotBlank()) {
-                                        resolved[p] = gn to tl
-                                    }
-                                }
+                            val p = rs.getString(1)?.trim().orEmpty()
+                            val gn = rs.getString(2)?.trim().orEmpty()
+                            val tl = rs.getString(3)?.trim().orEmpty()
+                            if (p.isNotBlank() && gn.isNotBlank() && tl.isNotBlank()) {
+                                resolved[p] = gn to tl
                             }
                         }
                     }
                     resolved
                 } finally {
+                    if (cancelled.get()) {
+                        runCatching { conn?.abort(dbAbortExecutor) }
+                    }
+                    runCatching { stmt?.close() }
+                    runCatching { conn?.close() }
                     activeStatementRef.set(null)
                     activeConnectionRef.set(null)
                     workerThreadRef.set(null)
                     activeDbLookupWorkers.decrementAndGet()
-                    dbLookupPermits.release()
                     Thread.interrupted()
                     workerDoneLatch.countDown()
+                    releasePermitParticipant()
                 }
             })
         } catch (e: java.util.concurrent.RejectedExecutionException) {
-            dbLookupPermits.release()
+            if (permitReleased.compareAndSet(false, true)) {
+                dbLookupPermits.release()
+            }
             logger.warn("[ChallengerLeaderboard] DB lookup executor saturated for {}; continuing without DB enrichment.", normalizedRegion)
             return emptyMap()
         }
@@ -748,42 +855,24 @@ class ChallengerLeagueService @Autowired constructor(
         return try {
             val rows = future.get(effectiveTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
             if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
-                workerDoneLatch.await(250L, java.util.concurrent.TimeUnit.MILLISECONDS)
+                workerDoneLatch.await(30L, java.util.concurrent.TimeUnit.MILLISECONDS)
             }
             rows
         } catch (e: java.util.concurrent.TimeoutException) {
             cancelled.set(true)
-            val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
-            if (cancelledBeforeStart) {
-                dbLookupPermits.release()
-            }
-            runCatching { activeStatementRef.get()?.cancel() }
-            runCatching { activeConnectionRef.get()?.abort(dbAbortExecutor) }
-            runCatching { activeConnectionRef.get()?.close() }
-            workerThreadRef.get()?.interrupt()
             future.cancel(true)
-            if (!cancelledBeforeStart) {
-                workerDoneLatch.await(250L, java.util.concurrent.TimeUnit.MILLISECONDS)
-            }
+            scheduleBoundedJdbcCancel()
+            workerDoneLatch.await(30L, java.util.concurrent.TimeUnit.MILLISECONDS)
             logger.warn(
-                "[ChallengerLeaderboard] Local DB identity lookup timed out after {}ms for {} (JDBC Statement.cancel invoked); continuing with snapshot identities.",
+                "[ChallengerLeaderboard] Local DB identity lookup timed out after {}ms for {} (off-thread JDBC cancel scheduled); continuing with snapshot identities.",
                 effectiveTimeoutMs, normalizedRegion
             )
             emptyMap()
         } catch (e: Exception) {
             cancelled.set(true)
-            val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
-            if (cancelledBeforeStart) {
-                dbLookupPermits.release()
-            }
-            runCatching { activeStatementRef.get()?.cancel() }
-            runCatching { activeConnectionRef.get()?.abort(dbAbortExecutor) }
-            runCatching { activeConnectionRef.get()?.close() }
-            workerThreadRef.get()?.interrupt()
             future.cancel(true)
-            if (!cancelledBeforeStart) {
-                workerDoneLatch.await(250L, java.util.concurrent.TimeUnit.MILLISECONDS)
-            }
+            scheduleBoundedJdbcCancel()
+            workerDoneLatch.await(30L, java.util.concurrent.TimeUnit.MILLISECONDS)
             logger.warn("[ChallengerLeaderboard] Local DB identity lookup failed for {}: {}", normalizedRegion, e.message)
             emptyMap()
         }
@@ -795,8 +884,8 @@ class ChallengerLeagueService @Autowired constructor(
      * 2. Entry count cap (`<= maxEntriesPerRegion`, max 300),
      * 3. Per-region serialized UTF-8 byte cap (`<= maxLastKnownGoodRegionBytes`), and
      * 4. Total 3-region serialized UTF-8 byte cap (`<= maxLastKnownGoodTotalBytes`).
-     * Retains ONLY a complete snapshot that fits within the byte caps; rejects an oversized whole
-     * without storing partial rank lists (so an absent/rejected snapshot yields HTTP 503 on upstream failure).
+     * Retains ONLY a complete snapshot that fits within both the entry count cap and byte caps;
+     * rejects an oversized whole without storing partial rank lists (so an absent/rejected snapshot yields HTTP 503 on upstream failure).
      */
     private fun storeLastKnownGoodBounded(
         normalizedRegion: String,
@@ -806,6 +895,21 @@ class ChallengerLeagueService @Autowired constructor(
     ): BoundedLeaderboardSnapshot? {
         if (normalizedRegion !in SUPPORTED_REGIONS) return null
         synchronized(lastKnownGoodLock) {
+            val safeEntryCap = maxEntriesPerRegion.coerceIn(1, MAX_LEADERBOARD_ENTRIES)
+            val allEntries = leaderboard.entries
+            if (allEntries.isEmpty()) {
+                lastKnownGoodByRegion.remove(normalizedRegion)
+                return null
+            }
+            if (allEntries.size > safeEntryCap) {
+                logger.warn(
+                    "[ChallengerLeaderboard] Rejecting oversized last-known-good snapshot for {} (entries={} > maxEntriesPerRegion={}); no partial rank fallback stored.",
+                    normalizedRegion, allEntries.size, safeEntryCap
+                )
+                lastKnownGoodByRegion.remove(normalizedRegion)
+                return null
+            }
+
             val safeRegionByteCap = maxLastKnownGoodRegionBytes.coerceIn(1_024, MAX_LAST_KNOWN_GOOD_REGION_BYTES)
             val safeTotalByteCap = maxLastKnownGoodTotalBytes.coerceIn(safeRegionByteCap, MAX_LAST_KNOWN_GOOD_TOTAL_BYTES)
             val otherRegionsBytes = lastKnownGoodByRegion.entries
@@ -818,15 +922,9 @@ class ChallengerLeagueService @Autowired constructor(
                 return null
             }
 
-            val fullBoundedEntries = leaderboard.entries.take(maxEntriesPerRegion.coerceIn(1, MAX_LEADERBOARD_ENTRIES))
-            if (fullBoundedEntries.isEmpty()) {
-                lastKnownGoodByRegion.remove(normalizedRegion)
-                return null
-            }
-
             val candidateDto = CachedLeaderboardDto(
                 lastRefreshed = lastRefreshed,
-                leaderboard = leaderboard.copy(entries = fullBoundedEntries)
+                leaderboard = leaderboard
             )
             val serializedBytes = objectMapper.writeValueAsString(candidateDto)
                 .toByteArray(StandardCharsets.UTF_8)
@@ -844,7 +942,7 @@ class ChallengerLeagueService @Autowired constructor(
 
             logger.warn(
                 "[ChallengerLeaderboard] Rejecting oversized last-known-good snapshot for {} (serializedBytes={} > effectiveByteBudget={}, entries={}); no partial rank fallback stored.",
-                normalizedRegion, serializedBytes, effectiveByteBudget, fullBoundedEntries.size
+                normalizedRegion, serializedBytes, effectiveByteBudget, allEntries.size
             )
             lastKnownGoodByRegion.remove(normalizedRegion)
             return null
