@@ -1060,6 +1060,192 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 streamResult.shouldContain("${AiAnalysisService.MAX_USER_MESSAGE_BYTES} bytes")
             }
         }
+
+        When("building a prompt for Spear Shot cached profile where rankedRecord (1020W 884L = 1904G, 53.6%), savedHistory (462W 421L = 883G, 52.3%), and recentMatchSample (11W 9L = 20G, 55.0%) have different denominators (#34)") {
+            Then("it renders each sample with its own explicit scope and denominator, rejects unscoped scalar conflation on both new and legacy payloads, handles absent/mismatched/zero samples, and preserves atomic sample labels under budget truncation") {
+                val buildGroundTruthMethod = AiAnalysisService::class.java.getDeclaredMethod(
+                    "buildGroundTruthSection",
+                    Map::class.java,
+                    String::class.java,
+                    String::class.java,
+                    Int::class.javaPrimitiveType
+                ).apply { isAccessible = true }
+
+                val buildConfigMethod = AiAnalysisService::class.java.getDeclaredMethod(
+                    "buildGenerationConfig",
+                    Double::class.javaPrimitiveType
+                ).apply { isAccessible = true }
+
+                val spearShotMatches = (0 until 20).map { idx ->
+                    mapOf(
+                        "matchId" to "EUW1_${8000 + idx}",
+                        "patch" to "26.1",
+                        "role" to "TOP",
+                        "side" to if (idx % 2 == 0) "Blue" else "Red",
+                        "champion" to "Pantheon",
+                        "win" to (idx < 11),
+                        "kda" to "6/4/7 (3.25)",
+                        "csPerMin" to 7.1
+                    )
+                }
+
+                val spearShotScopedContext = mapOf<String, Any>(
+                    "summonerName" to "Spear Shot#EUW",
+                    "rank" to "CHALLENGER I (1120 LP)",
+                    "rankedRecord" to mapOf(
+                        "wins" to 1020,
+                        "losses" to 884,
+                        "games" to 1904,
+                        "winRate" to "53.6"
+                    ),
+                    "savedHistory" to mapOf(
+                        "wins" to 462,
+                        "losses" to 421,
+                        "games" to 883,
+                        "winRate" to "52.3"
+                    ),
+                    "recentMatchSample" to mapOf(
+                        "games" to 20,
+                        "wins" to 11,
+                        "losses" to 9,
+                        "winRate" to "55.0"
+                    ),
+                    "primaryRole" to "TOP",
+                    "totalGamesAnalyzed" to 20,
+                    "timelineStatus" to "NOT_ANALYZED",
+                    "kda" to "2.21",
+                    "avgKills" to "5.7",
+                    "avgDeaths" to "4.9",
+                    "avgAssists" to "5.2",
+                    "avgCsPerMin" to "7.1",
+                    "avgKillParticipation" to "54.0",
+                    "avgSoloKills" to "1.2",
+                    "avgTurretPlates" to "2.1",
+                    "avgVisionScore" to "21.0",
+                    "blueSide" to mapOf("games" to 440, "wins" to 240, "losses" to 200, "winRate" to "54.5"),
+                    "redSide" to mapOf("games" to 443, "wins" to 222, "losses" to 221, "winRate" to "50.1"),
+                    "topChampions" to listOf(
+                        mapOf("name" to "Pantheon", "games" to 790, "wins" to 418, "losses" to 372, "winRate" to "53", "kda" to "2.21")
+                    ),
+                    "opponentStats" to mapOf("avgKda" to "2.10", "avgCsPerMin" to "6.9"),
+                    "recentMatches" to spearShotMatches
+                )
+
+                val prompt = constructPromptMethod.invoke(
+                    service,
+                    spearShotScopedContext,
+                    emptyList<Map<String, String>>(),
+                    "What is my overall win rate and how am I performing?",
+                    null,
+                    null
+                ) as String
+
+                // 1. Explicit scoped sample records with distinct denominators
+                prompt shouldContain "rankedRecord (Solo/Duo Queue Counter): 1020W 884L across 1904 games (53.6% WR)"
+                prompt shouldContain "savedHistory (Saved Match History): 462W 421L across 883 games (52.3% WR)"
+                prompt shouldContain "recentMatchSample (Detailed Match List): 11W 9L across 20 games (55.0% WR)"
+                prompt shouldContain "savedHistoryAverages [sample: savedHistory (883g)]: kda=2.21"
+                prompt shouldContain "savedHistorySideSplits [sample: savedHistory (883g)]: blueSide=240W 200L (440g, 54.5% WR), redSide=222W 221L (443g, 50.1% WR)"
+                prompt shouldContain "topChampions: Pantheon (790g, 53% WR, 2.21 KDA, 418W 372L) [sample: savedHistory (883g)]"
+                prompt shouldContain "opponentStats: {avgKda=2.10, avgCsPerMin=6.9} [sample: savedHistory (883g)]"
+                prompt shouldContain "Strict Sample Scope & Denominator Separation (`rankedRecord` vs. `savedHistory` vs. `recentMatchSample`)"
+
+                // 2. Never emit unscoped scalar lines or pair 52.3% with 1904 games on the same line
+                prompt shouldNotContain "\n  totalWins:"
+                prompt shouldNotContain "\n  totalLosses:"
+                prompt shouldNotContain "\n  totalGamesAnalyzed:"
+                prompt shouldNotContain "\n  winRate:"
+                prompt shouldNotContain "\n  blueSideWinRate:"
+                prompt shouldNotContain "\n  redSideWinRate:"
+                prompt.lines().any { line ->
+                    line.contains("52.3") && (line.contains("1904") || line.contains("1,904"))
+                } shouldBe false
+
+                // 3. Legacy unscoped Spear Shot payload (totalWins=1020, totalLosses=884, winRate="52.3", totalGamesAnalyzed=20)
+                // must compute 53.6% for rankedRecord (1020/1904) and mark savedHistory as unavailable (never pairing 52.3% with 1904)
+                val legacyUnscopedSpearShot = mapOf<String, Any>(
+                    "summonerName" to "Spear Shot#EUW",
+                    "rank" to "CHALLENGER I (1120 LP)",
+                    "totalWins" to 1020,
+                    "totalLosses" to 884,
+                    "winRate" to "52.3",
+                    "totalGamesAnalyzed" to 20,
+                    "timelineStatus" to "NOT_ANALYZED",
+                    "recentMatches" to spearShotMatches
+                )
+                val legacyPrompt = constructPromptMethod.invoke(
+                    service,
+                    legacyUnscopedSpearShot,
+                    emptyList<Map<String, String>>(),
+                    "What is my overall win rate?",
+                    null,
+                    null
+                ) as String
+                legacyPrompt shouldContain "rankedRecord (Solo/Duo Queue Counter): 1020W 884L across 1904 games (53.6% WR)"
+                legacyPrompt shouldContain "savedHistory (Saved Match History): unavailable (missing W/L counter; do NOT use rankedRecord)"
+                legacyPrompt shouldContain "recentMatchSample (Detailed Match List): 11W 9L across 20 games (55.0% WR)"
+                legacyPrompt shouldNotContain "52.3"
+
+                // 4. Absent, zero-game, or counter-mismatched sample handling (never derives savedHistory denominator from rankedRecord or recentMatches)
+                val mismatchedAndAbsentContext = mapOf<String, Any?>(
+                    "summonerName" to "EdgeCase#EUW",
+                    "rank" to "Unranked",
+                    "rankedRecord" to mapOf("wins" to 0, "losses" to 0, "games" to 0, "winRate" to "0.0"),
+                    "savedHistory" to mapOf("wins" to 462, "losses" to 421, "games" to 1904, "winRate" to "52.3"),
+                    "recentMatchSample" to mapOf("games" to 0, "wins" to 0, "losses" to 0, "winRate" to null),
+                    "kda" to "3.50",
+                    "topChampions" to listOf(mapOf("name" to "Pantheon", "games" to 10, "winRate" to "60", "kda" to "3.50"))
+                )
+                val edgePrompt = constructPromptMethod.invoke(
+                    service,
+                    mismatchedAndAbsentContext,
+                    emptyList<Map<String, String>>(),
+                    "Check my stats",
+                    null,
+                    null
+                ) as String
+                edgePrompt shouldContain "rankedRecord (Solo/Duo Queue Counter): unavailable (unranked or no valid ranked W/L counter)"
+                edgePrompt shouldContain "savedHistory (Saved Match History): unavailable (missing W/L counter; do NOT use rankedRecord)"
+                edgePrompt shouldContain "recentMatchSample (Detailed Match List): unavailable (0 detailed matches loaded)"
+                edgePrompt shouldNotContain "savedHistoryAverages ["
+                edgePrompt shouldNotContain "topChampions: Pantheon"
+
+                // 5. Truncation safety: at minimum cascade budget (256B) and tighter (160B), no line ever has an orphaned WR without its sample label and denominator
+                val gtAt256 = buildGroundTruthMethod.invoke(
+                    service,
+                    spearShotScopedContext,
+                    "What is my overall win rate?",
+                    "general",
+                    256
+                ) as String
+                (AiAnalysisService.utf8ByteSize(gtAt256) <= 256) shouldBe true
+                gtAt256 shouldContain "rankedRecord (Solo/Duo Queue Counter): 1020W 884L across 1904 games (53.6% WR)"
+                gtAt256 shouldContain "savedHistory (Saved Match History): 462W 421L across 883 games (52.3% WR)"
+                gtAt256 shouldContain "recentMatchSample (Detailed Match List): 11W 9L across 20 games (55.0% WR)"
+
+                val gtAt160 = buildGroundTruthMethod.invoke(
+                    service,
+                    spearShotScopedContext,
+                    "What is my overall win rate?",
+                    "general",
+                    160
+                ) as String
+                (AiAnalysisService.utf8ByteSize(gtAt160) <= 160) shouldBe true
+                gtAt160.lines().forEach { line ->
+                    if (line.contains("% WR")) {
+                        (line.contains("rankedRecord") || line.contains("savedHistory") || line.contains("recentMatchSample")) shouldBe true
+                        line shouldContain "games"
+                    }
+                }
+
+                // 6. Verify MAX_PROMPT_BYTES = 16_000 and maxOutputTokens = 4096 remain unchanged
+                AiAnalysisService.MAX_PROMPT_BYTES shouldBe 16_000
+                @Suppress("UNCHECKED_CAST")
+                val genConfig = buildConfigMethod.invoke(service, 0.7) as Map<String, Any>
+                genConfig["maxOutputTokens"] shouldBe 4096
+            }
+        }
     }
 })
+
 

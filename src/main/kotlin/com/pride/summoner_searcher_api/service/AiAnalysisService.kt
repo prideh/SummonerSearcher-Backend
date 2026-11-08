@@ -316,7 +316,8 @@ class AiAnalysisService(
         // 🎯 DYNAMIC OPTIMIZATIONS
         val playerRank = (context["rank"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: "Unranked").take(64)
         val rankOptimization = buildRankOptimization(playerRank)
-        val sampleSizeWarning = getSampleSizeWarning((context["totalGamesAnalyzed"] as? Number)?.toInt() ?: 0)
+        val recentSampleGameCount = resolveRecentSampleGameCount(context)
+        val sampleSizeWarning = getSampleSizeWarning(recentSampleGameCount)
         val streakToneAdjustment = getStreakToneAdjustment(context)
         val playerName = (context["summonerName"]?.toString() ?: "the player").take(64)
         val timelineStatus = (context["timelineStatus"]?.toString()?.trim()?.takeIf { it.isNotBlank() }
@@ -329,7 +330,7 @@ class AiAnalysisService(
             questionCategory = questionCategory,
             byteBudget = MAX_GROUND_TRUTH_BYTES
         )
-        val gameCount = (context["totalGamesAnalyzed"] as? Number)?.toInt() ?: 0
+        val gameCount = recentSampleGameCount
         val lowDataBlock = if (gameCount < 5) """
             **🚨 LIMITED DATA NOTE:**
             Only $gameCount games are available. Keep your strategic advice focused on what happened in these specific games, and avoid claiming long-term trends or habits yet.
@@ -378,6 +379,7 @@ class AiAnalysisService(
             
             **DATA-DRIVEN COACHING & DATA-BOUNDARY RULES:**
             - For player-specific claims (win rates, KDA, CS/min, match history, or matchups played), rely strictly on the provided GROUND TRUTH STATS and recentMatchSummary. Do not invent game events, player stats, or match results that are not listed in the data.
+            - **Strict Sample Scope & Denominator Separation (`rankedRecord` vs. `savedHistory` vs. `recentMatchSample`):** Ground-truth stats come from three distinct samples with different game counts: (1) `rankedRecord` (Solo/Duo Queue Riot League counter: ranked wins, losses, total games, and ranked win rate), (2) `savedHistory` (saved match-history aggregate: saved-history wins, losses, total games, saved-history win rate, plus `savedHistoryAverages`, `savedHistorySideSplits`, `topChampions`, and `opponentStats`), and (3) `recentMatchSample` (detailed recent matches loaded in context: `recentMatchSummary`, per-match `Game 1..N` rows, `championMatchups`, `topStrengths`, and `topWeaknesses`). NEVER combine a win rate from one sample with a game count from another sample (e.g., NEVER pair `savedHistory` win rate with `rankedRecord` total games or `recentMatchSample` games). Always cite the exact sample name and denominator alongside any win rate or record, and treat `unavailable` samples as unavailable without substituting another sample's denominator.
             - For general League of Legends domain questions (such as item descriptions, build paths, rune interactions, ability mechanics, or macro concepts), answer directly using functional League of Legends concepts connected to the player's champions or stats when relevant, without asserting stale patch numbers or unsupported item-effect specifics.
             - If the user asks for specific player data that is missing from the stats block, state clearly what data is unavailable.
             - **Timeline Status (`timelineStatus` = $timelineStatus):** When `timelineStatus` is `NOT_ANALYZED`, state clearly that only end-of-game summary and challenge stats are available; never make claims about exact item completion minutes, early gold/XP diffs at 10/15 minutes, or death locations.
@@ -739,6 +741,77 @@ class AiAnalysisService(
         }
     }
     
+    private data class ValidatedWinLossSample(
+        val wins: Int,
+        val losses: Int,
+        val games: Int,
+        val winRatePct: String
+    )
+
+    private fun parseValidatedWinLossSample(raw: Any?): ValidatedWinLossSample? {
+        val map = raw as? Map<*, *> ?: return null
+        val winsNum = map["wins"]?.toString()?.toDoubleOrNull() ?: return null
+        val lossesNum = map["losses"]?.toString()?.toDoubleOrNull() ?: return null
+        if (!winsNum.isFinite() || !lossesNum.isFinite() || winsNum < 0.0 || lossesNum < 0.0) return null
+        val wins = kotlin.math.round(winsNum).toInt()
+        val losses = kotlin.math.round(lossesNum).toInt()
+        val computedGames = wins + losses
+        if (computedGames <= 0) return null
+
+        val explicitGamesRaw = map["games"] ?: map["totalMatches"] ?: map["total"]
+        if (explicitGamesRaw != null) {
+            val explicitGamesNum = explicitGamesRaw.toString()?.toDoubleOrNull() ?: return null
+            if (!explicitGamesNum.isFinite() || kotlin.math.round(explicitGamesNum).toInt() != computedGames) {
+                return null
+            }
+        }
+
+        val computedWinRate = (wins.toDouble() / computedGames.toDouble()) * 100.0
+        val explicitWinRateRaw = map["winRate"]?.toString()?.trim()?.removeSuffix("%")
+        if (!explicitWinRateRaw.isNullOrEmpty()) {
+            val explicitWinRateNum = explicitWinRateRaw.toDoubleOrNull() ?: return null
+            if (!explicitWinRateNum.isFinite() || kotlin.math.abs(explicitWinRateNum - computedWinRate) > 0.55) {
+                return null
+            }
+        }
+
+        val formattedWinRate = String.format(java.util.Locale.US, "%.1f", computedWinRate)
+        return ValidatedWinLossSample(
+            wins = wins,
+            losses = losses,
+            games = computedGames,
+            winRatePct = "$formattedWinRate%"
+        )
+    }
+
+    private fun parseLegacyRankedSample(context: Map<String, Any>): ValidatedWinLossSample? {
+        val winsNum = context["totalWins"]?.toString()?.toDoubleOrNull() ?: return null
+        val lossesNum = context["totalLosses"]?.toString()?.toDoubleOrNull() ?: return null
+        if (!winsNum.isFinite() || !lossesNum.isFinite() || winsNum < 0.0 || lossesNum < 0.0) return null
+        val wins = kotlin.math.round(winsNum).toInt()
+        val losses = kotlin.math.round(lossesNum).toInt()
+        val games = wins + losses
+        if (games <= 0) return null
+        val computedWinRate = (wins.toDouble() / games.toDouble()) * 100.0
+        val formattedWinRate = String.format(java.util.Locale.US, "%.1f", computedWinRate)
+        return ValidatedWinLossSample(
+            wins = wins,
+            losses = losses,
+            games = games,
+            winRatePct = "$formattedWinRate%"
+        )
+    }
+
+    private fun resolveRecentSampleGameCount(context: Map<String, Any>): Int {
+        val sampleGames = ((context["recentMatchSample"] as? Map<*, *>)?.get("games") as? Number)?.toInt()
+            ?: (context["recentMatchSample"] as? Map<*, *>)?.get("games")?.toString()?.toDoubleOrNull()?.toInt()
+        if (sampleGames != null && sampleGames >= 0) return sampleGames
+        val analyzed = (context["totalGamesAnalyzed"] as? Number)?.toInt()
+            ?: context["totalGamesAnalyzed"]?.toString()?.toDoubleOrNull()?.toInt()
+        if (analyzed != null && analyzed >= 0) return analyzed
+        return (context["recentMatches"] as? List<*>)?.size ?: 0
+    }
+
     /**
      * Extract real stats from context and format as a question-selected, budget-bounded ground-truth block.
      * The AI is instructed to ONLY cite numbers from this block.
@@ -752,21 +825,124 @@ class AiAnalysisService(
     ): String {
         val headerLines = mutableListOf<String>()
 
-        // Scalar stats — pull known keys explicitly so we format them cleanly
-        val scalarKeys = listOf(
-            "rank", "role", "primaryRole", "totalWins", "totalLosses", "totalGamesAnalyzed",
-            "timelineStatus", "visionDataPrecision",
-            "winRate", "kda", "avgKda", "avgCsPerMin", "avgVisionScore", "avgDamagePerMin",
-            "avgGoldPerMin", "avgKillParticipation", "avgDeathsPerGame",
-            "avgAssistsPerGame", "avgKillsPerGame", "avgKills", "avgDeaths", "avgAssists",
-            "avgSoloKills", "avgTurretPlates", "blueSideWinRate", "redSideWinRate"
-        )
-        scalarKeys.forEach { key ->
+        val hasStructuredRanked = context.containsKey("rankedRecord")
+        val hasStructuredSaved = context.containsKey("savedHistory")
+        val hasStructuredRecent = context.containsKey("recentMatchSample")
+        val hasStructuredSamples = hasStructuredRanked || hasStructuredSaved || hasStructuredRecent
+
+        val rankedSample = if (hasStructuredRanked) {
+            parseValidatedWinLossSample(context["rankedRecord"])
+        } else {
+            parseLegacyRankedSample(context)
+        }
+        val savedSample = if (hasStructuredSaved) {
+            parseValidatedWinLossSample(context["savedHistory"])
+        } else {
+            parseValidatedWinLossSample(context["overallStats"])
+        }
+        val recentSampleFromMap = parseValidatedWinLossSample(context["recentMatchSample"])
+        val recentMatches = context["recentMatches"] as? List<Map<String, Any?>>
+
+        // 1. Top-priority atomic sample scope lines (kept first so budget cascade down to 256B never drops scope labels or splits rates from denominators)
+        if (rankedSample != null) {
+            headerLines.add(
+                "  rankedRecord (Solo/Duo Queue Counter): ${rankedSample.wins}W ${rankedSample.losses}L across ${rankedSample.games} games (${rankedSample.winRatePct} WR)"
+            )
+        } else if (hasStructuredSamples || context.containsKey("totalWins") || context.containsKey("totalLosses")) {
+            headerLines.add(
+                "  rankedRecord (Solo/Duo Queue Counter): unavailable (unranked or no valid ranked W/L counter)"
+            )
+        }
+
+        if (savedSample != null) {
+            headerLines.add(
+                "  savedHistory (Saved Match History): ${savedSample.wins}W ${savedSample.losses}L across ${savedSample.games} games (${savedSample.winRatePct} WR)"
+            )
+        } else if (hasStructuredSamples || context.containsKey("winRate") || context.containsKey("overallStats")) {
+            headerLines.add(
+                "  savedHistory (Saved Match History): unavailable (missing W/L counter; do NOT use rankedRecord)"
+            )
+        }
+
+        if (recentSampleFromMap != null) {
+            headerLines.add(
+                "  recentMatchSample (Detailed Match List): ${recentSampleFromMap.wins}W ${recentSampleFromMap.losses}L across ${recentSampleFromMap.games} games (${recentSampleFromMap.winRatePct} WR)"
+            )
+        } else if (!recentMatches.isNullOrEmpty()) {
+            val capped = recentMatches.take(20)
+            val g = capped.size
+            val w = capped.count { it["win"] == true }
+            val l = g - w
+            val wr = String.format(java.util.Locale.US, "%.1f%%", w * 100.0 / g)
+            headerLines.add(
+                "  recentMatchSample (Detailed Match List): ${w}W ${l}L across $g games ($wr WR)"
+            )
+        } else {
+            val rawGames = resolveRecentSampleGameCount(context)
+            if (rawGames > 0) {
+                headerLines.add(
+                    "  recentMatchSample (Detailed Match List): $rawGames games (per-match W/L not loaded)"
+                )
+            } else if (hasStructuredSamples) {
+                headerLines.add(
+                    "  recentMatchSample (Detailed Match List): unavailable (0 detailed matches loaded)"
+                )
+            }
+        }
+
+        // 2. Profile identity & status scalars (NEVER include unscoped totalWins, totalLosses, totalGamesAnalyzed, winRate, blueSideWinRate, redSideWinRate)
+        val profileScalarKeys = listOf("rank", "role", "primaryRole", "timelineStatus", "visionDataPrecision")
+        profileScalarKeys.forEach { key ->
             context[key]?.let { headerLines.add("  $key: ${it.toString().take(160)}") }
         }
         if (context["timelineStatus"] == null && headerLines.isNotEmpty()) {
             val inferredStatus = if (context["timelineInsights"] != null) "ANALYZED" else "NOT_ANALYZED"
             headerLines.add("  timelineStatus: $inferredStatus")
+        }
+
+        // 3. Saved-history per-game averages & side splits (explicitly scoped to savedHistory; omitted if structured savedHistory is invalid/null)
+        val allowSavedHistoryDerivedMetrics = !hasStructuredSaved || savedSample != null
+        val savedScopeTag = if (savedSample != null) {
+            "sample: savedHistory (${savedSample.games}g)"
+        } else {
+            "sample: savedHistory (denominator unavailable)"
+        }
+        if (allowSavedHistoryDerivedMetrics) {
+            val avgKeys = listOf(
+                "kda", "avgKda", "avgKills", "avgDeaths", "avgAssists",
+                "avgKillsPerGame", "avgDeathsPerGame", "avgAssistsPerGame",
+                "avgCsPerMin", "avgVisionScore", "avgDamagePerMin", "avgGoldPerMin",
+                "avgKillParticipation", "avgSoloKills", "avgTurretPlates"
+            )
+            val avgPairs = avgKeys.mapNotNull { key ->
+                val v = context[key]?.toString()?.trim()?.take(32) ?: return@mapNotNull null
+                if (v.isBlank() || v == "0" || v == "0.0" || v == "0.00" || v == "0.0%") null else "$key=$v"
+            }
+            if (avgPairs.isNotEmpty()) {
+                headerLines.add("  savedHistoryAverages [$savedScopeTag]: ${avgPairs.joinToString(", ")}")
+            }
+
+            val blueSample = parseValidatedWinLossSample(context["blueSide"])
+            val redSample = parseValidatedWinLossSample(context["redSide"])
+            if (blueSample != null || redSample != null) {
+                val sideParts = listOfNotNull(
+                    blueSample?.let { "blueSide=${it.wins}W ${it.losses}L (${it.games}g, ${it.winRatePct} WR)" },
+                    redSample?.let { "redSide=${it.wins}W ${it.losses}L (${it.games}g, ${it.winRatePct} WR)" }
+                )
+                headerLines.add("  savedHistorySideSplits [$savedScopeTag]: ${sideParts.joinToString(", ")}")
+            } else if (!context.containsKey("blueSide") && !context.containsKey("redSide")) {
+                val legacyBlue = context["blueSideWinRate"]?.toString()?.trim()?.takeIf { it.isNotBlank() && it != "0.0" && it != "0.0%" }
+                val legacyRed = context["redSideWinRate"]?.toString()?.trim()?.takeIf { it.isNotBlank() && it != "0.0" && it != "0.0%" }
+                val legacySideParts = listOfNotNull(
+                    legacyBlue?.let { "blueSideWinRate=$it" },
+                    legacyRed?.let { "redSideWinRate=$it" }
+                )
+                if (legacySideParts.isNotEmpty()) {
+                    headerLines.add(
+                        "  savedHistorySideSplits [sample: savedHistory (side game counts unavailable)]: ${legacySideParts.joinToString(", ")}"
+                    )
+                }
+            }
         }
 
         // Aggregate Early Lane CS@10 summary (actual, benchmark definition, role breakdown, denominators, missingness)
@@ -798,9 +974,9 @@ class AiAnalysisService(
             headerLines.add("  missingLaneCsAt10Matches: $missingCs10")
         }
 
-        // Top champions pool (cap at 5)
+        // Top champions pool (cap at 5; scoped to savedHistory)
         val topChampions = context["topChampions"] as? List<*>
-        if (!topChampions.isNullOrEmpty()) {
+        if (allowSavedHistoryDerivedMetrics && !topChampions.isNullOrEmpty()) {
             val formattedChamps = topChampions.take(5).mapNotNull { entry ->
                 when (entry) {
                     is Map<*, *> -> {
@@ -810,30 +986,39 @@ class AiAnalysisService(
                         val kda = entry["kda"] ?: entry["avgKda"] ?: "?"
                         val cs = entry["csPerMin"] ?: entry["avgCsPerMin"]
                         val csSuffix = if (cs != null) ", $cs CS/m" else ""
-                        "$name (${games}g, ${wr}% WR, $kda KDA$csSuffix)"
+                        val wins = entry["wins"]?.toString()?.toDoubleOrNull()?.toInt()
+                        val losses = entry["losses"]?.toString()?.toDoubleOrNull()?.toInt()
+                        val wlSuffix = if (wins != null && losses != null) ", ${wins}W ${losses}L" else ""
+                        "$name (${games}g, ${wr}% WR, $kda KDA$csSuffix$wlSuffix)"
                     }
                     else -> entry?.toString()
                 }
             }
             if (formattedChamps.isNotEmpty()) {
-                headerLines.add("  topChampions: ${formattedChamps.joinToString(", ")}")
+                headerLines.add("  topChampions: ${formattedChamps.joinToString(", ")} [$savedScopeTag]")
             }
         }
 
-        // Opponent stats block (compact single line)
+        // Opponent stats block (compact single line; scoped to savedHistory)
         val opponentStats = context["opponentStats"] as? Map<String, Any>
-        if (!opponentStats.isNullOrEmpty()) {
-            val compactOppStats = opponentStats.entries.take(8).joinToString(", ") { (k, v) -> "$k=${v.toString().take(48)}" }
-            headerLines.add("  opponentStats: {$compactOppStats}")
+        if (allowSavedHistoryDerivedMetrics && !opponentStats.isNullOrEmpty()) {
+            val nonZeroOppEntries = opponentStats.entries.filter { (_, v) ->
+                val s = v.toString().trim()
+                s.isNotBlank() && s != "0" && s != "0.0" && s != "0.00" && s != "0.0%"
+            }
+            if (nonZeroOppEntries.isNotEmpty()) {
+                val compactOppStats = nonZeroOppEntries.take(8).joinToString(", ") { (k, v) -> "$k=${v.toString().take(48)}" }
+                headerLines.add("  opponentStats: {$compactOppStats} [$savedScopeTag]")
+            }
         }
 
-        // Top strengths / weaknesses (cap at 4 each)
+        // Top strengths / weaknesses (cap at 4 each; scoped to recentMatchSample)
         val strengths = context["topStrengths"] as? List<*>
         if (!strengths.isNullOrEmpty()) {
             val formatted = strengths.take(4).joinToString(", ") { item ->
                 if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString().take(48)
             }
-            headerLines.add("  topStrengths: $formatted")
+            headerLines.add("  topStrengths: $formatted [sample: recentMatchSample]")
         }
 
         val weaknesses = context["topWeaknesses"] as? List<*>
@@ -841,10 +1026,10 @@ class AiAnalysisService(
             val formatted = weaknesses.take(4).joinToString(", ") { item ->
                 if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString().take(48)
             }
-            headerLines.add("  topWeaknesses: $formatted")
+            headerLines.add("  topWeaknesses: $formatted [sample: recentMatchSample]")
         }
 
-        // Champion Matchups (prioritize any champion mentioned in userMessage, up to 5)
+        // Champion Matchups (prioritize any champion mentioned in userMessage, up to 5; scoped to recentMatchSample)
         val matchups = context["championMatchups"] as? Map<String, Map<String, Any>>
         if (!matchups.isNullOrEmpty()) {
             val lowerQ = userMessage.lowercase()
@@ -862,11 +1047,10 @@ class AiAnalysisService(
                     "vs $champ: ${wins}W ${losses}L ($winRate)"
                 }
             if (formattedMatchups.isNotEmpty()) {
-                headerLines.add("  championMatchups: $formattedMatchups")
+                headerLines.add("  championMatchups: $formattedMatchups [sample: recentMatchSample]")
             }
         }
 
-        val recentMatches = context["recentMatches"] as? List<Map<String, Any?>>
         if (recentMatches.isNullOrEmpty()) {
             return if (headerLines.isEmpty()) {
                 "  (no structured stats available — do not invent any numbers)"
@@ -924,12 +1108,15 @@ class AiAnalysisService(
         val kept = mutableListOf<String>()
         var used = 0
         for (line in lines) {
-            val lineBytes = utf8ByteSize(line) + 1
-            if (kept.isNotEmpty() && used + lineBytes > byteBudget) break
+            val lineBytes = utf8ByteSize(line) + if (kept.isEmpty()) 0 else 1
+            if (used + lineBytes > byteBudget) {
+                // Never slice a line mid-string so a winRate is never severed from its sample label or denominator
+                break
+            }
             kept.add(line)
             used += lineBytes
         }
-        return kept.joinToString("\n").take(byteBudget)
+        return kept.joinToString("\n")
     }
 
     private data class ScoredMatch(
@@ -1065,7 +1252,7 @@ class AiAnalysisService(
         var emittedTargetLabel = false
         for (sm in selectedChronological) {
             val isFullDetail = sm.chronologicalIndex in fullDetailIndices || totalMatches <= MAX_FULL_DETAIL_MATCHES
-            val includeTargetLabel = !emittedTargetLabel && isFullDetail
+            val includeTargetLabel = !emittedTargetLabel
             val (line, usedTargetLabel) = formatMatchLine(
                 i = sm.chronologicalIndex,
                 totalMatches = totalMatches,
