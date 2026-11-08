@@ -45,14 +45,24 @@ class TimelineAnalysisService {
         timeline: MatchTimelineDto,
         matchDto: MatchDto,
         puuid: String
-    ): MatchTimelineDto {
-        val info = timeline.info ?: return timeline
-        val matchInfo = matchDto.info ?: return timeline
-        val playerMatchParticipant = matchInfo.participants.find { it.puuid == puuid } ?: return timeline
+    ): MatchTimelineDto? {
+        val info = timeline.info ?: return null
+        val rawFrames = info.frames?.takeIf { it.isNotEmpty() } ?: return null
+        val matchInfo = matchDto.info ?: return null
+        val playerMatchParticipant = matchInfo.participants.find { it.puuid == puuid } ?: return null
 
-        val analyzePlayerPid = info.participants?.find { it.puuid == puuid }?.participantId
-            ?: playerMatchParticipant.participantId
+        val analyzePlayerPid = (info.participants?.find { it.puuid == puuid }?.participantId
+            ?: playerMatchParticipant.participantId)?.takeIf { it in 1..10 }
         val improvementPlayerPid = resolveTimelineParticipantId(info, playerMatchParticipant, matchInfo.participants)
+            ?.takeIf { it in 1..10 }
+        if (analyzePlayerPid == null && improvementPlayerPid == null) return null
+
+        val playerFrameKeys = setOfNotNull(analyzePlayerPid?.toString(), improvementPlayerPid?.toString())
+        val hasAnyPlayerFrame = rawFrames.any { frame ->
+            val pFrames = frame.participantFrames ?: return@any false
+            playerFrameKeys.any { key -> pFrames.containsKey(key) }
+        }
+        if (!hasAnyPlayerFrame) return null
 
         val playerTeamId = playerMatchParticipant.teamId ?: 100
         val analyzeOpponent = matchInfo.participants.find { p ->
@@ -61,8 +71,8 @@ class TimelineAnalysisService {
                 !playerMatchParticipant.teamPosition.isNullOrBlank() &&
                 playerMatchParticipant.teamPosition != "NONE"
         }
-        val analyzeOpponentPid = info.participants?.find { it.puuid == analyzeOpponent?.puuid }?.participantId
-            ?: analyzeOpponent?.participantId
+        val analyzeOpponentPid = (info.participants?.find { it.puuid == analyzeOpponent?.puuid }?.participantId
+            ?: analyzeOpponent?.participantId)?.takeIf { it in 1..10 }
 
         val playerRole = normalizeRole(playerMatchParticipant.teamPosition ?: playerMatchParticipant.individualPosition)
         val improvementOpponent = matchInfo.participants.find { p ->
@@ -71,6 +81,7 @@ class TimelineAnalysisService {
                 playerRole != "UNKNOWN"
         }
         val improvementOpponentPid = resolveTimelineParticipantId(info, improvementOpponent, matchInfo.participants)
+            ?.takeIf { it in 1..10 }
 
         val keptParticipantIds = setOfNotNull(
             analyzePlayerPid,
@@ -78,10 +89,10 @@ class TimelineAnalysisService {
             analyzeOpponentPid,
             improvementOpponentPid
         )
-        if (keptParticipantIds.isEmpty()) return timeline
+        if (keptParticipantIds.isEmpty()) return null
         val keptFrameKeys = keptParticipantIds.map { it.toString() }.toSet()
 
-        val compactedFrames = info.frames?.map { frame ->
+        val compactedFrames = rawFrames.map { frame ->
             val filteredParticipantFrames = frame.participantFrames
                 ?.entries
                 ?.filter { (key, _) -> key in keptFrameKeys }
@@ -99,6 +110,10 @@ class TimelineAnalysisService {
                         "WARD_KILL" ->
                             (ev.killerId != null && ev.killerId in keptParticipantIds) ||
                                 (ev.participantId != null && ev.participantId in keptParticipantIds)
+                        "CHAMPION_KILL" ->
+                            (ev.killerId != null && ev.killerId in keptParticipantIds) ||
+                                (ev.victimId != null && ev.victimId in keptParticipantIds) ||
+                                (ev.assistingParticipantIds?.any { it in keptParticipantIds } == true)
                         else -> true
                     }
                 }
@@ -108,7 +123,7 @@ class TimelineAnalysisService {
                 participantFrames = filteredParticipantFrames,
                 events = filteredEvents
             )
-        }?.toList()
+        }.toList()
 
         return MatchTimelineDto(
             metadata = MatchTimelineMetadata(
@@ -118,7 +133,7 @@ class TimelineAnalysisService {
             info = MatchTimelineInfo(
                 frameInterval = info.frameInterval,
                 frames = compactedFrames,
-                participants = info.participants?.toList()
+                participants = info.participants?.filter { it.participantId in keptParticipantIds }
             )
         )
     }

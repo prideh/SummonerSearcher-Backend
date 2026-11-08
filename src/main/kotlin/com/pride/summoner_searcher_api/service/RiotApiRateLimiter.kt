@@ -62,6 +62,22 @@ class RiotApiRateLimiter(
     }
 
     /**
+     * Attempts to acquire a permit within [maxWaitMs].
+     * Returns `false` immediately without sleeping past the budget if active Retry-After or
+     * sliding-window bucket waits exceed [maxWaitMs].
+     */
+    suspend fun tryAcquirePermit(
+        region: String,
+        priority: ApiPriority,
+        endpointKey: String? = null,
+        maxWaitMs: Long
+    ): Boolean {
+        val normalizedRegion = region.lowercase()
+        return limiters.computeIfAbsent(normalizedRegion) { RegionRateLimiter(it) }
+            .tryAcquire(priority, endpointKey, maxWaitMs)
+    }
+
+    /**
      * Updates the rate limits for a region based on Riot API response headers.
      */
     suspend fun updateLimits(
@@ -268,6 +284,70 @@ class RiotApiRateLimiter(
             }
         }
 
+        suspend fun tryAcquire(
+            priority: ApiPriority,
+            endpointKey: String? = null,
+            maxWaitMs: Long
+        ): Boolean {
+            val startMs = timeProvider.now()
+            val safeBudgetMs = maxWaitMs.coerceAtLeast(0L)
+            val deadlineAtMs = startMs + safeBudgetMs
+            if (priority == ApiPriority.HIGH) {
+                lastHighPriorityAtMs = startMs
+            }
+
+            while (true) {
+                val now = timeProvider.now()
+                val remainingMs = deadlineAtMs - now
+                if (remainingMs < 0L) {
+                    return false
+                }
+                val retryWait = maxOf(retryAfterUntilMs, serviceRateLimitUntilMs) - now
+                if (retryWait > 0L) {
+                    val sleepMs = retryWait + 10L
+                    if (sleepMs > remainingMs) {
+                        return false
+                    }
+                    delay(sleepMs)
+                    if (timeProvider.now() <= now) {
+                        return false
+                    }
+                    continue
+                }
+                break
+            }
+
+            val nowBeforeBuckets = timeProvider.now()
+            val remainingBeforeBuckets = deadlineAtMs - nowBeforeBuckets
+            if (remainingBeforeBuckets < 0L) {
+                return false
+            }
+
+            val currentBuckets = buckets
+            val methodBuckets = if (!endpointKey.isNullOrBlank()) {
+                methodEndpoints[endpointKey]?.buckets ?: emptyList()
+            } else {
+                emptyList()
+            }
+            val maxBucketWait = (currentBuckets + methodBuckets)
+                .maxOfOrNull { it.requiredWaitMs(priority, nowBeforeBuckets) } ?: 0L
+            if (maxBucketWait > 0L && maxBucketWait + 10L > remainingBeforeBuckets) {
+                return false
+            }
+
+            for (bucket in currentBuckets) {
+                if (timeProvider.now() > deadlineAtMs || !bucket.tryAcquire(priority, deadlineAtMs)) {
+                    return false
+                }
+            }
+            for (bucket in methodBuckets) {
+                if (timeProvider.now() > deadlineAtMs || !bucket.tryAcquire(priority, deadlineAtMs)) {
+                    return false
+                }
+            }
+            return true
+        }
+
         suspend fun updateBuckets(limitHeader: String, countHeader: String) {
             bucketsMutex.withLock {
                 try {
@@ -448,6 +528,18 @@ class RiotApiRateLimiter(
             return currentUsage(now) < lowCap
         }
 
+        fun requiredWaitMs(priority: ApiPriority, now: Long): Long {
+            val effectiveCapacity = when (priority) {
+                ApiPriority.HIGH -> capacity
+                ApiPriority.LOW -> (capacity * LOW_PRIORITY_CAP_RATIO).toInt().coerceAtLeast(1)
+            }
+            val active = timestamps.filter { now - it < windowMs }
+            if (active.size < effectiveCapacity) return 0L
+            val targetIndex = (active.size - effectiveCapacity).coerceIn(0, active.size - 1)
+            val expiryTime = active[targetIndex] + windowMs
+            return (expiryTime - now).coerceAtLeast(0L)
+        }
+
         suspend fun updateConfig(newCapacity: Int, remoteCount: Int): Boolean {
             var changed = false
             if (capacity != newCapacity) {
@@ -506,6 +598,56 @@ class RiotApiRateLimiter(
                         } finally {
                             mutex.lock()
                         }
+                    }
+                }
+            }
+        }
+
+        suspend fun tryAcquire(priority: ApiPriority, deadlineAtMs: Long): Boolean {
+            mutex.withLock {
+                while (true) {
+                    val now = timeProvider.now()
+                    cleanUp(now)
+
+                    val effectiveCapacity = when (priority) {
+                        ApiPriority.HIGH -> capacity
+                        ApiPriority.LOW -> (capacity * LOW_PRIORITY_CAP_RATIO).toInt().coerceAtLeast(1)
+                    }
+
+                    if (timestamps.size < effectiveCapacity) {
+                        if (now > deadlineAtMs) {
+                            return false
+                        }
+                        timestamps.addLast(now)
+                        return true
+                    }
+
+                    val targetIndex = (timestamps.size - effectiveCapacity).coerceIn(0, timestamps.size - 1)
+                    val targetTimestamp = timestamps[targetIndex]
+                    val expiryTime = targetTimestamp + windowMs
+                    val waitTime = expiryTime - now
+                    val sleepMs = (waitTime + 10L).coerceAtLeast(1L)
+                    val remainingMs = deadlineAtMs - now
+
+                    if (waitTime > 0L) {
+                        if (sleepMs > remainingMs) {
+                            logger.debug(
+                                "[{}] Limit reached for {} ({}/{}). Required wait {}ms exceeds remaining budget {}ms.",
+                                name, priority, timestamps.size, effectiveCapacity, sleepMs, remainingMs
+                            )
+                            return false
+                        }
+                        mutex.unlock()
+                        try {
+                            delay(sleepMs)
+                        } finally {
+                            mutex.lock()
+                        }
+                        if (timeProvider.now() <= now) {
+                            return false
+                        }
+                    } else if (now > deadlineAtMs) {
+                        return false
                     }
                 }
             }

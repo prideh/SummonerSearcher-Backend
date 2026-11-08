@@ -67,46 +67,66 @@ class TimelineController(
         puuid: String,
         requestedMatchIds: List<String>?
     ): ResponseEntity<CoachTimelinePreparationResultDto> = runBlocking {
+        val normalizedRegion = region.lowercase()
+        val sanitizedRequestedIds = requestedMatchIds
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            ?.distinct()
+            ?.take(TimelineService.MAX_COACH_TIMELINE_MATCHES)
+            .orEmpty()
+
+        // 1. Check 350 MiB admission headroom BEFORE decoding cached profile from Redis
+        if (!timelineService.hasCoachAdmissionHeadroom()) {
+            logger.warn(
+                "Coach timeline preparation blocked at controller admission (350 MiB guard) before profile decode for puuid={} region={}",
+                puuid,
+                normalizedRegion
+            )
+            return@runBlocking ResponseEntity.ok(
+                timelineService.buildAdmissionBlockedResult(
+                    region = normalizedRegion,
+                    puuid = puuid,
+                    requestedMatchIds = sanitizedRequestedIds
+                )
+            )
+        }
+
         val profile = playerCacheService.getCachedProfile(puuid, region)
         if (profile == null) {
             logger.warn("Coach timeline preparation requested but no cached profile for puuid={} region={}", puuid, region)
             return@runBlocking ResponseEntity.notFound().build()
         }
 
-        val profileMatchIds = (profile.allMatchIds ?: profile.recentMatches?.mapNotNull { it.metadata?.matchId })
-            ?.take(TimelineService.MAX_COACH_TIMELINE_MATCHES)
-            ?: emptyList()
+        val recentMatches = profile.recentMatches.orEmpty()
+        val recentMatchesById = recentMatches
+            .mapNotNull { m -> m.metadata?.matchId?.trim()?.takeIf { it.isNotBlank() }?.let { it to m } }
+            .toMap()
+
+        val profileMatchIds = (
+            profile.allMatchIds
+                ?.map { it.trim() }
+                ?.filter { it.isNotBlank() }
+                ?.distinct()
+                ?.takeIf { it.isNotEmpty() }
+                ?: recentMatches.mapNotNull { it.metadata?.matchId?.trim()?.takeIf { id -> id.isNotBlank() } }.distinct()
+            ).take(TimelineService.MAX_COACH_TIMELINE_MATCHES)
 
         val allowedSet = profileMatchIds.toSet()
-        val effectiveMatchIds = if (!requestedMatchIds.isNullOrEmpty()) {
-            requestedMatchIds
-                .map { it.trim() }
+        val effectiveMatchIds = if (sanitizedRequestedIds.isNotEmpty()) {
+            sanitizedRequestedIds
                 .filter { it in allowedSet }
-                .distinct()
                 .take(TimelineService.MAX_COACH_TIMELINE_MATCHES)
                 .ifEmpty { profileMatchIds }
         } else {
             profileMatchIds
         }
 
-        val recentMatchesById = profile.recentMatches
-            ?.mapNotNull { m -> m.metadata?.matchId?.let { it to m } }
-            ?.toMap()
-            ?: emptyMap()
-        val missingDtoIds = effectiveMatchIds.filter { it !in recentMatchesById }
-        val fetchedMissingDtos = if (missingDtoIds.isNotEmpty()) {
-            playerCacheService.getMatchesByIds(missingDtoIds, region)
-                .mapNotNull { m -> m.metadata?.matchId?.let { it to m } }
-                .toMap()
-        } else {
-            emptyMap()
-        }
-        val orderedMatchDtos = effectiveMatchIds.mapNotNull { id ->
-            recentMatchesById[id] ?: fetchedMissingDtos[id]
-        }
+        // 2. Use ONLY current cached MatchDtos already attached to profile.recentMatches.
+        // Never invoke playerCacheService.getMatchesByIds (which can multiGet, launch async Riot fanout, or write DB indexes).
+        val orderedMatchDtos = effectiveMatchIds.mapNotNull { id -> recentMatchesById[id] }
 
         val result = timelineService.prepareCoachTimelines(
-            region = region,
+            region = normalizedRegion,
             puuid = puuid,
             requestedMatchIds = effectiveMatchIds,
             matchDtos = orderedMatchDtos

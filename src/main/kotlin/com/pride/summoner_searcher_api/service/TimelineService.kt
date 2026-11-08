@@ -93,6 +93,37 @@ class TimelineService @Autowired constructor(
     ): String =
         "coach_prep:${region.lowercase()}:${puuid}:${orderedMatchIds.joinToString(",")}:$analyzerVersion"
 
+    fun hasCoachAdmissionHeadroom(): Boolean = evaluateMemoryHeadroom(coachAdmissionMaxUsedBytes)
+
+    fun buildAdmissionBlockedResult(
+        region: String,
+        puuid: String,
+        requestedMatchIds: List<String>,
+        analyzerVersion: String = COACH_TIMELINE_ANALYZER_VERSION
+    ): CoachTimelinePreparationResultDto {
+        val normalizedRegion = region.lowercase()
+        val orderedMatchIds = requestedMatchIds
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .take(MAX_COACH_TIMELINE_MATCHES)
+        return CoachTimelinePreparationResultDto(
+            status = "BLOCKED",
+            region = normalizedRegion,
+            puuid = puuid,
+            analyzerVersion = analyzerVersion,
+            requestedMatchIds = orderedMatchIds,
+            coveredMatchIds = emptyList(),
+            missingMatches = orderedMatchIds.map {
+                MissingMatchTimelineDto(it, "MEMORY_HEADROOM_ADMISSION_BLOCKED")
+            },
+            stopReason = "MEMORY_HEADROOM_ADMISSION_BLOCKED",
+            cacheHit = false,
+            peakRetainedRawTimelines = 0,
+            analysis = null
+        )
+    }
+
     internal fun evaluateMemoryHeadroom(maxUsedBytesThreshold: Long): Boolean {
         return try {
             val raw = memoryStatsProvider.sample()
@@ -330,7 +361,13 @@ class TimelineService @Autowired constructor(
             val peakRetainedRawTimelines = AtomicInteger(0)
 
             for ((index, matchId) in orderedMatchIds.withIndex()) {
-                // Check deadline before each match
+                val matchDto = matchDtosById[matchId]
+                if (matchDto == null) {
+                    missingMatches.add(MissingMatchTimelineDto(matchId, "MISSING_MATCH_DTO"))
+                    continue
+                }
+
+                // Check deadline before each match decode/fetch
                 val elapsedMs = timeProvider.now() - startTimeMs
                 if (elapsedMs >= deadlineMs) {
                     stopReason = "DEADLINE_EXCEEDED"
@@ -349,82 +386,90 @@ class TimelineService @Autowired constructor(
                     break
                 }
 
-                val matchDto = matchDtosById[matchId]
-                if (matchDto == null) {
-                    missingMatches.add(MissingMatchTimelineDto(matchId, "MISSING_MATCH_DTO"))
-                    continue
-                }
-
                 val rawCacheKey = getCacheKey(matchId, normalizedRegion)
-                var rawTimeline: MatchTimelineDto? = redisCacheService.get(rawCacheKey, MatchTimelineDto::class.java)
-                if (rawTimeline != null) {
-                    val cur = liveRawTimelines.incrementAndGet()
-                    peakRetainedRawTimelines.accumulateAndGet(cur, ::maxOf)
-                }
+                val cachedOutcome = readAndCompactCachedTimeline(
+                    rawCacheKey = rawCacheKey,
+                    matchDto = matchDto,
+                    puuid = puuid,
+                    liveRawTimelines = liveRawTimelines,
+                    peakRetainedRawTimelines = peakRetainedRawTimelines
+                )
+                val hadCachedRaw = cachedOutcome.hadCachedRaw
+                val legacyNeedsBackfill = cachedOutcome.legacyNeedsBackfill
+                var compactedTimeline: MatchTimelineDto? = cachedOutcome.compactedTimeline
 
                 var fetchStopReason: String? = null
                 var itemMissingReason: String? = null
 
-                if (rawTimeline == null || needsTimelineBackfill(rawTimeline)) {
+                if (!hadCachedRaw || legacyNeedsBackfill) {
                     val activeCooldownMs = rateLimiter?.getActiveRetryAfterWaitMs(normalizedRegion) ?: 0L
                     if (activeCooldownMs > 0L) {
-                        if (rawTimeline == null) {
+                        if (compactedTimeline == null) {
                             fetchStopReason = "RATE_LIMIT_COOLDOWN"
                         }
                     } else {
-                        // Re-check 360 MiB headroom before outbound Riot HTTP fetch if legacy rawTimeline was decoded
-                        if (!evaluateMemoryHeadroom(coachStopMaxUsedBytes)) {
-                            if (rawTimeline != null) {
-                                rawTimeline = null
-                                liveRawTimelines.decrementAndGet()
-                            }
-                            stopReason = "MEMORY_HEADROOM_STOP"
-                            for (remainingId in orderedMatchIds.subList(index, orderedMatchIds.size)) {
-                                missingMatches.add(MissingMatchTimelineDto(remainingId, "MEMORY_HEADROOM_STOP"))
-                            }
-                            break
-                        }
-
-                        // Release legacy rawTimeline reference before fetching replacement so only 1 raw timeline exists
-                        val legacyFallback = rawTimeline
-                        if (rawTimeline != null) {
-                            rawTimeline = null
-                            liveRawTimelines.decrementAndGet()
-                        }
-
-                        val failureReason = AtomicReference<String?>(null)
-                        val fetched = riotApiService.getMatchTimelineBounded(
-                            matchId = matchId,
-                            region = normalizedRegion,
-                            priority = ApiPriority.HIGH,
-                            maxRetries = 0,
-                            failureReasonHolder = failureReason
-                        )
-                        if (fetched != null) {
-                            val cur = liveRawTimelines.incrementAndGet()
-                            peakRetainedRawTimelines.accumulateAndGet(cur, ::maxOf)
-                            redisCacheService.set(rawCacheKey, fetched, Duration.ofHours(24))
-                            rawTimeline = fetched
-                        } else if (legacyFallback != null) {
-                            val cur = liveRawTimelines.incrementAndGet()
-                            peakRetainedRawTimelines.accumulateAndGet(cur, ::maxOf)
-                            rawTimeline = legacyFallback
+                        val remainingBudgetMs = deadlineMs - (timeProvider.now() - startTimeMs)
+                        if (remainingBudgetMs <= 0L) {
+                            fetchStopReason = "DEADLINE_EXCEEDED"
+                        } else if (!evaluateMemoryHeadroom(coachStopMaxUsedBytes)) {
+                            fetchStopReason = "MEMORY_HEADROOM_STOP"
                         } else {
-                            when (failureReason.get()) {
-                                "HTTP_429_TOO_MANY_REQUESTS" -> fetchStopReason = "RATE_LIMIT_429"
-                                "NETWORK_TIMEOUT" -> fetchStopReason = "NETWORK_TIMEOUT"
-                                "HTTP_404_NOT_FOUND" -> itemMissingReason = "TIMELINE_NOT_FOUND"
-                                else -> itemMissingReason = "TIMELINE_UNAVAILABLE"
+                            val failureReason = AtomicReference<String?>(null)
+                            val fetched: MatchTimelineDto? = riotApiService.getMatchTimelineBounded(
+                                matchId = matchId,
+                                region = normalizedRegion,
+                                priority = ApiPriority.HIGH,
+                                maxRetries = 0,
+                                failureReasonHolder = failureReason,
+                                maxTotalDurationMs = remainingBudgetMs,
+                                headroomGuard = { evaluateMemoryHeadroom(coachStopMaxUsedBytes) }
+                            )
+                            if (fetched != null) {
+                                val postFetchElapsedMs = timeProvider.now() - startTimeMs
+                                if (postFetchElapsedMs >= deadlineMs) {
+                                    fetchStopReason = "DEADLINE_EXCEEDED"
+                                } else {
+                                    val compactedReplacement = cacheAndCompactFetchedTimeline(
+                                        rawCacheKey = rawCacheKey,
+                                        fetched = fetched,
+                                        matchDto = matchDto,
+                                        puuid = puuid,
+                                        liveRawTimelines = liveRawTimelines,
+                                        peakRetainedRawTimelines = peakRetainedRawTimelines
+                                    )
+                                    if (compactedReplacement != null) {
+                                        compactedTimeline = compactedReplacement
+                                    } else if (compactedTimeline == null) {
+                                        itemMissingReason = "TIMELINE_UNAVAILABLE"
+                                    }
+                                }
+                            } else {
+                                when (failureReason.get()) {
+                                    "DEADLINE_EXCEEDED" -> fetchStopReason = "DEADLINE_EXCEEDED"
+                                    "MEMORY_HEADROOM_STOP" -> fetchStopReason = "MEMORY_HEADROOM_STOP"
+                                    "HTTP_429_TOO_MANY_REQUESTS" -> fetchStopReason = "RATE_LIMIT_429"
+                                    "RATE_LIMIT_COOLDOWN" -> fetchStopReason = "RATE_LIMIT_COOLDOWN"
+                                    "NETWORK_TIMEOUT" -> fetchStopReason = "NETWORK_TIMEOUT"
+                                    "HTTP_404_NOT_FOUND" -> {
+                                        if (compactedTimeline == null) {
+                                            itemMissingReason = "TIMELINE_NOT_FOUND"
+                                        }
+                                    }
+                                    else -> {
+                                        if (compactedTimeline == null) {
+                                            itemMissingReason = "TIMELINE_UNAVAILABLE"
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
+                } else if (compactedTimeline == null) {
+                    itemMissingReason = "TIMELINE_UNAVAILABLE"
                 }
 
                 if (fetchStopReason != null) {
-                    if (rawTimeline != null) {
-                        rawTimeline = null
-                        liveRawTimelines.decrementAndGet()
-                    }
+                    compactedTimeline = null
                     stopReason = fetchStopReason
                     val currentReason = fetchStopReason
                     val subsequentReason = if (fetchStopReason == "RATE_LIMIT_429") "RATE_LIMIT_COOLDOWN" else fetchStopReason
@@ -435,18 +480,17 @@ class TimelineService @Autowired constructor(
                     break
                 }
 
-                if (rawTimeline == null) {
-                    missingMatches.add(MissingMatchTimelineDto(matchId, itemMissingReason ?: "TIMELINE_NOT_FOUND"))
+                if (compactedTimeline == null) {
+                    missingMatches.add(MissingMatchTimelineDto(matchId, itemMissingReason ?: "TIMELINE_UNAVAILABLE"))
                     continue
                 }
 
-                // Compact immediately to tracked player + opponent frames & relevant events, then release rawTimeline
-                val compacted = timelineAnalysisService.compactTimelineForPlayer(rawTimeline, matchDto, puuid)
-                rawTimeline = null
-                liveRawTimelines.decrementAndGet()
-
-                compactedTriples.add(Triple(matchId, compacted, matchDto))
+                compactedTriples.add(Triple(matchId, compactedTimeline, matchDto))
                 coveredMatchIds.add(matchId)
+            }
+
+            if (coveredMatchIds.isEmpty() && stopReason == null) {
+                stopReason = missingMatches.firstOrNull()?.reason ?: "TIMELINE_UNAVAILABLE"
             }
 
             val status = when {
@@ -483,6 +527,61 @@ class TimelineService @Autowired constructor(
             return finalResult
         } finally {
             activeGlobalPreparations.decrementAndGet()
+        }
+    }
+
+    private data class CachedTimelineCompactionOutcome(
+        val hadCachedRaw: Boolean,
+        val legacyNeedsBackfill: Boolean,
+        val compactedTimeline: MatchTimelineDto?
+    )
+
+    private fun readAndCompactCachedTimeline(
+        rawCacheKey: String,
+        matchDto: MatchDto,
+        puuid: String,
+        liveRawTimelines: AtomicInteger,
+        peakRetainedRawTimelines: AtomicInteger
+    ): CachedTimelineCompactionOutcome {
+        val rawTimeline = redisCacheService.get(rawCacheKey, MatchTimelineDto::class.java)
+            ?: return CachedTimelineCompactionOutcome(
+                hadCachedRaw = false,
+                legacyNeedsBackfill = false,
+                compactedTimeline = null
+            )
+        val cur = liveRawTimelines.incrementAndGet()
+        peakRetainedRawTimelines.accumulateAndGet(cur, ::maxOf)
+        return try {
+            val legacy = needsTimelineBackfill(rawTimeline)
+            val compacted = timelineAnalysisService.compactTimelineForPlayer(rawTimeline, matchDto, puuid)
+            CachedTimelineCompactionOutcome(
+                hadCachedRaw = true,
+                legacyNeedsBackfill = legacy,
+                compactedTimeline = compacted
+            )
+        } finally {
+            liveRawTimelines.decrementAndGet()
+        }
+    }
+
+    private fun cacheAndCompactFetchedTimeline(
+        rawCacheKey: String,
+        fetched: MatchTimelineDto,
+        matchDto: MatchDto,
+        puuid: String,
+        liveRawTimelines: AtomicInteger,
+        peakRetainedRawTimelines: AtomicInteger
+    ): MatchTimelineDto? {
+        val cur = liveRawTimelines.incrementAndGet()
+        peakRetainedRawTimelines.accumulateAndGet(cur, ::maxOf)
+        return try {
+            val compacted = timelineAnalysisService.compactTimelineForPlayer(fetched, matchDto, puuid)
+            if (compacted != null) {
+                redisCacheService.set(rawCacheKey, fetched, Duration.ofHours(24))
+            }
+            compacted
+        } finally {
+            liveRawTimelines.decrementAndGet()
         }
     }
 
@@ -527,7 +626,7 @@ class TimelineService @Autowired constructor(
     }
 
     private fun needsTimelineBackfill(timeline: MatchTimelineDto): Boolean {
-        val frames = timeline.info?.frames ?: return true
+        val frames = timeline.info?.frames?.takeIf { it.isNotEmpty() } ?: return false
         val killEvents = frames.flatMap { it.events ?: emptyList() }.filter { it.type == "CHAMPION_KILL" }
         return killEvents.isNotEmpty() && killEvents.all { it.bounty == null && it.shutdownBounty == null }
     }
