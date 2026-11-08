@@ -43,6 +43,9 @@ class RiotApiController(
     fun getChallengerLeague(@PathVariable region: String): ResponseEntity<LeagueListDTO?> {
         val queue = "RANKED_SOLO_5x5"
         val challengerLeague = challengerLeagueService.getChallengerLeagueFromCache(region, queue)
+        if (challengerLeague == null || challengerLeague.entries.isEmpty()) {
+            return ResponseEntity.status(org.springframework.http.HttpStatus.SERVICE_UNAVAILABLE).build()
+        }
         return ResponseEntity.ok(challengerLeague)
     }
 

@@ -22,15 +22,255 @@ import org.springframework.web.client.RestClient
  * All API calls are rate-limited using the RiotApiRateLimiter to prevent hitting Riot's rate limits.
  */
 @Service
-class RiotApiService(
+class RiotApiService @org.springframework.beans.factory.annotation.Autowired constructor(
     @org.springframework.beans.factory.annotation.Qualifier("riotRestClient")
     private val riotRestClient: RestClient,
     private val rateLimiter: RiotApiRateLimiter,
     @org.springframework.beans.factory.annotation.Qualifier("dataDragonRestClient")
-    private val dataDragonRestClient: RestClient = RestClient.builder().build()
+    private val dataDragonRestClient: RestClient = RestClient.builder().build(),
+    private val timeProvider: TimeProvider = SystemTimeProvider()
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
+
+    internal var platformBaseUrlResolver: (String) -> String = { region ->
+        "https://${region.trim().lowercase()}.api.riotgames.com"
+    }
+
+    private val activeBoundedHttpWorkers = java.util.concurrent.atomic.AtomicInteger(0)
+
+    private val boundedHttpExecutor = java.util.concurrent.ThreadPoolExecutor(
+        2,
+        4,
+        30L,
+        java.util.concurrent.TimeUnit.SECONDS,
+        java.util.concurrent.LinkedBlockingQueue(8),
+        java.util.concurrent.ThreadFactory { runnable ->
+            Thread(runnable, "riot-bounded-league-http").apply { isDaemon = true }
+        },
+        java.util.concurrent.ThreadPoolExecutor.AbortPolicy()
+    ).apply {
+        allowCoreThreadTimeOut(true)
+    }
+
+    private val leagueObjectMapper = com.fasterxml.jackson.databind.ObjectMapper()
+        .findAndRegisterModules()
+        .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+
+    internal fun getActiveBoundedHttpWorkers(): Int = activeBoundedHttpWorkers.get()
+
+    internal class HttpCancellationHandle {
+        private val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        private val closeables = java.util.concurrent.CopyOnWriteArrayList<AutoCloseable>()
+
+        fun isCancelled(): Boolean = cancelled.get()
+
+        fun registerCloseable(closeable: AutoCloseable) {
+            closeables.add(closeable)
+            if (cancelled.get()) {
+                runCatching { closeable.close() }
+            }
+        }
+
+        fun cancel() {
+            cancelled.set(true)
+            for (c in closeables) {
+                runCatching { c.close() }
+            }
+        }
+    }
+
+    private class BoundedLeagueStreamAbortedException(val reason: String) : java.io.IOException(reason)
+
+    private inner class BoundedLeagueInputStream(
+        private val delegate: java.io.InputStream,
+        private val response: org.springframework.http.client.ClientHttpResponse,
+        private val cancellationHandle: HttpCancellationHandle?,
+        private val deadlineAtMs: Long?,
+        private val maxResponseBytes: Int,
+        private val headroomGuard: (() -> Boolean)?,
+        private val failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>?
+    ) : java.io.InputStream() {
+        private var totalBytesRead = 0
+
+        private fun checkGuardsOrThrow() {
+            if (cancellationHandle?.isCancelled() == true ||
+                Thread.currentThread().isInterrupted ||
+                (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs)
+            ) {
+                failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                abortResponseBody(response, delegate)
+                throw BoundedLeagueStreamAbortedException("DEADLINE_EXCEEDED")
+            }
+            if (headroomGuard != null && !headroomGuard.invoke()) {
+                failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+                abortResponseBody(response, delegate)
+                throw BoundedLeagueStreamAbortedException("MEMORY_HEADROOM_STOP")
+            }
+            if (totalBytesRead > maxResponseBytes) {
+                failureReasonHolder?.set("RESPONSE_TOO_LARGE")
+                abortResponseBody(response, delegate)
+                throw BoundedLeagueStreamAbortedException("RESPONSE_TOO_LARGE")
+            }
+        }
+
+        override fun read(): Int {
+            checkGuardsOrThrow()
+            val b = delegate.read()
+            if (b != -1) {
+                totalBytesRead++
+            }
+            checkGuardsOrThrow()
+            return b
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (len <= 0) return 0
+            checkGuardsOrThrow()
+            val boundedLen = len.coerceAtMost(1_024)
+            val n = delegate.read(b, off, boundedLen)
+            if (n > 0) {
+                totalBytesRead += n
+            }
+            checkGuardsOrThrow()
+            return n
+        }
+
+        override fun close() {
+            abortResponseBody(response, delegate)
+        }
+    }
+
+    private fun unwrapClientHttpResponse(
+        response: org.springframework.http.client.ClientHttpResponse
+    ): org.springframework.http.client.ClientHttpResponse {
+        var current = response
+        while (current.javaClass.name != "org.springframework.http.client.ReactorClientHttpResponse") {
+            val delegateField = runCatching {
+                current.javaClass.getDeclaredField("delegate").apply { isAccessible = true }
+            }.getOrNull() ?: break
+            val next = runCatching {
+                delegateField.get(current) as? org.springframework.http.client.ClientHttpResponse
+            }.getOrNull() ?: break
+            if (next === current) break
+            current = next
+        }
+        return current
+    }
+
+    private fun abortResponseBody(
+        response: org.springframework.http.client.ClientHttpResponse,
+        openedBodyStream: java.io.InputStream? = null
+    ) {
+        try {
+            openedBodyStream?.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            val underlying = unwrapClientHttpResponse(response)
+            runCatching { underlying.body.close() }
+            if (underlying.javaClass.name == "org.springframework.http.client.ReactorClientHttpResponse") {
+                val connField = underlying.javaClass.getDeclaredField("connection").apply { isAccessible = true }
+                val conn = connField.get(underlying) as? reactor.netty.Connection
+                conn?.dispose()
+            }
+        } catch (_: Throwable) {
+        }
+        try {
+            response.close()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private suspend fun <T> runBoundedHttpCallWithDeadline(
+        deadlineAtMs: Long?,
+        failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>?,
+        block: (HttpCancellationHandle) -> T?
+    ): T? {
+        if (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs) {
+            failureReasonHolder?.set("DEADLINE_EXCEEDED")
+            return null
+        }
+        val cancellationHandle = HttpCancellationHandle()
+        val taskClaimedOrCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val workerDoneLatch = java.util.concurrent.CountDownLatch(1)
+        val submittedFuture: java.util.concurrent.Future<T?> = try {
+            boundedHttpExecutor.submit(java.util.concurrent.Callable<T?> {
+                if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
+                    workerDoneLatch.countDown()
+                    return@Callable null
+                }
+                activeBoundedHttpWorkers.incrementAndGet()
+                try {
+                    if (cancellationHandle.isCancelled() || Thread.currentThread().isInterrupted) {
+                        null
+                    } else {
+                        block(cancellationHandle)
+                    }
+                } finally {
+                    activeBoundedHttpWorkers.decrementAndGet()
+                    Thread.interrupted()
+                    workerDoneLatch.countDown()
+                }
+            })
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            failureReasonHolder?.set("HTTP_EXECUTOR_SATURATED")
+            return null
+        }
+
+        return try {
+            val result = withContext(Dispatchers.IO) {
+                if (deadlineAtMs != null) {
+                    val remainingBudgetMs = (deadlineAtMs - timeProvider.now()).coerceAtLeast(1L)
+                    submittedFuture.get(remainingBudgetMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+                } else {
+                    submittedFuture.get()
+                }
+            }
+            if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
+                withContext(Dispatchers.IO) {
+                    workerDoneLatch.await()
+                }
+            }
+            result
+        } catch (e: java.util.concurrent.TimeoutException) {
+            cancellationHandle.cancel()
+            val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            submittedFuture.cancel(true)
+            if (!cancelledBeforeStart) {
+                withContext(Dispatchers.IO) {
+                    workerDoneLatch.await()
+                }
+            }
+            if (failureReasonHolder?.get() == null) {
+                failureReasonHolder?.set("DEADLINE_EXCEEDED")
+            }
+            null
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            cancellationHandle.cancel()
+            val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            submittedFuture.cancel(true)
+            if (!cancelledBeforeStart) {
+                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                    workerDoneLatch.await()
+                }
+            }
+            throw e
+        } catch (e: java.util.concurrent.ExecutionException) {
+            val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            if (!cancelledBeforeStart) {
+                withContext(Dispatchers.IO) {
+                    workerDoneLatch.await()
+                }
+            }
+            throw (e.cause ?: e)
+        }
+    }
+
+    companion object {
+        const val MAX_CHALLENGER_LEAGUE_RESPONSE_BYTES = 524_288 // 512 KiB strict bound
+        const val MAX_CHALLENGER_LEAGUE_ENTRIES = 300
+    }
 
     /**
      * Wrapper function that enforces rate limiting for all Riot API calls.
@@ -315,50 +555,318 @@ class RiotApiService(
     }
 
 
-    suspend fun fetchChallengerLeague(region: String, queue: String): LeagueListDTO? = coroutineScope {
-        val baseUrl = "https://${region}.api.riotgames.com"
+    /**
+     * Fetches the Challenger league for [region] and [queue] in a SINGLE bounded Riot API call
+     * (`/lol/league/v4/challengerleagues/by-queue/{queue}`) with:
+     * - Zero `getAccountByPuuid` (`account-v1-by-puuid`) fanout,
+     * - Strict stream byte cap ([maxResponseBytes], default 512 KiB) and entry cap ([maxEntries], default 300),
+     * - Pre-flight, limiter-wait, mid-stream, and post-decode [deadlineAtMs] and [headroomGuard] enforcement,
+     * - Immediate ReactorNetty connection disposal on deadline, headroom stop, or oversized payload.
+     */
+    suspend fun fetchChallengerLeagueBounded(
+        region: String,
+        queue: String = "RANKED_SOLO_5x5",
+        priority: ApiPriority = ApiPriority.LOW,
+        maxRetries: Int = 0,
+        deadlineAtMs: Long? = null,
+        maxResponseBytes: Int = MAX_CHALLENGER_LEAGUE_RESPONSE_BYTES,
+        maxEntries: Int = MAX_CHALLENGER_LEAGUE_ENTRIES,
+        headroomGuard: (() -> Boolean)? = null,
+        httpAttemptCounter: java.util.concurrent.atomic.AtomicInteger? = null,
+        failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>? = null
+    ): LeagueListDTO? {
+        val normalizedRegion = region.trim().lowercase()
+        val safeMaxBytes = maxResponseBytes.coerceIn(4_096, 2 * 1024 * 1024)
+        val safeMaxEntries = maxEntries.coerceIn(1, MAX_CHALLENGER_LEAGUE_ENTRIES)
+        val effectiveMaxRetries = maxRetries.coerceAtLeast(0)
+        val endpointKey = "league-v4-challenger"
+
+        if (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs) {
+            failureReasonHolder?.set("DEADLINE_EXCEEDED")
+            return null
+        }
+        if (headroomGuard != null && !headroomGuard.invoke()) {
+            failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+            return null
+        }
+
+        val baseUrl = platformBaseUrlResolver(normalizedRegion)
         val uri = "$baseUrl/lol/league/v4/challengerleagues/by-queue/{queue}"
-        
-        // Fetching the list itself is a background task but infrequent, can be HIGH or LOW. 
-        // Let's keep it LOW since it's part of the warmer.
-        val leagueList = executeRateLimitedCall(region, ApiPriority.LOW, "league-v4-challenger") {
-            try {
-                riotRestClient.get()
-                    .uri(uri, queue)
-                    .retrieve()
-                    .toEntity(LeagueListDTO::class.java)
-            } catch (e: HttpClientErrorException.NotFound) {
-                logger.warn("fetchChallengerLeague returned 404 for region {} queue {}", region, queue)
-                null
-            }
-        }
-        
-        if (leagueList == null) {
-            return@coroutineScope null
-        }
 
-        val totalEntries = leagueList.entries.size
-        logger.info("[Cache Warmer] $region: Starting enrichment for $totalEntries players...")
-
-        // Process entries in parallel with rate limiting automatically handled by the rate limiter
-        val enrichedEntries = leagueList.entries.mapIndexed { index, entry ->
-            async {
-                // Use LOW priority for cache warming to avoid blocking user requests
-                val account = entry.puuid?.let { getAccountByPuuid(it, region, ApiPriority.LOW) }
-                
-                if ((index + 1) % 50 == 0) {
-                    logger.info("[Cache Warmer] $region: Processed ${index + 1} / $totalEntries players...")
+        if (priority == ApiPriority.HIGH) {
+            rateLimiter.beginUserRequest(normalizedRegion)
+        }
+        try {
+            var attempts = 0
+            while (true) {
+                if (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs) {
+                    failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                    return null
                 }
-                
-                entry.copy(
-                    gameName = account?.gameName,
-                    tagLine = account?.tagLine
-                )
-            }
-        }.awaitAll()
+                if (headroomGuard != null && !headroomGuard.invoke()) {
+                    failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+                    return null
+                }
 
-        logger.info("[Cache Warmer] $region: Enrichment complete for $totalEntries players")
-        leagueList.copy(entries = enrichedEntries)
+                val permitAcquired = if (deadlineAtMs != null) {
+                    val remainingWaitMs = (deadlineAtMs - timeProvider.now()).coerceAtLeast(0L)
+                    if (remainingWaitMs <= 0L) {
+                        false
+                    } else {
+                        kotlinx.coroutines.withTimeoutOrNull(remainingWaitMs) {
+                            if (priority == ApiPriority.LOW) {
+                                rateLimiter.awaitLowPriorityClearance(normalizedRegion)
+                            }
+                            rateLimiter.acquirePermit(normalizedRegion, priority, endpointKey)
+                            true
+                        } ?: false
+                    }
+                } else {
+                    if (priority == ApiPriority.LOW) {
+                        rateLimiter.awaitLowPriorityClearance(normalizedRegion)
+                    }
+                    rateLimiter.acquirePermit(normalizedRegion, priority, endpointKey)
+                    true
+                }
+
+                if (!permitAcquired || (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs)) {
+                    failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                    return null
+                }
+                if (headroomGuard != null && !headroomGuard.invoke()) {
+                    failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+                    return null
+                }
+
+                try {
+                    httpAttemptCounter?.incrementAndGet()
+                    val response = runBoundedHttpCallWithDeadline(deadlineAtMs, failureReasonHolder) { cancellationHandle ->
+                        try {
+                            riotRestClient.get()
+                                .uri(uri, queue)
+                                .exchange { _, clientResponse ->
+                                    cancellationHandle.registerCloseable(AutoCloseable {
+                                        abortResponseBody(clientResponse)
+                                    })
+                                    val status = clientResponse.statusCode
+                                    val headers = clientResponse.headers
+                                    val declaredLength = headers.contentLength
+                                    when {
+                                        status.value() == 404 -> {
+                                            failureReasonHolder?.set("HTTP_404_NOT_FOUND")
+                                            logger.warn("fetchChallengerLeagueBounded returned 404 for region {} queue {}", normalizedRegion, queue)
+                                            abortResponseBody(clientResponse)
+                                            ResponseEntity.status(status).headers(headers).body(null)
+                                        }
+                                        status.value() == 429 -> {
+                                            abortResponseBody(clientResponse)
+                                            throw HttpClientErrorException.create(
+                                                status,
+                                                "Too Many Requests",
+                                                headers,
+                                                ByteArray(0),
+                                                null
+                                            )
+                                        }
+                                        !status.is2xxSuccessful -> {
+                                            failureReasonHolder?.set("HTTP_${status.value()}")
+                                            logger.warn("fetchChallengerLeagueBounded HTTP {} for region {} queue {}", status.value(), normalizedRegion, queue)
+                                            abortResponseBody(clientResponse)
+                                            ResponseEntity.status(status).headers(headers).body(null)
+                                        }
+                                        declaredLength > safeMaxBytes -> {
+                                            failureReasonHolder?.set("RESPONSE_TOO_LARGE")
+                                            logger.warn(
+                                                "fetchChallengerLeagueBounded Content-Length {} exceeds maxResponseBytes {} for region {}",
+                                                declaredLength, safeMaxBytes, normalizedRegion
+                                            )
+                                            abortResponseBody(clientResponse)
+                                            ResponseEntity.status(status).headers(headers).body(null)
+                                        }
+                                        cancellationHandle.isCancelled() || (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs) -> {
+                                            failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                                            abortResponseBody(clientResponse)
+                                            ResponseEntity.status(status).headers(headers).body(null)
+                                        }
+                                        headroomGuard != null && !headroomGuard.invoke() -> {
+                                            failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+                                            abortResponseBody(clientResponse)
+                                            ResponseEntity.status(status).headers(headers).body(null)
+                                        }
+                                        else -> {
+                                            val rawStream = clientResponse.body
+                                            val boundedStream = BoundedLeagueInputStream(
+                                                delegate = rawStream,
+                                                response = clientResponse,
+                                                cancellationHandle = cancellationHandle,
+                                                deadlineAtMs = deadlineAtMs,
+                                                maxResponseBytes = safeMaxBytes,
+                                                headroomGuard = headroomGuard,
+                                                failureReasonHolder = failureReasonHolder
+                                            )
+                                            cancellationHandle.registerCloseable(boundedStream)
+                                            val decoded = leagueObjectMapper.readValue(
+                                                boundedStream,
+                                                LeagueListDTO::class.java
+                                            )
+                                            if (cancellationHandle.isCancelled() || (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs)) {
+                                                failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                                                abortResponseBody(clientResponse, rawStream)
+                                                ResponseEntity.status(status).headers(headers).body(null)
+                                            } else if (headroomGuard != null && !headroomGuard.invoke()) {
+                                                failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+                                                abortResponseBody(clientResponse, rawStream)
+                                                ResponseEntity.status(status).headers(headers).body(null)
+                                            } else {
+                                                val boundedEntries = decoded.entries
+                                                    .asSequence()
+                                                    .filter { !it.puuid.isNullOrBlank() }
+                                                    .sortedByDescending { it.leaguePoints ?: Int.MIN_VALUE }
+                                                    .take(safeMaxEntries)
+                                                    .map { entry ->
+                                                        LeagueEntryDto(
+                                                            puuid = entry.puuid?.trim(),
+                                                            leaguePoints = entry.leaguePoints,
+                                                            rank = entry.rank,
+                                                            wins = entry.wins,
+                                                            losses = entry.losses,
+                                                            veteran = entry.veteran,
+                                                            inactive = entry.inactive,
+                                                            freshBlood = entry.freshBlood,
+                                                            hotStreak = entry.hotStreak,
+                                                            leagueId = entry.leagueId,
+                                                            queueType = entry.queueType,
+                                                            tier = entry.tier,
+                                                            summonerName = entry.summonerName,
+                                                            gameName = entry.gameName?.trim()?.takeIf { it.isNotBlank() },
+                                                            tagLine = entry.tagLine?.trim()?.takeIf { it.isNotBlank() }
+                                                        )
+                                                    }
+                                                    .toList()
+                                                ResponseEntity.status(status).headers(headers).body(
+                                                    decoded.copy(entries = boundedEntries)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                        } catch (e: BoundedLeagueStreamAbortedException) {
+                            failureReasonHolder?.set(e.reason)
+                            logger.warn("fetchChallengerLeagueBounded aborted stream decode ({}) for region {}", e.reason, normalizedRegion)
+                            null
+                        } catch (e: HttpClientErrorException.NotFound) {
+                            failureReasonHolder?.set("HTTP_404_NOT_FOUND")
+                            null
+                        } catch (e: HttpClientErrorException.TooManyRequests) {
+                            throw e
+                        } catch (e: Exception) {
+                            val abortedByGuard = generateSequence<Throwable>(e) { it.cause }
+                                .filterIsInstance<BoundedLeagueStreamAbortedException>()
+                                .firstOrNull()
+                            val hasInterrupt = generateSequence<Throwable>(e) { it.cause }
+                                .any { it is InterruptedException || it is java.io.InterruptedIOException }
+                            when {
+                                abortedByGuard != null -> failureReasonHolder?.set(abortedByGuard.reason)
+                                cancellationHandle.isCancelled() || hasInterrupt || (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs) -> {
+                                    val currentReason = failureReasonHolder?.get()
+                                    if (currentReason != "MEMORY_HEADROOM_STOP" && currentReason != "RESPONSE_TOO_LARGE") {
+                                        failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                                    }
+                                }
+                                else -> {
+                                    if (failureReasonHolder?.get() == null) {
+                                        failureReasonHolder?.set("HTTP_ERROR")
+                                    }
+                                }
+                            }
+                            logger.warn("fetchChallengerLeagueBounded failed for region {}: {}", normalizedRegion, e.message)
+                            null
+                        }
+                    }
+
+                    if (response != null) {
+                        val headers = response.headers
+                        rateLimiter.updateLimits(
+                            region = normalizedRegion,
+                            limitHeader = headers.getFirst("X-App-Rate-Limit"),
+                            countHeader = headers.getFirst("X-App-Rate-Limit-Count"),
+                            endpointKey = endpointKey,
+                            methodLimitHeader = headers.getFirst("X-Method-Rate-Limit"),
+                            methodCountHeader = headers.getFirst("X-Method-Rate-Limit-Count")
+                        )
+                        return response.body
+                    }
+                    return null
+                } catch (e: HttpClientErrorException.TooManyRequests) {
+                    attempts++
+                    val rateLimitType = e.responseHeaders?.getFirst("X-Rate-Limit-Type")
+                    failureReasonHolder?.set("HTTP_429_TOO_MANY_REQUESTS")
+                    rateLimiter.updateLimits(
+                        region = normalizedRegion,
+                        limitHeader = e.responseHeaders?.getFirst("X-App-Rate-Limit"),
+                        countHeader = e.responseHeaders?.getFirst("X-App-Rate-Limit-Count"),
+                        endpointKey = endpointKey,
+                        methodLimitHeader = e.responseHeaders?.getFirst("X-Method-Rate-Limit"),
+                        methodCountHeader = e.responseHeaders?.getFirst("X-Method-Rate-Limit-Count")
+                    )
+                    val retryAfterSeconds = e.responseHeaders?.getFirst("Retry-After")?.toLongOrNull()
+                    val baseWaitMs = when {
+                        retryAfterSeconds != null -> (retryAfterSeconds * 1000) + 100
+                        rateLimitType.equals("service", ignoreCase = true) -> RiotApiRateLimiter.SERVICE_429_MIN_BACKOFF_MS
+                        else -> 1_100L
+                    }
+                    rateLimiter.recordRetryAfter(normalizedRegion, baseWaitMs, rateLimitType)
+                    if (attempts > effectiveMaxRetries) {
+                        return null
+                    }
+                    if (deadlineAtMs != null && timeProvider.now() + baseWaitMs >= deadlineAtMs) {
+                        failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                        return null
+                    }
+                    kotlinx.coroutines.delay(baseWaitMs)
+                } catch (e: org.springframework.web.client.ResourceAccessException) {
+                    val abortedByGuard = generateSequence<Throwable>(e) { it.cause }
+                        .filterIsInstance<BoundedLeagueStreamAbortedException>()
+                        .firstOrNull()
+                    if (abortedByGuard != null) {
+                        failureReasonHolder?.set(abortedByGuard.reason)
+                        return null
+                    }
+                    val currentReason = failureReasonHolder?.get()
+                    if (currentReason == "MEMORY_HEADROOM_STOP" || currentReason == "RESPONSE_TOO_LARGE" || currentReason == "DEADLINE_EXCEEDED") {
+                        return null
+                    }
+                    if (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs) {
+                        failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                        return null
+                    }
+                    attempts++
+                    failureReasonHolder?.set("NETWORK_TIMEOUT")
+                    if (attempts > effectiveMaxRetries) {
+                        return null
+                    }
+                    val waitMs = 1000L * attempts
+                    if (deadlineAtMs != null && timeProvider.now() + waitMs >= deadlineAtMs) {
+                        failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                        return null
+                    }
+                    kotlinx.coroutines.delay(waitMs)
+                }
+            }
+        } finally {
+            if (priority == ApiPriority.HIGH) {
+                rateLimiter.endUserRequest(normalizedRegion)
+            }
+        }
+    }
+
+    /**
+     * Fetches the Challenger league in a single bounded Riot API call with zero per-entry
+     * `account-v1-by-puuid` fanout. Identity enrichment is performed locally by [ChallengerLeagueService]
+     * using cached/last-known-good snapshots and local DB `indexed_players` rows.
+     */
+    suspend fun fetchChallengerLeague(region: String, queue: String): LeagueListDTO? {
+        return fetchChallengerLeagueBounded(region = region, queue = queue)
     }
 
     suspend fun getMatchIdsByPuuid(puuid: String, region: String, queueId: Int, startTime: Long? = null, endTime: Long? = null, count: Int, start: Int = 0): List<String>? {
