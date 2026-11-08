@@ -638,6 +638,48 @@ class RiotApiService(
         }
     }
 
+    suspend fun getMatchTimelineBounded(
+        matchId: String,
+        region: String,
+        priority: ApiPriority = ApiPriority.HIGH,
+        maxRetries: Int = 0,
+        httpAttemptCounter: java.util.concurrent.atomic.AtomicInteger? = null,
+        failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>? = null
+    ): com.pride.summoner_searcher_api.dto.MatchTimelineDto? {
+        val regionalRouting = mapToRegionRouting(region)
+        val matchBaseUrl = "https://${regionalRouting}.api.riotgames.com"
+        val uri = "$matchBaseUrl/lol/match/v5/matches/{matchId}/timeline"
+
+        return executeRateLimitedCall(
+            region = region,
+            priority = priority,
+            endpointKey = "match-v5-timeline-by-id",
+            maxRetries = maxRetries,
+            httpAttemptCounter = httpAttemptCounter,
+            failureReasonHolder = failureReasonHolder,
+            suppressThrowOnZeroRetryFailure = true
+        ) {
+            try {
+                riotRestClient.get()
+                    .uri(uri, matchId)
+                    .retrieve()
+                    .toEntity(com.pride.summoner_searcher_api.dto.MatchTimelineDto::class.java)
+            } catch (e: HttpClientErrorException.NotFound) {
+                failureReasonHolder?.set("HTTP_404_NOT_FOUND")
+                logger.warn("getMatchTimelineBounded returned 404 for matchId: {}", matchId)
+                null
+            } catch (e: HttpClientErrorException.TooManyRequests) {
+                throw e
+            } catch (e: org.springframework.web.client.ResourceAccessException) {
+                throw e
+            } catch (e: org.springframework.web.client.RestClientException) {
+                failureReasonHolder?.set("HTTP_ERROR")
+                logger.warn("getMatchTimelineBounded failed for matchId {}: {}", matchId, e.message)
+                null
+            }
+        }
+    }
+
     private fun getPreferredContent(translations: List<RiotContent>): String? {
         return translations.find { it.locale.equals("en_US", ignoreCase = true) }?.content
             ?: translations.firstOrNull()?.content

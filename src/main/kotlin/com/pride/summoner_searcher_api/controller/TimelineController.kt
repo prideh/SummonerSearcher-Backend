@@ -1,5 +1,7 @@
 package com.pride.summoner_searcher_api.controller
 
+import com.pride.summoner_searcher_api.dto.CoachTimelinePreparationRequestDto
+import com.pride.summoner_searcher_api.dto.CoachTimelinePreparationResultDto
 import com.pride.summoner_searcher_api.dto.MatchTimelineDto
 import com.pride.summoner_searcher_api.dto.TimelineAnalysisDto
 import com.pride.summoner_searcher_api.service.PlayerCacheService
@@ -11,9 +13,11 @@ import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 
 /**
- * Provides two endpoints for the Riot Timeline API:
- *  - GET /api/riot/timeline/{region}/{matchId}          — single timeline (cached 24h)
- *  - GET /api/riot/timeline/analyze/{region}/{puuid}    — analyze last 10 timelines for a player
+ * Provides endpoints for the Riot Timeline API:
+ *  - GET  /api/riot/timeline/{region}/{matchId}               — single timeline (cached 24h)
+ *  - GET  /api/riot/timeline/analyze/{region}/{puuid}         — analyze last 20 timelines for a player
+ *  - POST /api/riot/timeline/prepare-coach/{region}/{puuid}   — bounded sequential on-demand coach timeline prep
+ *  - GET  /api/riot/timeline/prepare-coach/{region}/{puuid}   — bounded sequential on-demand coach timeline prep
  */
 @RestController
 @RequestMapping("/api/riot/timeline")
@@ -35,6 +39,79 @@ class TimelineController(
     ): ResponseEntity<MatchTimelineDto?> = runBlocking {
         val timeline = timelineService.getTimeline(matchId, region)
         ResponseEntity.ok(timeline)
+    }
+
+    /**
+     * Bounded on-demand timeline preparation when AI Coach opens.
+     * Strictly uses at most 20 current cached profile match IDs (never hydrating 883-match seasonal history),
+     * reuses already-loaded profile.recentMatches where available, and delegates to [TimelineService.prepareCoachTimelines].
+     */
+    @PostMapping("/prepare-coach/{region}/{puuid}")
+    fun prepareCoachTimelinesPost(
+        @PathVariable region: String,
+        @PathVariable puuid: String,
+        @RequestBody(required = false) request: CoachTimelinePreparationRequestDto?
+    ): ResponseEntity<CoachTimelinePreparationResultDto> =
+        prepareCoachTimelinesInternal(region, puuid, request?.matchIds)
+
+    @GetMapping("/prepare-coach/{region}/{puuid}")
+    fun prepareCoachTimelinesGet(
+        @PathVariable region: String,
+        @PathVariable puuid: String,
+        @RequestParam(required = false) matchIds: List<String>?
+    ): ResponseEntity<CoachTimelinePreparationResultDto> =
+        prepareCoachTimelinesInternal(region, puuid, matchIds)
+
+    private fun prepareCoachTimelinesInternal(
+        region: String,
+        puuid: String,
+        requestedMatchIds: List<String>?
+    ): ResponseEntity<CoachTimelinePreparationResultDto> = runBlocking {
+        val profile = playerCacheService.getCachedProfile(puuid, region)
+        if (profile == null) {
+            logger.warn("Coach timeline preparation requested but no cached profile for puuid={} region={}", puuid, region)
+            return@runBlocking ResponseEntity.notFound().build()
+        }
+
+        val profileMatchIds = (profile.allMatchIds ?: profile.recentMatches?.mapNotNull { it.metadata?.matchId })
+            ?.take(TimelineService.MAX_COACH_TIMELINE_MATCHES)
+            ?: emptyList()
+
+        val allowedSet = profileMatchIds.toSet()
+        val effectiveMatchIds = if (!requestedMatchIds.isNullOrEmpty()) {
+            requestedMatchIds
+                .map { it.trim() }
+                .filter { it in allowedSet }
+                .distinct()
+                .take(TimelineService.MAX_COACH_TIMELINE_MATCHES)
+                .ifEmpty { profileMatchIds }
+        } else {
+            profileMatchIds
+        }
+
+        val recentMatchesById = profile.recentMatches
+            ?.mapNotNull { m -> m.metadata?.matchId?.let { it to m } }
+            ?.toMap()
+            ?: emptyMap()
+        val missingDtoIds = effectiveMatchIds.filter { it !in recentMatchesById }
+        val fetchedMissingDtos = if (missingDtoIds.isNotEmpty()) {
+            playerCacheService.getMatchesByIds(missingDtoIds, region)
+                .mapNotNull { m -> m.metadata?.matchId?.let { it to m } }
+                .toMap()
+        } else {
+            emptyMap()
+        }
+        val orderedMatchDtos = effectiveMatchIds.mapNotNull { id ->
+            recentMatchesById[id] ?: fetchedMissingDtos[id]
+        }
+
+        val result = timelineService.prepareCoachTimelines(
+            region = region,
+            puuid = puuid,
+            requestedMatchIds = effectiveMatchIds,
+            matchDtos = orderedMatchDtos
+        )
+        ResponseEntity.ok(result)
     }
 
     /**

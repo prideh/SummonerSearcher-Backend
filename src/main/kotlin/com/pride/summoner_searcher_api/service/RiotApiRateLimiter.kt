@@ -121,6 +121,15 @@ class RiotApiRateLimiter(
     }
 
     /**
+     * Returns the remaining active regional `429 Retry-After` or `service` backoff wait time in milliseconds,
+     * or `0L` if no cooldown is currently active.
+     */
+    fun getActiveRetryAfterWaitMs(region: String): Long {
+        val normalizedRegion = region.lowercase()
+        return limiters[normalizedRegion]?.getActiveRetryAfterWaitMs() ?: 0L
+    }
+
+    /**
      * Returns a read-only verification snapshot of observed App, Method, and Service rate limits and headroom.
      */
     fun getVerificationSnapshot(
@@ -201,6 +210,11 @@ class RiotApiRateLimiter(
             if (normalizedType == "service" && target > serviceRateLimitUntilMs) {
                 serviceRateLimitUntilMs = target
             }
+        }
+
+        fun getActiveRetryAfterWaitMs(): Long {
+            val now = timeProvider.now()
+            return (maxOf(retryAfterUntilMs, serviceRateLimitUntilMs) - now).coerceAtLeast(0L)
         }
 
         private fun isForegroundYieldActive(now: Long): Boolean {
