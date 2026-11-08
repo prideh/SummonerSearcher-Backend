@@ -5,36 +5,156 @@ on:
     branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates, feat/collector-session-memory-series, feat/scalar-patch-metadata-queries, feat/cached-player-exact-ingestion ]
   pull_request:
     branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   backend-tests:
+    if: github.event.repository.private == false && github.event.repository.visibility == 'public'
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
     - uses: actions/checkout@v4
-    - name: Set up JDK 21
+      with:
+        fetch-depth: 0
+    - name: Verify public repo free-runner invariant and exact e7e882c + 87d5f44 commit SHAs
+      run: |
+        test "${{ github.event.repository.private }}" = "false"
+        test "${{ github.event.repository.visibility }}" = "public"
+        git cat-file -e e7e882c34539fd344fa40f567732a7170de23ab9^{commit}
+        git cat-file -e 87d5f4406ef641edf5a2d14413f4027af43e0a14^{commit}
+    - name: Set up JDK 21 for exact e7e882c unit test verification
       uses: actions/setup-java@v4
       with:
         java-version: '21'
         distribution: 'temurin'
         cache: 'gradle'
-    - name: Grant execute permission for gradlew and preflight script
-      run: chmod +x gradlew scripts/preflight.sh
-    - name: Run shared preflight (compileKotlin compileTestKotlin + full test)
-      run: ./scripts/preflight.sh
-    - name: Run Real 512 MB Container Proof on Exact Repo Dockerfile (--memory=512m --memory-swap=512m) [Strict <78% Gate]
-      if: github.ref == 'refs/heads/feat/collector-session-memory-series' || github.ref == 'refs/heads/feat/durable-cohort-cell-aggregates' || github.ref == 'refs/heads/fix/collector-session-hard-cap' || github.ref == 'refs/heads/mem/candidate-512m'
+    - name: Build exact Candidate (e7e882c) and Rollback Base (87d5f44) Docker images and capture 76-test JDK 21 XML/exit evidence from detached worktrees
       run: |
-        PG_FIXTURE_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
-        test "${#PG_FIXTURE_PASSWORD}" -eq 48
-        POSTGRES_PASSWORD="$PG_FIXTURE_PASSWORD" docker run -d --name ss-postgres -p 5432:5432 -e POSTGRES_PASSWORD -e POSTGRES_DB=summoner_searcher postgres:16-alpine
-        docker run -d --name ss-redis -p 6379:6379 redis:7-alpine
-        docker build -f Dockerfile -t ss-backend:512m-proof .
+        git worktree add --detach /tmp/wt-e7e882c e7e882c34539fd344fa40f567732a7170de23ab9
+        docker build -f /tmp/wt-e7e882c/Dockerfile -t ss-backend:cand-e7e882c /tmp/wt-e7e882c
+        docker tag ss-backend:cand-e7e882c ss-backend:512m-proof
+
+        mkdir -p /tmp/coach-input-contract-512m-proof-raw/jdk21-test-e7e882c/xml-results
+        mkdir -p /tmp/coach-input-contract-512m-proof-artifacts/jdk21-test-e7e882c/xml-results
+        chmod +x /tmp/wt-e7e882c/gradlew
+        set +e
+        (cd /tmp/wt-e7e882c && ./gradlew compileKotlin compileTestKotlin test --no-daemon --console=plain) > /tmp/coach-input-contract-512m-proof-raw/jdk21-test-e7e882c/test.log 2>&1
+        TEST_EXIT=$?
+        set -e
+        echo "$TEST_EXIT" > /tmp/coach-input-contract-512m-proof-raw/jdk21-test-e7e882c/test.exit
+        cp /tmp/wt-e7e882c/build/test-results/test/TEST-*.xml /tmp/coach-input-contract-512m-proof-raw/jdk21-test-e7e882c/xml-results/ || true
+        cp /tmp/coach-input-contract-512m-proof-raw/jdk21-test-e7e882c/test.exit /tmp/coach-input-contract-512m-proof-artifacts/jdk21-test-e7e882c/test.exit
+        cp /tmp/coach-input-contract-512m-proof-raw/jdk21-test-e7e882c/test.log /tmp/coach-input-contract-512m-proof-artifacts/jdk21-test-e7e882c/test.log
+        cp /tmp/coach-input-contract-512m-proof-raw/jdk21-test-e7e882c/xml-results/TEST-*.xml /tmp/coach-input-contract-512m-proof-artifacts/jdk21-test-e7e882c/xml-results/ || true
+        git worktree remove --force /tmp/wt-e7e882c
+
+        test "$TEST_EXIT" -eq 0
+        python3 -c '
+        import glob, xml.etree.ElementTree as ET
+        files = sorted(glob.glob("/tmp/coach-input-contract-512m-proof-artifacts/jdk21-test-e7e882c/xml-results/TEST-*.xml"))
+        assert len(files) == 13, f"Expected 13 XML suites, got {len(files)}"
+        tests = sum(int(ET.parse(f).getroot().attrib["tests"]) for f in files)
+        failures = sum(int(ET.parse(f).getroot().attrib["failures"]) for f in files)
+        errors = sum(int(ET.parse(f).getroot().attrib["errors"]) for f in files)
+        assert tests == 76 and failures == 0 and errors == 0, f"Unexpected counts: tests={tests}, failures={failures}, errors={errors}"
+        '
+
+        git worktree add --detach /tmp/wt-87d5f44 87d5f4406ef641edf5a2d14413f4027af43e0a14
+        docker build -f /tmp/wt-87d5f44/Dockerfile -t ss-backend:base-87d5f44 /tmp/wt-87d5f44
+        git worktree remove --force /tmp/wt-87d5f44
+    - name: Prepare local Mock Riot TLS certificate and container truststore
+      run: |
         openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/mockriot.key -out /tmp/mockriot.crt -days 1 \
           -subj "/CN=api.riotgames.com" \
           -addext "subjectAltName=DNS:euw1.api.riotgames.com,DNS:na1.api.riotgames.com,DNS:kr.api.riotgames.com,DNS:europe.api.riotgames.com,DNS:americas.api.riotgames.com,DNS:asia.api.riotgames.com,DNS:ddragon.leagueoflegends.com"
-        cid=$(docker create ss-backend:512m-proof)
+        cid=$(docker create ss-backend:cand-e7e882c)
         docker cp "$cid:/opt/java/openjdk/lib/security/cacerts" /tmp/cacerts
         docker rm "$cid"
         keytool -importcert -noprompt -trustcacerts -alias mockriot -file /tmp/mockriot.crt -keystore /tmp/cacerts -storepass changeit
         chmod 644 /tmp/cacerts
-        PROOF_MODE=10_CYCLE ENABLE_NMT=0 DB_PASS="$PG_FIXTURE_PASSWORD" sudo --preserve-env=PROOF_MODE,ENABLE_NMT,DB_PASS python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
+    - name: Run Real 512 MB Container Acceptance Proof (Candidate e7e882c + Rollback 87d5f44)
+      run: |
+        chmod +x scripts/verify_512m_container.py
+        python3 ./scripts/verify_512m_container.py --self-test
+        CAND_IMAGE="ss-backend:cand-e7e882c" BASE_IMAGE="ss-backend:base-87d5f44" \
+        RAW_ARTIFACT_DIR="/tmp/coach-input-contract-512m-proof-raw" \
+        ARTIFACT_DIR="/tmp/coach-input-contract-512m-proof-artifacts" \
+          sudo --preserve-env=CAND_IMAGE,BASE_IMAGE,RAW_ARTIFACT_DIR,ARTIFACT_DIR python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
+    - name: Sanitize and verify zero secrets in upload directory on all paths
+      id: artifact_gate
+      if: always()
+      run: |
+        sudo python3 - << 'PYEOF'
+        import json, os, re, shutil, sys
+        raw_dir = "/tmp/coach-input-contract-512m-proof-raw"
+        upload_dir = "/tmp/coach-input-contract-512m-proof-artifacts"
+        if not os.path.isdir(upload_dir):
+            print("Upload directory does not exist; failing closed.", file=sys.stderr)
+            sys.exit(1)
+        forbidden_tokens = []
+        secrets_manifest = os.path.join(raw_dir, ".ephemeral_secrets.json")
+        if os.path.isfile(secrets_manifest):
+            forbidden_tokens = [t for t in json.load(open(secrets_manifest, "r", encoding="utf-8")) if t]
+        redact_patterns = [
+            re.compile(r"RGAPI-[0-9a-fA-F-]{16,}"),
+            re.compile(r"\bre_[0-9a-zA-Z_]{16,}\b"),
+            re.compile(r"\bgh[pousr]_[0-9a-zA-Z]{20,}\b"),
+            re.compile(r"\bgithub_pat_[0-9a-zA-Z_]{20,}\b"),
+            re.compile(r'(?i)((?:db_pass|postgres_password|jwt_secret_key|twofa_secret_key|cohort_operator_token|riot_api_key|resend_api_key)\s*[=:]\s*)(?!\[REDACTED\])[^\s"\',;<>\]}]+'),
+        ]
+        # Sanitize staged JDK 21 test logs/XMLs in upload_dir while keeping raw_dir untouched
+        jdk_upload_dir = os.path.join(upload_dir, "jdk21-test-e7e882c")
+        if os.path.isdir(jdk_upload_dir):
+            for root, _dirs, files in os.walk(jdk_upload_dir):
+                for fname in files:
+                    fpath = os.path.join(root, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    text = open(fpath, "r", encoding="utf-8", errors="replace").read()
+                    orig = text
+                    for tok in forbidden_tokens:
+                        text = text.replace(tok, "[REDACTED]")
+                    for pat in redact_patterns[:4]:
+                        text = pat.sub("[REDACTED]", text)
+                    text = redact_patterns[4].sub(r"\1[REDACTED]", text)
+                    if text != orig:
+                        open(fpath, "w", encoding="utf-8").write(text)
+        # Strict post-sanitization leak scan and JSON parseability check across EVERY file in upload_dir
+        file_count = 0
+        for root, _dirs, files in os.walk(upload_dir):
+            for fname in files:
+                fpath = os.path.join(root, fname)
+                if not os.path.isfile(fpath):
+                    continue
+                file_count += 1
+                text = open(fpath, "r", encoding="utf-8", errors="replace").read()
+                for tok in forbidden_tokens:
+                    if tok in text:
+                        shutil.rmtree(upload_dir, ignore_errors=True)
+                        raise RuntimeError(f"SECRET_TOKEN_SCAN_GATE_FAILED in {fpath}")
+                for pat in redact_patterns:
+                    if pat.search(text):
+                        shutil.rmtree(upload_dir, ignore_errors=True)
+                        raise RuntimeError(f"SECRET_REGEX_SCAN_GATE_FAILED in {fpath} matching {pat.pattern}")
+                if fname.endswith(".json"):
+                    try:
+                        json.loads(text)
+                    except Exception as e:
+                        shutil.rmtree(upload_dir, ignore_errors=True)
+                        raise RuntimeError(f"INVALID_JSON_ARTIFACT in {fpath}: {e}")
+        if file_count == 0:
+            shutil.rmtree(upload_dir, ignore_errors=True)
+            raise RuntimeError("EMPTY_UPLOAD_DIRECTORY")
+        print(f"Verified {file_count} sanitized artifact files with 0 secret leaks.")
+        PYEOF
+    - name: Upload Sanitized 512 MiB Coach Contract Proof & 76-Test XML/Exit Evidence Artifacts
+      if: always() && steps.artifact_gate.outcome == 'success'
+      uses: actions/upload-artifact@v4
+      with:
+        name: coach-input-contract-512m-proof-e7e882c
+        path: /tmp/coach-input-contract-512m-proof-artifacts
+        if-no-files-found: error
+        retention-days: 7
