@@ -193,6 +193,7 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
         }
         val cancellationHandle = HttpCancellationHandle()
         val taskClaimedOrCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val workerThreadRef = java.util.concurrent.atomic.AtomicReference<Thread?>(null)
         val workerDoneLatch = java.util.concurrent.CountDownLatch(1)
         val submittedFuture: java.util.concurrent.Future<T?> = try {
             boundedHttpExecutor.submit(java.util.concurrent.Callable<T?> {
@@ -201,6 +202,7 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
                     return@Callable null
                 }
                 activeBoundedHttpWorkers.incrementAndGet()
+                workerThreadRef.set(Thread.currentThread())
                 try {
                     if (cancellationHandle.isCancelled() || Thread.currentThread().isInterrupted) {
                         null
@@ -208,6 +210,7 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
                         block(cancellationHandle)
                     }
                 } finally {
+                    workerThreadRef.set(null)
                     activeBoundedHttpWorkers.decrementAndGet()
                     Thread.interrupted()
                     workerDoneLatch.countDown()
@@ -229,17 +232,18 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
             }
             if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
                 withContext(Dispatchers.IO) {
-                    workerDoneLatch.await()
+                    workerDoneLatch.await(250L, java.util.concurrent.TimeUnit.MILLISECONDS)
                 }
             }
             result
         } catch (e: java.util.concurrent.TimeoutException) {
             cancellationHandle.cancel()
             val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            workerThreadRef.get()?.interrupt()
             submittedFuture.cancel(true)
             if (!cancelledBeforeStart) {
                 withContext(Dispatchers.IO) {
-                    workerDoneLatch.await()
+                    workerDoneLatch.await(250L, java.util.concurrent.TimeUnit.MILLISECONDS)
                 }
             }
             if (failureReasonHolder?.get() == null) {
@@ -249,10 +253,11 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
         } catch (e: kotlinx.coroutines.CancellationException) {
             cancellationHandle.cancel()
             val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            workerThreadRef.get()?.interrupt()
             submittedFuture.cancel(true)
             if (!cancelledBeforeStart) {
                 withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
-                    workerDoneLatch.await()
+                    workerDoneLatch.await(250L, java.util.concurrent.TimeUnit.MILLISECONDS)
                 }
             }
             throw e
@@ -260,7 +265,7 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
             val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
             if (!cancelledBeforeStart) {
                 withContext(Dispatchers.IO) {
-                    workerDoneLatch.await()
+                    workerDoneLatch.await(250L, java.util.concurrent.TimeUnit.MILLISECONDS)
                 }
             }
             throw (e.cause ?: e)
@@ -866,7 +871,11 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
      * using cached/last-known-good snapshots and local DB `indexed_players` rows.
      */
     suspend fun fetchChallengerLeague(region: String, queue: String): LeagueListDTO? {
-        return fetchChallengerLeagueBounded(region = region, queue = queue)
+        return fetchChallengerLeagueBounded(
+            region = region,
+            queue = queue,
+            deadlineAtMs = timeProvider.now() + 5_000L
+        )
     }
 
     suspend fun getMatchIdsByPuuid(puuid: String, region: String, queueId: Int, startTime: Long? = null, endTime: Long? = null, count: Int, start: Int = 0): List<String>? {

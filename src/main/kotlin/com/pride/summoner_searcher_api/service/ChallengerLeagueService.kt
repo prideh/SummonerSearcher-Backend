@@ -53,6 +53,8 @@ class ChallengerLeagueService @Autowired constructor(
     private val failureBackoffMs: Long = DEFAULT_FAILURE_BACKOFF_MS,
     @Value("\${leaderboard.challenger.max-response-bytes:524288}")
     private val maxResponseBytes: Int = RiotApiService.MAX_CHALLENGER_LEAGUE_RESPONSE_BYTES,
+    @Value("\${leaderboard.challenger.db-lookup-timeout-ms:1500}")
+    private val dbLookupTimeoutMs: Long = DEFAULT_DB_LOOKUP_TIMEOUT_MS,
     private val maxEntriesPerRegion: Int = MAX_LEADERBOARD_ENTRIES,
     private val maxLastKnownGoodRegionBytes: Int = MAX_LAST_KNOWN_GOOD_REGION_BYTES,
     private val maxLastKnownGoodTotalBytes: Int = MAX_LAST_KNOWN_GOOD_TOTAL_BYTES
@@ -61,17 +63,45 @@ class ChallengerLeagueService @Autowired constructor(
     private val logger = LoggerFactory.getLogger(javaClass)
     private val objectMapper = ObjectMapper().findAndRegisterModules()
     private val singleFlightMutex = Mutex()
+    private val lastKnownGoodLock = Any()
     private val inFlightRefreshes = ConcurrentHashMap<String, CompletableDeferred<LeagueListDTO?>>()
     private val failureBackoffUntilMs = ConcurrentHashMap<String, Long>()
     private val lastRefreshFailureReasonByRegion = ConcurrentHashMap<String, String>()
     private val lastKnownGoodByRegion = ConcurrentHashMap<String, BoundedLeaderboardSnapshot>()
+    private val lastIdentityCoverageByRegion = ConcurrentHashMap<String, IdentityCoverageStats>()
     private val refreshScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val activeDbLookupWorkers = AtomicInteger(0)
+    private val dbLookupThreadCounter = AtomicInteger(0)
+    private val dbLookupExecutor = java.util.concurrent.ThreadPoolExecutor(
+        3,
+        3,
+        30L,
+        java.util.concurrent.TimeUnit.SECONDS,
+        java.util.concurrent.LinkedBlockingQueue(6),
+        java.util.concurrent.ThreadFactory { runnable ->
+            Thread(runnable, "challenger-db-lookup-${dbLookupThreadCounter.incrementAndGet()}").apply {
+                isDaemon = true
+            }
+        },
+        java.util.concurrent.ThreadPoolExecutor.AbortPolicy()
+    ).apply {
+        allowCoreThreadTimeOut(true)
+    }
 
     internal data class BoundedLeaderboardSnapshot(
         val region: String,
         val queue: String,
         val cachedDto: CachedLeaderboardDto,
-        val serializedBytes: Int
+        val serializedBytes: Int,
+        val isComplete: Boolean = true
+    )
+
+    internal data class IdentityCoverageStats(
+        val totalEntries: Int,
+        val resolvedIdentityCount: Int,
+        val missingIdentityCount: Int,
+        val dbResolvedCount: Int,
+        val snapshotResolvedCount: Int
     )
 
     companion object {
@@ -81,6 +111,7 @@ class ChallengerLeagueService @Autowired constructor(
         const val MAX_LAST_KNOWN_GOOD_REGION_BYTES = 131_072 // 128 KiB per region
         const val MAX_LAST_KNOWN_GOOD_TOTAL_BYTES = 393_216 // 384 KiB across 3 regions
         const val DEFAULT_REFRESH_DEADLINE_MS = 5_000L
+        const val DEFAULT_DB_LOOKUP_TIMEOUT_MS = 1_500L
         const val DEFAULT_FAILURE_BACKOFF_MS = 30_000L
         const val CACHE_STALE_HOURS = 24L
     }
@@ -96,15 +127,24 @@ class ChallengerLeagueService @Autowired constructor(
         return leaderboard.entries.any { !it.puuid.isNullOrBlank() }
     }
 
-    internal fun getLastKnownGoodRegionCount(): Int = lastKnownGoodByRegion.size
+    internal fun getLastKnownGoodRegionCount(): Int = synchronized(lastKnownGoodLock) {
+        lastKnownGoodByRegion.size
+    }
 
-    internal fun getLastKnownGoodRegionBytes(region: String): Int =
+    internal fun getLastKnownGoodRegionBytes(region: String): Int = synchronized(lastKnownGoodLock) {
         lastKnownGoodByRegion[normalizeRegion(region)]?.serializedBytes ?: 0
+    }
 
-    internal fun getLastKnownGoodTotalBytes(): Int =
+    internal fun getLastKnownGoodTotalBytes(): Int = synchronized(lastKnownGoodLock) {
         lastKnownGoodByRegion.values.sumOf { it.serializedBytes }
+    }
 
     internal fun getInFlightRefreshCount(): Int = inFlightRefreshes.size
+
+    internal fun getActiveDbLookupWorkers(): Int = activeDbLookupWorkers.get()
+
+    internal fun getLastIdentityCoverage(region: String): IdentityCoverageStats? =
+        lastIdentityCoverageByRegion[normalizeRegion(region)]
 
     internal fun getRemainingBackoffMs(region: String, queue: String = DEFAULT_QUEUE): Long {
         val cacheKey = getCacheKey(region, queue)
@@ -188,14 +228,18 @@ class ChallengerLeagueService @Autowired constructor(
 
         val cachedLeaderboard = cachedData?.leaderboard
         if (isValidLeaderboard(cachedLeaderboard)) {
+            val previousSnapshot = synchronized(lastKnownGoodLock) {
+                lastKnownGoodByRegion[normalizedRegion]?.cachedDto?.leaderboard
+            }
             val enrichedCached = enrichAndBoundLeaderboard(
                 normalizedRegion = normalizedRegion,
                 rawLeague = cachedLeaderboard!!,
-                previousSnapshot = lastKnownGoodByRegion[normalizedRegion]?.cachedDto?.leaderboard,
-                onlyMissingDbIdentities = true
+                previousSnapshot = previousSnapshot,
+                onlyMissingDbIdentities = true,
+                deadlineAtMs = timeProvider.now() + dbLookupTimeoutMs.coerceAtLeast(100L)
             )
             val refreshedAt = cachedData?.lastRefreshed ?: Instant.ofEpochMilli(timeProvider.now())
-            val storedSnapshot = storeLastKnownGoodBounded(
+            storeLastKnownGoodBounded(
                 normalizedRegion = normalizedRegion,
                 queue = queue,
                 lastRefreshed = refreshedAt,
@@ -204,14 +248,14 @@ class ChallengerLeagueService @Autowired constructor(
             val isFresh = cachedData?.lastRefreshed != null &&
                 Duration.between(cachedData.lastRefreshed, Instant.ofEpochMilli(timeProvider.now())).toHours() < CACHE_STALE_HOURS
             if (isFresh) {
-                return storedSnapshot?.cachedDto?.leaderboard ?: enrichedCached
+                return enrichedCached
             }
             logger.info("[ChallengerLeaderboard] Stale cache hit for key: {}. Attempting guarded singleflight refresh.", cacheKey)
             return refreshChallengerLeagueSingleFlight(
                 normalizedRegion = normalizedRegion,
                 queue = queue,
-                previousLeaderboard = storedSnapshot?.cachedDto?.leaderboard ?: enrichedCached
-            ) ?: storedSnapshot?.cachedDto?.leaderboard ?: enrichedCached
+                previousLeaderboard = enrichedCached
+            ) ?: enrichedCached
         }
 
         if (cachedData != null) {
@@ -220,7 +264,9 @@ class ChallengerLeagueService @Autowired constructor(
             logger.info("[ChallengerLeaderboard] Absent Redis entry for key: {}. Self-healing via singleflight.", cacheKey)
         }
 
-        val fallbackBeforeRefresh = lastKnownGoodByRegion[normalizedRegion]?.cachedDto?.leaderboard
+        val fallbackBeforeRefresh = synchronized(lastKnownGoodLock) {
+            lastKnownGoodByRegion[normalizedRegion]?.cachedDto?.leaderboard
+        }
         val refreshed = refreshChallengerLeagueSingleFlight(
             normalizedRegion = normalizedRegion,
             queue = queue,
@@ -230,14 +276,7 @@ class ChallengerLeagueService @Autowired constructor(
             return refreshed
         }
 
-        val fallback = lastKnownGoodByRegion[normalizedRegion]
-        if (fallback != null && isValidLeaderboard(fallback.cachedDto.leaderboard)) {
-            runCatching {
-                redisCacheService.set(cacheKey, fallback.cachedDto, Duration.ZERO)
-            }
-            return fallback.cachedDto.leaderboard
-        }
-        return null
+        return reseedAndReturnLastKnownGood(cacheKey, normalizedRegion, fallbackBeforeRefresh)
     }
 
     /**
@@ -257,11 +296,15 @@ class ChallengerLeagueService @Autowired constructor(
 
         val lastRefreshed = cachedData?.lastRefreshed
         if (isValidLeaderboard(cachedData?.leaderboard)) {
+            val previousSnapshot = synchronized(lastKnownGoodLock) {
+                lastKnownGoodByRegion[normalizedRegion]?.cachedDto?.leaderboard
+            }
             val enrichedCached = enrichAndBoundLeaderboard(
                 normalizedRegion = normalizedRegion,
                 rawLeague = cachedData!!.leaderboard!!,
-                previousSnapshot = lastKnownGoodByRegion[normalizedRegion]?.cachedDto?.leaderboard,
-                onlyMissingDbIdentities = true
+                previousSnapshot = previousSnapshot,
+                onlyMissingDbIdentities = true,
+                deadlineAtMs = timeProvider.now() + dbLookupTimeoutMs.coerceAtLeast(100L)
             )
             storeLastKnownGoodBounded(
                 normalizedRegion = normalizedRegion,
@@ -280,11 +323,13 @@ class ChallengerLeagueService @Autowired constructor(
         val logMessage = if (cachedData == null || !isValidLeaderboard(cachedData.leaderboard)) "MISS" else "STALE"
         logger.info("[Cache Warmer] {} for key: {}. Fetching from API...", logMessage, cacheKey)
 
+        val previousLeaderboard = synchronized(lastKnownGoodLock) {
+            lastKnownGoodByRegion[normalizedRegion]?.cachedDto?.leaderboard
+        } ?: cachedData?.leaderboard
         refreshChallengerLeagueSingleFlight(
             normalizedRegion = normalizedRegion,
             queue = queue,
-            previousLeaderboard = lastKnownGoodByRegion[normalizedRegion]?.cachedDto?.leaderboard
-                ?: cachedData?.leaderboard
+            previousLeaderboard = previousLeaderboard
         )
     }
 
@@ -306,7 +351,7 @@ class ChallengerLeagueService @Autowired constructor(
 
         var isLeader = false
         val deferred = singleFlightMutex.withLock {
-            val existing = inFlightRefreshes[cacheKey]
+            val existing = inFlightRefreshes[cacheKey]?.takeIf { !it.isCompleted }
             if (existing != null) {
                 existing
             } else {
@@ -322,19 +367,29 @@ class ChallengerLeagueService @Autowired constructor(
             }
         } ?: return reseedAndReturnLastKnownGood(cacheKey, normalizedRegion, previousLeaderboard)
 
+        val safeRefreshDeadlineMs = refreshDeadlineMs.coerceAtLeast(100L)
         if (isLeader) {
             refreshScope.launch {
                 try {
-                    val result = executeBoundedLeaderRefresh(
-                        normalizedRegion = normalizedRegion,
-                        queue = queue,
-                        cacheKey = cacheKey,
-                        previousLeaderboard = previousLeaderboard
-                    )
+                    val result = withTimeoutOrNull(safeRefreshDeadlineMs + 200L) {
+                        executeBoundedLeaderRefresh(
+                            normalizedRegion = normalizedRegion,
+                            queue = queue,
+                            cacheKey = cacheKey,
+                            previousLeaderboard = previousLeaderboard
+                        )
+                    } ?: run {
+                        if (lastRefreshFailureReasonByRegion[normalizedRegion] == null) {
+                            recordFailureBackoff(cacheKey, normalizedRegion, "DEADLINE_EXCEEDED")
+                        }
+                        reseedAndReturnLastKnownGood(cacheKey, normalizedRegion, previousLeaderboard)
+                    }
+                    inFlightRefreshes.remove(cacheKey, deferred)
                     deferred.complete(result)
                 } catch (t: Throwable) {
                     recordFailureBackoff(cacheKey, normalizedRegion, "EXCEPTION")
                     val fallback = reseedAndReturnLastKnownGood(cacheKey, normalizedRegion, previousLeaderboard)
+                    inFlightRefreshes.remove(cacheKey, deferred)
                     deferred.complete(fallback)
                 } finally {
                     inFlightRefreshes.remove(cacheKey, deferred)
@@ -342,12 +397,15 @@ class ChallengerLeagueService @Autowired constructor(
             }
         }
 
-        val waitBudgetMs = refreshDeadlineMs.coerceAtLeast(100L) + 250L
+        val waitBudgetMs = safeRefreshDeadlineMs + 250L
         val awaited = withTimeoutOrNull(waitBudgetMs) {
             deferred.await()
         }
         if (awaited != null) {
             return awaited
+        }
+        if (!deferred.isCompleted) {
+            inFlightRefreshes.remove(cacheKey, deferred)
         }
         return reseedAndReturnLastKnownGood(cacheKey, normalizedRegion, previousLeaderboard)
     }
@@ -357,10 +415,19 @@ class ChallengerLeagueService @Autowired constructor(
         normalizedRegion: String,
         previousLeaderboard: LeagueListDTO?
     ): LeagueListDTO? {
-        val snapshot = lastKnownGoodByRegion[normalizedRegion]
+        val snapshot = synchronized(lastKnownGoodLock) {
+            lastKnownGoodByRegion[normalizedRegion]
+        }
         if (snapshot != null && isValidLeaderboard(snapshot.cachedDto.leaderboard)) {
+            val dtoToReseed = if (snapshot.isComplete) {
+                snapshot.cachedDto
+            } else {
+                // Mark truncated fallback snapshot as stale in Redis so that once failure backoff expires,
+                // the next request refreshes the full 300-entry leaderboard rather than serving a truncated list as fresh.
+                snapshot.cachedDto.copy(lastRefreshed = Instant.EPOCH)
+            }
             runCatching {
-                redisCacheService.set(cacheKey, snapshot.cachedDto, Duration.ZERO)
+                redisCacheService.set(cacheKey, dtoToReseed, Duration.ZERO)
             }
             return snapshot.cachedDto.leaderboard
         }
@@ -384,7 +451,7 @@ class ChallengerLeagueService @Autowired constructor(
         val failureReasonHolder = AtomicReference<String?>(null)
 
         val freshLeague = try {
-            val boundedResult = riotApiService.fetchChallengerLeagueBounded(
+            riotApiService.fetchChallengerLeagueBounded(
                 region = normalizedRegion,
                 queue = queue,
                 priority = ApiPriority.LOW,
@@ -396,13 +463,6 @@ class ChallengerLeagueService @Autowired constructor(
                 httpAttemptCounter = httpAttempts,
                 failureReasonHolder = failureReasonHolder
             )
-            if (boundedResult != null) {
-                boundedResult
-            } else if (httpAttempts.get() == 0 && failureReasonHolder.get() == null) {
-                riotApiService.fetchChallengerLeague(normalizedRegion, queue)
-            } else {
-                null
-            }
         } catch (e: Exception) {
             failureReasonHolder.compareAndSet(null, "UPSTREAM_EXCEPTION")
             logger.warn("[ChallengerLeaderboard] Upstream fetch failed for {}: {}", cacheKey, e.message)
@@ -419,21 +479,25 @@ class ChallengerLeagueService @Autowired constructor(
             return reseedAndReturnLastKnownGood(cacheKey, normalizedRegion, previousLeaderboard)
         }
 
+        val fallbackSnapshot = previousLeaderboard ?: synchronized(lastKnownGoodLock) {
+            lastKnownGoodByRegion[normalizedRegion]?.cachedDto?.leaderboard
+        }
         val enriched = enrichAndBoundLeaderboard(
             normalizedRegion = normalizedRegion,
             rawLeague = freshLeague!!,
-            previousSnapshot = previousLeaderboard ?: lastKnownGoodByRegion[normalizedRegion]?.cachedDto?.leaderboard,
-            onlyMissingDbIdentities = false
+            previousSnapshot = fallbackSnapshot,
+            onlyMissingDbIdentities = false,
+            deadlineAtMs = deadlineAtMs
         )
 
         val refreshedAt = Instant.ofEpochMilli(timeProvider.now())
-        val storedSnapshot = storeLastKnownGoodBounded(
+        storeLastKnownGoodBounded(
             normalizedRegion = normalizedRegion,
             queue = queue,
             lastRefreshed = refreshedAt,
             leaderboard = enriched
         )
-        val dtoToCache = storedSnapshot?.cachedDto ?: CachedLeaderboardDto(
+        val fullDtoToCache = CachedLeaderboardDto(
             lastRefreshed = refreshedAt,
             leaderboard = enriched
         )
@@ -442,13 +506,13 @@ class ChallengerLeagueService @Autowired constructor(
         lastRefreshFailureReasonByRegion.remove(normalizedRegion)
 
         runCatching {
-            redisCacheService.set(cacheKey, dtoToCache, Duration.ZERO)
-            logger.info("[Cache Warmer] Populating cache with fresh data for key: {} (entries={})", cacheKey, dtoToCache.leaderboard?.entries?.size ?: 0)
+            redisCacheService.set(cacheKey, fullDtoToCache, Duration.ZERO)
+            logger.info("[Cache Warmer] Populating cache with fresh data for key: {} (entries={})", cacheKey, enriched.entries.size)
         }.onFailure { e ->
             logger.warn("[ChallengerLeaderboard] Failed to write refreshed leaderboard to Redis for {}: {}", cacheKey, e.message)
         }
 
-        return dtoToCache.leaderboard
+        return enriched
     }
 
     private fun recordFailureBackoff(cacheKey: String, normalizedRegion: String, reason: String) {
@@ -461,15 +525,16 @@ class ChallengerLeagueService @Autowired constructor(
 
     /**
      * Enriches [rawLeague] entries with `(gameName, tagLine)` using ONLY:
-     * 1. Local DB `indexed_players` rows via a single batched `findAllById` lookup (`<= 300` PUUIDs), and
+     * 1. Local DB `indexed_players` rows via a single batched `findAllById` lookup (`<= 300` PUUIDs) bounded by deadline, and
      * 2. Previously cached / last-known-good leaderboard entries for the region.
-     * Makes ZERO Riot Account-V1 API calls.
+     * Makes ZERO Riot Account-V1 API calls and records [IdentityCoverageStats] for observability.
      */
     private fun enrichAndBoundLeaderboard(
         normalizedRegion: String,
         rawLeague: LeagueListDTO,
         previousSnapshot: LeagueListDTO?,
-        onlyMissingDbIdentities: Boolean = false
+        onlyMissingDbIdentities: Boolean = false,
+        deadlineAtMs: Long? = null
     ): LeagueListDTO {
         val safeMaxEntries = maxEntriesPerRegion.coerceIn(1, MAX_LEADERBOARD_ENTRIES)
         val sortedBoundedEntries = rawLeague.entries
@@ -502,20 +567,20 @@ class ChallengerLeagueService @Autowired constructor(
         val dbIdentityByPuuid = HashMap<String, Pair<String, String>>()
         val repo = indexedPlayerRepository
         if (candidatePuuidsForDb.isNotEmpty() && repo != null) {
-            runCatching {
-                val dbPlayers = repo.findAllById(candidatePuuidsForDb)
-                for (player in dbPlayers) {
-                    val p = player.puuid.trim()
-                    val gn = player.gameName.trim()
-                    val tl = player.tagLine.trim()
-                    if (p.isNotBlank() && gn.isNotBlank() && tl.isNotBlank()) {
-                        dbIdentityByPuuid[p] = gn to tl
-                    }
+            val dbPlayers = fetchDbIdentitiesBounded(normalizedRegion, repo, candidatePuuidsForDb, deadlineAtMs)
+            for (player in dbPlayers) {
+                val p = player.puuid.trim()
+                val gn = player.gameName.trim()
+                val tl = player.tagLine.trim()
+                if (p.isNotBlank() && gn.isNotBlank() && tl.isNotBlank()) {
+                    dbIdentityByPuuid[p] = gn to tl
                 }
-            }.onFailure { e ->
-                logger.warn("[ChallengerLeaderboard] Local DB identity lookup failed for {}: {}", normalizedRegion, e.message)
             }
         }
+
+        var resolvedCount = 0
+        var dbResolvedCount = 0
+        var snapshotResolvedCount = 0
 
         val enrichedEntries = sortedBoundedEntries.map { entry ->
             val puuid = entry.puuid?.trim()
@@ -526,6 +591,15 @@ class ChallengerLeagueService @Autowired constructor(
 
             val resolvedGameName = dbIdentity?.first ?: existingGameName ?: prevIdentity?.first
             val resolvedTagLine = dbIdentity?.second ?: existingTagLine ?: prevIdentity?.second
+
+            if (!resolvedGameName.isNullOrBlank() && !resolvedTagLine.isNullOrBlank()) {
+                resolvedCount++
+                if (dbIdentity != null) {
+                    dbResolvedCount++
+                } else if (existingGameName == null && prevIdentity != null) {
+                    snapshotResolvedCount++
+                }
+            }
 
             LeagueEntryDto(
                 puuid = puuid,
@@ -546,6 +620,27 @@ class ChallengerLeagueService @Autowired constructor(
             )
         }
 
+        val missingCount = (enrichedEntries.size - resolvedCount).coerceAtLeast(0)
+        val coverage = IdentityCoverageStats(
+            totalEntries = enrichedEntries.size,
+            resolvedIdentityCount = resolvedCount,
+            missingIdentityCount = missingCount,
+            dbResolvedCount = dbResolvedCount,
+            snapshotResolvedCount = snapshotResolvedCount
+        )
+        lastIdentityCoverageByRegion[normalizedRegion] = coverage
+        if (missingCount > 0) {
+            logger.warn(
+                "[ChallengerLeaderboard] Partial Riot ID coverage for {}: resolved={}/{} (missing={}, dbResolved={}, snapshotResolved={}). Rows without gameName/tagLine are unclickable in Dashboard until indexed.",
+                normalizedRegion, resolvedCount, enrichedEntries.size, missingCount, dbResolvedCount, snapshotResolvedCount
+            )
+        } else {
+            logger.info(
+                "[ChallengerLeaderboard] Full Riot ID coverage for {}: resolved={}/{} (dbResolved={}, snapshotResolved={}).",
+                normalizedRegion, resolvedCount, enrichedEntries.size, dbResolvedCount, snapshotResolvedCount
+            )
+        }
+
         return LeagueListDTO(
             tier = rawLeague.tier,
             leagueId = rawLeague.leagueId,
@@ -555,12 +650,90 @@ class ChallengerLeagueService @Autowired constructor(
         )
     }
 
+    private fun fetchDbIdentitiesBounded(
+        normalizedRegion: String,
+        repo: IndexedPlayerRepository,
+        candidatePuuids: List<String>,
+        deadlineAtMs: Long?
+    ): List<com.pride.summoner_searcher_api.model.IndexedPlayer> {
+        val safeDbTimeoutMs = dbLookupTimeoutMs.coerceAtLeast(50L)
+        val remainingDeadlineMs = if (deadlineAtMs != null) {
+            deadlineAtMs - timeProvider.now()
+        } else {
+            safeDbTimeoutMs
+        }
+        val effectiveTimeoutMs = minOf(safeDbTimeoutMs, remainingDeadlineMs)
+        if (effectiveTimeoutMs <= 0L) {
+            logger.warn("[ChallengerLeaderboard] Skipping DB identity lookup for {} because deadline already expired.", normalizedRegion)
+            return emptyList()
+        }
+
+        val taskClaimedOrCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val workerThreadRef = java.util.concurrent.atomic.AtomicReference<Thread?>(null)
+        val workerDoneLatch = java.util.concurrent.CountDownLatch(1)
+        val future = try {
+            dbLookupExecutor.submit(java.util.concurrent.Callable<List<com.pride.summoner_searcher_api.model.IndexedPlayer>> {
+                if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
+                    workerDoneLatch.countDown()
+                    return@Callable emptyList()
+                }
+                activeDbLookupWorkers.incrementAndGet()
+                workerThreadRef.set(Thread.currentThread())
+                try {
+                    if (Thread.currentThread().isInterrupted) {
+                        emptyList()
+                    } else {
+                        repo.findAllById(candidatePuuids).toList()
+                    }
+                } finally {
+                    workerThreadRef.set(null)
+                    activeDbLookupWorkers.decrementAndGet()
+                    Thread.interrupted()
+                    workerDoneLatch.countDown()
+                }
+            })
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            logger.warn("[ChallengerLeaderboard] DB lookup executor saturated for {}; continuing without DB enrichment.", normalizedRegion)
+            return emptyList()
+        }
+
+        return try {
+            val rows = future.get(effectiveTimeoutMs, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
+                workerDoneLatch.await(100L, java.util.concurrent.TimeUnit.MILLISECONDS)
+            }
+            rows
+        } catch (e: java.util.concurrent.TimeoutException) {
+            val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            workerThreadRef.get()?.interrupt()
+            future.cancel(true)
+            if (!cancelledBeforeStart) {
+                workerDoneLatch.await(100L, java.util.concurrent.TimeUnit.MILLISECONDS)
+            }
+            logger.warn(
+                "[ChallengerLeaderboard] Local DB identity lookup timed out after {}ms for {}; continuing with snapshot identities.",
+                effectiveTimeoutMs, normalizedRegion
+            )
+            emptyList()
+        } catch (e: Exception) {
+            val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            workerThreadRef.get()?.interrupt()
+            future.cancel(true)
+            if (!cancelledBeforeStart) {
+                workerDoneLatch.await(100L, java.util.concurrent.TimeUnit.MILLISECONDS)
+            }
+            logger.warn("[ChallengerLeaderboard] Local DB identity lookup failed for {}: {}", normalizedRegion, e.message)
+            emptyList()
+        }
+    }
+
     /**
-     * Stores [leaderboard] in [lastKnownGoodByRegion] while enforcing:
+     * Stores [leaderboard] in [lastKnownGoodByRegion] while atomically enforcing:
      * 1. Region allowlist (`euw1`, `na1`, `kr` — max 3 regions),
      * 2. Entry count cap (`<= maxEntriesPerRegion`, max 300),
      * 3. Per-region serialized UTF-8 byte cap (`<= maxLastKnownGoodRegionBytes`), and
      * 4. Total 3-region serialized UTF-8 byte cap (`<= maxLastKnownGoodTotalBytes`).
+     * Never accepts an oversized entry even when `currentEntries.size == 1`.
      */
     private fun storeLastKnownGoodBounded(
         normalizedRegion: String,
@@ -569,37 +742,50 @@ class ChallengerLeagueService @Autowired constructor(
         leaderboard: LeagueListDTO
     ): BoundedLeaderboardSnapshot? {
         if (normalizedRegion !in SUPPORTED_REGIONS) return null
-        val safeRegionByteCap = maxLastKnownGoodRegionBytes.coerceIn(2_048, MAX_LAST_KNOWN_GOOD_REGION_BYTES)
-        val safeTotalByteCap = maxLastKnownGoodTotalBytes.coerceIn(safeRegionByteCap, MAX_LAST_KNOWN_GOOD_TOTAL_BYTES)
-        val otherRegionsBytes = lastKnownGoodByRegion.entries
-            .filter { it.key != normalizedRegion }
-            .sumOf { it.value.serializedBytes }
-        val effectiveByteBudget = minOf(safeRegionByteCap, (safeTotalByteCap - otherRegionsBytes).coerceAtLeast(2_048))
+        synchronized(lastKnownGoodLock) {
+            val safeRegionByteCap = maxLastKnownGoodRegionBytes.coerceIn(1_024, MAX_LAST_KNOWN_GOOD_REGION_BYTES)
+            val safeTotalByteCap = maxLastKnownGoodTotalBytes.coerceIn(safeRegionByteCap, MAX_LAST_KNOWN_GOOD_TOTAL_BYTES)
+            val otherRegionsBytes = lastKnownGoodByRegion.entries
+                .filter { it.key != normalizedRegion }
+                .sumOf { it.value.serializedBytes }
+            val remainingTotalBudget = (safeTotalByteCap - otherRegionsBytes).coerceAtLeast(0)
+            val effectiveByteBudget = minOf(safeRegionByteCap, remainingTotalBudget)
+            if (effectiveByteBudget <= 0) {
+                lastKnownGoodByRegion.remove(normalizedRegion)
+                return null
+            }
 
-        var currentEntries = leaderboard.entries.take(maxEntriesPerRegion.coerceIn(1, MAX_LEADERBOARD_ENTRIES))
-        while (currentEntries.isNotEmpty()) {
-            val candidateDto = CachedLeaderboardDto(
-                lastRefreshed = lastRefreshed,
-                leaderboard = leaderboard.copy(entries = currentEntries)
-            )
-            val serializedBytes = objectMapper.writeValueAsString(candidateDto)
-                .toByteArray(StandardCharsets.UTF_8)
-                .size
-            if (serializedBytes <= effectiveByteBudget || currentEntries.size == 1) {
-                val snapshot = BoundedLeaderboardSnapshot(
-                    region = normalizedRegion,
-                    queue = queue,
-                    cachedDto = candidateDto,
-                    serializedBytes = serializedBytes
+            val fullBoundedEntries = leaderboard.entries.take(maxEntriesPerRegion.coerceIn(1, MAX_LEADERBOARD_ENTRIES))
+            var currentEntries = fullBoundedEntries
+            while (currentEntries.isNotEmpty()) {
+                val candidateDto = CachedLeaderboardDto(
+                    lastRefreshed = lastRefreshed,
+                    leaderboard = leaderboard.copy(entries = currentEntries)
                 )
-                lastKnownGoodByRegion[normalizedRegion] = snapshot
-                return snapshot
+                val serializedBytes = objectMapper.writeValueAsString(candidateDto)
+                    .toByteArray(StandardCharsets.UTF_8)
+                    .size
+                if (serializedBytes <= effectiveByteBudget) {
+                    val snapshot = BoundedLeaderboardSnapshot(
+                        region = normalizedRegion,
+                        queue = queue,
+                        cachedDto = candidateDto,
+                        serializedBytes = serializedBytes,
+                        isComplete = currentEntries.size == fullBoundedEntries.size
+                    )
+                    lastKnownGoodByRegion[normalizedRegion] = snapshot
+                    return snapshot
+                }
+                if (currentEntries.size == 1) {
+                    break
+                }
+                val nextSize = (currentEntries.size * 3 / 4).coerceAtLeast(1).let {
+                    if (it >= currentEntries.size) currentEntries.size - 1 else it
+                }
+                currentEntries = currentEntries.take(nextSize)
             }
-            val nextSize = (currentEntries.size * 3 / 4).coerceAtLeast(1).let {
-                if (it >= currentEntries.size) currentEntries.size - 1 else it
-            }
-            currentEntries = currentEntries.take(nextSize)
+            lastKnownGoodByRegion.remove(normalizedRegion)
+            return null
         }
-        return null
     }
 }
