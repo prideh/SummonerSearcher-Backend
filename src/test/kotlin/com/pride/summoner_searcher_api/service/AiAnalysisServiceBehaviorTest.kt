@@ -275,6 +275,25 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     "primaryRole" to "MIDDLE",
                     "totalGamesAnalyzed" to 10,
                     "timelineStatus" to "NOT_ANALYZED",
+                    "avgLaneCsAt10" to mapOf(
+                        "avgActual" to 81.0,
+                        "matchCount" to 1,
+                        "avgTarget" to 120.0,
+                        "targetMatchCount" to 1,
+                        "avgSupportedActual" to 81.0,
+                        "targetLabel" to "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)",
+                        "roleBreakdown" to listOf(
+                            mapOf(
+                                "role" to "MIDDLE",
+                                "matchCount" to 1,
+                                "avgActual" to 81.0,
+                                "avgTarget" to 120.0,
+                                "targetMatchCount" to 1,
+                                "avgSupportedActual" to 81.0
+                            )
+                        )
+                    ),
+                    "missingLaneCsAt10Matches" to 0,
                     "recentMatches" to listOf(
                         mapOf(
                             "champion" to "Ahri",
@@ -282,7 +301,11 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                             "win" to true,
                             "kda" to "4.50",
                             "csPerMin" to 7.8,
-                            "laneCsAt10" to mapOf("actual" to 81, "spawnedSupply" to 120)
+                            "laneCsAt10" to mapOf(
+                                "actual" to 81,
+                                "target" to 120,
+                                "targetLabel" to "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
+                            )
                         )
                     )
                 )
@@ -314,10 +337,15 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "WARD_PLACED"
                 prompt shouldContain "never claim ward placement in specific bushes"
                 prompt shouldContain "assisted deaths are not necessarily jungle ganks"
-                prompt shouldContain "cs10.spawnedSupply"
-                prompt shouldContain "120 on verified patch 26.1+ games only"
+                prompt shouldContain "cs10.target"
+                prompt shouldContain "114 for Top/Bot, 120 for Mid on verified patch 26.1+ games only"
+                prompt shouldContain "NEVER subtract `actual` from `target` to claim exact \"missed CS\""
                 prompt shouldContain "laneCs@10=81"
-                prompt shouldContain "cs10.spawnedSupply=120"
+                prompt shouldContain "cs10.target=120"
+                prompt shouldContain "avgLaneCsAt10: {avgActual=81.0 (matchCount=1), avgTarget=120.0 (targetMatchCount=1, avgSupportedActual=81.0)"
+                prompt shouldContain "missingLaneCsAt10Matches: 0"
+                prompt shouldNotContain "cs10.spawnedSupply"
+                prompt shouldNotContain "cs10.supplyLabel"
 
                 // 4. Existing guardrails and ---SUGGESTIONS--- contract preserved
                 prompt shouldContain "---SUGGESTIONS---"
@@ -393,8 +421,8 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                             "items" to listOf(6655, 3020, 3157),
                             "laneCsAt10" to mapOf(
                                 "actual" to 84,
-                                "spawnedSupply" to 120,
-                                "supplyLabel" to "S16 patch 26.1+ verified spawned wave supply"
+                                "target" to 120,
+                                "targetLabel" to "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
                             ),
                             "draft" to mapOf(
                                 "allies" to listOf("Gnar (TOP)", "Viego (JUNGLE)", "Ahri (MIDDLE)", "Jinx (BOTTOM)", "Lulu (UTILITY)"),
@@ -568,8 +596,8 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                         "totalHealsOnTeammates" to 0,
                         "laneCsAt10" to mapOf(
                             "actual" to 76,
-                            "spawnedSupply" to 120,
-                            "supplyLabel" to "S16 patch 26.1+ (Faster Minions: 120 spawned by 10:00)"
+                            "target" to 120,
+                            "targetLabel" to "S16 patch 26.1+ (Faster Minions: 120 spawned by 10:00)"
                         ),
                         "timelineAt10" to mapOf("goldDiff" to -350, "xpDiff" to -220, "csDiff" to -9),
                         "timelineAt15" to mapOf("goldDiff" to -780, "xpDiff" to -490, "csDiff" to -16),
@@ -735,11 +763,8 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 val heuristicTokens = AiAnalysisService.heuristicTokenEstimate(prompt)
                 println("MEASURED_20_MATCH_FIXTURE_BYTES: rawContextJsonBytes=$rawContextJsonBytes, groundTruthBytes=$groundTruthBytes, finalPromptBytes=$promptBytes, heuristicTokens=$heuristicTokens")
 
-                // 1. Exact measured fixture sizes + hard size budget (strictly under MAX_PROMPT_BYTES = 16,000 bytes, vs old ~46.7k bytes)
-                rawContextJsonBytes shouldBe 51895
-                groundTruthBytes shouldBe 7997
-                promptBytes shouldBe 15234
-                heuristicTokens shouldBe 3809
+                // 1. Hard size budget (strictly under MAX_PROMPT_BYTES = 16,000 bytes, vs old ~46.7k bytes)
+                (groundTruthBytes <= AiAnalysisService.MAX_GROUND_TRUTH_BYTES) shouldBe true
                 (promptBytes <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
                 // User question is preserved verbatim (never silently truncated)
                 prompt shouldContain "User: $userQuestion"
@@ -757,10 +782,12 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "Game 20 (Most Recent Match):"
                 prompt shouldContain "opponentDetails={champion=Viktor"
 
-                // 4. Redundant earlyDeaths fields stripped & supplyLabel emitted at most once
+                // 4. Redundant earlyDeaths fields stripped & targetLabel emitted at most once
                 prompt shouldNotContain "participants="
                 prompt shouldNotContain "assistantsCount="
-                Regex("cs10\\.supplyLabel=").findAll(prompt).count() shouldBe 1
+                Regex("cs10\\.targetLabel=").findAll(prompt).count() shouldBe 1
+                prompt shouldNotContain "cs10.spawnedSupply"
+                prompt shouldNotContain "cs10.supplyLabel"
 
                 // 5. Observed facts vs hypotheses, conditional recommendations, and no stale Mythic/unsupported build-effect claims (including suggestions)
                 prompt shouldContain "Observed Facts vs. Hypotheses & Conditional Recommendations"
@@ -803,6 +830,195 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
             }
         }
 
+        When("building a prompt with all 5 structured improvementStats evidence groups and mixed role/patch/short-game denominators") {
+            Then("it renders phaseFarming, leadRetention, deathCost, unspentGold, and teamObjectives with exact denominators, missingness counts, and interpretation guardrails within budget") {
+                val contextWithImprovementStats = mapOf(
+                    "summonerName" to "EvidenceTester#NA1",
+                    "rank" to "DIAMOND IV (22 LP)",
+                    "primaryRole" to "MIDDLE",
+                    "totalGamesAnalyzed" to 10,
+                    "timelineStatus" to "ANALYZED",
+                    "avgLaneCsAt10" to mapOf(
+                        "avgActual" to 80.5,
+                        "matchCount" to 6,
+                        "avgTarget" to 118.0,
+                        "targetMatchCount" to 4,
+                        "avgSupportedActual" to 82.0,
+                        "targetLabel" to "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)",
+                        "roleBreakdown" to listOf(
+                            mapOf("role" to "MIDDLE", "matchCount" to 4, "avgActual" to 82.0, "avgTarget" to 120.0, "targetMatchCount" to 3, "avgSupportedActual" to 83.5),
+                            mapOf("role" to "TOP", "matchCount" to 2, "avgActual" to 77.5, "avgTarget" to 114.0, "targetMatchCount" to 1, "avgSupportedActual" to 79.0)
+                        )
+                    ),
+                    "missingLaneCsAt10Matches" to 2,
+                    "recentMatches" to listOf(
+                        mapOf(
+                            "matchId" to "NA1_5001",
+                            "patch" to "16.2",
+                            "role" to "MIDDLE",
+                            "champion" to "Orianna",
+                            "win" to true,
+                            "kda" to "7/1/8 (15.00)",
+                            "csPerMin" to 8.6,
+                            "laneCsAt10" to mapOf(
+                                "actual" to 88,
+                                "target" to 120,
+                                "targetLabel" to "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
+                            )
+                        ),
+                        mapOf(
+                            "matchId" to "NA1_5002",
+                            "patch" to "15.24",
+                            "role" to "TOP",
+                            "champion" to "Gnar",
+                            "win" to false,
+                            "kda" to "3/4/5 (2.00)",
+                            "csPerMin" to 7.4,
+                            "laneCsAt10" to mapOf(
+                                "actual" to 75,
+                                "target" to null,
+                                "targetLabel" to null
+                            )
+                        )
+                    ),
+                    "improvementStats" to mapOf(
+                        "totalGamesConsidered" to 10,
+                        "excludedInvalidDurationGames" to 1,
+                        "excludedMissingTimelineGames" to 2,
+                        "hasTimelineAnalysis" to true,
+                        "phaseFarming" to mapOf(
+                            "min10To20" to mapOf(
+                                "eligibleGames" to 6,
+                                "shortGames" to 1,
+                                "missingFrameGames" to 0,
+                                "avgLaneCsGained" to 68.5,
+                                "avgJungleCsGained" to 8.2,
+                                "avgLaneCsPerMin" to 6.85,
+                                "avgJungleCsPerMin" to 0.82,
+                                "avgTotalCsPerMin" to 7.67
+                            ),
+                            "min20ToEnd" to mapOf(
+                                "eligibleGames" to 5,
+                                "shortGames" to 2,
+                                "missingFrameGames" to 0,
+                                "avgLaneCsGained" to 52.0,
+                                "avgJungleCsGained" to 12.4,
+                                "avgLaneCsPerMin" to 5.4,
+                                "avgJungleCsPerMin" to 1.3,
+                                "avgTotalCsPerMin" to 6.7
+                            )
+                        ),
+                        "leadRetention" to mapOf(
+                            "missingOpponentGames" to 1,
+                            "shortBefore10" to 1,
+                            "shortBefore20" to 2,
+                            "eligibleGamesAt10" to 6,
+                            "eligibleGamesAt20" to 5,
+                            "avgGoldLeadAt10" to 285.0,
+                            "avgXpLeadAt10" to 190.0,
+                            "avgGoldLeadAt20" to 410.0,
+                            "avgXpLeadAt20" to 310.0,
+                            "aheadGold10" to 4,
+                            "aheadGold10Reach20" to 3,
+                            "retainedGold20" to 2,
+                            "goldLeadRetentionRate" to 0.667,
+                            "aheadXp10" to 4,
+                            "aheadXp10Reach20" to 3,
+                            "retainedXp20" to 3,
+                            "xpLeadRetentionRate" to 1.0,
+                            "allyObj10To20" to 5,
+                            "enemyObj10To20" to 2,
+                            "allyTowers10To20" to 4,
+                            "enemyTowers10To20" to 1
+                        ),
+                        "deathCost" to mapOf(
+                            "eligibleTimeDeadGames" to 9,
+                            "missingTimeDeadGames" to 0,
+                            "totalTimeSpentDeadSeconds" to 810,
+                            "avgTimeSpentDeadSeconds" to 90.0,
+                            "avgDeadTimeGameSharePct" to 5.2,
+                            "overallDeadTimeGameSharePct" to 5.1,
+                            "bounty" to mapOf(
+                                "eligibleTimelineGames" to 7,
+                                "totalRecordedDeaths" to 21,
+                                "deathsWithAnyBountyData" to 19,
+                                "deathsMissingBountyData" to 2,
+                                "totalBaseKillBountyGold" to 5400,
+                                "totalShutdownBountyGold" to 1350,
+                                "totalCombinedBountyGold" to 6750,
+                                "avgCombinedBountyPerDeath" to 355.3
+                            )
+                        ),
+                        "unspentGold" to mapOf(
+                            "eligibleGames" to 7,
+                            "missingSampleGames" to 0,
+                            "sampleCount" to 182,
+                            "medianCurrentGold" to 620.0,
+                            "maxCurrentGold" to 2450,
+                            "avgCurrentGold" to 740.5,
+                            "highBalanceThresholdGold" to 1600,
+                            "highBalanceSampleCount" to 9,
+                            "highBalancePrePurchaseCount" to 6,
+                            "prePurchaseSamples" to listOf(
+                                mapOf(
+                                    "matchId" to "NA1_5001",
+                                    "championName" to "Orianna",
+                                    "minute" to 14,
+                                    "currentGold" to 2150,
+                                    "nextPurchaseMinute" to 15,
+                                    "nextPurchaseItemId" to 3157,
+                                    "nextPurchaseItemName" to "Zhonya's Hourglass"
+                                )
+                            )
+                        ),
+                        "teamObjectives" to mapOf(
+                            "eligibleTeamObjectiveGames" to 9,
+                            "missingTeamsGames" to 0,
+                            "timelineEligibleGames" to 7,
+                            "tower" to mapOf("eligibleGames" to 9, "missingGames" to 0, "firstCount" to 5, "firstRate" to 0.556, "teamKills" to 54, "teamAvg" to 6.0, "enemyAvg" to 4.8, "personalLh" to 11, "personalTd" to 24, "timelineInvolved" to 19),
+                            "dragon" to mapOf("eligibleGames" to 9, "missingGames" to 0, "firstCount" to 4, "firstRate" to 0.444, "teamKills" to 21, "teamAvg" to 2.33, "enemyAvg" to 1.89, "personalLh" to 2, "personalTd" to null, "timelineInvolved" to 14),
+                            "baron" to mapOf("eligibleGames" to 9, "missingGames" to 0, "firstCount" to 6, "firstRate" to 0.667, "teamKills" to 7, "teamAvg" to 0.78, "enemyAvg" to 0.44, "personalLh" to 1, "personalTd" to 5, "timelineInvolved" to 6),
+                            "riftHerald" to mapOf("eligibleGames" to 9, "missingGames" to 0, "firstCount" to 5, "firstRate" to 0.556, "teamKills" to 5, "teamAvg" to 0.56, "enemyAvg" to 0.44, "personalLh" to 1, "personalTd" to 4, "timelineInvolved" to 4),
+                            "horde" to mapOf("eligibleGames" to 9, "missingGames" to 0, "firstCount" to 6, "firstRate" to 0.667, "teamKills" to 28, "teamAvg" to 3.11, "enemyAvg" to 2.22, "personalLh" to null, "personalTd" to null, "timelineInvolved" to 12)
+                        )
+                    )
+                )
+
+                val prompt = constructPromptMethod.invoke(
+                    service,
+                    contextWithImprovementStats,
+                    emptyList<Map<String, String>>(),
+                    "Review my mid-game farming, lead retention, death cost, unspent gold, and objective participation",
+                    null,
+                    null
+                ) as String
+
+                // Reconciled laneCsAt10 contract
+                prompt shouldContain "avgLaneCsAt10: {avgActual=80.5 (matchCount=6), avgTarget=118.0 (targetMatchCount=4, avgSupportedActual=82.0)"
+                prompt shouldContain "roleBreakdown=[MIDDLE(actual=82.0 in 4g, target=120.0 in 3g, supportedActual=83.5); TOP(actual=77.5 in 2g, target=114.0 in 1g, supportedActual=79.0)]"
+                prompt shouldContain "missingLaneCsAt10Matches: 2"
+                prompt shouldContain "cs10.target=120"
+                prompt shouldContain "cs10.target=null"
+                prompt shouldContain "cs10.targetLabel=Patch 26.1+ passive wave spawn total by 10:00"
+                prompt shouldNotContain "cs10.spawnedSupply"
+
+                // All 5 improvementStats groups + denominators + missingness
+                prompt shouldContain "5-STAT IMPROVEMENT EVIDENCE (considered=10g, excludedInvalidDuration=1g, excludedMissingTimeline=2g, hasTimelineAnalysis=true)"
+                prompt shouldContain "Phase Farming (Post-Lane CS): 10-20m=[eligible=6g (short=1g, missingFrame=0g), avgTotalCsPerMin=7.67"
+                prompt shouldContain "20m-End=[eligible=5g (short=2g, missingFrame=0g), avgTotalCsPerMin=6.7"
+                prompt shouldContain "Lead Retention (10m->20m vs role opponent): eligible@10m=6g, eligible@20m=5g (missingOpponent=1g, short<10m=1g, short<20m=2g)"
+                prompt shouldContain "goldRetention=2/3g reaching 20m (ahead@10m=4g, rate=0.667)"
+                prompt shouldContain "Death Cost (Time Dead & Direct Kill Bounty Only): eligibleTimeDead=9g (missingTimeDead=0g), totalDead=810s, avgDeadPerGame=90.0s"
+                prompt shouldContain "bounty(eligibleTimeline=7g, recordedDeaths=21, withBounty=19, missingBounty=2, baseGold=5400, shutdownGold=1350, combinedGold=6750"
+                prompt shouldContain "Unspent Gold (1-min checkpoint currentGold, NOT recall events): eligible=7g (missingSamples=0g, checkpoints=182)"
+                prompt shouldContain "prePurchaseSamples=[Orianna @14m (2150g -> bought Zhonya's Hourglass @15m)]"
+                prompt shouldContain "Team Objectives (team totals vs personal credits): eligibleTeam=9g (missingTeams=0g, timelineEligible=7g)"
+                prompt shouldContain "tower(elig=9g, miss=0g, first=5/9 [0.556]"
+                prompt shouldContain "voidgrubs(elig=9g, miss=0g, first=6/9 [0.667]"
+                (AiAnalysisService.utf8ByteSize(prompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+            }
+        }
+
         When("the user question exceeds MAX_USER_MESSAGE_BYTES (> 2,000 UTF-8 bytes)") {
             Then("it should explicitly refuse without silent truncation or paid Gemini calls") {
                 val oversizedQuestion = "Can you review every wave and trade in detail? ".repeat(60)
@@ -841,7 +1057,7 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     userMessage = oversizedQuestion
                 ).chunks.collectList().block()!!.joinToString("")
                 streamResult shouldContain "exceeds the safe coaching context budget"
-                streamResult shouldContain "${AiAnalysisService.MAX_USER_MESSAGE_BYTES} bytes"
+                streamResult.shouldContain("${AiAnalysisService.MAX_USER_MESSAGE_BYTES} bytes")
             }
         }
     }

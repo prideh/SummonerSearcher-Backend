@@ -336,6 +336,7 @@ class AiAnalysisService(
         """.trimIndent() else ""
 
         var timelineSection = buildTimelineInsightsSection(context)
+        var improvementSection = buildImprovementStatsSection(context, compact = false)
         var promptVersionSection = promptVersion?.promptTemplate?.takeIf { it.isNotBlank() }?.let {
             """
             **CATEGORY COACHING DIRECTIVE (${promptVersion.versionName.take(64)}):**
@@ -343,7 +344,7 @@ class AiAnalysisService(
             """.trimIndent()
         } ?: ""
 
-        fun assemblePrompt(gt: String, fs: String, ph: String, hist: String, pv: String, tl: String): String = """
+        fun assemblePrompt(gt: String, fs: String, ph: String, hist: String, pv: String, tl: String, imp: String): String = """
             You are an experienced, evidence-driven League of Legends coach analyzing ranked performance data. Calibrate your coaching depth and terminology to the player's actual rank ($playerRank) while using a constructive, natural, and analytical coaching methodology.
             
             **ANALYSIS FRAMEWORK (INTERNAL CHECKLIST):**
@@ -373,6 +374,7 @@ class AiAnalysisService(
             **🔒 GROUND TRUTH STATS:**
             $gt
             $tl
+            $imp
             
             **DATA-DRIVEN COACHING & DATA-BOUNDARY RULES:**
             - For player-specific claims (win rates, KDA, CS/min, match history, or matchups played), rely strictly on the provided GROUND TRUTH STATS and recentMatchSummary. Do not invent game events, player stats, or match results that are not listed in the data.
@@ -383,8 +385,9 @@ class AiAnalysisService(
             - **Deaths & Assist Attribution:** Treat "assisted" deaths as multi-enemy kill participation only—assisted deaths are not necessarily jungle ganks (lane 2v2s, support roams, and skirmishes/teamfights produce assists too). Treat "unassisted" deaths as single-enemy kill credit with zero recorded assists—never equate unassisted deaths with 1v1 duels (solo picks, roam catches, or delayed finishes after assist timers expire also record zero assists). Describe recorded enemy involvement rather than inferring how the fight started.
             - **Observed Facts vs. Hypotheses & Conditional Recommendations:** Death events do **not** prove bad trades, overextension, greed, or mechanical misplays. Always separate **observed facts** (timestamps, approximate zones, killers, recorded assistants, gold/XP/CS diffs, items built) from **hypotheses** about why they happened, and frame all coaching recommendations **conditionally** (e.g., *"If this death happened while pushing without river vision, consider...; if it happened rotating to a skirmish, instead..."*).
             - **No Stale Mythic-Era or Unsupported Build-Effect Claims (Including `---SUGGESTIONS---`):** The Mythic item system was removed in Season 14. NEVER propose or mention "Mythic items", "Mythic passives", "Mythic paths/rushes", or removed Mythic-era items (e.g., Divine Sunderer, Everfrost, Galeforce, Goredrinker, Duskblade, Prowler's Claw, Crown of the Shattered Queen, Night Harvester, Radiant Virtue). Do not claim specific patch-dependent item stats, gold costs, or build-effect numbers unless the supplied patch/context data explicitly supports them; anchor build discussion to the items present in context (`items`, `opponentDetails.items`, `itemSpikes`) and their functional purpose. Apply this same rule to the 3 `---SUGGESTIONS---` follow-up questions.
-            - **Early CS Supply (`cs10.spawnedSupply`):** `cs10.spawnedSupply` (120 on verified patch 26.1+ games only) is theoretical spawned minion supply by 10:00, not guaranteed farmable CS. Compare actual CS@10 primarily against the lane opponent, matchup pressure, and role expectations.
-            - **Incomplete Legacy Cache Fields:** When any stat or timeline breakdown (such as `assistedDeaths`, `unassistedDeaths`, `wardsByTimeBucket`, or `cs10.spawnedSupply`) is `null` or marked `incomplete`, treat it as unavailable/incomplete data from an older cache—never treat `null` or `incomplete` fields as `0`.
+            - **Early Lane CS Target (`cs10.target`, `cs10.targetLabel`, `avgLaneCsAt10`, `missingLaneCsAt10Matches`):** `cs10.target` (114 for Top/Bot, 120 for Mid on verified patch 26.1+ games only; `null` for `JUNGLE`, `UTILITY`/`SUPPORT`, short `<600s` games, or pre-26.1 patches) is a role-specific 10:00 lane benchmark definition, **not** farmable supply or a missed-CS counter. NEVER subtract `actual` from `target` to claim exact "missed CS" or "missed last-hits", and never resurrect obsolete `spawnedSupply` claims. Keep `actual` (`laneCs@10`), benchmark definition (`cs10.target` / `cs10.targetLabel`), `patch`, `role`, denominator (`matchCount` vs `targetMatchCount`), and missingness (`missingLaneCsAt10Matches`, `null`) distinct (`avgTarget` is `null` on mixed-patch samples where `targetMatchCount < matchCount`).
+            - **5-Stat Improvement Evidence (`phaseFarming`, `leadRetention`, `deathCost`, `unspentGold`, `teamObjectives`):** Cite exact denominators (`eligibleGames`, `eligibleGamesAt10` vs `eligibleGamesAt20`, `eligibleTimeDeadGames`, `eligibleTimelineGames`, `eligibleTeamObjectiveGames`) and exclusions (`shortGames`, `excludedMissingTimeline`, `missingOpponentGames`). Never claim missed CS in `phaseFarming`; treat `10-20m` objective/tower events in `leadRetention` as temporal association only (never proof of a throw or solo credit); never infer lost farm or death avoidability from `deathCost`; treat `>=1600g` 1-minute `currentGold` snapshots in `unspentGold` as descriptive balance checkpoints (never a mistake score or recall event); and keep team objective outcomes (`firstRate`, `teamAvg` vs `enemyAvg`) strictly separate from personal `personalLastHits`/`personalTakedowns`/`timelineInvolved`.
+            - **Incomplete Legacy Cache Fields:** When any stat or timeline breakdown (such as `assistedDeaths`, `unassistedDeaths`, `wardsByTimeBucket`, or `cs10.target`) is `null` or marked `incomplete`, treat it as unavailable/incomplete data—never treat `null` or `incomplete` fields as `0`.
             
             **MATCHUP GURU EXPERTISE:**
             When discussing champion matchups, utilize the provided data. Go beyond basic win rates: explain *why* a matchup is favored or difficult by discussing specific ability interactions, cooldown windows, tethering, or power spikes.
@@ -415,20 +418,24 @@ class AiAnalysisService(
             2. **NO OFF-TOPIC**: Refuse non-League of Legends questions.
         """.trimIndent().replace(Regex("(?m)^ {12}"), "")
 
-        var finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection)
+        var finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
+        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES && improvementSection.isNotEmpty()) {
+            improvementSection = buildImprovementStatsSection(context, compact = true)
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
+        }
         if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
             historyString = formatBoundedHistory(messages, 2, 800)
-            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection)
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
         }
         if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
             fewShotSection = ""
             patternHints = ""
-            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection)
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
         }
         if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
             historyString = ""
             promptVersionSection = ""
-            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection)
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
         }
         var currentGtBudget = utf8ByteSize(groundTruth)
         while (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES && currentGtBudget > 256) {
@@ -443,12 +450,16 @@ class AiAnalysisService(
             if (utf8ByteSize(nextGt) >= currentGtBudget && nextBudget <= 256) break
             groundTruth = nextGt
             currentGtBudget = minOf(nextBudget, utf8ByteSize(groundTruth))
-            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection)
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
             if (currentGtBudget <= 256) break
+        }
+        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES && improvementSection.isNotEmpty()) {
+            improvementSection = ""
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
         }
         if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
             timelineSection = ""
-            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection)
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
         }
         if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
             throw PromptBudgetExceededException(
@@ -758,6 +769,35 @@ class AiAnalysisService(
             headerLines.add("  timelineStatus: $inferredStatus")
         }
 
+        // Aggregate Early Lane CS@10 summary (actual, benchmark definition, role breakdown, denominators, missingness)
+        val avgLaneCsAt10 = context["avgLaneCsAt10"] as? Map<*, *>
+        if (avgLaneCsAt10 != null) {
+            val avgActual = avgLaneCsAt10["avgActual"] ?: "null"
+            val matchCount = avgLaneCsAt10["matchCount"] ?: 0
+            val avgTarget = avgLaneCsAt10["avgTarget"] ?: "null"
+            val targetMatchCount = avgLaneCsAt10["targetMatchCount"] ?: 0
+            val avgSupportedActual = avgLaneCsAt10["avgSupportedActual"] ?: "null"
+            val targetLabel = avgLaneCsAt10["targetLabel"] ?: "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
+            val roleBreakdownList = (avgLaneCsAt10["roleBreakdown"] as? List<*>)?.mapNotNull { entry ->
+                val rm = entry as? Map<*, *> ?: return@mapNotNull null
+                val r = rm["role"] ?: return@mapNotNull null
+                val mc = rm["matchCount"] ?: 0
+                val aa = rm["avgActual"] ?: "null"
+                val at = rm["avgTarget"] ?: "null"
+                val tmc = rm["targetMatchCount"] ?: 0
+                val asa = rm["avgSupportedActual"] ?: "null"
+                "$r(actual=$aa in ${mc}g, target=$at in ${tmc}g, supportedActual=$asa)"
+            } ?: emptyList()
+            val roleBreakdownStr = if (roleBreakdownList.isNotEmpty()) ", roleBreakdown=[${roleBreakdownList.joinToString("; ")}]" else ""
+            headerLines.add(
+                "  avgLaneCsAt10: {avgActual=$avgActual (matchCount=$matchCount), avgTarget=$avgTarget (targetMatchCount=$targetMatchCount, avgSupportedActual=$avgSupportedActual), targetLabel=\"$targetLabel\"$roleBreakdownStr}"
+            )
+        }
+        if (context.containsKey("missingLaneCsAt10Matches")) {
+            val missingCs10 = context["missingLaneCsAt10Matches"] ?: "null"
+            headerLines.add("  missingLaneCsAt10Matches: $missingCs10")
+        }
+
         // Top champions pool (cap at 5)
         val topChampions = context["topChampions"] as? List<*>
         if (!topChampions.isNullOrEmpty()) {
@@ -1022,20 +1062,20 @@ class AiAnalysisService(
             lines.add("  omittedMatchesRollup: ${omitted.size} games not expanded (${omittedWins}W/${omittedLosses}L, champs=[$champCounts])")
         }
 
-        var emittedSupplyLabel = false
+        var emittedTargetLabel = false
         for (sm in selectedChronological) {
             val isFullDetail = sm.chronologicalIndex in fullDetailIndices || totalMatches <= MAX_FULL_DETAIL_MATCHES
-            val includeSupplyLabel = !emittedSupplyLabel && isFullDetail
-            val (line, usedSupplyLabel) = formatMatchLine(
+            val includeTargetLabel = !emittedTargetLabel && isFullDetail
+            val (line, usedTargetLabel) = formatMatchLine(
                 i = sm.chronologicalIndex,
                 totalMatches = totalMatches,
                 m = sm.match,
                 fullDetail = isFullDetail,
-                includeSupplyLabel = includeSupplyLabel,
+                includeTargetLabel = includeTargetLabel,
                 questionCategory = questionCategory,
                 userMessage = userMessage
             )
-            if (usedSupplyLabel) emittedSupplyLabel = true
+            if (usedTargetLabel) emittedTargetLabel = true
             lines.add(line)
         }
 
@@ -1048,7 +1088,7 @@ class AiAnalysisService(
         totalMatches: Int,
         m: Map<String, Any?>,
         fullDetail: Boolean,
-        includeSupplyLabel: Boolean,
+        includeTargetLabel: Boolean,
         questionCategory: String,
         userMessage: String
     ): Pair<String, Boolean> {
@@ -1138,19 +1178,19 @@ class AiAnalysisService(
         (m["goldPerMinute"] ?: m["goldPerMin"])?.let { advStats.add("gold/min=$it") }
         m["soloKills"]?.let { advStats.add("soloKills=$it") }
         m["laneMinionsFirst10Minutes"]?.let { advStats.add("laneCs@10=$it") }
-        var usedSupplyLabel = false
+        var usedTargetLabel = false
         val cs10Map = (m["laneCsAt10"] ?: m["cs10"]) as? Map<String, Any?>
         if (cs10Map != null) {
             val actual = cs10Map["actual"]
-            val spawnedSupply = cs10Map["spawnedSupply"]
-            val supplyLabel = cs10Map["supplyLabel"]
+            val target = cs10Map["target"]
+            val targetLabel = cs10Map["targetLabel"]
             if (m["laneMinionsFirst10Minutes"] == null && actual != null) {
                 advStats.add("laneCs@10=$actual")
             }
-            advStats.add("cs10.spawnedSupply=${spawnedSupply ?: "null"}")
-            if (supplyLabel != null && includeSupplyLabel) {
-                advStats.add("cs10.supplyLabel=$supplyLabel")
-                usedSupplyLabel = true
+            advStats.add("cs10.target=${target ?: "null"}")
+            if (targetLabel != null && includeTargetLabel) {
+                advStats.add("cs10.targetLabel=$targetLabel")
+                usedTargetLabel = true
             }
         }
         m["jungleCsBefore10Minutes"]?.let { advStats.add("jungleCs@10=$it") }
@@ -1184,7 +1224,7 @@ class AiAnalysisService(
             else -> ""
         }
         val line = "    Game ${i + 1}$recencyLabel: $win on $champion vs $oppName ($oppChamp), kda=$kda, cs/min=$cs$advStr"
-        return line to usedSupplyLabel
+        return line to usedTargetLabel
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -1243,6 +1283,181 @@ class AiAnalysisService(
         }
         if (timeline.containsKey("deathsNearObjectiveWindows")) {
             lines.add("  - Deaths near objective windows: ${timeline["deathsNearObjectiveWindows"] ?: "incomplete (legacy cache)"}")
+        }
+
+        return if (lines.size > 1) lines.joinToString("\n") else ""
+    }
+
+    /**
+     * Renders the 5 structured improvementStats evidence groups into a dedicated ground-truth section,
+     * preserving exact denominators, missingness/exclusion counts, and telemetry boundaries.
+     */
+    @Suppress("UNCHECKED_CAST")
+    private fun buildImprovementStatsSection(context: Map<String, Any>, compact: Boolean = false): String {
+        val imp = context["improvementStats"] as? Map<String, Any?> ?: return ""
+        val lines = mutableListOf<String>()
+
+        val totalConsidered = imp["totalGamesConsidered"] ?: "?"
+        val excludedInvalidDur = imp["excludedInvalidDurationGames"] ?: 0
+        val topExcludedMissingTimeline = imp["excludedMissingTimelineGames"]
+        val hasTimeline = imp["hasTimelineAnalysis"]
+        val headerMeta = buildList {
+            add("considered=${totalConsidered}g")
+            add("excludedInvalidDuration=${excludedInvalidDur}g")
+            topExcludedMissingTimeline?.let { add("excludedMissingTimeline=${it}g") }
+            hasTimeline?.let { add("hasTimelineAnalysis=$it") }
+        }.joinToString(", ")
+
+        lines.add("\n**📈 5-STAT IMPROVEMENT EVIDENCE ($headerMeta):**")
+
+        // 1. Phase Farming (10-20m & 20m+ Post-Lane CS)
+        val pf = imp["phaseFarming"] as? Map<String, Any?>
+        if (pf != null) {
+            val m10 = pf["min10To20"] as? Map<String, Any?>
+            val m20 = pf["min20ToEnd"] as? Map<String, Any?>
+            fun fmtWindow(w: Map<String, Any?>?): String {
+                if (w == null) return "unavailable"
+                val elig = w["eligibleGames"] ?: 0
+                val shortG = w["shortGames"] ?: w["excludedShortGames"] ?: 0
+                val missFrame = w["missingFrameGames"] ?: w["excludedMissingFrameGames"] ?: 0
+                val totalCsm = w["avgTotalCsPerMin"] ?: "null"
+                val laneCsm = w["avgLaneCsPerMin"] ?: "null"
+                val jgCsm = w["avgJungleCsPerMin"] ?: "null"
+                val laneGain = w["avgLaneCsGained"] ?: "null"
+                val jgGain = w["avgJungleCsGained"] ?: "null"
+                return if (compact) {
+                    "eligible=${elig}g (short=${shortG}g, missingFrame=${missFrame}g), totalCS/m=$totalCsm (lane=$laneCsm, jg=$jgCsm)"
+                } else {
+                    "eligible=${elig}g (short=${shortG}g, missingFrame=${missFrame}g), avgTotalCsPerMin=$totalCsm (laneCsPerMin=$laneCsm, jungleCsPerMin=$jgCsm, avgLaneCsGained=$laneGain, avgJungleCsGained=$jgGain)"
+                }
+            }
+            lines.add("  - Phase Farming (Post-Lane CS): 10-20m=[${fmtWindow(m10)}]; 20m-End=[${fmtWindow(m20)}]")
+        }
+
+        // 2. Lead Conversion & Retention (10m -> 20m vs Assigned Role Opponent)
+        val lr = imp["leadRetention"] as? Map<String, Any?>
+        if (lr != null) {
+            val elig10 = lr["eligibleGamesAt10"] ?: 0
+            val elig20 = lr["eligibleGamesAt20"] ?: 0
+            val missOpp = lr["missingOpponentGames"] ?: lr["excludedMissingOpponentGames"] ?: 0
+            val short10 = lr["shortBefore10"] ?: lr["excludedShortBefore10Games"] ?: 0
+            val short20 = lr["shortBefore20"] ?: lr["excludedShortBefore20Games"] ?: 0
+            val gold10 = lr["avgGoldLeadAt10"] ?: "null"
+            val xp10 = lr["avgXpLeadAt10"] ?: "null"
+            val gold20 = lr["avgGoldLeadAt20"] ?: "null"
+            val xp20 = lr["avgXpLeadAt20"] ?: "null"
+            val aheadG10 = lr["aheadGold10"] ?: lr["gamesAheadGoldAt10"] ?: 0
+            val reachG20 = lr["aheadGold10Reach20"] ?: lr["gamesAheadGoldAt10Reaching20"] ?: 0
+            val retG20 = lr["retainedGold20"] ?: lr["gamesRetainedGoldLeadAt20"] ?: 0
+            val retGRate = lr["goldLeadRetentionRate"] ?: "null"
+            val aheadX10 = lr["aheadXp10"] ?: lr["gamesAheadXpAt10"] ?: 0
+            val reachX20 = lr["aheadXp10Reach20"] ?: lr["gamesAheadXpAt10Reaching20"] ?: 0
+            val retX20 = lr["retainedXp20"] ?: lr["gamesRetainedXpLeadAt20"] ?: 0
+            val retXRate = lr["xpLeadRetentionRate"] ?: "null"
+            val allyObj = lr["allyObj10To20"] ?: lr["totalAllyObjectives10To20WhenAheadAt10"] ?: 0
+            val enemyObj = lr["enemyObj10To20"] ?: lr["totalEnemyObjectives10To20WhenAheadAt10"] ?: 0
+            val allyTow = lr["allyTowers10To20"] ?: lr["totalAllyTowerKills10To20WhenAheadAt10"] ?: 0
+            val enemyTow = lr["enemyTowers10To20"] ?: lr["totalEnemyTowerKills10To20WhenAheadAt10"] ?: 0
+            lines.add(
+                "  - Lead Retention (10m->20m vs role opponent): eligible@10m=${elig10}g, eligible@20m=${elig20}g (missingOpponent=${missOpp}g, short<10m=${short10}g, short<20m=${short20}g); " +
+                    "avgLead@10m=(gold=$gold10, xp=$xp10), avgLead@20m=(gold=$gold20, xp=$xp20); " +
+                    "goldRetention=$retG20/${reachG20}g reaching 20m (ahead@10m=${aheadG10}g, rate=$retGRate), " +
+                    "xpRetention=$retX20/${reachX20}g reaching 20m (ahead@10m=${aheadX10}g, rate=$retXRate); " +
+                    "whenAheadGold@10m_10to20m=(allyObj=$allyObj vs enemyObj=$enemyObj, allyTowers=$allyTow vs enemyTowers=$enemyTow)"
+            )
+        }
+
+        // 3. Death Cost (Grey-Screen Time & Direct Kill Bounty Conceded)
+        val dc = imp["deathCost"] as? Map<String, Any?>
+        if (dc != null) {
+            val eligTd = dc["eligibleTimeDeadGames"] ?: 0
+            val missTd = dc["missingTimeDeadGames"] ?: dc["excludedMissingTimeDeadGames"] ?: 0
+            val totDeadSec = dc["totalTimeSpentDeadSeconds"] ?: 0
+            val avgDeadSec = dc["avgTimeSpentDeadSeconds"] ?: "null"
+            val avgShare = dc["avgDeadTimeGameSharePct"] ?: "null"
+            val ovrShare = dc["overallDeadTimeGameSharePct"] ?: "null"
+            val bounty = dc["bounty"] as? Map<String, Any?>
+            val bountyStr = if (bounty != null) {
+                val eligTl = bounty["eligibleTimelineGames"] ?: 0
+                val totDeaths = bounty["totalRecordedDeaths"] ?: 0
+                val withBounty = bounty["deathsWithAnyBountyData"] ?: 0
+                val missBounty = bounty["deathsMissingBountyData"] ?: 0
+                val baseGold = bounty["totalBaseKillBountyGold"] ?: "null"
+                val shutGold = bounty["totalShutdownBountyGold"] ?: "null"
+                val combGold = bounty["totalCombinedBountyGold"] ?: "null"
+                val avgComb = bounty["avgCombinedBountyPerDeath"] ?: "null"
+                "bounty(eligibleTimeline=${eligTl}g, recordedDeaths=$totDeaths, withBounty=$withBounty, missingBounty=$missBounty, baseGold=$baseGold, shutdownGold=$shutGold, combinedGold=$combGold, avgCombinedPerDeath=$avgComb)"
+            } else {
+                "bounty=unavailable"
+            }
+            lines.add(
+                "  - Death Cost (Time Dead & Direct Kill Bounty Only): eligibleTimeDead=${eligTd}g (missingTimeDead=${missTd}g), " +
+                    "totalDead=${totDeadSec}s, avgDeadPerGame=${avgDeadSec}s, avgGameShare=${avgShare}%, overallShare=${ovrShare}%; $bountyStr"
+            )
+        }
+
+        // 4. Unspent Gold (`currentGold` at 1-Min Frame Checkpoints & Pre-Purchase Windows)
+        val ug = imp["unspentGold"] as? Map<String, Any?>
+        if (ug != null) {
+            val eligG = ug["eligibleGames"] ?: 0
+            val missSamp = ug["missingSampleGames"] ?: ug["excludedMissingSampleGames"] ?: 0
+            val sampCnt = ug["sampleCount"] ?: 0
+            val medGold = ug["medianCurrentGold"] ?: "null"
+            val avgGold = ug["avgCurrentGold"] ?: "null"
+            val maxGold = ug["maxCurrentGold"] ?: "null"
+            val thresh = ug["highBalanceThresholdGold"] ?: 1300
+            val highCnt = ug["highBalanceSampleCount"] ?: 0
+            val prePurchCnt = ug["highBalancePrePurchaseCount"] ?: 0
+            val samples = (ug["prePurchaseSamples"] as? List<*>) ?: (ug["highBalanceSamples"] as? List<*>) ?: emptyList<Any?>()
+            val sampleStr = if (!compact && samples.isNotEmpty()) {
+                val formattedSamples = samples.take(3).mapNotNull { s ->
+                    val sm = s as? Map<*, *> ?: return@mapNotNull null
+                    val champ = sm["championName"] ?: "?"
+                    val min = sm["minute"] ?: "?"
+                    val cg = sm["currentGold"] ?: "?"
+                    val nextMin = sm["nextPurchaseMinute"] ?: "?"
+                    val nextItem = sm["nextPurchaseItemName"] ?: sm["nextPurchaseItemId"] ?: "?"
+                    "$champ @${min}m (${cg}g -> bought $nextItem @${nextMin}m)"
+                }
+                if (formattedSamples.isNotEmpty()) ", prePurchaseSamples=[${formattedSamples.joinToString("; ")}]" else ""
+            } else ""
+            lines.add(
+                "  - Unspent Gold (1-min checkpoint currentGold, NOT recall events): eligible=${eligG}g (missingSamples=${missSamp}g, checkpoints=$sampCnt), " +
+                    "median=${medGold}g, avg=${avgGold}g, max=${maxGold}g, highBalance(>=$thresh)=${highCnt} checkpoints (followedByPurchaseWithin2m=$prePurchCnt)$sampleStr"
+            )
+        }
+
+        // 5. Team Objectives & Personal Participation
+        val to = imp["teamObjectives"] as? Map<String, Any?>
+        if (to != null) {
+            val eligTeam = to["eligibleTeamObjectiveGames"] ?: 0
+            val missTeams = to["missingTeamsGames"] ?: to["excludedMissingTeamsGames"] ?: 0
+            val tlElig = to["timelineEligibleGames"] ?: 0
+            fun fmtObj(key: String, label: String): String? {
+                val om = to[key] as? Map<String, Any?> ?: return null
+                val elig = om["eligibleGames"] ?: eligTeam
+                val miss = om["missingGames"] ?: om["excludedMissingObjectiveGames"] ?: 0
+                val firstCnt = om["firstCount"] ?: om["firstObjectiveGames"] ?: 0
+                val firstRate = om["firstRate"] ?: om["firstObjectiveRate"] ?: "null"
+                val teamKills = om["teamKills"] ?: om["totalTeamKills"] ?: 0
+                val teamAvg = om["teamAvg"] ?: om["avgTeamKillsPerGame"] ?: "null"
+                val enemyAvg = om["enemyAvg"] ?: om["avgEnemyKillsPerGame"] ?: "null"
+                val lh = om["personalLh"] ?: om["totalPersonalLastHits"] ?: "null"
+                val td = om["personalTd"] ?: om["totalPersonalTakedowns"] ?: "null"
+                val tlInv = om["timelineInvolved"] ?: om["timelineObjectivesInvolved"] ?: "null"
+                return "$label(elig=${elig}g, miss=${miss}g, first=$firstCnt/$elig [$firstRate], teamKills=$teamKills [avg $teamAvg vs enemy $enemyAvg], personalLastHits=$lh, personalTakedowns=$td, timelineInvolved=$tlInv)"
+            }
+            val objSummaries = listOfNotNull(
+                fmtObj("tower", "tower"),
+                fmtObj("dragon", "dragon"),
+                fmtObj("baron", "baron"),
+                fmtObj("riftHerald", "riftHerald"),
+                fmtObj("horde", "voidgrubs")
+            )
+            lines.add(
+                "  - Team Objectives (team totals vs personal credits): eligibleTeam=${eligTeam}g (missingTeams=${missTeams}g, timelineEligible=${tlElig}g); " +
+                    objSummaries.joinToString("; ")
+            )
         }
 
         return if (lines.size > 1) lines.joinToString("\n") else ""
