@@ -7,12 +7,17 @@ import io.mockk.coVerify
 import io.mockk.every
 import io.mockk.mockk
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
 import org.junit.jupiter.api.Assertions.*
 import org.junit.jupiter.api.Test
 import java.time.Duration
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -1130,9 +1135,328 @@ class CoachTimelinePreparationBehaviorTest {
             assertEquals("BLOCKED", res.status)
             assertEquals("DEADLINE_EXCEEDED", res.stopReason)
             assertTrue(wallElapsed < 1_500L, "Blocking HTTP call should abort near 250ms deadline, took ${wallElapsed}ms")
-            // Give worker thread a brief moment to record interruption catch
-            Thread.sleep(20)
+            assertEquals(0, riotApiService.getActiveBoundedHttpWorkers())
+            assertEquals(0, service.getActiveGlobalPreparations())
             assertEquals(1, threadInterruptedCount.get())
+        }
+    }
+
+    @Test
+    fun `production ReactorNettyClientRequestFactory aborts delayed headers, delayed body, and mid-body headroom stop with zero worker or raw retention after caller returns`() = runBlocking {
+        val redisCacheService = mockk<RedisCacheService>(relaxed = true)
+        every { redisCacheService.get(any(), MatchTimelineDto::class.java) } returns null
+
+        val validRaw = buildRichRawTimeline("EUW1_NETTY_1")
+        val serializedTimelineBytes = mapper.writeValueAsBytes(validRaw)
+        assertTrue(serializedTimelineBytes.size > 4_096, "Expected multi-KB serialized timeline payload")
+
+        val delayedHeaderRequests = AtomicInteger(0)
+        val delayedBodyRequests = AtomicInteger(0)
+        val delayedBodySecondHalfCompleted = AtomicInteger(0)
+        val midBodyHeadroomRequests = AtomicInteger(0)
+        val midBodySecondHalfCompleted = AtomicInteger(0)
+        val midBodyMemoryProviderRef = AtomicReference<MutableMemoryStatsProvider?>(null)
+
+        val server = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+        server.executor = java.util.concurrent.Executors.newCachedThreadPool { r ->
+            Thread(r, "local-test-riot-server").apply { isDaemon = true }
+        }
+        server.createContext("/lol/match/v5/matches/") { exchange ->
+            val path = exchange.requestURI.path
+            try {
+                when {
+                    path.contains("EUW1_NETTY_HDR_1") -> {
+                        delayedHeaderRequests.incrementAndGet()
+                        // Delay response headers for 5,000ms (production ReactorNetty has 30s responseTimeout)
+                        Thread.sleep(5_000L)
+                        exchange.responseHeaders.add("Content-Type", "application/json")
+                        exchange.sendResponseHeaders(200, serializedTimelineBytes.size.toLong())
+                        exchange.responseBody.use { it.write(serializedTimelineBytes) }
+                    }
+                    path.contains("EUW1_NETTY_BODY_1") -> {
+                        delayedBodyRequests.incrementAndGet()
+                        exchange.responseHeaders.add("Content-Type", "application/json")
+                        // Chunked transfer encoding (0L) so headers + first chunk flush immediately
+                        exchange.sendResponseHeaders(200, 0L)
+                        val out = exchange.responseBody
+                        val splitIndex = serializedTimelineBytes.size / 2
+                        out.write(serializedTimelineBytes, 0, splitIndex)
+                        out.flush()
+                        // Stall mid-body for 5,000ms while Jackson + SubscriberInputStream await remaining JSON bytes
+                        Thread.sleep(5_000L)
+                        out.write(serializedTimelineBytes, splitIndex, serializedTimelineBytes.size - splitIndex)
+                        out.flush()
+                        delayedBodySecondHalfCompleted.incrementAndGet()
+                    }
+                    path.contains("EUW1_NETTY_MEM_1") -> {
+                        midBodyHeadroomRequests.incrementAndGet()
+                        exchange.responseHeaders.add("Content-Type", "application/json")
+                        exchange.sendResponseHeaders(200, 0L)
+                        val out = exchange.responseBody
+                        val firstChunkLen = 1_024
+                        val secondChunkLen = 1_024
+                        // Chunk 1: sent while memory is 325 MiB so client passes pre-decode check and begins Jackson stream parsing
+                        out.write(serializedTimelineBytes, 0, firstChunkLen)
+                        out.flush()
+                        Thread.sleep(80L)
+                        // Chunk 2: raise memory above 360 MiB stop threshold, flush 1 KiB to complete the next bounded read, then stall 5s
+                        midBodyMemoryProviderRef.get()?.cgroupUsedBytes = 362L * 1024L * 1024L
+                        out.write(serializedTimelineBytes, firstChunkLen, secondChunkLen)
+                        out.flush()
+                        Thread.sleep(5_000L)
+                        val remainingOffset = firstChunkLen + secondChunkLen
+                        out.write(serializedTimelineBytes, remainingOffset, serializedTimelineBytes.size - remainingOffset)
+                        out.flush()
+                        midBodySecondHalfCompleted.incrementAndGet()
+                    }
+                    else -> {
+                        exchange.sendResponseHeaders(404, -1L)
+                    }
+                }
+            } catch (_: Throwable) {
+                // Expected when client aborts/closes socket mid-request or mid-stream
+            } finally {
+                runCatching { exchange.close() }
+            }
+        }
+        server.start()
+        val port = server.address.port
+
+        try {
+            // Use the exact production RestClient + ReactorNettyClientRequestFactory from RestClientConfig
+            val prodRestClient = com.pride.summoner_searcher_api.config.RestClientConfig.buildRiotRestClient("test-riot-key")
+
+            // 1. Delayed-Header test against real ReactorNettyClientRequestFactory
+            run {
+                val timeProvider = SystemTimeProvider()
+                val memoryProvider = MutableMemoryStatsProvider(cgroupUsedBytes = 320L * 1024L * 1024L)
+                val rateLimiter = RiotApiRateLimiter(timeProvider)
+                val riotApiService = RiotApiService(prodRestClient, rateLimiter, prodRestClient, timeProvider).apply {
+                    matchBaseUrlResolver = { "http://127.0.0.1:$port" }
+                }
+                val service = TimelineService(
+                    riotApiService = riotApiService,
+                    redisCacheService = redisCacheService,
+                    timelineAnalysisService = TimelineAnalysisService(),
+                    rateLimiter = rateLimiter,
+                    timeProvider = timeProvider,
+                    memoryStatsProvider = memoryProvider,
+                    prepDeadlineMs = 600L
+                )
+
+                val matchIds = listOf("EUW1_NETTY_HDR_1")
+                val matchDtos = matchIds.map { buildMatchDto(it) }
+                val wallStart = System.currentTimeMillis()
+                val res = service.prepareCoachTimelines("euw1", puuid, matchIds, matchDtos)
+                val wallElapsed = System.currentTimeMillis() - wallStart
+
+                assertEquals(1, delayedHeaderRequests.get())
+                assertEquals("BLOCKED", res.status)
+                assertEquals("DEADLINE_EXCEEDED", res.stopReason)
+                assertTrue(res.coveredMatchIds.isEmpty())
+                assertNull(res.analysis)
+                assertEquals(0, res.peakRetainedRawTimelines)
+                assertTrue(wallElapsed < 2_200L, "Delayed-header request should abort near 600ms deadline (vs 5s server stall), took ${wallElapsed}ms")
+                // Prove zero active workers and zero global inflight slots remain when caller returns
+                assertEquals(0, riotApiService.getActiveBoundedHttpWorkers())
+                assertEquals(0, service.getActiveGlobalPreparations())
+            }
+
+            // 2. Delayed-Body test against real ReactorNettyClientRequestFactory + SubscriberInputStream
+            run {
+                val timeProvider = SystemTimeProvider()
+                val memoryProvider = MutableMemoryStatsProvider(cgroupUsedBytes = 320L * 1024L * 1024L)
+                val rateLimiter = RiotApiRateLimiter(timeProvider)
+                val riotApiService = RiotApiService(prodRestClient, rateLimiter, prodRestClient, timeProvider).apply {
+                    matchBaseUrlResolver = { "http://127.0.0.1:$port" }
+                }
+                val service = TimelineService(
+                    riotApiService = riotApiService,
+                    redisCacheService = redisCacheService,
+                    timelineAnalysisService = TimelineAnalysisService(),
+                    rateLimiter = rateLimiter,
+                    timeProvider = timeProvider,
+                    memoryStatsProvider = memoryProvider,
+                    prepDeadlineMs = 600L
+                )
+
+                val matchIds = listOf("EUW1_NETTY_BODY_1")
+                val matchDtos = matchIds.map { buildMatchDto(it) }
+                val wallStart = System.currentTimeMillis()
+                val res = service.prepareCoachTimelines("euw1", puuid, matchIds, matchDtos)
+                val wallElapsed = System.currentTimeMillis() - wallStart
+
+                assertEquals(1, delayedBodyRequests.get())
+                assertEquals("BLOCKED", res.status)
+                assertEquals("DEADLINE_EXCEEDED", res.stopReason)
+                assertTrue(res.coveredMatchIds.isEmpty())
+                assertNull(res.analysis)
+                assertEquals(0, res.peakRetainedRawTimelines)
+                assertEquals(0, delayedBodySecondHalfCompleted.get())
+                assertTrue(wallElapsed < 2_200L, "Delayed-body stream should close and abort near 600ms deadline (vs 5s server stall), took ${wallElapsed}ms")
+                // Prove zero active workers and zero global inflight slots remain when caller returns
+                assertEquals(0, riotApiService.getActiveBoundedHttpWorkers())
+                assertEquals(0, service.getActiveGlobalPreparations())
+                io.mockk.verify(exactly = 0) { redisCacheService.set(any<String>(), any<MatchTimelineDto>(), any<Duration>()) }
+            }
+
+            // 3. Mid-Body 360 MiB Memory Headroom Stop test against real ReactorNettyClientRequestFactory
+            run {
+                val timeProvider = SystemTimeProvider()
+                val memoryProvider = MutableMemoryStatsProvider(cgroupUsedBytes = 325L * 1024L * 1024L)
+                midBodyMemoryProviderRef.set(memoryProvider)
+                val rateLimiter = RiotApiRateLimiter(timeProvider)
+                val riotApiService = RiotApiService(prodRestClient, rateLimiter, prodRestClient, timeProvider).apply {
+                    matchBaseUrlResolver = { "http://127.0.0.1:$port" }
+                }
+                val service = TimelineService(
+                    riotApiService = riotApiService,
+                    redisCacheService = redisCacheService,
+                    timelineAnalysisService = TimelineAnalysisService(),
+                    rateLimiter = rateLimiter,
+                    timeProvider = timeProvider,
+                    memoryStatsProvider = memoryProvider,
+                    prepDeadlineMs = 5_000L
+                )
+
+                val matchIds = listOf("EUW1_NETTY_MEM_1")
+                val matchDtos = matchIds.map { buildMatchDto(it) }
+                val wallStart = System.currentTimeMillis()
+                val res = service.prepareCoachTimelines("euw1", puuid, matchIds, matchDtos)
+                val wallElapsed = System.currentTimeMillis() - wallStart
+
+                assertEquals(1, midBodyHeadroomRequests.get())
+                assertEquals("BLOCKED", res.status)
+                assertEquals("MEMORY_HEADROOM_STOP", res.stopReason)
+                assertTrue(res.coveredMatchIds.isEmpty())
+                assertNull(res.analysis)
+                assertEquals(0, res.peakRetainedRawTimelines)
+                assertEquals(0, midBodySecondHalfCompleted.get())
+                assertTrue(wallElapsed < 1_800L, "Mid-body headroom stop should abort near 80ms without waiting 5s, took ${wallElapsed}ms")
+                assertEquals(0, riotApiService.getActiveBoundedHttpWorkers())
+                assertEquals(0, service.getActiveGlobalPreparations())
+                io.mockk.verify(exactly = 0) { redisCacheService.set(any<String>(), any<MatchTimelineDto>(), any<Duration>()) }
+            }
+        } finally {
+            server.stop(0)
+        }
+    }
+
+    @Test
+    fun `rate limiter bounds both initial mutex acquisition and post-delay mutex reacquisition by remaining deadline budget`() = runBlocking {
+        val redisCacheService = mockk<RedisCacheService>(relaxed = true)
+        every { redisCacheService.get(any(), MatchTimelineDto::class.java) } returns null
+        val matchIds = listOf("EUW1_MTX_1")
+        val matchDtos = matchIds.map { buildMatchDto(it) }
+
+        // 1. Initial bucket mutex acquisition contention exceeds remaining budget -> returns DEADLINE_EXCEEDED within budget
+        run {
+            val timeProvider = SystemTimeProvider()
+            val memoryProvider = MutableMemoryStatsProvider(cgroupUsedBytes = 320L * 1024L * 1024L)
+            val rateLimiter = RiotApiRateLimiter(timeProvider)
+            rateLimiter.updateLimits("euw1", "20:1", "0:1")
+
+            val httpCallCount = AtomicInteger(0)
+            val requestFactory = org.springframework.http.client.ClientHttpRequestFactory { uri, _ ->
+                httpCallCount.incrementAndGet()
+                throw AssertionError("HTTP should not execute when bucket mutex acquisition times out: $uri")
+            }
+            val restClient = org.springframework.web.client.RestClient.builder().requestFactory(requestFactory).build()
+            val riotApiService = RiotApiService(restClient, rateLimiter, restClient, timeProvider)
+            val service = TimelineService(
+                riotApiService = riotApiService,
+                redisCacheService = redisCacheService,
+                timelineAnalysisService = TimelineAnalysisService(),
+                rateLimiter = rateLimiter,
+                timeProvider = timeProvider,
+                memoryStatsProvider = memoryProvider,
+                prepDeadlineMs = 200L
+            )
+
+            val lockAcquiredLatch = CountDownLatch(1)
+            val releaseLockLatch = CountDownLatch(1)
+            val holderJob = launch(Dispatchers.Default) {
+                rateLimiter.withRegionAppBucketLockForTest("euw1", 1) {
+                    lockAcquiredLatch.countDown()
+                    withContext(Dispatchers.IO) {
+                        releaseLockLatch.await(5_000L, TimeUnit.MILLISECONDS)
+                    }
+                }
+            }
+            assertTrue(lockAcquiredLatch.await(2_000L, TimeUnit.MILLISECONDS))
+
+            try {
+                val wallStart = System.currentTimeMillis()
+                val res = service.prepareCoachTimelines("euw1", puuid, matchIds, matchDtos)
+                val wallElapsed = System.currentTimeMillis() - wallStart
+
+                assertEquals("BLOCKED", res.status)
+                assertEquals("DEADLINE_EXCEEDED", res.stopReason)
+                assertEquals(0, httpCallCount.get())
+                assertTrue(wallElapsed < 1_500L, "Initial mutex contention must abort near 200ms budget, took ${wallElapsed}ms")
+            } finally {
+                releaseLockLatch.countDown()
+                holderJob.join()
+            }
+        }
+
+        // 2. Post-delay mutex reacquisition contention: bucket is full (1/1 in 1s window) with ~90ms remaining wait,
+        // so tryAcquire acquires mutex, unlocks to delay(~100ms), and while delayed another coroutine grabs the bucket mutex for 5s.
+        // Reacquiring the mutex after delay must time out at remaining budget (~250ms total) instead of waiting 5s.
+        run {
+            val startWall = System.currentTimeMillis()
+            val customTimeProvider = object : TimeProvider {
+                @Volatile
+                var offsetMs: Long = 0L
+                override fun now(): Long = System.currentTimeMillis() + offsetMs
+            }
+            val memoryProvider = MutableMemoryStatsProvider(cgroupUsedBytes = 320L * 1024L * 1024L)
+            val rateLimiter = RiotApiRateLimiter(customTimeProvider)
+            // Record 1/1 used at t = now - 910ms so requiredWaitMs is ~90ms (sleepMs ~100ms <= 280ms budget)
+            customTimeProvider.offsetMs = -910L
+            rateLimiter.updateLimits("euw1", "1:1", "1:1")
+            customTimeProvider.offsetMs = 0L
+
+            val httpCallCount = AtomicInteger(0)
+            val requestFactory = org.springframework.http.client.ClientHttpRequestFactory { uri, _ ->
+                httpCallCount.incrementAndGet()
+                throw AssertionError("HTTP should not execute when post-delay mutex reacquisition times out: $uri")
+            }
+            val restClient = org.springframework.web.client.RestClient.builder().requestFactory(requestFactory).build()
+            val riotApiService = RiotApiService(restClient, rateLimiter, restClient, customTimeProvider)
+            val service = TimelineService(
+                riotApiService = riotApiService,
+                redisCacheService = redisCacheService,
+                timelineAnalysisService = TimelineAnalysisService(),
+                rateLimiter = rateLimiter,
+                timeProvider = customTimeProvider,
+                memoryStatsProvider = memoryProvider,
+                prepDeadlineMs = 280L
+            )
+
+            val releaseLockLatch = CountDownLatch(1)
+            // Grab the bucket mutex 35ms after start (while tryAcquire is unlocked inside delay(~100ms))
+            val contenderJob = launch(Dispatchers.Default) {
+                kotlinx.coroutines.delay(35L)
+                rateLimiter.withRegionAppBucketLockForTest("euw1", 1) {
+                    withContext(Dispatchers.IO) {
+                        releaseLockLatch.await(5_000L, TimeUnit.MILLISECONDS)
+                    }
+                }
+            }
+
+            try {
+                val res = service.prepareCoachTimelines("euw1", puuid, matchIds, matchDtos)
+                val wallElapsed = System.currentTimeMillis() - startWall
+
+                assertEquals("BLOCKED", res.status)
+                assertEquals("DEADLINE_EXCEEDED", res.stopReason)
+                assertEquals(0, httpCallCount.get())
+                assertTrue(wallElapsed < 1_500L, "Post-delay mutex reacquisition must abort near 280ms budget, took ${wallElapsed}ms")
+            } finally {
+                releaseLockLatch.countDown()
+                contenderJob.join()
+            }
         }
     }
 }

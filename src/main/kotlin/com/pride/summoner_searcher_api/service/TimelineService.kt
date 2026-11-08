@@ -75,6 +75,8 @@ class TimelineService @Autowired constructor(
     private val inFlightPreparations = ConcurrentHashMap<String, CompletableDeferred<CoachTimelinePreparationResultDto>>()
     private val activeGlobalPreparations = AtomicInteger(0)
 
+    internal fun getActiveGlobalPreparations(): Int = activeGlobalPreparations.get()
+
     private val preparedCacheMutex = Mutex()
     private val preparedCache = object : LinkedHashMap<String, CachedPreparationEntry>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, CachedPreparationEntry>?): Boolean {

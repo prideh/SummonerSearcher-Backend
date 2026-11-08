@@ -86,15 +86,67 @@ class RiotApiRateLimiter(
         countHeader: String?,
         endpointKey: String? = null,
         methodLimitHeader: String? = null,
-        methodCountHeader: String? = null
+        methodCountHeader: String? = null,
+        deadlineAtMs: Long? = null
     ) {
         val normalizedRegion = region.lowercase()
         val regionLimiter = limiters.computeIfAbsent(normalizedRegion) { RegionRateLimiter(it) }
         if (limitHeader != null && countHeader != null) {
-            regionLimiter.updateBuckets(limitHeader, countHeader)
+            regionLimiter.updateBuckets(limitHeader, countHeader, deadlineAtMs)
         }
         if (!endpointKey.isNullOrBlank() && methodLimitHeader != null && methodCountHeader != null) {
-            regionLimiter.updateMethodBuckets(endpointKey, methodLimitHeader, methodCountHeader)
+            regionLimiter.updateMethodBuckets(endpointKey, methodLimitHeader, methodCountHeader, deadlineAtMs)
+        }
+    }
+
+    internal suspend fun <T> withRegionAppBucketLockForTest(
+        region: String,
+        windowSeconds: Int,
+        block: suspend () -> T
+    ): T {
+        val normalizedRegion = region.lowercase()
+        val regionLimiter = limiters.computeIfAbsent(normalizedRegion) { RegionRateLimiter(it) }
+        return regionLimiter.withAppBucketLockForTest(windowSeconds, block)
+    }
+
+    private suspend fun tryLockWithDeadline(mutex: Mutex, deadlineAtMs: Long): Boolean {
+        val now = timeProvider.now()
+        val remainingMs = deadlineAtMs - now
+        if (remainingMs < 0L) {
+            return false
+        }
+        if (mutex.tryLock()) {
+            if (timeProvider.now() > deadlineAtMs) {
+                mutex.unlock()
+                return false
+            }
+            return true
+        }
+        if (remainingMs == 0L) {
+            return false
+        }
+        var locked = false
+        return try {
+            val acquired = kotlinx.coroutines.withTimeoutOrNull(remainingMs) {
+                mutex.lock()
+                locked = true
+                true
+            } ?: false
+            if (!acquired && locked) {
+                mutex.unlock()
+                locked = false
+            }
+            if (locked && timeProvider.now() > deadlineAtMs) {
+                mutex.unlock()
+                locked = false
+                return false
+            }
+            locked
+        } catch (t: Throwable) {
+            if (locked) {
+                mutex.unlock()
+            }
+            throw t
         }
     }
 
@@ -348,84 +400,112 @@ class RiotApiRateLimiter(
             return true
         }
 
-        suspend fun updateBuckets(limitHeader: String, countHeader: String) {
-            bucketsMutex.withLock {
-                try {
-                    val limits = parseHeader(limitHeader)
-                    val counts = parseHeader(countHeader)
+        internal suspend fun <T> withAppBucketLockForTest(
+            windowSeconds: Int,
+            block: suspend () -> T
+        ): T {
+            val bucket = buckets.find { it.windowSeconds == windowSeconds }
+                ?: error("No app bucket with windowSeconds=$windowSeconds in region=$regionName")
+            return bucket.withBucketLockForTest(block)
+        }
 
-                    if (limits.size != counts.size || limits.isEmpty()) {
-                        logger.warn("[{}] Mismatch in limit/count headers: {} vs {}", regionName, limitHeader, countHeader)
-                        return
-                    }
+        suspend fun updateBuckets(limitHeader: String, countHeader: String, deadlineAtMs: Long? = null) {
+            if (deadlineAtMs != null) {
+                if (!tryLockWithDeadline(bucketsMutex, deadlineAtMs)) {
+                    return
+                }
+            } else {
+                bucketsMutex.lock()
+            }
+            try {
+                val limits = parseHeader(limitHeader)
+                val counts = parseHeader(countHeader)
 
-                    lastAppLimitHeader = limitHeader
-                    lastAppCountHeader = countHeader
-                    appLimitsVerifiedFromHeaders = true
+                if (limits.size != counts.size || limits.isEmpty()) {
+                    logger.warn("[{}] Mismatch in limit/count headers: {} vs {}", regionName, limitHeader, countHeader)
+                    return
+                }
 
-                    val newBuckets = mutableListOf<SlidingWindowBucket>()
-                    var changed = false
+                lastAppLimitHeader = limitHeader
+                lastAppCountHeader = countHeader
+                appLimitsVerifiedFromHeaders = true
 
-                    limits.forEachIndexed { index, (capacity, seconds) ->
-                        val count = counts[index].first
-                        val window = Duration.ofSeconds(seconds.toLong())
+                val newBuckets = mutableListOf<SlidingWindowBucket>()
+                var changed = false
 
-                        val existingBucket = buckets.find { it.windowSeconds == seconds }
+                limits.forEachIndexed { index, (capacity, seconds) ->
+                    val count = counts[index].first
+                    val window = Duration.ofSeconds(seconds.toLong())
 
-                        if (existingBucket != null) {
-                            if (existingBucket.updateConfig(capacity, count)) {
-                                changed = true
-                            }
-                            newBuckets.add(existingBucket)
-                        } else {
-                            logger.info("[{}] Discovered new rate limit: {} req / {}s", regionName, capacity, seconds)
-                            val newBucket = SlidingWindowBucket(capacity, window, "$regionName-${seconds}s")
-                            newBucket.syncCount(count)
-                            newBuckets.add(newBucket)
+                    val existingBucket = buckets.find { it.windowSeconds == seconds }
+
+                    if (existingBucket != null) {
+                        if (existingBucket.updateConfig(capacity, count, deadlineAtMs)) {
                             changed = true
                         }
+                        newBuckets.add(existingBucket)
+                    } else {
+                        logger.info("[{}] Discovered new rate limit: {} req / {}s", regionName, capacity, seconds)
+                        val newBucket = SlidingWindowBucket(capacity, window, "$regionName-${seconds}s")
+                        newBucket.syncCount(count, deadlineAtMs)
+                        newBuckets.add(newBucket)
+                        changed = true
                     }
-
-                    if (changed || newBuckets.size != buckets.size) {
-                        buckets = newBuckets
-                        logger.debug("[{}] Buckets updated. Active limits: {}", regionName, buckets.map { "${it.capacity}/${it.windowSeconds}s" })
-                    }
-                } catch (e: Exception) {
-                    logger.error("[{}] Failed to parse rate limit headers: {} / {}", regionName, limitHeader, countHeader, e)
                 }
+
+                if (changed || newBuckets.size != buckets.size) {
+                    buckets = newBuckets
+                    logger.debug("[{}] Buckets updated. Active limits: {}", regionName, buckets.map { "${it.capacity}/${it.windowSeconds}s" })
+                }
+            } catch (e: Exception) {
+                logger.error("[{}] Failed to parse rate limit headers: {} / {}", regionName, limitHeader, countHeader, e)
+            } finally {
+                bucketsMutex.unlock()
             }
         }
 
-        suspend fun updateMethodBuckets(endpointKey: String, methodLimitHeader: String, methodCountHeader: String) {
+        suspend fun updateMethodBuckets(
+            endpointKey: String,
+            methodLimitHeader: String,
+            methodCountHeader: String,
+            deadlineAtMs: Long? = null
+        ) {
             val state = methodEndpoints.computeIfAbsent(endpointKey) { MethodEndpointState(it) }
-            state.mutex.withLock {
-                try {
-                    val limits = parseHeader(methodLimitHeader)
-                    val counts = parseHeader(methodCountHeader)
-                    if (limits.size != counts.size || limits.isEmpty()) return
-
-                    state.lastLimitHeader = methodLimitHeader
-                    state.lastCountHeader = methodCountHeader
-                    state.lastUpdatedAtMs = timeProvider.now()
-
-                    val newBuckets = mutableListOf<SlidingWindowBucket>()
-                    limits.forEachIndexed { index, (capacity, seconds) ->
-                        val count = counts[index].first
-                        val window = Duration.ofSeconds(seconds.toLong())
-                        val existing = state.buckets.find { it.windowSeconds == seconds }
-                        if (existing != null) {
-                            existing.updateConfig(capacity, count)
-                            newBuckets.add(existing)
-                        } else {
-                            val b = SlidingWindowBucket(capacity, window, "$regionName-$endpointKey-${seconds}s")
-                            b.syncCount(count)
-                            newBuckets.add(b)
-                        }
-                    }
-                    state.buckets = newBuckets
-                } catch (e: Exception) {
-                    logger.debug("[{}:{}] Failed to parse method rate limit headers: {} / {}", regionName, endpointKey, methodLimitHeader, methodCountHeader)
+            if (deadlineAtMs != null) {
+                if (!tryLockWithDeadline(state.mutex, deadlineAtMs)) {
+                    return
                 }
+            } else {
+                state.mutex.lock()
+            }
+            try {
+                val limits = parseHeader(methodLimitHeader)
+                val counts = parseHeader(methodCountHeader)
+                if (limits.size != counts.size || limits.isEmpty()) return
+
+                state.lastLimitHeader = methodLimitHeader
+                state.lastCountHeader = methodCountHeader
+                state.lastUpdatedAtMs = timeProvider.now()
+
+                val newBuckets = mutableListOf<SlidingWindowBucket>()
+                limits.forEachIndexed { index, (capacity, seconds) ->
+                    val count = counts[index].first
+                    val window = Duration.ofSeconds(seconds.toLong())
+                    val existing = state.buckets.find { it.windowSeconds == seconds }
+                    if (existing != null) {
+                        existing.updateConfig(capacity, count, deadlineAtMs)
+                        newBuckets.add(existing)
+                    } else {
+                        val b = SlidingWindowBucket(capacity, window, "$regionName-$endpointKey-${seconds}s")
+                        b.syncCount(count, deadlineAtMs)
+                        newBuckets.add(b)
+                    }
+                }
+                state.buckets = newBuckets
+            } catch (e: Exception) {
+                logger.debug("[{}:{}] Failed to parse method rate limit headers: {} / {}", regionName, endpointKey, methodLimitHeader, methodCountHeader)
+            } finally {
+                state.mutex.unlock()
             }
         }
 
@@ -519,6 +599,10 @@ class RiotApiRateLimiter(
         val windowSeconds = window.seconds.toInt()
         private val windowMs = window.toMillis()
 
+        internal suspend fun <T> withBucketLockForTest(block: suspend () -> T): T {
+            return mutex.withLock { block() }
+        }
+
         fun currentUsage(now: Long): Int {
             return timestamps.count { now - it < windowMs }
         }
@@ -540,7 +624,7 @@ class RiotApiRateLimiter(
             return (expiryTime - now).coerceAtLeast(0L)
         }
 
-        suspend fun updateConfig(newCapacity: Int, remoteCount: Int): Boolean {
+        suspend fun updateConfig(newCapacity: Int, remoteCount: Int, deadlineAtMs: Long? = null): Boolean {
             var changed = false
             if (capacity != newCapacity) {
                 logger.info("[{}] Capacity changed: {} -> {}", name, capacity, newCapacity)
@@ -548,12 +632,19 @@ class RiotApiRateLimiter(
                 changed = true
             }
 
-            syncCount(remoteCount)
+            syncCount(remoteCount, deadlineAtMs)
             return changed
         }
 
-        suspend fun syncCount(remoteCount: Int) {
-            mutex.withLock {
+        suspend fun syncCount(remoteCount: Int, deadlineAtMs: Long? = null) {
+            if (deadlineAtMs != null) {
+                if (!tryLockWithDeadline(mutex, deadlineAtMs)) {
+                    return
+                }
+            } else {
+                mutex.lock()
+            }
+            try {
                 val now = timeProvider.now()
                 cleanUp(now)
 
@@ -565,6 +656,8 @@ class RiotApiRateLimiter(
                         timestamps.addLast(now)
                     }
                 }
+            } finally {
+                mutex.unlock()
             }
         }
 
@@ -604,7 +697,11 @@ class RiotApiRateLimiter(
         }
 
         suspend fun tryAcquire(priority: ApiPriority, deadlineAtMs: Long): Boolean {
-            mutex.withLock {
+            if (!tryLockWithDeadline(mutex, deadlineAtMs)) {
+                return false
+            }
+            var holdsLock = true
+            try {
                 while (true) {
                     val now = timeProvider.now()
                     cleanUp(now)
@@ -638,17 +735,22 @@ class RiotApiRateLimiter(
                             return false
                         }
                         mutex.unlock()
-                        try {
-                            delay(sleepMs)
-                        } finally {
-                            mutex.lock()
-                        }
+                        holdsLock = false
+                        delay(sleepMs)
                         if (timeProvider.now() <= now) {
                             return false
                         }
+                        if (!tryLockWithDeadline(mutex, deadlineAtMs)) {
+                            return false
+                        }
+                        holdsLock = true
                     } else if (now > deadlineAtMs) {
                         return false
                     }
+                }
+            } finally {
+                if (holdsLock) {
+                    mutex.unlock()
                 }
             }
         }
