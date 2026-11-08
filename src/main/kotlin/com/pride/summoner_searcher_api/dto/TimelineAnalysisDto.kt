@@ -132,3 +132,27 @@ data class TimelineAggregateSummary(
     val deathsNearObjectiveWindows: Int? = null,
     val wardsByTimeBucket: WardTimeBucketsDto? = null
 )
+
+data class CoachTimelinePreparationRequestDto(
+    val matchIds: List<String>? = null
+)
+
+data class MissingMatchTimelineDto(
+    val matchId: String,
+    val reason: String
+)
+
+data class CoachTimelinePreparationResultDto(
+    /** "COMPLETE", "PARTIAL", or "BLOCKED" */
+    val status: String,
+    val region: String,
+    val puuid: String,
+    val analyzerVersion: String,
+    val requestedMatchIds: List<String>,
+    val coveredMatchIds: List<String>,
+    val missingMatches: List<MissingMatchTimelineDto>,
+    val stopReason: String? = null,
+    val cacheHit: Boolean = false,
+    val peakRetainedRawTimelines: Int = 0,
+    val analysis: TimelineAnalysisDto? = null
+)

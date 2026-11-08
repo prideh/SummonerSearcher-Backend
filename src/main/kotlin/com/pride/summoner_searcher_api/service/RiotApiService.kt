@@ -22,20 +22,246 @@ import org.springframework.web.client.RestClient
  * All API calls are rate-limited using the RiotApiRateLimiter to prevent hitting Riot's rate limits.
  */
 @Service
-class RiotApiService(
+class RiotApiService @org.springframework.beans.factory.annotation.Autowired constructor(
     @org.springframework.beans.factory.annotation.Qualifier("riotRestClient")
     private val riotRestClient: RestClient,
     private val rateLimiter: RiotApiRateLimiter,
     @org.springframework.beans.factory.annotation.Qualifier("dataDragonRestClient")
-    private val dataDragonRestClient: RestClient = RestClient.builder().build()
+    private val dataDragonRestClient: RestClient = RestClient.builder().build(),
+    private val timeProvider: TimeProvider = SystemTimeProvider()
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
 
+    internal var matchBaseUrlResolver: (String) -> String = { regionalRouting ->
+        "https://${regionalRouting}.api.riotgames.com"
+    }
+
+    private val activeBoundedHttpWorkers = java.util.concurrent.atomic.AtomicInteger(0)
+
+    private val boundedHttpExecutor = java.util.concurrent.ThreadPoolExecutor(
+        2,
+        4,
+        30L,
+        java.util.concurrent.TimeUnit.SECONDS,
+        java.util.concurrent.LinkedBlockingQueue(8),
+        java.util.concurrent.ThreadFactory { runnable ->
+            Thread(runnable, "riot-bounded-http").apply { isDaemon = true }
+        },
+        java.util.concurrent.ThreadPoolExecutor.AbortPolicy()
+    ).apply {
+        allowCoreThreadTimeOut(true)
+    }
+
+    private val timelineObjectMapper = com.fasterxml.jackson.databind.ObjectMapper()
+        .findAndRegisterModules()
+        .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
+
+    internal fun getActiveBoundedHttpWorkers(): Int = activeBoundedHttpWorkers.get()
+
+    internal class HttpCancellationHandle {
+        private val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        private val closeables = java.util.concurrent.CopyOnWriteArrayList<AutoCloseable>()
+
+        fun isCancelled(): Boolean = cancelled.get()
+
+        fun registerCloseable(closeable: AutoCloseable) {
+            closeables.add(closeable)
+            if (cancelled.get()) {
+                runCatching { closeable.close() }
+            }
+        }
+
+        fun cancel() {
+            cancelled.set(true)
+            for (c in closeables) {
+                runCatching { c.close() }
+            }
+        }
+    }
+
+    private class BoundedStreamAbortedException(val reason: String) : java.io.IOException(reason)
+
+    private inner class BoundedAbortableInputStream(
+        private val delegate: java.io.InputStream,
+        private val response: org.springframework.http.client.ClientHttpResponse,
+        private val cancellationHandle: HttpCancellationHandle?,
+        private val deadlineAtMs: Long?,
+        private val headroomGuard: (() -> Boolean)?,
+        private val failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>?
+    ) : java.io.InputStream() {
+
+        private fun checkGuardsOrThrow() {
+            if (cancellationHandle?.isCancelled() == true ||
+                Thread.currentThread().isInterrupted ||
+                (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs)
+            ) {
+                failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                abortResponseBody(response, delegate)
+                throw BoundedStreamAbortedException("DEADLINE_EXCEEDED")
+            }
+            if (headroomGuard != null && !headroomGuard.invoke()) {
+                failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+                abortResponseBody(response, delegate)
+                throw BoundedStreamAbortedException("MEMORY_HEADROOM_STOP")
+            }
+        }
+
+        override fun read(): Int {
+            checkGuardsOrThrow()
+            val b = delegate.read()
+            checkGuardsOrThrow()
+            return b
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (len <= 0) return 0
+            checkGuardsOrThrow()
+            // SubscriberInputStream.read(b, off, len) loops until `len` bytes are filled or EOF.
+            // Cap each underlying read to 1 KiB so deadline and 360 MiB memory headroom guards
+            // are evaluated at least every 1 KiB of incoming stream data.
+            val boundedLen = len.coerceAtMost(1_024)
+            val n = delegate.read(b, off, boundedLen)
+            checkGuardsOrThrow()
+            return n
+        }
+
+        override fun close() {
+            abortResponseBody(response, delegate)
+        }
+    }
+
+    private fun unwrapClientHttpResponse(
+        response: org.springframework.http.client.ClientHttpResponse
+    ): org.springframework.http.client.ClientHttpResponse {
+        var current = response
+        while (current.javaClass.name != "org.springframework.http.client.ReactorClientHttpResponse") {
+            val delegateField = runCatching {
+                current.javaClass.getDeclaredField("delegate").apply { isAccessible = true }
+            }.getOrNull() ?: break
+            val next = runCatching {
+                delegateField.get(current) as? org.springframework.http.client.ClientHttpResponse
+            }.getOrNull() ?: break
+            if (next === current) break
+            current = next
+        }
+        return current
+    }
+
+    private fun abortResponseBody(
+        response: org.springframework.http.client.ClientHttpResponse,
+        openedBodyStream: java.io.InputStream? = null
+    ) {
+        try {
+            openedBodyStream?.close()
+        } catch (_: Throwable) {
+        }
+        try {
+            val underlying = unwrapClientHttpResponse(response)
+            runCatching { underlying.body.close() }
+            if (underlying.javaClass.name == "org.springframework.http.client.ReactorClientHttpResponse") {
+                val connField = underlying.javaClass.getDeclaredField("connection").apply { isAccessible = true }
+                val conn = connField.get(underlying) as? reactor.netty.Connection
+                conn?.dispose()
+            }
+        } catch (_: Throwable) {
+        }
+        try {
+            response.close()
+        } catch (_: Throwable) {
+        }
+    }
+
+    private suspend fun <T> executeBlockingCallWithDeadline(
+        remainingBudgetMs: Long,
+        failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>?,
+        cancellationHandle: HttpCancellationHandle,
+        apiCall: () -> ResponseEntity<T>?
+    ): ResponseEntity<T>? {
+        val taskClaimedOrCancelled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val workerDoneLatch = java.util.concurrent.CountDownLatch(1)
+        val submittedFuture: java.util.concurrent.Future<ResponseEntity<T>?> = try {
+            boundedHttpExecutor.submit<ResponseEntity<T>?> {
+                if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
+                    workerDoneLatch.countDown()
+                    return@submit null
+                }
+                activeBoundedHttpWorkers.incrementAndGet()
+                try {
+                    if (cancellationHandle.isCancelled() || Thread.currentThread().isInterrupted) {
+                        null
+                    } else {
+                        apiCall()
+                    }
+                } finally {
+                    activeBoundedHttpWorkers.decrementAndGet()
+                    Thread.interrupted()
+                    workerDoneLatch.countDown()
+                }
+            }
+        } catch (e: java.util.concurrent.RejectedExecutionException) {
+            failureReasonHolder?.set("DEADLINE_EXCEEDED")
+            return null
+        }
+
+        return try {
+            val result = withContext(Dispatchers.IO) {
+                submittedFuture.get(remainingBudgetMs.coerceAtLeast(1L), java.util.concurrent.TimeUnit.MILLISECONDS)
+            }
+            if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
+                withContext(Dispatchers.IO) {
+                    workerDoneLatch.await()
+                }
+            }
+            result
+        } catch (e: java.util.concurrent.TimeoutException) {
+            cancellationHandle.cancel()
+            val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            submittedFuture.cancel(true)
+            if (!cancelledBeforeStart) {
+                withContext(Dispatchers.IO) {
+                    workerDoneLatch.await()
+                }
+            }
+            if (failureReasonHolder?.get() == null) {
+                failureReasonHolder?.set("DEADLINE_EXCEEDED")
+            }
+            null
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            cancellationHandle.cancel()
+            val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            submittedFuture.cancel(true)
+            if (!cancelledBeforeStart) {
+                withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
+                    workerDoneLatch.await()
+                }
+            }
+            throw e
+        } catch (e: java.util.concurrent.ExecutionException) {
+            val cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            if (!cancelledBeforeStart) {
+                withContext(Dispatchers.IO) {
+                    workerDoneLatch.await()
+                }
+            }
+            val cause = e.cause ?: e
+            if (cancellationHandle.isCancelled() ||
+                failureReasonHolder?.get() == "DEADLINE_EXCEEDED" ||
+                failureReasonHolder?.get() == "MEMORY_HEADROOM_STOP"
+            ) {
+                null
+            } else {
+                throw cause
+            }
+        }
+    }
+
     /**
      * Wrapper function that enforces rate limiting for all Riot API calls.
      * 
-     * Now supports Dynamic Rate Limiting by parsing both App and Method response headers.
+     * Now supports Dynamic Rate Limiting by parsing both App and Method response headers,
+     * as well as optional deadline-budget bounding and fresh memory headroom checks after
+     * rate-limiter waits and before HTTP execution.
      */
     private suspend fun <T> executeRateLimitedCall(
         region: String, 
@@ -45,6 +271,9 @@ class RiotApiService(
         httpAttemptCounter: java.util.concurrent.atomic.AtomicInteger? = null,
         failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>? = null,
         suppressThrowOnZeroRetryFailure: Boolean = false,
+        deadlineAtMs: Long? = null,
+        headroomGuard: (() -> Boolean)? = null,
+        cancellationHandle: HttpCancellationHandle? = null,
         apiCall: () -> ResponseEntity<T>?
     ): T? {
         var attempts = 0
@@ -54,25 +283,65 @@ class RiotApiService(
         }
         try {
             while (true) {
-                val waitStartMs = System.currentTimeMillis()
-                if (priority == ApiPriority.LOW) {
-                    rateLimiter.awaitLowPriorityClearance(region)
+                if (headroomGuard != null && !headroomGuard.invoke()) {
+                    failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+                    return null
                 }
-                rateLimiter.acquirePermit(region, priority, endpointKey)
-                val limiterWaitMs = System.currentTimeMillis() - waitStartMs
+                val waitStartMs = timeProvider.now()
+                if (deadlineAtMs != null) {
+                    val remainingForPermitMs = deadlineAtMs - waitStartMs
+                    if (remainingForPermitMs <= 0L) {
+                        failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                        return null
+                    }
+                    val acquired = rateLimiter.tryAcquirePermit(region, priority, endpointKey, remainingForPermitMs)
+                    if (!acquired) {
+                        failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                        return null
+                    }
+                } else {
+                    if (priority == ApiPriority.LOW) {
+                        rateLimiter.awaitLowPriorityClearance(region)
+                    }
+                    rateLimiter.acquirePermit(region, priority, endpointKey)
+                }
+                val afterWaitMs = timeProvider.now()
+                val limiterWaitMs = afterWaitMs - waitStartMs
                 if (limiterWaitMs > 25L) {
                     logger.info(
                         "Riot rate limiter wait: region={}, endpoint={}, priority={}, limiterWaitMs={}",
                         region, endpointKey ?: "unspecified", priority, limiterWaitMs
                     )
                 }
+                if (deadlineAtMs != null && afterWaitMs >= deadlineAtMs) {
+                    failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                    return null
+                }
+                if (headroomGuard != null && !headroomGuard.invoke()) {
+                    failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+                    return null
+                }
                 try {
                     httpAttemptCounter?.incrementAndGet()
-                    val httpStartMs = System.currentTimeMillis()
-                    val response = withContext(Dispatchers.IO) {
-                        apiCall()
+                    val httpStartMs = timeProvider.now()
+                    val response = if (deadlineAtMs != null) {
+                        val remainingForHttpMs = deadlineAtMs - httpStartMs
+                        if (remainingForHttpMs <= 0L) {
+                            failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                            return null
+                        }
+                        executeBlockingCallWithDeadline(
+                            remainingBudgetMs = remainingForHttpMs,
+                            failureReasonHolder = failureReasonHolder,
+                            cancellationHandle = cancellationHandle ?: HttpCancellationHandle(),
+                            apiCall = apiCall
+                        )
+                    } else {
+                        withContext(Dispatchers.IO) {
+                            apiCall()
+                        }
                     }
-                    val httpMs = System.currentTimeMillis() - httpStartMs
+                    val httpMs = timeProvider.now() - httpStartMs
                     
                     if (response != null) {
                         val headers = response.headers
@@ -86,7 +355,8 @@ class RiotApiService(
                             countHeader = appCount,
                             endpointKey = endpointKey,
                             methodLimitHeader = methodLimit,
-                            methodCountHeader = methodCount
+                            methodCountHeader = methodCount,
+                            deadlineAtMs = deadlineAtMs
                         )
                         logger.debug(
                             "Riot API call complete: region={}, endpoint={}, priority={}, limiterWaitMs={}, httpMs={}, appLimit={} ({}), methodLimit={} ({})",
@@ -633,6 +903,180 @@ class RiotApiService(
                     .toEntity(com.pride.summoner_searcher_api.dto.MatchTimelineDto::class.java)
             } catch (e: HttpClientErrorException.NotFound) {
                 logger.warn("getMatchTimeline returned 404 for matchId: {}", matchId)
+                null
+            }
+        }
+    }
+
+    suspend fun getMatchTimelineBounded(
+        matchId: String,
+        region: String,
+        priority: ApiPriority = ApiPriority.HIGH,
+        maxRetries: Int = 0,
+        httpAttemptCounter: java.util.concurrent.atomic.AtomicInteger? = null,
+        failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>? = null,
+        maxTotalDurationMs: Long? = null,
+        headroomGuard: (() -> Boolean)? = null
+    ): com.pride.summoner_searcher_api.dto.MatchTimelineDto? {
+        val regionalRouting = mapToRegionRouting(region)
+        val matchBaseUrl = matchBaseUrlResolver(regionalRouting)
+        val uri = "$matchBaseUrl/lol/match/v5/matches/{matchId}/timeline"
+        val deadlineAtMs = maxTotalDurationMs?.let { timeProvider.now() + it.coerceAtLeast(0L) }
+        val cancellationHandle = HttpCancellationHandle()
+
+        return executeRateLimitedCall(
+            region = region,
+            priority = priority,
+            endpointKey = "match-v5-timeline-by-id",
+            maxRetries = maxRetries,
+            httpAttemptCounter = httpAttemptCounter,
+            failureReasonHolder = failureReasonHolder,
+            suppressThrowOnZeroRetryFailure = true,
+            deadlineAtMs = deadlineAtMs,
+            headroomGuard = headroomGuard,
+            cancellationHandle = cancellationHandle
+        ) {
+            try {
+                riotRestClient.get()
+                    .uri(uri, matchId)
+                    .exchange { _, response ->
+                        cancellationHandle.registerCloseable(AutoCloseable {
+                            abortResponseBody(response)
+                        })
+                        val status = response.statusCode
+                        val headers = response.headers
+                        when {
+                            status.value() == 404 -> {
+                                failureReasonHolder?.set("HTTP_404_NOT_FOUND")
+                                logger.warn("getMatchTimelineBounded returned 404 for matchId: {}", matchId)
+                                abortResponseBody(response)
+                                ResponseEntity.status(status).headers(headers).body(null)
+                            }
+                            status.value() == 429 -> {
+                                abortResponseBody(response)
+                                throw HttpClientErrorException.create(
+                                    status,
+                                    response.statusText,
+                                    headers,
+                                    ByteArray(0),
+                                    null
+                                )
+                            }
+                            status.isError -> {
+                                failureReasonHolder?.set("HTTP_ERROR")
+                                logger.warn("getMatchTimelineBounded HTTP {} for matchId: {}", status.value(), matchId)
+                                abortResponseBody(response)
+                                ResponseEntity.status(status).headers(headers).body(null)
+                            }
+                            cancellationHandle.isCancelled() || (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs) -> {
+                                failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                                logger.warn("getMatchTimelineBounded deadline exceeded before decode for matchId: {}", matchId)
+                                abortResponseBody(response)
+                                ResponseEntity.status(status).headers(headers).body(null)
+                            }
+                            headroomGuard != null && !headroomGuard.invoke() -> {
+                                failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+                                logger.warn("getMatchTimelineBounded memory headroom stop before decode for matchId: {}", matchId)
+                                abortResponseBody(response)
+                                ResponseEntity.status(status).headers(headers).body(null)
+                            }
+                            else -> {
+                                val rawStream = response.body
+                                val boundedStream = BoundedAbortableInputStream(
+                                    delegate = rawStream,
+                                    response = response,
+                                    cancellationHandle = cancellationHandle,
+                                    deadlineAtMs = deadlineAtMs,
+                                    headroomGuard = headroomGuard,
+                                    failureReasonHolder = failureReasonHolder
+                                )
+                                cancellationHandle.registerCloseable(boundedStream)
+                                val decoded = timelineObjectMapper.readValue(
+                                    boundedStream,
+                                    com.pride.summoner_searcher_api.dto.MatchTimelineDto::class.java
+                                )
+                                if (cancellationHandle.isCancelled() || (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs)) {
+                                    failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                                    abortResponseBody(response, rawStream)
+                                    ResponseEntity.status(status).headers(headers).body(null)
+                                } else if (headroomGuard != null && !headroomGuard.invoke()) {
+                                    failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+                                    abortResponseBody(response, rawStream)
+                                    ResponseEntity.status(status).headers(headers).body(null)
+                                } else {
+                                    ResponseEntity.status(status).headers(headers).body(decoded)
+                                }
+                            }
+                        }
+                    }
+            } catch (e: BoundedStreamAbortedException) {
+                failureReasonHolder?.set(e.reason)
+                logger.warn("getMatchTimelineBounded aborted stream decode ({}) for matchId: {}", e.reason, matchId)
+                null
+            } catch (e: HttpClientErrorException.NotFound) {
+                failureReasonHolder?.set("HTTP_404_NOT_FOUND")
+                logger.warn("getMatchTimelineBounded returned 404 for matchId: {}", matchId)
+                null
+            } catch (e: HttpClientErrorException.TooManyRequests) {
+                throw e
+            } catch (e: org.springframework.web.client.ResourceAccessException) {
+                val hasInterrupt = generateSequence<Throwable>(e) { it.cause }
+                    .any { it is InterruptedException || it is java.io.InterruptedIOException || it is BoundedStreamAbortedException }
+                val abortedByGuard = generateSequence<Throwable>(e) { it.cause }
+                    .filterIsInstance<BoundedStreamAbortedException>()
+                    .firstOrNull()
+                if (abortedByGuard != null) {
+                    failureReasonHolder?.set(abortedByGuard.reason)
+                    null
+                } else if (cancellationHandle.isCancelled() || hasInterrupt || (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs)) {
+                    if (failureReasonHolder?.get() != "MEMORY_HEADROOM_STOP") {
+                        failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                    }
+                    null
+                } else {
+                    throw e
+                }
+            } catch (e: org.springframework.web.client.RestClientException) {
+                val abortedByGuard = generateSequence<Throwable>(e) { it.cause }
+                    .filterIsInstance<BoundedStreamAbortedException>()
+                    .firstOrNull()
+                val hasInterrupt = generateSequence<Throwable>(e) { it.cause }
+                    .any { it is InterruptedException || it is java.io.InterruptedIOException }
+                when {
+                    abortedByGuard != null -> failureReasonHolder?.set(abortedByGuard.reason)
+                    cancellationHandle.isCancelled() || hasInterrupt || (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs) -> {
+                        if (failureReasonHolder?.get() != "MEMORY_HEADROOM_STOP") {
+                            failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                        }
+                    }
+                    else -> {
+                        if (failureReasonHolder?.get() == null) {
+                            failureReasonHolder?.set("HTTP_ERROR")
+                        }
+                    }
+                }
+                logger.warn("getMatchTimelineBounded failed for matchId {}: {}", matchId, e.message)
+                null
+            } catch (e: Exception) {
+                val abortedByGuard = generateSequence<Throwable>(e) { it.cause }
+                    .filterIsInstance<BoundedStreamAbortedException>()
+                    .firstOrNull()
+                val hasInterrupt = generateSequence<Throwable>(e) { it.cause }
+                    .any { it is InterruptedException || it is java.io.InterruptedIOException }
+                when {
+                    abortedByGuard != null -> failureReasonHolder?.set(abortedByGuard.reason)
+                    cancellationHandle.isCancelled() || hasInterrupt || (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs) -> {
+                        if (failureReasonHolder?.get() != "MEMORY_HEADROOM_STOP") {
+                            failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                        }
+                    }
+                    else -> {
+                        if (failureReasonHolder?.get() == null) {
+                            failureReasonHolder?.set("HTTP_ERROR")
+                        }
+                    }
+                }
+                logger.warn("getMatchTimelineBounded failed for matchId {}: {}", matchId, e.message)
                 null
             }
         }

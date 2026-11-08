@@ -21,6 +21,123 @@ class TimelineAnalysisService {
     // Riot map coordinates range 0..15000 for both X and Y.
     private val MAP_SIZE = 15000.0
 
+    companion object {
+        private val RELEVANT_TIMELINE_EVENT_TYPES = setOf(
+            "ITEM_PURCHASED",
+            "LEVEL_UP",
+            "SKILL_LEVEL_UP",
+            "CHAMPION_KILL",
+            "BUILDING_KILL",
+            "TURRET_PLATE_DESTROYED",
+            "ELITE_MONSTER_KILL",
+            "WARD_PLACED",
+            "WARD_KILL"
+        )
+    }
+
+    /**
+     * Strips a single raw [MatchTimelineDto] down to ONLY the participant frame entries and timeline events
+     * read by [analyze] and [computeImprovementStats] for [puuid] and their assigned/lane opponent,
+     * copying into compact collections so the full 10-player raw frame/event graph can be garbage-collected
+     * immediately before the next match is decoded/fetched.
+     */
+    fun compactTimelineForPlayer(
+        timeline: MatchTimelineDto,
+        matchDto: MatchDto,
+        puuid: String
+    ): MatchTimelineDto? {
+        val info = timeline.info ?: return null
+        val rawFrames = info.frames?.takeIf { it.isNotEmpty() } ?: return null
+        val matchInfo = matchDto.info ?: return null
+        val playerMatchParticipant = matchInfo.participants.find { it.puuid == puuid } ?: return null
+
+        val analyzePlayerPid = (info.participants?.find { it.puuid == puuid }?.participantId
+            ?: playerMatchParticipant.participantId)?.takeIf { it in 1..10 }
+        val improvementPlayerPid = resolveTimelineParticipantId(info, playerMatchParticipant, matchInfo.participants)
+            ?.takeIf { it in 1..10 }
+        if (analyzePlayerPid == null && improvementPlayerPid == null) return null
+
+        val playerFrameKeys = setOfNotNull(analyzePlayerPid?.toString(), improvementPlayerPid?.toString())
+        val hasAnyPlayerFrame = rawFrames.any { frame ->
+            val pFrames = frame.participantFrames ?: return@any false
+            playerFrameKeys.any { key -> pFrames.containsKey(key) }
+        }
+        if (!hasAnyPlayerFrame) return null
+
+        val playerTeamId = playerMatchParticipant.teamId ?: 100
+        val analyzeOpponent = matchInfo.participants.find { p ->
+            p.teamId != playerTeamId &&
+                p.teamPosition == playerMatchParticipant.teamPosition &&
+                !playerMatchParticipant.teamPosition.isNullOrBlank() &&
+                playerMatchParticipant.teamPosition != "NONE"
+        }
+        val analyzeOpponentPid = (info.participants?.find { it.puuid == analyzeOpponent?.puuid }?.participantId
+            ?: analyzeOpponent?.participantId)?.takeIf { it in 1..10 }
+
+        val playerRole = normalizeRole(playerMatchParticipant.teamPosition ?: playerMatchParticipant.individualPosition)
+        val improvementOpponent = matchInfo.participants.find { p ->
+            p.teamId != playerTeamId &&
+                normalizeRole(p.teamPosition ?: p.individualPosition) == playerRole &&
+                playerRole != "UNKNOWN"
+        }
+        val improvementOpponentPid = resolveTimelineParticipantId(info, improvementOpponent, matchInfo.participants)
+            ?.takeIf { it in 1..10 }
+
+        val keptParticipantIds = setOfNotNull(
+            analyzePlayerPid,
+            improvementPlayerPid,
+            analyzeOpponentPid,
+            improvementOpponentPid
+        )
+        if (keptParticipantIds.isEmpty()) return null
+        val keptFrameKeys = keptParticipantIds.map { it.toString() }.toSet()
+
+        val compactedFrames = rawFrames.map { frame ->
+            val filteredParticipantFrames = frame.participantFrames
+                ?.entries
+                ?.filter { (key, _) -> key in keptFrameKeys }
+                ?.associate { (key, value) -> key to value }
+            val filteredEvents = frame.events
+                ?.filter { ev ->
+                    val type = ev.type ?: return@filter false
+                    if (type !in RELEVANT_TIMELINE_EVENT_TYPES) return@filter false
+                    when (type) {
+                        "ITEM_PURCHASED", "LEVEL_UP", "SKILL_LEVEL_UP" ->
+                            ev.participantId != null && ev.participantId in keptParticipantIds
+                        "WARD_PLACED" ->
+                            (ev.creatorId != null && ev.creatorId in keptParticipantIds) ||
+                                (ev.participantId != null && ev.participantId in keptParticipantIds)
+                        "WARD_KILL" ->
+                            (ev.killerId != null && ev.killerId in keptParticipantIds) ||
+                                (ev.participantId != null && ev.participantId in keptParticipantIds)
+                        "CHAMPION_KILL" ->
+                            (ev.killerId != null && ev.killerId in keptParticipantIds) ||
+                                (ev.victimId != null && ev.victimId in keptParticipantIds) ||
+                                (ev.assistingParticipantIds?.any { it in keptParticipantIds } == true)
+                        else -> true
+                    }
+                }
+                ?.toList()
+            TimelineFrameDto(
+                timestamp = frame.timestamp,
+                participantFrames = filteredParticipantFrames,
+                events = filteredEvents
+            )
+        }.toList()
+
+        return MatchTimelineDto(
+            metadata = MatchTimelineMetadata(
+                matchId = timeline.metadata?.matchId,
+                participants = null
+            ),
+            info = MatchTimelineInfo(
+                frameInterval = info.frameInterval,
+                frames = compactedFrames,
+                participants = info.participants?.filter { it.participantId in keptParticipantIds }
+            )
+        )
+    }
+
     /**
      * Entry point: given timelines + the base match info (to get champion names, participant IDs, and win/loss),
      * produce the full [TimelineAnalysisDto].

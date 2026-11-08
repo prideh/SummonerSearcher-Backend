@@ -1243,6 +1243,30 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 @Suppress("UNCHECKED_CAST")
                 val genConfig = buildConfigMethod.invoke(service, 0.7) as Map<String, Any>
                 genConfig["maxOutputTokens"] shouldBe 4096
+
+                // 7. Verify timelineCoverage (PARTIAL/BLOCKED/COMPLETE) and Season 2026 turretPlates prompt note
+                val partialCoverageContext = spearShotScopedContext + mapOf(
+                    "timelineStatus" to "PARTIAL",
+                    "timelineCoverage" to mapOf(
+                        "status" to "PARTIAL",
+                        "requested" to 20,
+                        "covered" to 12,
+                        "missing" to 8,
+                        "stopReason" to "RATE_LIMIT_COOLDOWN"
+                    )
+                )
+                val partialPrompt = constructPromptMethod.invoke(
+                    service,
+                    partialCoverageContext,
+                    emptyList<Map<String, String>>(),
+                    "How is my early laning and turret plate pressure?",
+                    null,
+                    null
+                ) as String
+                partialPrompt shouldContain "timelineStatus: PARTIAL"
+                partialPrompt shouldContain "timelineCoverage: {status=PARTIAL, covered=12/20 games, stopReason=RATE_LIMIT_COOLDOWN}"
+                partialPrompt shouldContain "When `timelineStatus` is `PARTIAL`, cite the exact `covered`/`requested` timeline denominator from `timelineCoverage`"
+                partialPrompt shouldContain "In Season 2026 (Patch 26.1+), Riot's `challenges.turretPlatesTaken` (`turretPlates` / `avgTurretPlates`) counts permanent turret plates across Outer, Inner, and Inhibitor turrets (5 plates per turret across 9 lane turrets, not just pre-14:00 outer plates)."
             }
         }
     }
