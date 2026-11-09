@@ -240,7 +240,7 @@ class OffProdChallengerIdentityCompletionTool(
         val dryRun: Boolean = true,
         val networkEnabled: Boolean = false,
         val allowDurableWrites: Boolean = false,
-        val enforceAbsentManifestScope: Boolean = false,
+        val enforceAbsentManifestScope: Boolean = true,
         val keyCoordinationMode: KeyCoordinationMode = KeyCoordinationMode.UNCOORDINATED,
         val coordinationAttestation: String = "",
         val maxTotalHttpAttempts: Int = MAX_ALLOWED_HTTP_ATTEMPTS,

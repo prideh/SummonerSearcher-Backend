@@ -461,6 +461,40 @@ class OffProdChallengerIdentityPostgresQualificationTest {
                         assertEquals(409, rs.getInt(1), "Must never insert fabricated rows or alter indexed_players count")
                     }
                 }
+                // Measure exact PostgreSQL storage bytes for the 191 verified rows (31 euw1 + 160 kr) before adding conflicting test row
+                conn.createStatement().use { stmt ->
+                    stmt.execute("VACUUM ANALYZE player_riot_identities")
+                }
+                conn.prepareStatement(
+                    """
+                    SELECT
+                        pg_relation_size('public.player_riot_identities') AS heap_bytes,
+                        pg_indexes_size('public.player_riot_identities') AS index_bytes,
+                        pg_total_relation_size('public.player_riot_identities') AS total_bytes,
+                        (SELECT COALESCE(SUM(pg_column_size(t.*)), 0) FROM public.player_riot_identities t) AS live_tuple_bytes,
+                        (SELECT COALESCE(MIN(pg_column_size(t.*)), 0) FROM public.player_riot_identities t) AS min_tuple_bytes,
+                        (SELECT COALESCE(MAX(pg_column_size(t.*)), 0) FROM public.player_riot_identities t) AS max_tuple_bytes
+                    """.trimIndent()
+                ).use { ps ->
+                    ps.executeQuery().use { rs ->
+                        assertTrue(rs.next())
+                        val heapBytes = rs.getLong("heap_bytes")
+                        val indexBytes = rs.getLong("index_bytes")
+                        val totalBytes = rs.getLong("total_bytes")
+                        val liveTupleBytes = rs.getLong("live_tuple_bytes")
+                        val minTupleBytes = rs.getLong("min_tuple_bytes")
+                        val maxTupleBytes = rs.getLong("max_tuple_bytes")
+                        println(
+                            "[MEASURED_PG_191_FIXTURE_BYTES] heapBytes=$heapBytes indexBytes=$indexBytes " +
+                                "totalBytes=$totalBytes liveTupleBytes=$liveTupleBytes " +
+                                "minTupleBytes=$minTupleBytes maxTupleBytes=$maxTupleBytes"
+                        )
+                        assertTrue(heapBytes in 8_192L..65_536L, "Expected 191-row heap <= 64 KiB, was $heapBytes")
+                        assertTrue(indexBytes in 8_192L..65_536L, "Expected 191-row PK index <= 64 KiB, was $indexBytes")
+                        assertTrue(totalBytes <= 131_072L, "Expected 191-row total relation size <= 128 KiB, was $totalBytes")
+                        assertTrue(liveTupleBytes in 20_000L..35_000L, "Expected 191 live tuples ~24-30 KiB, was $liveTupleBytes")
+                    }
+                }
                 // Verify non-blank CHECK constraint in real PostgreSQL
                 assertThrows(SQLException::class.java) {
                     conn.prepareStatement(
@@ -572,7 +606,7 @@ class OffProdChallengerIdentityPostgresQualificationTest {
             }
 
             // 8. Verify default CLI absent-manifest scope blocks any candidate present in indexed_players with blank field (0 HTTP calls, 0 indexed_players updates)
-            //    and verify shared global maxWallTimeMs budget across --apply-additive-ddl=true + runBounded
+            //    in BOTH dry-run precheck mode AND live mode, and verify separate DDL stage budget + shared global maxWallTimeMs budget
             val pBlankIndexed = deterministicPuuid("euw1", 999)
             pgDataSource.connection.use { conn ->
                 conn.prepareStatement(
@@ -589,6 +623,18 @@ class OffProdChallengerIdentityPostgresQualificationTest {
                 entries = listOf(ManifestEntry(pBlankIndexed, "euw1"))
             )
             val callsBeforeScopeCheck = httpCalls.get()
+            val blockedDryRunScopeResult = OffProdChallengerIdentityCompletionCli.runCli(
+                args = listOf(
+                    "--manifest-file=${blankScopeFile.absolutePath}",
+                    "--jdbc-url=$jdbcUrl",
+                    "--db-user=postgres",
+                    "--db-pass="
+                )
+            )
+            assertEquals(1, blockedDryRunScopeResult.exitCode, "Dry-run precheck must also stop immediately with exitCode=1 if any candidate is now partially in indexed_players")
+            assertEquals(RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT, blockedDryRunScopeResult.report!!.outcome)
+            assertEquals(0, blockedDryRunScopeResult.report!!.durableIndexedPlayerUpdatesVerifiedCount)
+
             val blockedScopeResult = OffProdChallengerIdentityCompletionCli.runCli(
                 args = listOf(
                     "--manifest-file=${blankScopeFile.absolutePath}",
@@ -608,9 +654,11 @@ class OffProdChallengerIdentityPostgresQualificationTest {
             assertEquals(callsBeforeScopeCheck, httpCalls.get(), "Must make 0 HTTP calls when absent-manifest scope is violated")
             assertEquals(0, blockedScopeResult.report!!.durableIndexedPlayerUpdatesVerifiedCount)
 
-            // Verify shared global wall-time budget across DDL + runBounded:
-            // (a) If DDL takes 50_000ms of a 180_000ms budget, runBounded receives the remaining 130_000ms budget;
-            // (b) If DDL consumes the entire 180_000ms budget, runCli halts with exitCode=10 and 0 HTTP calls.
+            // Verify separate DDL stage budget + shared global wall-time budget across DDL + runBounded:
+            assertTrue(liveResult.ddlStageBudgetMs in 1L..2_500L)
+            assertTrue(liveResult.runStageBudgetMs in 1L..180_000L)
+            assertEquals(180_000L, liveResult.totalProcessBudgetMs)
+
             val ddlExhaustClock = object : MonotonicClock {
                 private val currentMs = AtomicLong(1_000L)
                 override fun nowMs(): Long = currentMs.addAndGet(100L)
@@ -626,6 +674,7 @@ class OffProdChallengerIdentityPostgresQualificationTest {
                     "--network-enabled=true",
                     "--allow-durable-writes=true",
                     "--apply-additive-ddl=true",
+                    "--ddl-timeout-ms=5000",
                     "--db-timeout-ms=5000",
                     "--max-wall-time-ms=1000"
                 ),

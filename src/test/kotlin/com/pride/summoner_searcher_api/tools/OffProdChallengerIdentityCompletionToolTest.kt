@@ -730,12 +730,28 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 wallClock = WallClock { Instant.parse("2026-11-09T03:00:00Z") }
             )
 
+            val defaultScopeReport = tool.runBounded(
+                manifest = manifest,
+                options = ExecutionOptions(
+                    dryRun = false,
+                    networkEnabled = true,
+                    allowDurableWrites = true,
+                    keyCoordinationMode = KeyCoordinationMode.EXCLUSIVE_KEY,
+                    coordinationAttestation = "Exclusive off-prod key"
+                ),
+                riotApiKeyProvider = { "RGAPI-test" }
+            )
+            defaultScopeReport.outcome shouldBe RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT
+            defaultScopeReport.httpAttemptsMade shouldBe 0
+            defaultScopeReport.durableIndexedPlayerUpdatesVerifiedCount shouldBe 0
+
             val report = tool.runBounded(
                 manifest = manifest,
                 options = ExecutionOptions(
                     dryRun = false,
                     networkEnabled = true,
                     allowDurableWrites = true,
+                    enforceAbsentManifestScope = false,
                     keyCoordinationMode = KeyCoordinationMode.EXCLUSIVE_KEY,
                     coordinationAttestation = "Exclusive off-prod key"
                 ),

@@ -53,7 +53,12 @@ object OffProdChallengerIdentityCompletionCli {
         val ddlApplied: Boolean,
         val outputReportPath: String?,
         val outputRemainingManifestPath: String?,
-        val errorMessage: String? = null
+        val errorMessage: String? = null,
+        val ddlStageBudgetMs: Long = 0L,
+        val ddlStageElapsedMs: Long = 0L,
+        val runStageBudgetMs: Long = 0L,
+        val totalProcessBudgetMs: Long = 0L,
+        val totalProcessElapsedMs: Long = 0L
     )
 
     @JsonIgnoreProperties(ignoreUnknown = true)
@@ -176,6 +181,7 @@ object OffProdChallengerIdentityCompletionCli {
             ?: OffProdChallengerIdentityCompletionTool.DEFAULT_MAX_WALL_TIME_MS
         val dbTimeoutMs = flags["db-timeout-ms"]?.toLongOrNull()
             ?: OffProdChallengerIdentityCompletionTool.DEFAULT_DB_OPERATION_TIMEOUT_MS
+        val ddlTimeoutMs = flags["ddl-timeout-ms"]?.toLongOrNull() ?: dbTimeoutMs
         val connectTimeoutMs = flags["http-connect-timeout-ms"]?.toIntOrNull()
             ?: OffProdChallengerIdentityCompletionTool.DEFAULT_CONNECT_TIMEOUT_MS
         val readTimeoutMs = flags["http-read-timeout-ms"]?.toIntOrNull()
@@ -185,14 +191,14 @@ object OffProdChallengerIdentityCompletionCli {
         val maxBodyBytes = flags["max-body-bytes"]?.toIntOrNull()
             ?: OffProdChallengerIdentityCompletionTool.MAX_RESPONSE_BODY_BYTES
 
-        if (maxWallTimeMs <= 0L) {
+        if (maxWallTimeMs <= 0L || ddlTimeoutMs <= 0L) {
             return CliExecutionResult(
                 exitCode = 2,
                 report = null,
                 ddlApplied = false,
                 outputReportPath = null,
                 outputRemainingManifestPath = null,
-                errorMessage = "Invalid execution options: maxWallTimeMs must be > 0"
+                errorMessage = "Invalid execution options: maxWallTimeMs and ddlTimeoutMs must be > 0"
             )
         }
 
@@ -223,13 +229,19 @@ object OffProdChallengerIdentityCompletionCli {
         }
 
         var ddlApplied = false
+        var effectiveDdlStageBudgetMs = 0L
+        var ddlStageElapsedMs = 0L
         if (applyAdditiveDdl) {
-            val elapsedBeforeDdlMs = (monotonicClock.nowMs() - cliStartMonoMs).coerceAtLeast(0L)
+            val ddlStartMonoMs = monotonicClock.nowMs()
+            val elapsedBeforeDdlMs = (ddlStartMonoMs - cliStartMonoMs).coerceAtLeast(0L)
             val remainingGlobalBeforeDdlMs = maxWallTimeMs - elapsedBeforeDdlMs
-            val effectiveDdlTimeoutMs = minOf(dbTimeoutMs, remainingGlobalBeforeDdlMs)
-            val ddlResult = applyReviewedAdditiveDdlBounded(dataSource, effectiveDdlTimeoutMs, monotonicClock)
+            effectiveDdlStageBudgetMs = minOf(ddlTimeoutMs, remainingGlobalBeforeDdlMs).coerceAtLeast(0L)
+            val ddlResult = applyReviewedAdditiveDdlBounded(dataSource, effectiveDdlStageBudgetMs, monotonicClock)
+            val ddlEndMonoMs = monotonicClock.nowMs()
+            ddlStageElapsedMs = (ddlEndMonoMs - ddlStartMonoMs).coerceAtLeast(0L)
             if (!ddlResult.first) {
-                val remainingGlobalAfterDdlMs = maxWallTimeMs - (monotonicClock.nowMs() - cliStartMonoMs).coerceAtLeast(0L)
+                val totalElapsedMs = (ddlEndMonoMs - cliStartMonoMs).coerceAtLeast(0L)
+                val remainingGlobalAfterDdlMs = maxWallTimeMs - totalElapsedMs
                 val ddlExitCode = if (remainingGlobalAfterDdlMs <= 0L) 10 else 3
                 return CliExecutionResult(
                     exitCode = ddlExitCode,
@@ -237,7 +249,12 @@ object OffProdChallengerIdentityCompletionCli {
                     ddlApplied = false,
                     outputReportPath = null,
                     outputRemainingManifestPath = null,
-                    errorMessage = "Failed to apply additive migration DDL: ${ddlResult.second}"
+                    errorMessage = "Failed to apply additive migration DDL: ${ddlResult.second}",
+                    ddlStageBudgetMs = effectiveDdlStageBudgetMs,
+                    ddlStageElapsedMs = ddlStageElapsedMs,
+                    runStageBudgetMs = remainingGlobalAfterDdlMs.coerceAtLeast(0L),
+                    totalProcessBudgetMs = maxWallTimeMs,
+                    totalProcessElapsedMs = totalElapsedMs
                 )
             }
             ddlApplied = true
@@ -252,7 +269,12 @@ object OffProdChallengerIdentityCompletionCli {
                 ddlApplied = ddlApplied,
                 outputReportPath = null,
                 outputRemainingManifestPath = null,
-                errorMessage = "Shared global wall-time budget (${maxWallTimeMs}ms) exhausted before runBounded stage"
+                errorMessage = "Shared global wall-time budget (${maxWallTimeMs}ms) exhausted before runBounded stage",
+                ddlStageBudgetMs = effectiveDdlStageBudgetMs,
+                ddlStageElapsedMs = ddlStageElapsedMs,
+                runStageBudgetMs = 0L,
+                totalProcessBudgetMs = maxWallTimeMs,
+                totalProcessElapsedMs = elapsedBeforeRunMs
             )
         }
 
@@ -281,7 +303,12 @@ object OffProdChallengerIdentityCompletionCli {
                 ddlApplied = ddlApplied,
                 outputReportPath = null,
                 outputRemainingManifestPath = null,
-                errorMessage = "Invalid execution options: ${e.message}"
+                errorMessage = "Invalid execution options: ${e.message}",
+                ddlStageBudgetMs = effectiveDdlStageBudgetMs,
+                ddlStageElapsedMs = ddlStageElapsedMs,
+                runStageBudgetMs = remainingWallTimeForRunMs,
+                totalProcessBudgetMs = maxWallTimeMs,
+                totalProcessElapsedMs = (monotonicClock.nowMs() - cliStartMonoMs).coerceAtLeast(0L)
             )
         }
 
@@ -313,7 +340,12 @@ object OffProdChallengerIdentityCompletionCli {
                 ddlApplied = ddlApplied,
                 outputReportPath = null,
                 outputRemainingManifestPath = null,
-                errorMessage = "Execution failed: ${e.message}"
+                errorMessage = "Execution failed: ${e.message}",
+                ddlStageBudgetMs = effectiveDdlStageBudgetMs,
+                ddlStageElapsedMs = ddlStageElapsedMs,
+                runStageBudgetMs = remainingWallTimeForRunMs,
+                totalProcessBudgetMs = maxWallTimeMs,
+                totalProcessElapsedMs = (monotonicClock.nowMs() - cliStartMonoMs).coerceAtLeast(0L)
             )
         }
 
@@ -348,7 +380,12 @@ object OffProdChallengerIdentityCompletionCli {
             report = report,
             ddlApplied = ddlApplied,
             outputReportPath = reportOutPath,
-            outputRemainingManifestPath = remainingManifestOutPath
+            outputRemainingManifestPath = remainingManifestOutPath,
+            ddlStageBudgetMs = effectiveDdlStageBudgetMs,
+            ddlStageElapsedMs = ddlStageElapsedMs,
+            runStageBudgetMs = remainingWallTimeForRunMs,
+            totalProcessBudgetMs = maxWallTimeMs,
+            totalProcessElapsedMs = (monotonicClock.nowMs() - cliStartMonoMs).coerceAtLeast(0L)
         )
     }
 
