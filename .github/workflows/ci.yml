@@ -19,48 +19,53 @@ jobs:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
-    - name: Verify public repo free-runner invariant and exact 5959a70 + 139a7de commit SHAs
+    - name: Verify public repo free-runner invariant and exact c71e2bd + 5959a70 + 139a7de commit SHAs
       run: |
         test "${{ github.event.repository.private }}" = "false"
         test "${{ github.event.repository.visibility }}" = "public"
+        git fetch origin feat/offprod-missing-challenger-identity-completion:refs/remotes/origin/feat/offprod-missing-challenger-identity-completion || true
+        git cat-file -e c71e2bdd0d91cec8adad0eb52e79530cad4aa004^{commit}
         git cat-file -e 5959a7036c9e281f72d17f0a0bd5003ba59476f8^{commit}
         git cat-file -e 139a7de48e67af9d664c08fd61ce131b6e63bd74^{commit}
-    - name: Set up JDK 21 for exact 5959a70 unit test verification
+    - name: Set up JDK 21 for exact c71e2bd unit and PostgreSQL qualification test verification
       uses: actions/setup-java@v4
       with:
         java-version: '21'
         distribution: 'temurin'
         cache: 'gradle'
-    - name: Build exact Candidate (5959a70) and Rollback Base (139a7de) Docker images and capture 83-test JDK 21 XML/exit evidence from detached worktrees
+    - name: Build exact Integrated Candidate (c71e2bd) and Rollback Base (139a7de) Docker images and capture 104-test JDK 21 XML/exit evidence from detached worktrees
       run: |
-        git worktree add --detach /tmp/wt-5959a70 5959a7036c9e281f72d17f0a0bd5003ba59476f8
-        test "$(git -C /tmp/wt-5959a70 rev-parse HEAD)" = "5959a7036c9e281f72d17f0a0bd5003ba59476f8"
-        docker build -f /tmp/wt-5959a70/Dockerfile -t ss-backend:cand-5959a70 /tmp/wt-5959a70
-        docker tag ss-backend:cand-5959a70 ss-backend:512m-proof
+        git worktree add --detach /tmp/wt-c71e2bd c71e2bdd0d91cec8adad0eb52e79530cad4aa004
+        test "$(git -C /tmp/wt-c71e2bd rev-parse HEAD)" = "c71e2bdd0d91cec8adad0eb52e79530cad4aa004"
+        docker build -f /tmp/wt-c71e2bd/Dockerfile -t ss-backend:cand-c71e2bd /tmp/wt-c71e2bd
+        docker tag ss-backend:cand-c71e2bd ss-backend:512m-proof
 
-        mkdir -p /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-5959a70/xml-results
-        mkdir -p /tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-5959a70/xml-results
-        chmod +x /tmp/wt-5959a70/gradlew
+        mkdir -p /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-c71e2bd/xml-results
+        mkdir -p /tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-c71e2bd/xml-results
+        chmod +x /tmp/wt-c71e2bd/gradlew
         set +e
-        (cd /tmp/wt-5959a70 && ./gradlew compileKotlin compileTestKotlin test --no-daemon --console=plain) > /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-5959a70/test.log 2>&1
+        (cd /tmp/wt-c71e2bd && ./gradlew compileKotlin compileTestKotlin test --no-daemon --console=plain) > /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-c71e2bd/test.log 2>&1
         TEST_EXIT=$?
         set -e
-        echo "$TEST_EXIT" > /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-5959a70/test.exit
-        cp /tmp/wt-5959a70/build/test-results/test/TEST-*.xml /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-5959a70/xml-results/ || true
-        cp /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-5959a70/test.exit /tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-5959a70/test.exit
-        cp /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-5959a70/test.log /tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-5959a70/test.log
-        cp /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-5959a70/xml-results/TEST-*.xml /tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-5959a70/xml-results/ || true
-        git worktree remove --force /tmp/wt-5959a70
+        echo "$TEST_EXIT" > /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-c71e2bd/test.exit
+        cp /tmp/wt-c71e2bd/build/test-results/test/TEST-*.xml /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-c71e2bd/xml-results/ || true
+        cp /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-c71e2bd/test.exit /tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-c71e2bd/test.exit
+        cp /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-c71e2bd/test.log /tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-c71e2bd/test.log
+        cp /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-c71e2bd/xml-results/TEST-*.xml /tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-c71e2bd/xml-results/ || true
+        git worktree remove --force /tmp/wt-c71e2bd
 
-        test "$TEST_EXIT" -eq 0
+        if [ "$TEST_EXIT" -ne 0 ]; then
+          tail -n 120 /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-c71e2bd/test.log
+          exit "$TEST_EXIT"
+        fi
         python3 -c '
         import glob, xml.etree.ElementTree as ET
-        files = sorted(glob.glob("/tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-5959a70/xml-results/TEST-*.xml"))
-        assert len(files) == 14, f"Expected 14 XML suites, got {len(files)}"
+        files = sorted(glob.glob("/tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-c71e2bd/xml-results/TEST-*.xml"))
+        assert len(files) == 16, f"Expected 16 XML suites, got {len(files)}"
         tests = sum(int(ET.parse(f).getroot().attrib["tests"]) for f in files)
         failures = sum(int(ET.parse(f).getroot().attrib["failures"]) for f in files)
         errors = sum(int(ET.parse(f).getroot().attrib["errors"]) for f in files)
-        assert tests == 83 and failures == 0 and errors == 0, f"Unexpected counts: tests={tests}, failures={failures}, errors={errors}"
+        assert tests == 104 and failures == 0 and errors == 0, f"Unexpected counts: tests={tests}, failures={failures}, errors={errors}"
         '
 
         git worktree add --detach /tmp/wt-139a7de 139a7de48e67af9d664c08fd61ce131b6e63bd74
@@ -71,16 +76,16 @@ jobs:
         openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/mockriot.key -out /tmp/mockriot.crt -days 1 \
           -subj "/CN=api.riotgames.com" \
           -addext "subjectAltName=DNS:euw1.api.riotgames.com,DNS:na1.api.riotgames.com,DNS:kr.api.riotgames.com,DNS:europe.api.riotgames.com,DNS:americas.api.riotgames.com,DNS:asia.api.riotgames.com,DNS:ddragon.leagueoflegends.com"
-        cid=$(docker create ss-backend:cand-5959a70)
+        cid=$(docker create ss-backend:cand-c71e2bd)
         docker cp "$cid:/opt/java/openjdk/lib/security/cacerts" /tmp/cacerts
         docker rm "$cid"
         keytool -importcert -noprompt -trustcacerts -alias mockriot -file /tmp/mockriot.crt -keystore /tmp/cacerts -storepass changeit
         chmod 644 /tmp/cacerts
-    - name: Run Real 512 MiB Container Acceptance Proof (Candidate 5959a70 + Rollback 139a7de)
+    - name: Run Real 512 MiB Container Acceptance Proof (Integrated Candidate c71e2bd + Rollback 139a7de)
       run: |
         chmod +x scripts/verify_512m_container.py
         python3 ./scripts/verify_512m_container.py --self-test
-        CAND_IMAGE="ss-backend:cand-5959a70" BASE_IMAGE="ss-backend:base-139a7de" \
+        CAND_IMAGE="ss-backend:cand-c71e2bd" BASE_IMAGE="ss-backend:base-139a7de" \
         RAW_ARTIFACT_DIR="/tmp/challenger-leaderboard-512m-proof-raw" \
         ARTIFACT_DIR="/tmp/challenger-leaderboard-512m-proof-artifacts" \
           sudo --preserve-env=CAND_IMAGE,BASE_IMAGE,RAW_ARTIFACT_DIR,ARTIFACT_DIR python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
@@ -106,7 +111,7 @@ jobs:
             re.compile(r"\bgithub_pat_[0-9a-zA-Z_]{20,}\b"),
             re.compile(r'(?i)((?:db_pass|postgres_password|jwt_secret_key|twofa_secret_key|cohort_operator_token|riot_api_key|resend_api_key)\s*[=:]\s*)(?!\[REDACTED\])[^\s"\',;<>\]}]+'),
         ]
-        jdk_upload_dir = os.path.join(upload_dir, "jdk21-test-5959a70")
+        jdk_upload_dir = os.path.join(upload_dir, "jdk21-test-c71e2bd")
         if os.path.isdir(jdk_upload_dir):
             for root, _dirs, files in os.walk(jdk_upload_dir):
                 for fname in files:
@@ -149,11 +154,11 @@ jobs:
             raise RuntimeError("EMPTY_UPLOAD_DIRECTORY")
         print(f"Verified {file_count} sanitized artifact files with 0 secret leaks.")
         PYEOF
-    - name: Upload Sanitized 512 MiB Challenger Leaderboard Proof & 83-Test XML/Exit Evidence Artifacts
+    - name: Upload Sanitized 512 MiB Challenger Leaderboard Proof & 104-Test XML/Exit Evidence Artifacts
       if: always() && steps.artifact_gate.outcome == 'success'
       uses: actions/upload-artifact@v4
       with:
-        name: challenger-leaderboard-512m-proof-5959a70
+        name: challenger-leaderboard-512m-proof-c71e2bd
         path: /tmp/challenger-leaderboard-512m-proof-artifacts
         if-no-files-found: error
         retention-days: 7

@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Isolated 512 MiB Container Proof for Challenger Leaderboard Cache Resilience & Bounded Recovery
-(Candidate 5959a7036c9e281f72d17f0a0bd5003ba59476f8 + Rollback Base 139a7de48e67af9d664c08fd61ce131b6e63bd74).
+Isolated 512 MiB Container Proof for Challenger Leaderboard Cache Resilience, Bounded Off-Production
+Missing-Identity Completion (191 = 31 EUW + 160 KR), 600/600 Read Consumer Coverage, and Rollback Compatibility
+(Integrated Candidate c71e2bdd0d91cec8adad0eb52e79530cad4aa004 based on 5959a7036c9e281f72d17f0a0bd5003ba59476f8
++ Rollback Base 139a7de48e67af9d664c08fd61ce131b6e63bd74).
 
 Enforces:
 1. Internal-only Docker bridge network (ab-isolated-net, 172.28.0.0/16) + explicit iptables DOCKER-USER/INPUT
@@ -9,24 +11,34 @@ Enforces:
 2. Real postgres:16-alpine (ss-postgres) and redis:7-alpine (ss-redis), and ss-backend-512m running with
    --memory=512m --memory-swap=512m and continuous 2-second host cgroup v2 sampling (< 78.0% / 64 MiB guard,
    cgroupCurrentBytes < 418,759,311, cgroupPeakBytes < 418,759,311, 0 OOMs, 0 restarts).
-3. Challenger Leaderboard 512 MiB Container Verification Scenarios:
-   - Scenario 1: Bounded EUW (300/300 local DB identities) & KR (5/300 local DB identities, 295 null) 300-entry
-     hydration with 1 League-V4 call per region and 0 account-v1 fanout calls; cold NA1 >512 KiB chunked stream
-     abort -> HTTP 503 Service Unavailable (never caching empty 200) + 30s failure backoff suppression.
+3. Challenger Leaderboard & Off-Production Identity Completion Verification Scenarios:
+   - Scenario 1 (Pre-Migration Missing-Table Compatibility + Cold NA1 >512 KiB Abort):
+     Before `player_riot_identities` exists in PostgreSQL, verifies EUW (269/300 local DB identities, 31 missing)
+     and KR (140/300 local DB identities, 160 missing) 300-entry hydration with 1 League-V4 call per region and
+     0 Account-V1 fanout calls; cold NA1 >512 KiB chunked stream abort -> HTTP 503 Service Unavailable + 30s backoff.
+   - Scenario 1B (Standalone Off-Production CLI Dry-Run 0-Effects + Additive Migration + 191 (31 EUW + 160 KR)
+     Mocked Riot Completion + 600/600 Read Consumer Coverage with Indexed-First Priority):
+     Runs `OffProdChallengerIdentityCompletionCli` in a separate bounded off-prod container (`172.28.0.5`):
+     (a) Default dry-run makes 0 HTTP attempts, 0 DB writes, leaves `player_riot_identities` absent, reports 191 pending.
+     (b) `--apply-additive-ddl=true` creates `player_riot_identities` and completes all 191 missing identities
+         (31 EUW + 160 KR) over HTTPS against the Mock Riot server (`offprodCliAccountByPuuid == 191`,
+         `backendAccountByPuuid == 0`), with 0 fabricated rows in `indexed_players`.
+     (c) Evicts EUW & KR Redis keys and verifies `ss-backend-512m` resolves 300/300 EUW + 300/300 KR (600/600 total)
+         with `indexed_players` taking priority over `player_riot_identities` (`indexed-first`) and 0 Account-V1 fanout.
    - Scenario 2: Singleflight concurrency coalescing on Redis cache miss (16 concurrent callers on EUW1 ->
-     exact 1 upstream League-V4 call, all 16 callers receive 300 complete entries, 0 account-v1 calls).
+     exact 1 upstream League-V4 call, all 16 callers receive 300/300 complete entries, 0 Account-V1 calls).
    - Scenario 3: Real PostgreSQL ACCESS EXCLUSIVE lock on indexed_players -> bounded 1.5s JDBC query timeout &
      off-thread Statement.cancel() on dbCancelExecutor without hanging refresh or stranding workers, followed by
      post-lock DB identity lookup recovery.
    - Scenario 4: Upstream pre-header / response stall (> 5s) deadline abort on EUW1 -> aborts stalled HTTP call at
      ~5.0s deadline and serves/reseeds complete 300-entry last-known-good snapshot.
    - Scenario 5: Full Redis cache loss (redis-cli FLUSHALL) + upstream HTTP 503 outage on KR -> serves complete
-     300-entry last-known-good snapshot (5/300 identities) and suppresses repeat upstream calls during 30s backoff.
+     300-entry last-known-good snapshot (300/300 identities) and suppresses repeat upstream calls during 30s backoff.
    - Scenario 6: Cold NA1 recovery after 30s backoff expiry (HTTP 503 -> HTTP 200 with 300/300 DB identities) +
      warmed NA1 >512 KiB chunked body stream abort -> complete 300-entry last-known-good fallback with all 3
-     supported regions (EUW1, KR, NA1) simultaneously resident under the 78% / 64 MiB cgroup memory guard.
-   - Scenario 7: Rollback Base (139a7de48e67af9d664c08fd61ce131b6e63bd74) read compatibility against the live
-     Postgres + Redis state under --memory=512m --memory-swap=512m.
+     supported regions (EUW1, KR, NA1 = 900/900 identities) simultaneously resident under the 78% / 64 MiB guard.
+   - Scenario 7: Rollback Base (139a7de48e67af9d664c08fd61ce131b6e63bd74) read & autocomplete compatibility against
+     the live Postgres (with `player_riot_identities` present) + Redis state under --memory=512m --memory-swap=512m.
 """
 
 import http.server
@@ -46,7 +58,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-CANDIDATE_COMMIT_SHA = "5959a7036c9e281f72d17f0a0bd5003ba59476f8"
+CANDIDATE_COMMIT_SHA = "c71e2bdd0d91cec8adad0eb52e79530cad4aa004"
+BASE_5959_COMMIT_SHA = "5959a7036c9e281f72d17f0a0bd5003ba59476f8"
 ROLLBACK_BASE_COMMIT_SHA = "139a7de48e67af9d664c08fd61ce131b6e63bd74"
 
 NETWORK_NAME = "ab-isolated-net"
@@ -56,6 +69,7 @@ GATEWAY_IP = "172.28.0.1"
 POSTGRES_IP = "172.28.0.2"
 REDIS_IP = "172.28.0.3"
 BACKEND_IP = "172.28.0.4"
+OFFPROD_CLI_IP = "172.28.0.5"
 PORT_MOCK_RIOT = 443
 BASE_URL = f"http://{BACKEND_IP}:10000"
 
@@ -69,6 +83,7 @@ EPHEMERAL_DB_PASS = f"ephem_db_{secrets.token_hex(12)}"
 EPHEMERAL_JWT_SECRET = secrets.token_hex(32)
 EPHEMERAL_TWOFA_SECRET = secrets.token_hex(32)
 EPHEMERAL_RIOT_TOKEN = f"ephem_riot_{secrets.token_hex(12)}"
+EPHEMERAL_OFFPROD_RIOT_TOKEN = f"ephem_offprod_riot_{secrets.token_hex(12)}"
 EPHEMERAL_RESEND_TOKEN = f"ephem_resend_{secrets.token_hex(12)}"
 EPHEMERAL_OP_TOKEN = f"ephem_op_{secrets.token_hex(12)}"
 OP_HEADERS = {"X-Cohort-Operator-Token": EPHEMERAL_OP_TOKEN}
@@ -94,6 +109,23 @@ EXPECTED_EXTRA_HOSTS = [
 ]
 
 
+def puuid_78(region: str, rank_idx: int) -> str:
+    """
+    Generates an official-schema 78-character base64url PUUID (`^[A-Za-z0-9_-]{78}$`).
+    """
+    prefix = f"puuid-{region.lower()}-{rank_idx:04d}-"
+    pad = "a" * (78 - len(prefix))
+    out = prefix + pad
+    assert len(out) == 78
+    return out
+
+
+PUUID_TO_REGION_RANK = {}
+for _reg in ("euw1", "kr", "na1"):
+    for _idx in range(1, 301):
+        PUUID_TO_REGION_RANK[puuid_78(_reg, _idx)] = (_reg, _idx)
+
+
 def sanitize_text(text: str) -> str:
     if not text:
         return text
@@ -103,6 +135,7 @@ def sanitize_text(text: str) -> str:
         EPHEMERAL_JWT_SECRET,
         EPHEMERAL_TWOFA_SECRET,
         EPHEMERAL_RIOT_TOKEN,
+        EPHEMERAL_OFFPROD_RIOT_TOKEN,
         EPHEMERAL_RESEND_TOKEN,
         EPHEMERAL_OP_TOKEN,
     ):
@@ -131,11 +164,11 @@ def build_raw_challenger_league_json(region: str, entry_count: int = 300) -> byt
     and entries arrive in unsorted order so ChallengerLeagueService must sort descending by `leaguePoints`.
     """
     entries = []
-    # Build in ascending LP order so service sorting (descending LP) is verified
     for rank_idx in range(entry_count, 0, -1):
         lp = 1000 + (entry_count - rank_idx + 1) * 3
+        puuid_val = puuid_78(region, rank_idx) if rank_idx <= 300 else f"puuid-oversize-{region}-{rank_idx:05d}"
         entries.append({
-            "puuid": f"puuid-{region}-{rank_idx}",
+            "puuid": puuid_val,
             "leaguePoints": lp,
             "rank": "I",
             "wins": 180 + (rank_idx % 70),
@@ -163,7 +196,6 @@ CHALLENGER_300_BYTES_BY_REGION = {
 OVERSIZED_CHALLENGER_640K_BYTES = build_raw_challenger_league_json("na1", 4500)
 
 MOCK_LOCK = threading.Lock()
-# Modes per region: "OK_300", "CHUNKED_OVERSIZE_640K", "STALL_6_5S", "HTTP_503", "HTTP_429"
 REGION_BEHAVIOR = {
     "euw1": {"mode": "OK_300", "delaySec": 0.0},
     "kr": {"mode": "OK_300", "delaySec": 0.0},
@@ -173,6 +205,7 @@ REGION_BEHAVIOR = {
 RIOT_CALL_COUNTS = {
     "challengerByRegion": {"euw1": 0, "kr": 0, "na1": 0},
     "accountByPuuid": 0,
+    "offprodCliAccountByPuuid": 0,
     "accountByRiotId": 0,
     "summonerByPuuid": 0,
     "otherCalls": 0,
@@ -184,6 +217,7 @@ def reset_riot_call_counts():
         for r in ("euw1", "kr", "na1"):
             RIOT_CALL_COUNTS["challengerByRegion"][r] = 0
         RIOT_CALL_COUNTS["accountByPuuid"] = 0
+        RIOT_CALL_COUNTS["offprodCliAccountByPuuid"] = 0
         RIOT_CALL_COUNTS["accountByRiotId"] = 0
         RIOT_CALL_COUNTS["summonerByPuuid"] = 0
         RIOT_CALL_COUNTS["otherCalls"] = 0
@@ -194,6 +228,7 @@ def snapshot_riot_call_counts() -> dict:
         return {
             "challengerByRegion": dict(RIOT_CALL_COUNTS["challengerByRegion"]),
             "accountByPuuid": RIOT_CALL_COUNTS["accountByPuuid"],
+            "offprodCliAccountByPuuid": RIOT_CALL_COUNTS["offprodCliAccountByPuuid"],
             "accountByRiotId": RIOT_CALL_COUNTS["accountByRiotId"],
             "summonerByPuuid": RIOT_CALL_COUNTS["summonerByPuuid"],
             "otherCalls": RIOT_CALL_COUNTS["otherCalls"],
@@ -206,24 +241,27 @@ class MockRiotHandler(http.server.BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         pass
 
-    def _send_riot_json(self, body: bytes, status: int = 200, method_limit: str = "500:10,30000:600"):
+    def _send_riot_json(
+        self,
+        body: bytes,
+        status: int = 200,
+        app_limit: str = "500:1,1000:120",
+        app_count: str = "1:1,1:120",
+        method_limit: str = "500:10,30000:600",
+        method_count: str = "1:10,1:600",
+    ):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-App-Rate-Limit", "20:1,100:120")
-        self.send_header("X-App-Rate-Limit-Count", "1:1,1:120")
+        self.send_header("X-App-Rate-Limit", app_limit)
+        self.send_header("X-App-Rate-Limit-Count", app_count)
         self.send_header("X-Method-Rate-Limit", method_limit)
-        self.send_header("X-Method-Rate-Limit-Count", "1:10,1:600")
+        self.send_header("X-Method-Rate-Limit-Count", method_count)
         self.end_headers()
         self.wfile.write(body)
         self.wfile.flush()
 
     def _send_chunked_oversized(self, chunk_size: int = 16_384):
-        """
-        Streams a valid >640 KiB JSON payload using HTTP/1.1 Transfer-Encoding: chunked without Content-Length,
-        exercising RiotApiService.BoundedLeagueInputStream mid-stream abort (> 524,288 bytes -> RESPONSE_TOO_LARGE)
-        inside the 512 MiB container.
-        """
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Transfer-Encoding", "chunked")
@@ -244,13 +282,13 @@ class MockRiotHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
-            # Expected when the client aborts the connection after crossing 524,288 bytes
             pass
 
     def do_GET(self):
         path = self.path.split("?", 1)[0]
         host_hdr = (self.headers.get("Host") or "").split(":", 1)[0].lower()
         region_prefix = host_hdr.split(".", 1)[0] if "." in host_hdr else "euw1"
+        client_ip = self.client_address[0] if self.client_address else ""
 
         if path.endswith("/versions.json"):
             body = json.dumps(["16.7.1", "16.6.1"]).encode("utf-8")
@@ -291,9 +329,35 @@ class MockRiotHandler(http.server.BaseHTTPRequestHandler):
             else:
                 self._send_riot_json(b'{"status":{"message":"Unexpected mode","status_code":500}}', 500)
         elif "/riot/account/v1/accounts/by-puuid/" in path:
-            with MOCK_LOCK:
-                RIOT_CALL_COUNTS["accountByPuuid"] += 1
-            self._send_riot_json(b'{"status":{"message":"Forbidden account-v1 fanout","status_code":500}}', 500)
+            if client_ip == OFFPROD_CLI_IP:
+                puuid_req = path.rsplit("/", 1)[-1]
+                with MOCK_LOCK:
+                    RIOT_CALL_COUNTS["offprodCliAccountByPuuid"] += 1
+                    cli_count = RIOT_CALL_COUNTS["offprodCliAccountByPuuid"]
+                reg_rank = PUUID_TO_REGION_RANK.get(puuid_req)
+                if reg_rank is not None:
+                    reg_code, r_idx = reg_rank
+                    game_name = f"EuwBackfilled{r_idx}" if reg_code == "euw1" else f"KrBackfilled{r_idx}"
+                    tag_line = "EUW" if reg_code == "euw1" else "KR"
+                    payload = json.dumps({
+                        "puuid": puuid_req,
+                        "gameName": game_name,
+                        "tagLine": tag_line,
+                    }).encode("utf-8")
+                    self._send_riot_json(
+                        payload,
+                        status=200,
+                        app_limit="500:1,1000:120",
+                        app_count=f"{cli_count}:1,{cli_count}:120",
+                        method_limit="1000:60",
+                        method_count=f"{cli_count}:60",
+                    )
+                else:
+                    self._send_riot_json(b'{"status":{"message":"Data not found","status_code":404}}', 404)
+            else:
+                with MOCK_LOCK:
+                    RIOT_CALL_COUNTS["accountByPuuid"] += 1
+                self._send_riot_json(b'{"status":{"message":"Forbidden backend account-v1 fanout","status_code":500}}', 500)
         elif "/riot/account/v1/accounts/by-riot-id/" in path:
             with MOCK_LOCK:
                 RIOT_CALL_COUNTS["accountByRiotId"] += 1
@@ -374,7 +438,7 @@ def setup_isolated_network():
 
 
 def teardown_isolated_network():
-    for name in ("ss-backend-512m", "ss-redis", "ss-postgres"):
+    for name in ("ss-offprod-cli", "ss-backend-512m", "ss-redis", "ss-postgres"):
         subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     subprocess.run(
         ["iptables", "-D", "DOCKER-USER", "-i", BRIDGE_NAME, "!", "-d", SUBNET_CIDR, "-j", "REJECT"],
@@ -623,6 +687,47 @@ def start_backend_container(
     return info["pid"]
 
 
+def run_offprod_cli_container(image_tag: str, work_dir: str, cli_args: list, db_pass: str) -> int:
+    """
+    Runs OffProdChallengerIdentityCompletionCli inside an isolated off-production container
+    (ss-offprod-cli, 172.28.0.5) on ab-isolated-net without booting Spring Boot web/scheduler.
+    """
+    subprocess.run(["docker", "rm", "-f", "ss-offprod-cli"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    inner_args = " ".join(f"'{a}'" for a in cli_args)
+    shell_cmd = (
+        "mkdir -p /tmp/unpacked && unzip -q /app/app.jar -d /tmp/unpacked && "
+        "exec java -XX:TieredStopAtLevel=1 -XX:+UseSerialGC -Xms16m -Xmx96m "
+        "-cp '/tmp/unpacked/BOOT-INF/classes:/tmp/unpacked/BOOT-INF/lib/*' "
+        f"com.pride.summoner_searcher_api.tools.OffProdChallengerIdentityCompletionCli {inner_args}"
+    )
+    cmd = [
+        "docker", "run", "--rm",
+        "--name", "ss-offprod-cli",
+        "--network", NETWORK_NAME,
+        "--ip", OFFPROD_CLI_IP,
+        "--memory=256m",
+        "--memory-swap=256m",
+        "--entrypoint", "sh",
+        *[f"--add-host={entry}" for entry in EXPECTED_EXTRA_HOSTS],
+        "-v", "/tmp/cacerts:/opt/java/openjdk/lib/security/cacerts:ro",
+        "-v", f"{work_dir}:/work",
+        "-e", "OFFPROD_DB_PASS",
+        "-e", "OFFPROD_RIOT_API_KEY",
+        image_tag,
+        "-c", shell_cmd,
+    ]
+    env = {
+        **os.environ,
+        "OFFPROD_DB_PASS": db_pass,
+        "OFFPROD_RIOT_API_KEY": EPHEMERAL_OFFPROD_RIOT_TOKEN,
+    }
+    proc = subprocess.run(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=60, check=False)
+    if proc.returncode != 0:
+        out = proc.stdout.decode("utf-8", errors="replace")
+        print(f"OffProd CLI exited with {proc.returncode}: {sanitize_text(out)}", flush=True)
+    return proc.returncode
+
+
 def psql_query_json(sql: str) -> list:
     wrapped = f"SELECT COALESCE(json_agg(t), '[]'::json) FROM ({sql}) t;"
     out = subprocess.check_output([
@@ -675,12 +780,14 @@ def redis_flushall():
 
 def seed_initial_indexed_players():
     """
-    Pre-creates `indexed_players` matching IndexedPlayer.kt and seeds:
-    - 300 EUW1 Challenger identities (puuid-euw1-1..300 -> EuwChallenger1#EUW .. EuwChallenger300#EUW)
-    - 5 KR Challenger identities (puuid-kr-1..5 -> KrChallenger1#KR .. KrChallenger5#KR; 295 KR PUUIDs absent)
-    - 300 NA1 Challenger identities (puuid-na1-1..300 -> NaChallenger1#NA1 .. NaChallenger300#NA1)
+    Pre-creates `indexed_players` WITHOUT `player_riot_identities` and seeds:
+    - 269 EUW1 Challenger identities (rank 1..269 -> EuwChallenger1#EUW .. EuwChallenger269#EUW; 31 EUW PUUIDs 270..300 absent)
+    - 140 KR Challenger identities (rank 1..140 -> KrChallenger1#KR .. KrChallenger140#KR; 160 KR PUUIDs 141..300 absent)
+    - 300 NA1 Challenger identities (rank 1..300 -> NaChallenger1#NA1 .. NaChallenger300#NA1)
+    Total missing across EUW + KR = 31 + 160 = 191.
     """
     psql_exec("""
+        DROP TABLE IF EXISTS player_riot_identities;
         CREATE TABLE IF NOT EXISTS indexed_players (
             puuid varchar(255) NOT NULL PRIMARY KEY,
             game_name varchar(255) NOT NULL,
@@ -695,29 +802,29 @@ def seed_initial_indexed_players():
         TRUNCATE TABLE indexed_players;
         INSERT INTO indexed_players (puuid, game_name, tag_line, region, profile_icon_id, summoner_level, last_seen_at)
         SELECT
-            'puuid-euw1-' || gs,
+            RPAD('puuid-euw1-' || LPAD(gs::text, 4, '0') || '-', 78, 'a'),
             'EuwChallenger' || gs,
             'EUW',
             'euw1',
             4000 + (gs % 500),
             300 + gs,
             NOW()
-        FROM generate_series(1, 300) AS gs;
+        FROM generate_series(1, 269) AS gs;
 
         INSERT INTO indexed_players (puuid, game_name, tag_line, region, profile_icon_id, summoner_level, last_seen_at)
         SELECT
-            'puuid-kr-' || gs,
+            RPAD('puuid-kr-' || LPAD(gs::text, 4, '0') || '-', 78, 'a'),
             'KrChallenger' || gs,
             'KR',
             'kr',
             4500 + gs,
             400 + gs,
             NOW()
-        FROM generate_series(1, 5) AS gs;
+        FROM generate_series(1, 140) AS gs;
 
         INSERT INTO indexed_players (puuid, game_name, tag_line, region, profile_icon_id, summoner_level, last_seen_at)
         SELECT
-            'puuid-na1-' || gs,
+            RPAD('puuid-na1-' || LPAD(gs::text, 4, '0') || '-', 78, 'a'),
             'NaChallenger' || gs,
             'NA1',
             'na1',
@@ -735,8 +842,8 @@ def verify_leaderboard_response(dto: dict, region: str, expected_hydrated_count:
     assert len(entries) == 300, f"[{region}] Expected exactly 300 entries, got {len(entries)}"
     lps = [e.get("leaguePoints") for e in entries]
     assert lps == sorted(lps, reverse=True), f"[{region}] Entries are not sorted descending by leaguePoints"
-    assert entries[0]["puuid"] == f"puuid-{region}-1", f"[{region}] Expected top-1 puuid-{region}-1, got {entries[0]['puuid']}"
-    assert entries[-1]["puuid"] == f"puuid-{region}-300", f"[{region}] Expected rank-300 puuid-{region}-300, got {entries[-1]['puuid']}"
+    assert entries[0]["puuid"] == puuid_78(region, 1), f"[{region}] Expected top-1 {puuid_78(region, 1)}, got {entries[0]['puuid']}"
+    assert entries[-1]["puuid"] == puuid_78(region, 300), f"[{region}] Expected rank-300 {puuid_78(region, 300)}, got {entries[-1]['puuid']}"
     assert entries[0].get("gameName") == expected_top1_name, (
         f"[{region}] Expected top-1 gameName={expected_top1_name}, got {entries[0].get('gameName')}"
     )
@@ -763,6 +870,8 @@ def verify_leaderboard_response(dto: dict, region: str, expected_hydrated_count:
         "top1TagLine": entries[0].get("tagLine"),
         "top1LeaguePoints": entries[0].get("leaguePoints"),
         "rank300Puuid": entries[-1]["puuid"],
+        "rank300GameName": entries[-1].get("gameName"),
+        "rank300TagLine": entries[-1].get("tagLine"),
         "rank300LeaguePoints": entries[-1].get("leaguePoints"),
     }
 
@@ -809,6 +918,7 @@ def write_sanitized_artifacts(artifact_dir: str, summary: dict, cgroup_samples: 
         EPHEMERAL_JWT_SECRET,
         EPHEMERAL_TWOFA_SECRET,
         EPHEMERAL_RIOT_TOKEN,
+        EPHEMERAL_OFFPROD_RIOT_TOKEN,
         EPHEMERAL_RESEND_TOKEN,
         EPHEMERAL_OP_TOKEN,
     )
@@ -883,7 +993,7 @@ def finalize_teardown(
 
 def main():
     db_pass = os.environ.get("DB_PASS", "").strip() or EPHEMERAL_DB_PASS
-    cand_image = os.environ.get("CAND_IMAGE", "ss-backend:cand-5959a70")
+    cand_image = os.environ.get("CAND_IMAGE", "ss-backend:cand-c71e2bd")
     base_image = os.environ.get("BASE_IMAGE", "ss-backend:base-139a7de")
     raw_dir = os.environ.get("RAW_ARTIFACT_DIR", "/tmp/challenger-leaderboard-512m-proof-raw")
     artifact_dir = os.environ.get("ARTIFACT_DIR", "/tmp/challenger-leaderboard-512m-proof-artifacts")
@@ -899,6 +1009,7 @@ def main():
             EPHEMERAL_JWT_SECRET,
             EPHEMERAL_TWOFA_SECRET,
             EPHEMERAL_RIOT_TOKEN,
+            EPHEMERAL_OFFPROD_RIOT_TOKEN,
             EPHEMERAL_RESEND_TOKEN,
             EPHEMERAL_OP_TOKEN,
         ], sf)
@@ -914,6 +1025,7 @@ def main():
     summary = {
         "status": "IN_PROGRESS",
         "candidateCommitSha": CANDIDATE_COMMIT_SHA,
+        "base5959CommitSha": BASE_5959_COMMIT_SHA,
         "rollbackBaseCommitSha": ROLLBACK_BASE_COMMIT_SHA,
     }
     setup_isolated_network()
@@ -954,7 +1066,7 @@ def main():
         else:
             raise RuntimeError("Postgres or Redis failed to become ready")
 
-        print("=== 2. Seeding Postgres indexed_players (300 EUW1, 5 KR, 300 NA1) before container boot ===", flush=True)
+        print("=== 2. Seeding Postgres indexed_players (269 EUW1, 140 KR, 300 NA1; 191 missing across EUW+KR; player_riot_identities absent) ===", flush=True)
         seed_initial_indexed_players()
         db_counts = psql_query_json("SELECT region, COUNT(*)::int AS cnt FROM indexed_players GROUP BY region ORDER BY region")
         print("SEEDED INDEXED_PLAYERS:", json.dumps(db_counts), flush=True)
@@ -977,28 +1089,27 @@ def main():
         record_sample("post_boot_after_startup_warmer")
 
         # =========================================================================
-        # SCENARIO 1: Startup 300-Entry Hydration (EUW 300/300, KR 5/300) + Cold NA1 >512 KiB Abort -> HTTP 503
+        # SCENARIO 1: Pre-Migration Missing-Table Compatibility (EUW 269/300, KR 140/300) + Cold NA1 >512 KiB Abort -> HTTP 503
         # =========================================================================
-        print("=== 4. Scenario 1: Verify EUW (300/300 DB identities), KR (5/300 DB identities), and Cold NA1 (>512 KiB Chunked Abort -> HTTP 503) ===", flush=True)
+        print("=== 4. Scenario 1: Pre-Migration Missing-Table Compatibility (EUW 269/300, KR 140/300) + Cold NA1 >512 KiB Abort -> HTTP 503 ===", flush=True)
         startup_calls = snapshot_riot_call_counts()
         assert startup_calls["challengerByRegion"]["euw1"] == 1, f"Expected 1 startup League-V4 call for euw1, got {startup_calls}"
         assert startup_calls["challengerByRegion"]["kr"] == 1, f"Expected 1 startup League-V4 call for kr, got {startup_calls}"
         assert startup_calls["challengerByRegion"]["na1"] == 1, f"Expected 1 startup League-V4 call for na1, got {startup_calls}"
-        assert startup_calls["accountByPuuid"] == 0, f"Expected 0 accountByPuuid calls, got {startup_calls}"
+        assert startup_calls["accountByPuuid"] == 0, f"Expected 0 backend accountByPuuid calls, got {startup_calls}"
 
-        euw_status, euw_dto = http_request_status_and_json(f"{BASE_URL}/api/riot/leaderboards/challenger/euw1")
-        assert euw_status == 200, f"Expected HTTP 200 for euw1, got {euw_status}"
-        euw_check = verify_leaderboard_response(euw_dto, "euw1", expected_hydrated_count=300, expected_top1_name="EuwChallenger1")
-        euw_redis_bytes = redis_strlen("leaderboard:euw1::RANKED_SOLO_5x5")
-        assert euw_redis_bytes > 1000
+        euw_pre_status, euw_pre_dto = http_request_status_and_json(f"{BASE_URL}/api/riot/leaderboards/challenger/euw1")
+        assert euw_pre_status == 200, f"Expected HTTP 200 for euw1 pre-migration, got {euw_pre_status}"
+        euw_pre_check = verify_leaderboard_response(
+            euw_pre_dto, "euw1", expected_hydrated_count=269, expected_top1_name="EuwChallenger1"
+        )
 
-        kr_status, kr_dto = http_request_status_and_json(f"{BASE_URL}/api/riot/leaderboards/challenger/kr")
-        assert kr_status == 200, f"Expected HTTP 200 for kr, got {kr_status}"
-        kr_check = verify_leaderboard_response(kr_dto, "kr", expected_hydrated_count=5, expected_top1_name="KrChallenger1")
-        kr_redis_bytes = redis_strlen("leaderboard:kr::RANKED_SOLO_5x5")
-        assert kr_redis_bytes > 1000
+        kr_pre_status, kr_pre_dto = http_request_status_and_json(f"{BASE_URL}/api/riot/leaderboards/challenger/kr")
+        assert kr_pre_status == 200, f"Expected HTTP 200 for kr pre-migration, got {kr_pre_status}"
+        kr_pre_check = verify_leaderboard_response(
+            kr_pre_dto, "kr", expected_hydrated_count=140, expected_top1_name="KrChallenger1"
+        )
 
-        # Cold NA1 had its >512 KiB (640 KiB) chunked stream aborted during startup warmer and has no last-known-good snapshot
         na1_cold_status_1, _ = http_request_status_and_json(f"{BASE_URL}/api/riot/leaderboards/challenger/na1")
         na1_cold_status_2, _ = http_request_status_and_json(f"{BASE_URL}/api/riot/leaderboards/challenger/na1")
         calls_after_na1_503 = snapshot_riot_call_counts()
@@ -1009,7 +1120,114 @@ def main():
         assert calls_after_na1_503["challengerByRegion"]["na1"] == 1, (
             f"Expected 30s failure backoff to suppress additional na1 upstream calls, got {calls_after_na1_503}"
         )
-        record_sample("after_scenario1_euw_kr_na1_initial")
+        record_sample("after_scenario1_pre_migration_missing_table_compat")
+
+        # =========================================================================
+        # SCENARIO 1B: Standalone Off-Production CLI Dry-Run (0 Effects) + Additive Migration + 191 (31 EUW + 160 KR) Completion + 600/600 Read Coverage
+        # =========================================================================
+        print("=== 4B. Scenario 1B: Off-Production CLI Dry-Run (0 Effects) + Additive DDL + 191 (31 EUW + 160 KR) Backfill + 600/600 Read Coverage ===", flush=True)
+        cli_work_dir = tempfile.mkdtemp(prefix="offprod-cli-512m-")
+        os.chmod(cli_work_dir, 0o777)
+        manifest_entries = (
+            [{"puuid": puuid_78("euw1", idx), "platformRegion": "euw1"} for idx in range(270, 301)]
+            + [{"puuid": puuid_78("kr", idx), "platformRegion": "kr"} for idx in range(141, 301)]
+        )
+        assert len(manifest_entries) == 191
+        manifest_path = os.path.join(cli_work_dir, "manifest-191.json")
+        with open(manifest_path, "w", encoding="utf-8") as mf:
+            json.dump({
+                "snapshotCapturedAtUtc": "2026-11-09T11:34:00Z",
+                "isLiveLadder": False,
+                "entries": manifest_entries,
+            }, mf, indent=2)
+
+        # (a) Default dry-run: 0 HTTP attempts, 0 DB writes, player_riot_identities still does not exist
+        dry_exit = run_offprod_cli_container(
+            cand_image,
+            cli_work_dir,
+            [
+                "--manifest-file=/work/manifest-191.json",
+                f"--jdbc-url=jdbc:postgresql://{POSTGRES_IP}:5432/summoner_searcher",
+                "--db-user=postgres",
+                "--output-report-file=/work/dry-run-report.json",
+            ],
+            db_pass,
+        )
+        assert dry_exit == 0, f"Expected dry-run CLI exit 0, got {dry_exit}"
+        dry_report = json.load(open(os.path.join(cli_work_dir, "dry-run-report.json"), "r", encoding="utf-8"))
+        assert dry_report["outcome"] == "DRY_RUN_DB_RECHECK_ONLY_COMPLETED"
+        assert dry_report["manifestTotalCount"] == 191
+        assert dry_report["httpAttemptsMade"] == 0
+        assert dry_report["durableIdentityTableUpsertsVerifiedCount"] == 0
+        assert dry_report["remainingPendingCount"] == 191
+        reg_after_dry = psql_query_json("SELECT to_regclass('public.player_riot_identities') AS tbl")
+        assert reg_after_dry[0]["tbl"] is None, f"Dry-run must not create player_riot_identities: {reg_after_dry}"
+        assert snapshot_riot_call_counts()["offprodCliAccountByPuuid"] == 0
+
+        # (b) Apply additive DDL + execute bounded 191 (31 EUW + 160 KR) completion
+        live_exit = run_offprod_cli_container(
+            cand_image,
+            cli_work_dir,
+            [
+                "--manifest-file=/work/manifest-191.json",
+                f"--jdbc-url=jdbc:postgresql://{POSTGRES_IP}:5432/summoner_searcher",
+                "--db-user=postgres",
+                "--dry-run=false",
+                "--network-enabled=true",
+                "--allow-durable-writes=true",
+                "--apply-additive-ddl=true",
+                "--key-coordination-mode=EXCLUSIVE_KEY",
+                "--coordination-attestation=isolated-512m-proof-lease-001",
+                "--max-http-attempts=191",
+                "--max-wall-time-ms=180000",
+                "--output-report-file=/work/live-report.json",
+                "--output-remaining-manifest-file=/work/remaining-manifest.json",
+            ],
+            db_pass,
+        )
+        assert live_exit == 0, f"Expected live CLI exit 0, got {live_exit}"
+        live_report = json.load(open(os.path.join(cli_work_dir, "live-report.json"), "r", encoding="utf-8"))
+        remaining_manifest = json.load(open(os.path.join(cli_work_dir, "remaining-manifest.json"), "r", encoding="utf-8"))
+        assert live_report["outcome"] == "STAGED_ALL_CANDIDATES"
+        assert live_report["manifestTotalCount"] == 191
+        assert live_report["httpAttemptsMade"] == 191
+        assert live_report["durableIdentityTableUpsertsVerifiedCount"] == 191
+        assert live_report["remainingPendingCount"] == 0
+        assert len(remaining_manifest["entries"]) == 0
+        calls_after_cli = snapshot_riot_call_counts()
+        assert calls_after_cli["offprodCliAccountByPuuid"] == 191
+        assert calls_after_cli["accountByPuuid"] == 0, "Backend container must make 0 accountByPuuid calls"
+
+        # Insert 1 overlapping row for top-1 EUW into player_riot_identities to prove indexed_players takes priority (indexed-first)
+        psql_exec(f"""
+            INSERT INTO player_riot_identities (puuid, platform_region, game_name, tag_line, verified_at)
+            VALUES ('{puuid_78("euw1", 1)}', 'euw1', 'OverriddenByIndexedPlayers', 'OVERRIDE', NOW());
+        """)
+        id_table_counts = psql_query_json(
+            "SELECT platform_region, COUNT(*)::int AS cnt FROM player_riot_identities GROUP BY platform_region ORDER BY platform_region"
+        )
+        idx_table_count = psql_query_json("SELECT COUNT(*)::int AS cnt FROM indexed_players")[0]["cnt"]
+        assert idx_table_count == 709, f"indexed_players count must remain 709 (0 fabricated rows), got {idx_table_count}"
+        shutil.rmtree(cli_work_dir, ignore_errors=True)
+
+        # (c) Evict EUW1 and KR Redis keys so ss-backend-512m refreshes both regions from League-V4 + indexed_players + player_riot_identities
+        redis_del("leaderboard:euw1::RANKED_SOLO_5x5", "leaderboard:kr::RANKED_SOLO_5x5")
+        euw_status, euw_dto = http_request_status_and_json(f"{BASE_URL}/api/riot/leaderboards/challenger/euw1")
+        kr_status, kr_dto = http_request_status_and_json(f"{BASE_URL}/api/riot/leaderboards/challenger/kr")
+        assert euw_status == 200 and kr_status == 200
+        euw_check = verify_leaderboard_response(
+            euw_dto, "euw1", expected_hydrated_count=300, expected_top1_name="EuwChallenger1"
+        )
+        assert euw_check["rank300GameName"] == "EuwBackfilled300", f"Expected EuwBackfilled300 at rank 300, got {euw_check}"
+        kr_check = verify_leaderboard_response(
+            kr_dto, "kr", expected_hydrated_count=300, expected_top1_name="KrChallenger1"
+        )
+        assert kr_check["rank300GameName"] == "KrBackfilled300", f"Expected KrBackfilled300 at rank 300, got {kr_check}"
+        euw_redis_bytes = redis_strlen("leaderboard:euw1::RANKED_SOLO_5x5")
+        kr_redis_bytes = redis_strlen("leaderboard:kr::RANKED_SOLO_5x5")
+        assert euw_redis_bytes > 1000 and kr_redis_bytes > 1000
+        assert snapshot_riot_call_counts()["accountByPuuid"] == 0
+        record_sample("after_scenario1b_offprod_191_completion_and_600_of_600_read")
 
         # =========================================================================
         # SCENARIO 2: Singleflight Concurrency Coalescing (16 Concurrent Callers on EUW1 Cache Miss)
@@ -1066,10 +1284,7 @@ def main():
         # SCENARIO 3: Real PostgreSQL ACCESS EXCLUSIVE Table Lock -> Bounded 1.5s JDBC Timeout & Off-Thread Statement.cancel()
         # =========================================================================
         print("=== 6. Scenario 3: Real PostgreSQL ACCESS EXCLUSIVE Lock on indexed_players -> Bounded 1.5s JDBC Timeout & Statement.cancel() ===", flush=True)
-        # Update top-1 EUW player name in Postgres right before acquiring ACCESS EXCLUSIVE lock:
-        # While locked, the 1.5s JDBC timeout must cancel the query and fall back to previousSnapshot ("EuwChallenger1").
-        # Once unlocked, the next refresh must read the updated DB value ("EuwPostLockUpdated1").
-        psql_exec("UPDATE indexed_players SET game_name = 'EuwPostLockUpdated1' WHERE puuid = 'puuid-euw1-1';")
+        psql_exec(f"UPDATE indexed_players SET game_name = 'EuwPostLockUpdated1' WHERE puuid = '{puuid_78('euw1', 1)}';")
 
         lock_proc = subprocess.Popen([
             "docker", "exec", "ss-postgres",
@@ -1105,7 +1320,6 @@ def main():
             assert 1200.0 <= locked_latency_ms <= 4200.0, (
                 f"Expected JDBC timeout (~1500ms) to bound refresh latency well below 5000ms deadline, got {locked_latency_ms}ms"
             )
-            # Because the DB query was canceled by the 1.5s JDBC timeout, top-1 entry preserves previousSnapshot identity ("EuwChallenger1")
             locked_check = verify_leaderboard_response(
                 locked_dto, "euw1", expected_hydrated_count=300, expected_top1_name="EuwChallenger1"
             )
@@ -1113,7 +1327,6 @@ def main():
         finally:
             lock_proc.wait(timeout=15)
 
-        # Now that the Postgres table lock is released, evict Redis and verify DB lookup succeeds immediately
         redis_del("leaderboard:euw1::RANKED_SOLO_5x5")
         t_unlock_start = time.monotonic()
         unlocked_status, unlocked_dto = http_request_status_and_json(
@@ -1159,9 +1372,9 @@ def main():
         record_sample("after_scenario4_deadline_abort_euw1")
 
         # =========================================================================
-        # SCENARIO 5: Full Redis FLUSHALL + Upstream HTTP 503 Outage + Last-Known-Good Fallback + 30s Backoff on KR
+        # SCENARIO 5: Full Redis FLUSHALL + Upstream HTTP 503 Outage + Last-Known-Good Fallback (300/300 KR) + 30s Backoff
         # =========================================================================
-        print("=== 8. Scenario 5: Full Redis FLUSHALL + Upstream HTTP 503 Outage on KR -> Complete 300-Entry Fallback + 30s Backoff ===", flush=True)
+        print("=== 8. Scenario 5: Full Redis FLUSHALL + Upstream HTTP 503 Outage on KR -> Complete 300/300 Fallback + 30s Backoff ===", flush=True)
         redis_flushall()
         assert redis_exists("leaderboard:euw1::RANKED_SOLO_5x5") == 0
         assert redis_exists("leaderboard:kr::RANKED_SOLO_5x5") == 0
@@ -1176,12 +1389,11 @@ def main():
         calls_kr_outage_1 = snapshot_riot_call_counts()
         assert kr_outage_status_1 == 200, f"Expected HTTP 200 from KR last-known-good snapshot after FLUSHALL, got {kr_outage_status_1}"
         kr_outage_check = verify_leaderboard_response(
-            kr_outage_dto_1, "kr", expected_hydrated_count=5, expected_top1_name="KrChallenger1"
+            kr_outage_dto_1, "kr", expected_hydrated_count=300, expected_top1_name="KrChallenger1"
         )
         assert redis_exists("leaderboard:kr::RANKED_SOLO_5x5") == 1, "Expected KR Redis key reseeded from last-known-good snapshot"
         assert calls_kr_outage_1["challengerByRegion"]["kr"] == 1
 
-        # Evict KR Redis key again during the 30s failure backoff window -> must serve fallback with 0 new upstream calls
         redis_del("leaderboard:kr::RANKED_SOLO_5x5")
         kr_outage_status_2, kr_outage_dto_2 = http_request_status_and_json(
             f"{BASE_URL}/api/riot/leaderboards/challenger/kr",
@@ -1194,7 +1406,6 @@ def main():
             f"Expected 0 additional KR upstream calls during 30s failure backoff, got {calls_kr_outage_2}"
         )
 
-        # Also reseed EUW1 (which is currently in its 30s backoff from Scenario 4) by reading it -> serves 300 entries with 0 upstream calls
         euw_backoff_status, euw_backoff_dto = http_request_status_and_json(
             f"{BASE_URL}/api/riot/leaderboards/challenger/euw1",
             timeout=15
@@ -1231,7 +1442,6 @@ def main():
         na1_redis_bytes = redis_strlen("leaderboard:na1::RANKED_SOLO_5x5")
         assert na1_redis_bytes > 1000
 
-        # Now test >512 KiB chunked stream abort on warmed NA1 -> aborts stream at 512 KiB and serves 300-entry fallback
         redis_del("leaderboard:na1::RANKED_SOLO_5x5")
         reset_riot_call_counts()
         with MOCK_LOCK:
@@ -1249,7 +1459,6 @@ def main():
         assert calls_na1_oversize["challengerByRegion"]["na1"] == 1
         assert redis_exists("leaderboard:na1::RANKED_SOLO_5x5") == 1
 
-        # Verify application-level memoryHeadroom endpoint with all 3 regions resident in memory & Redis
         collector_status = http_json(
             f"{BASE_URL}/api/riot/cohorts/euw1/collector/status?patch=16.7",
             headers=OP_HEADERS,
@@ -1262,12 +1471,10 @@ def main():
 
         record_sample("after_scenario6_all_3_regions_resident_and_chunked_abort")
 
-        # Stop sampler cleanly before swapping to rollback base container
         sampler.stop_and_join(check_errors=True)
-        capture_sanitized_container_log(artifact_dir, "ss-backend-512m", "candidate_5959a70_container.log")
+        capture_sanitized_container_log(artifact_dir, "ss-backend-512m", "candidate_c71e2bd_container.log")
 
-        # Verify container log contains the expected JDBC timeout/cancellation and >512 KiB stream abort evidence
-        cand_log_text = open(os.path.join(artifact_dir, "candidate_5959a70_container.log"), "r", encoding="utf-8").read()
+        cand_log_text = open(os.path.join(artifact_dir, "candidate_c71e2bd_container.log"), "r", encoding="utf-8").read()
         assert "RESPONSE_TOO_LARGE" in cand_log_text, "Expected >512 KiB stream abort (RESPONSE_TOO_LARGE) log entry in container log"
         assert (
             "Local DB identity lookup timed out after 1500ms" in cand_log_text
@@ -1275,7 +1482,7 @@ def main():
         ), "Expected bounded JDBC timeout / Statement.cancel() log entry in container log"
 
         # =========================================================================
-        # SCENARIO 7: Rollback Base (139a7de48e67af9d664c08fd61ce131b6e63bd74) Read Compatibility
+        # SCENARIO 7: Rollback Base (139a7de48e67af9d664c08fd61ce131b6e63bd74) Read & Autocomplete Compatibility
         # =========================================================================
         print(f"=== 10. Scenario 7: Booting Rollback Base ({base_image}, SHA {ROLLBACK_BASE_COMMIT_SHA}) on Same Live Postgres & Redis ===", flush=True)
         rb_pid = start_backend_container(base_image, db_pass)
@@ -1285,6 +1492,7 @@ def main():
         rb_kr_status, rb_kr_dto = http_request_status_and_json(f"{BASE_URL}/api/riot/leaderboards/challenger/kr")
         rb_na1_status, rb_na1_dto = http_request_status_and_json(f"{BASE_URL}/api/riot/leaderboards/challenger/na1")
         rb_autocomplete = http_json(f"{BASE_URL}/api/search/autocomplete?query=EuwPostLock&region=euw1")
+        rb_autocomplete_backfilled = http_json(f"{BASE_URL}/api/search/autocomplete?query=EuwBackfilled&region=euw1")
         rb_cg = inspect_container_liveness("ss-backend-512m", expected_pid=rb_pid)
         capture_sanitized_container_log(artifact_dir, "ss-backend-512m", "rollback_139a7de_container.log")
 
@@ -1293,6 +1501,9 @@ def main():
         assert rb_na1_status == 200 and len(rb_na1_dto["entries"]) == 300
         assert any(p.get("gameName") == "EuwPostLockUpdated1" for p in rb_autocomplete), (
             f"Expected EuwPostLockUpdated1 in rollback autocomplete: {rb_autocomplete}"
+        )
+        assert len(rb_autocomplete_backfilled) == 0, (
+            f"Identity-only rows in player_riot_identities must not pollute indexed_players autocomplete: {rb_autocomplete_backfilled}"
         )
 
         cand_samples_snapshot = sampler.snapshot_samples()
@@ -1309,19 +1520,37 @@ def main():
         summary.update({
             "status": "PASSED",
             "candidateCommitSha": CANDIDATE_COMMIT_SHA,
+            "base5959CommitSha": BASE_5959_COMMIT_SHA,
             "rollbackBaseCommitSha": ROLLBACK_BASE_COMMIT_SHA,
             "egressIsolation": egress_proof,
             "rollbackEgressIsolation": rb_egress,
-            "scenario1_hydrationAndColdOversizeAbort": {
-                "euw1": {**euw_check, "redisCompressedBytes": euw_redis_bytes},
-                "kr": {**kr_check, "redisCompressedBytes": kr_redis_bytes},
+            "scenario1_preMigrationMissingTableCompatibilityAndColdOversizeAbort": {
+                "euw1PreMigration": euw_pre_check,
+                "krPreMigration": kr_pre_check,
                 "na1ColdOversizeChunkedAbort": {
                     "firstCallerHttpStatus": na1_cold_status_1,
                     "secondCallerBackoffHttpStatus": na1_cold_status_2,
                     "redisKeyCachedOnFailure": False,
                     "upstreamCallsDuringBackoff": calls_after_na1_503["challengerByRegion"]["na1"],
                 },
-                "accountV1ByPuuidCalls": startup_calls["accountByPuuid"],
+                "backendAccountV1ByPuuidCalls": startup_calls["accountByPuuid"],
+            },
+            "scenario1b_offprodCliDryRunAdditiveDdl191BackfillAnd600ReadCoverage": {
+                "dryRunOutcome": dry_report["outcome"],
+                "dryRunHttpAttemptsMade": dry_report["httpAttemptsMade"],
+                "dryRunDurableWrites": dry_report["durableIdentityTableUpsertsVerifiedCount"],
+                "dryRunRemainingPending": dry_report["remainingPendingCount"],
+                "liveOutcome": live_report["outcome"],
+                "liveHttpAttemptsMade": live_report["httpAttemptsMade"],
+                "liveDurableIdentityTableUpsertsVerified": live_report["durableIdentityTableUpsertsVerifiedCount"],
+                "liveRemainingPending": live_report["remainingPendingCount"],
+                "playerRiotIdentitiesByRegion": id_table_counts,
+                "indexedPlayersCountUnchanged": idx_table_count,
+                "euw1PostCompletion": {**euw_check, "redisCompressedBytes": euw_redis_bytes},
+                "krPostCompletion": {**kr_check, "redisCompressedBytes": kr_redis_bytes},
+                "totalHydratedAcrossEuwAndKr": euw_check["hydratedIdentities"] + kr_check["hydratedIdentities"],
+                "indexedFirstPrecedenceVerifiedOnTop1Euw": euw_check["top1GameName"] == "EuwChallenger1",
+                "backendAccountV1ByPuuidCalls": 0,
             },
             "scenario2_singleflightConcurrency": {
                 "concurrentCallers": conc_count,
@@ -1374,6 +1603,7 @@ def main():
                 "na1Status": rb_na1_status,
                 "na1Entries": len(rb_na1_dto["entries"]),
                 "autocompleteMatchedUpdatedRow": True,
+                "autocompleteUnpollutedByIdentityOnlyTable": True,
                 "rollbackCgroupCurrentBytes": rb_cg["cgroupCurrentBytes"],
                 "rollbackCgroupCurrentMiB": rb_cg["cgroupCurrentMiB"],
                 "rollbackCgroupRatioPct": rb_cg["cgroupRatioPct"],
@@ -1401,7 +1631,7 @@ def main():
 
         write_sanitized_artifacts(artifact_dir, summary, cand_samples_snapshot)
         proof_completed_ok = True
-        print("=== ALL 512 MiB CHALLENGER LEADERBOARD CONTAINER PROOF CHECKS PASSED ===", flush=True)
+        print("=== ALL 512 MiB CHALLENGER LEADERBOARD + OFFPROD 191 IDENTITY COMPLETION PROOF CHECKS PASSED ===", flush=True)
         print(json.dumps(summary["candidateMemory512m"], indent=2), flush=True)
     finally:
         finalize_teardown(
@@ -1420,8 +1650,8 @@ def run_static_smoke_test():
         raw = CHALLENGER_300_BYTES_BY_REGION[region]
         parsed = json.loads(raw.decode("utf-8"))
         assert len(parsed["entries"]) == 300
-        assert parsed["entries"][0]["puuid"] == f"puuid-{region}-300"
-        assert parsed["entries"][-1]["puuid"] == f"puuid-{region}-1"
+        assert parsed["entries"][0]["puuid"] == puuid_78(region, 300)
+        assert parsed["entries"][-1]["puuid"] == puuid_78(region, 1)
 
     with tempfile.TemporaryDirectory() as tmp_root:
         os.environ["RAW_ARTIFACT_DIR"] = os.path.join(tmp_root, "raw")
@@ -1454,6 +1684,7 @@ def run_static_smoke_test():
 
     print("STATIC_SMOKE_TEST_OK", json.dumps({
         "candidateCommitSha": CANDIDATE_COMMIT_SHA,
+        "base5959CommitSha": BASE_5959_COMMIT_SHA,
         "rollbackBaseCommitSha": ROLLBACK_BASE_COMMIT_SHA,
         "euw300PayloadBytes": len(CHALLENGER_300_BYTES_BY_REGION["euw1"]),
     }))
