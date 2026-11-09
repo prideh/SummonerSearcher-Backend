@@ -2,7 +2,7 @@ name: Backend CI
 
 on:
   push:
-    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates, feat/collector-session-memory-series, feat/scalar-patch-metadata-queries, feat/cached-player-exact-ingestion ]
+    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates, feat/collector-session-memory-series, feat/scalar-patch-metadata-queries, feat/cached-player-exact-ingestion, test/challenger-leaderboard-512m-proof-5959a70 ]
   pull_request:
     branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates ]
   workflow_dispatch:
@@ -19,13 +19,14 @@ jobs:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0
-    - name: Verify public repo free-runner invariant, PostgreSQL binaries, and exact 634e880 + fef2ed6 commit SHAs
+    - name: Verify public repo free-runner invariant, PostgreSQL binaries, and exact 634e880 + 5959a70 + 139a7de commit SHAs
       run: |
         test "${{ github.event.repository.private }}" = "false"
         test "${{ github.event.repository.visibility }}" = "public"
-        git fetch origin feat/offprod-missing-challenger-identity-completion:refs/remotes/origin/feat/offprod-missing-challenger-identity-completion
+        git fetch origin feat/offprod-missing-challenger-identity-completion:refs/remotes/origin/feat/offprod-missing-challenger-identity-completion || true
         git cat-file -e 634e880b44e2ec7293b46076306774e194f157dc^{commit}
-        git cat-file -e fef2ed6d41d82fdac38384974cec6ca0a73e6aae^{commit}
+        git cat-file -e 5959a7036c9e281f72d17f0a0bd5003ba59476f8^{commit}
+        git cat-file -e 139a7de48e67af9d664c08fd61ce131b6e63bd74^{commit}
         if [ ! -x /usr/lib/postgresql/16/bin/initdb ] && [ ! -x /usr/lib/postgresql/15/bin/initdb ] && [ ! -x /usr/lib/postgresql/14/bin/initdb ]; then
           PG_INITDB="$(find /usr/lib/postgresql -name initdb 2>/dev/null | head -n 1 || true)"
           if [ -z "$PG_INITDB" ]; then
@@ -39,73 +40,107 @@ jobs:
         if [ ! -x /usr/bin/time ]; then
           sudo apt-get update && sudo apt-get install -y time
         fi
-    - name: Set up JDK 21 for exact 634e880 unit, real PostgreSQL qualification, and standalone timing/RSS proof
+    - name: Set up JDK 21 for exact 634e880 unit and PostgreSQL qualification test verification
       uses: actions/setup-java@v4
       with:
         java-version: '21'
         distribution: 'temurin'
         cache: 'gradle'
-    - name: Run isolated 634e880 119-test qualification + standalone CLI timing and OS RSS / 256MiB cgroup proof
+    - name: Build exact Integrated Candidate (634e880) and Rollback Base (139a7de) Docker images and capture 119-test JDK 21 XML/exit evidence from detached worktrees
       run: |
         git worktree add --detach /tmp/wt-634e880 634e880b44e2ec7293b46076306774e194f157dc
         test "$(git -C /tmp/wt-634e880 rev-parse HEAD)" = "634e880b44e2ec7293b46076306774e194f157dc"
+        docker build -f /tmp/wt-634e880/Dockerfile -t ss-backend:cand-634e880 /tmp/wt-634e880
+        docker tag ss-backend:cand-634e880 ss-backend:512m-proof
 
-        mkdir -p /tmp/offprod-qualification-proof-raw/jdk21-test-634e880/xml-results
-        mkdir -p /tmp/offprod-qualification-proof-artifacts/jdk21-test-634e880/xml-results
-        mkdir -p /tmp/offprod-qualification-proof-artifacts/sources
-        mkdir -p /tmp/offprod-qualification-proof-artifacts/standalone-timing-rss
-
-        git -C /tmp/wt-634e880 diff fef2ed6d41d82fdac38384974cec6ca0a73e6aae..634e880b44e2ec7293b46076306774e194f157dc > /tmp/offprod-qualification-proof-artifacts/source-diff-from-fef2ed6.patch
-        git -C /tmp/wt-634e880 show 634e880b44e2ec7293b46076306774e194f157dc > /tmp/offprod-qualification-proof-artifacts/commit-634e880.patch
-        FEF_DIFF_BYTES="$(git -C /tmp/wt-634e880 diff fef2ed6d41d82fdac38384974cec6ca0a73e6aae -- src/main/kotlin/com/pride/summoner_searcher_api/tools/OffProdChallengerIdentityCompletionTool.kt src/main/kotlin/com/pride/summoner_searcher_api/tools/OffProdChallengerIdentityCompletionCli.kt src/main/kotlin/com/pride/summoner_searcher_api/repository/PlayerRiotIdentityRepository.kt src/main/kotlin/com/pride/summoner_searcher_api/service/ChallengerLeagueService.kt src/main/resources/db/migration/V11__create_player_riot_identities.sql | wc -c | tr -d ' ')"
-        test "$FEF_DIFF_BYTES" = "0"
-        echo "CANDIDATE_SHA=634e880b44e2ec7293b46076306774e194f157dc" > /tmp/offprod-qualification-proof-artifacts/fef2ed6-preservation-check.txt
-        echo "FEF2ED6_SHA=fef2ed6d41d82fdac38384974cec6ca0a73e6aae" >> /tmp/offprod-qualification-proof-artifacts/fef2ed6-preservation-check.txt
-        echo "FEF2ED6_DIFF_BYTE_COUNT=$FEF_DIFF_BYTES" >> /tmp/offprod-qualification-proof-artifacts/fef2ed6-preservation-check.txt
-
-        cp /tmp/wt-634e880/src/main/kotlin/com/pride/summoner_searcher_api/tools/OffProdAdditiveIdentitySchemaSetupCli.kt /tmp/offprod-qualification-proof-artifacts/sources/
-        cp /tmp/wt-634e880/src/test/kotlin/com/pride/summoner_searcher_api/tools/OffProdAdditiveIdentitySchemaSetupCliTest.kt /tmp/offprod-qualification-proof-artifacts/sources/
-        cp /tmp/wt-634e880/src/main/kotlin/com/pride/summoner_searcher_api/tools/OffProdPrewarmedChallengerIdentityCompletionCli.kt /tmp/offprod-qualification-proof-artifacts/sources/
-        cp /tmp/wt-634e880/src/test/kotlin/com/pride/summoner_searcher_api/tools/OffProdPrewarmedChallengerIdentityCompletionCliTest.kt /tmp/offprod-qualification-proof-artifacts/sources/
-
+        mkdir -p /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-634e880/xml-results
+        mkdir -p /tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-634e880/xml-results
         chmod +x /tmp/wt-634e880/gradlew
         set +e
-        (cd /tmp/wt-634e880 && ./gradlew compileKotlin compileTestKotlin test bootJar --no-daemon --console=plain) > /tmp/offprod-qualification-proof-raw/jdk21-test-634e880/test.log 2>&1
+        (cd /tmp/wt-634e880 && ./gradlew compileKotlin compileTestKotlin test --no-daemon --console=plain) > /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-634e880/test.log 2>&1
         TEST_EXIT=$?
         set -e
-        echo "$TEST_EXIT" > /tmp/offprod-qualification-proof-raw/jdk21-test-634e880/test.exit
-        cp /tmp/wt-634e880/build/test-results/test/TEST-*.xml /tmp/offprod-qualification-proof-raw/jdk21-test-634e880/xml-results/ || true
-        cp /tmp/offprod-qualification-proof-raw/jdk21-test-634e880/test.exit /tmp/offprod-qualification-proof-artifacts/jdk21-test-634e880/test.exit
-        cp /tmp/offprod-qualification-proof-raw/jdk21-test-634e880/test.log /tmp/offprod-qualification-proof-artifacts/jdk21-test-634e880/test.log
-        cp /tmp/offprod-qualification-proof-raw/jdk21-test-634e880/xml-results/TEST-*.xml /tmp/offprod-qualification-proof-artifacts/jdk21-test-634e880/xml-results/ || true
-
-        if [ "$TEST_EXIT" -ne 0 ]; then
-          tail -n 120 /tmp/offprod-qualification-proof-raw/jdk21-test-634e880/test.log
-          exit "$TEST_EXIT"
-        fi
-
-        mkdir -p /tmp/standalone-runtime
-        cp /tmp/wt-634e880/build/libs/summoner-searcher-api-0.0.1-SNAPSHOT.jar /tmp/standalone-runtime/app.jar
-        (cd /tmp/standalone-runtime && jar xf app.jar)
+        echo "$TEST_EXIT" > /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-634e880/test.exit
+        cp /tmp/wt-634e880/build/test-results/test/TEST-*.xml /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-634e880/xml-results/ || true
+        cp /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-634e880/test.exit /tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-634e880/test.exit
+        cp /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-634e880/test.log /tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-634e880/test.log
+        cp /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-634e880/xml-results/TEST-*.xml /tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-634e880/xml-results/ || true
         git worktree remove --force /tmp/wt-634e880
 
-        python3 ./scripts/verify_standalone_timing_rss_634e880.py
+        if [ "$TEST_EXIT" -ne 0 ]; then
+          tail -n 120 /tmp/challenger-leaderboard-512m-proof-raw/jdk21-test-634e880/test.log
+          exit "$TEST_EXIT"
+        fi
+        python3 -c '
+        import glob, xml.etree.ElementTree as ET
+        files = sorted(glob.glob("/tmp/challenger-leaderboard-512m-proof-artifacts/jdk21-test-634e880/xml-results/TEST-*.xml"))
+        assert len(files) == 18, f"Expected 18 XML suites, got {len(files)}"
+        tests = sum(int(ET.parse(f).getroot().attrib["tests"]) for f in files)
+        failures = sum(int(ET.parse(f).getroot().attrib["failures"]) for f in files)
+        errors = sum(int(ET.parse(f).getroot().attrib["errors"]) for f in files)
+        skipped = sum(int(ET.parse(f).getroot().attrib.get("skipped", "0")) for f in files)
+        assert tests == 119 and failures == 0 and errors == 0 and skipped == 0, f"Unexpected counts: tests={tests}, failures={failures}, errors={errors}, skipped={skipped}"
+        '
+
+        git worktree add --detach /tmp/wt-139a7de 139a7de48e67af9d664c08fd61ce131b6e63bd74
+        docker build -f /tmp/wt-139a7de/Dockerfile -t ss-backend:base-139a7de /tmp/wt-139a7de
+        git worktree remove --force /tmp/wt-139a7de
+    - name: Prepare local Mock Riot TLS certificate and container truststore
+      run: |
+        openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/mockriot.key -out /tmp/mockriot.crt -days 1 \
+          -subj "/CN=api.riotgames.com" \
+          -addext "subjectAltName=DNS:euw1.api.riotgames.com,DNS:na1.api.riotgames.com,DNS:kr.api.riotgames.com,DNS:europe.api.riotgames.com,DNS:americas.api.riotgames.com,DNS:asia.api.riotgames.com,DNS:ddragon.leagueoflegends.com"
+        cid=$(docker create ss-backend:cand-634e880)
+        docker cp "$cid:/opt/java/openjdk/lib/security/cacerts" /tmp/cacerts
+        docker rm "$cid"
+        keytool -importcert -noprompt -trustcacerts -alias mockriot -file /tmp/mockriot.crt -keystore /tmp/cacerts -storepass changeit
+        chmod 644 /tmp/cacerts
+    - name: Run Real 512 MiB Container Acceptance Proof (Integrated Candidate 634e880 + Rollback 139a7de)
+      run: |
+        chmod +x scripts/verify_512m_container.py
+        python3 ./scripts/verify_512m_container.py --self-test
+        CAND_IMAGE="ss-backend:cand-634e880" BASE_IMAGE="ss-backend:base-139a7de" \
+        RAW_ARTIFACT_DIR="/tmp/challenger-leaderboard-512m-proof-raw" \
+        ARTIFACT_DIR="/tmp/challenger-leaderboard-512m-proof-artifacts" \
+          sudo --preserve-env=CAND_IMAGE,BASE_IMAGE,RAW_ARTIFACT_DIR,ARTIFACT_DIR python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
     - name: Sanitize and verify zero secrets in upload directory on all paths
       id: artifact_gate
       if: always()
       run: |
         sudo python3 - << 'PYEOF'
         import json, os, re, shutil, sys
-        upload_dir = "/tmp/offprod-qualification-proof-artifacts"
+        raw_dir = "/tmp/challenger-leaderboard-512m-proof-raw"
+        upload_dir = "/tmp/challenger-leaderboard-512m-proof-artifacts"
         if not os.path.isdir(upload_dir):
             print("Upload directory does not exist; failing closed.", file=sys.stderr)
             sys.exit(1)
+        forbidden_tokens = []
+        secrets_manifest = os.path.join(raw_dir, ".ephemeral_secrets.json")
+        if os.path.isfile(secrets_manifest):
+            forbidden_tokens = [t for t in json.load(open(secrets_manifest, "r", encoding="utf-8")) if t]
         redact_patterns = [
-            re.compile(r"RGAPI-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"),
+            re.compile(r"RGAPI-[0-9a-fA-F-]{16,}"),
             re.compile(r"\bre_[0-9a-zA-Z_]{16,}\b"),
             re.compile(r"\bgh[pousr]_[0-9a-zA-Z]{20,}\b"),
             re.compile(r"\bgithub_pat_[0-9a-zA-Z_]{20,}\b"),
+            re.compile(r'(?i)((?:db_pass|postgres_password|jwt_secret_key|twofa_secret_key|cohort_operator_token|riot_api_key|resend_api_key)\s*[=:]\s*)(?!\[REDACTED\])[^\s"\',;<>\]}]+'),
         ]
+        jdk_upload_dir = os.path.join(upload_dir, "jdk21-test-634e880")
+        if os.path.isdir(jdk_upload_dir):
+            for root, _dirs, files in os.walk(jdk_upload_dir):
+                for fname in files:
+                    fpath = os.path.join(root, fname)
+                    if not os.path.isfile(fpath):
+                        continue
+                    text = open(fpath, "r", encoding="utf-8", errors="replace").read()
+                    orig = text
+                    for tok in forbidden_tokens:
+                        text = text.replace(tok, "[REDACTED]")
+                    for pat in redact_patterns[:4]:
+                        text = pat.sub("[REDACTED]", text)
+                    text = redact_patterns[4].sub(r"\1[REDACTED]", text)
+                    if text != orig:
+                        open(fpath, "w", encoding="utf-8").write(text)
         file_count = 0
         for root, _dirs, files in os.walk(upload_dir):
             for fname in files:
@@ -114,6 +149,10 @@ jobs:
                     continue
                 file_count += 1
                 text = open(fpath, "r", encoding="utf-8", errors="replace").read()
+                for tok in forbidden_tokens:
+                    if tok in text:
+                        shutil.rmtree(upload_dir, ignore_errors=True)
+                        raise RuntimeError(f"SECRET_TOKEN_SCAN_GATE_FAILED in {fpath}")
                 for pat in redact_patterns:
                     if pat.search(text):
                         shutil.rmtree(upload_dir, ignore_errors=True)
@@ -129,11 +168,11 @@ jobs:
             raise RuntimeError("EMPTY_UPLOAD_DIRECTORY")
         print(f"Verified {file_count} sanitized artifact files with 0 secret leaks.")
         PYEOF
-    - name: Upload Sanitized Off-Prod Qualification + Standalone Timing/RSS Proof (634e880)
+    - name: Upload Sanitized 512 MiB Challenger Leaderboard Proof & 119-Test XML/Exit Evidence Artifacts
       if: always() && steps.artifact_gate.outcome == 'success'
       uses: actions/upload-artifact@v4
       with:
-        name: offprod-qualification-and-standalone-rss-proof-634e880
-        path: /tmp/offprod-qualification-proof-artifacts
+        name: challenger-leaderboard-512m-proof-634e880
+        path: /tmp/challenger-leaderboard-512m-proof-artifacts
         if-no-files-found: error
         retention-days: 7
