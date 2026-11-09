@@ -891,6 +891,119 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             verify(exactly = 0) { lateConn.prepareStatement(any()) }
         }
 
+        Then("stalled PreparedStatement setter (ps.setTimestamp(5, ...) and ps.setString) that ignores interruption and resolves AFTER caller timeout executes ZERO executeUpdate or executeQuery calls") {
+            val pSetter = validPuuid78("stalled_setter_ignores_interrupt")
+
+            // Part A: Write path — ps.setTimestamp(5, ...) stalls ignoring InterruptedException; released AFTER 100ms timeout returns FailureOrUnknownCommit
+            val enteredSetTimestampLatch = CountDownLatch(1)
+            val releaseSetTimestampLatch = CountDownLatch(1)
+            val writeStmtClosedOrAbortedLatch = CountDownLatch(1)
+            val executeUpdateCountAfterTimeout = AtomicInteger(0)
+
+            val stalledWritePs = mockk<PreparedStatement>(relaxed = true)
+            every { stalledWritePs.setTimestamp(5, any()) } answers {
+                enteredSetTimestampLatch.countDown()
+                val waitLimitMs = System.currentTimeMillis() + 5_000L
+                while (System.currentTimeMillis() < waitLimitMs) {
+                    try {
+                        if (releaseSetTimestampLatch.await(10, TimeUnit.MILLISECONDS)) {
+                            break
+                        }
+                    } catch (_: InterruptedException) {
+                        // Intentionally ignore thread interruption during setter!
+                    }
+                }
+            }
+            every { stalledWritePs.executeUpdate() } answers {
+                executeUpdateCountAfterTimeout.incrementAndGet()
+                error("executeUpdate() MUST NOT be called when ps.setTimestamp(5, ...) resolves after caller timeout!")
+            }
+            every { stalledWritePs.close() } answers {
+                writeStmtClosedOrAbortedLatch.countDown()
+            }
+
+            val writeConn = mockk<Connection>(relaxed = true)
+            every { writeConn.autoCommit } returns true
+            every {
+                writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE)
+            } returns stalledWritePs
+
+            val writeDs = mockk<DataSource>(relaxed = true)
+            every { writeDs.connection } returns writeConn
+
+            val writeAdapter = JdbcIdentityCompletionPersistenceAdapter(writeDs)
+            val writeResult = writeAdapter.persistAndVerifyIdentityBounded(
+                puuid = pSetter,
+                platformRegion = "euw1",
+                gameName = "StalledSetterName",
+                tagLine = "EUW",
+                verifiedAt = Instant.parse("2026-11-09T03:45:00Z"),
+                preCallDbState = PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS,
+                timeoutMs = 100L
+            )
+
+            // 1. Caller returned FailureOrUnknownCommit after 100ms timeout while worker was inside ps.setTimestamp(5, ...)
+            (writeResult is DbWriteVerificationResult.FailureOrUnknownCommit) shouldBe true
+            enteredSetTimestampLatch.await(1, TimeUnit.SECONDS) shouldBe true
+
+            // 2. Release stalled ps.setTimestamp(5, ...) AFTER caller has already returned
+            releaseSetTimestampLatch.countDown()
+
+            // 3. Wait for worker thread to exit the statement block via the direct pre-executeUpdate fence
+            writeStmtClosedOrAbortedLatch.await(2, TimeUnit.SECONDS) shouldBe true
+
+            // 4. Prove ZERO executeUpdate() calls occurred!
+            executeUpdateCountAfterTimeout.get() shouldBe 0
+            verify(exactly = 0) { stalledWritePs.executeUpdate() }
+
+            // Part B: Read-only recheck path — ps.setString(1, ...) stalls ignoring InterruptedException; released AFTER 100ms timeout returns Failure
+            val enteredSetStringLatch = CountDownLatch(1)
+            val releaseSetStringLatch = CountDownLatch(1)
+            val readStmtClosedOrAbortedLatch = CountDownLatch(1)
+            val executeQueryCountAfterTimeout = AtomicInteger(0)
+
+            val stalledReadPs = mockk<PreparedStatement>(relaxed = true)
+            every { stalledReadPs.setString(1, any()) } answers {
+                enteredSetStringLatch.countDown()
+                val waitLimitMs = System.currentTimeMillis() + 5_000L
+                while (System.currentTimeMillis() < waitLimitMs) {
+                    try {
+                        if (releaseSetStringLatch.await(10, TimeUnit.MILLISECONDS)) {
+                            break
+                        }
+                    } catch (_: InterruptedException) {
+                        // Intentionally ignore thread interruption during setter!
+                    }
+                }
+            }
+            every { stalledReadPs.executeQuery() } answers {
+                executeQueryCountAfterTimeout.incrementAndGet()
+                error("executeQuery() MUST NOT be called when ps.setString(1, ...) resolves after caller timeout!")
+            }
+            every { stalledReadPs.close() } answers {
+                readStmtClosedOrAbortedLatch.countDown()
+            }
+
+            val readConn = mockk<Connection>(relaxed = true)
+            every { readConn.prepareStatement(any()) } returns stalledReadPs
+            val readDs = mockk<DataSource>(relaxed = true)
+            every { readDs.connection } returns readConn
+
+            val readAdapter = JdbcIdentityCompletionPersistenceAdapter(readDs)
+            val readResult = readAdapter.recheckExistingIdentitiesBounded(
+                entries = listOf(ManifestEntry(pSetter, "euw1")),
+                timeoutMs = 100L
+            )
+            (readResult is DbRecheckResult.Failure) shouldBe true
+            enteredSetStringLatch.await(1, TimeUnit.SECONDS) shouldBe true
+
+            releaseSetStringLatch.countDown()
+            readStmtClosedOrAbortedLatch.await(2, TimeUnit.SECONDS) shouldBe true
+
+            executeQueryCountAfterTimeout.get() shouldBe 0
+            verify(exactly = 0) { stalledReadPs.executeQuery() }
+        }
+
         Then("same-connection post-write read with autoCommit=false is rejected as FailureOrUnknownCommit, while autoCommit=true or explicit commit + distinct read connection succeeds") {
             val pAutoCommit = validPuuid78("autocommit_proof_1")
             val verifiedTs = Instant.parse("2026-11-09T03:30:00Z")
