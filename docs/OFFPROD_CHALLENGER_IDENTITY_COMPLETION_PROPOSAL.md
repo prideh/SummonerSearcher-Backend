@@ -127,18 +127,29 @@
 
 ---
 
-### 2.2 Grounded Key-Budget Coordination & Explicit Blocker Analysis
+### 2.2 Official Riot Policy Constraint, No-Effect Key Consumer Inventory & Grounded Coordination Mechanism
 
-- **Grounded Codebase Fact**:
-  - In `SummonerSearcher-Backend`, [`RiotApiRateLimiter.kt`](../src/main/kotlin/com/pride/summoner_searcher_api/service/RiotApiRateLimiter.kt) is strictly an **in-JVM memory** rate limiter (`ConcurrentHashMap` inside the Spring Boot process).
-  - Live production callers (`RiotApiService`, `ChallengerLeagueService`, `CacheWarmer`, `/api/summoner/*`, `/api/matches/*`) **do not** consult any Redis key, Redis lock, or cross-process coordinator before dispatching requests with `RIOT_API_KEY`.
-- **Grounded Coordination Requirements & Explicit Blockers**:
-  1. **Route A (Separate Authorized Riot Application Rate-Limit Budget)**:
-     - Merely having a different token string is **insufficient** if two keys belong to the same Riot application/project rate-limit bucket or if the key is not authorized for this use.
-     - Route A requires a credential (`OFFPROD_RIOT_API_KEY`) backed by a **separate authorized Riot Developer application/project budget** whose `X-App-Rate-Limit` / `X-Method-Rate-Limit` bucket at `europe.api.riotgames.com` and `asia.api.riotgames.com` is completely independent of the production service and has **zero** concurrent callers during the `<= 180s` CLI run (`--key-coordination-mode=EXCLUSIVE_KEY`).
-  2. **Route B (Shared Production Application Key — Explicit Blocker Without Owner Downtime Authorization & Single-Holder Proof)**:
-     - Because **no** cross-process key coordinator is enforced by production callers, running against the shared production Riot application key while production is live is **EXPLICITLY BLOCKED**.
-     - Furthermore, suspending the Render production service is an **owner/product downtime decision** (not an engineering grant) and does **not** automatically prove that no other developer workstation, script, or external process is concurrently using that key. Route B is therefore **blocked** unless the owner explicitly authorizes a production maintenance stop **and** confirms that zero other processes/users hold or invoke that Riot application key during the `<= 180s` window (`--key-coordination-mode=COORDINATED_MAINTENANCE_WINDOW`).
+1. **Official Riot Developer Policy Constraint (`https://developer.riotgames.com/docs/faqs`)**:
+   - Per Riot Games' official Developer Portal policy, a developer/organization is permitted **only one application per game per product**, and **registering or using multiple applications/projects for the same product to bypass rate limits is strictly forbidden**.
+   - Accordingly, provisioning a second Riot application/project ("Route A" separate application bucket) is **ineligible and removed**. Nor should the existing production Riot API key be regenerated or modified.
+   - All off-production identity completion calls for `SummonerSearcher` must therefore execute within the **single existing authorized Riot application rate-limit budget** under a verified full-quiescence window (`--key-coordination-mode=COORDINATED_MAINTENANCE_WINDOW`).
+
+2. **Grounded Codebase Fact (Why Live Concurrent Execution Is Blocked)**:
+   - In `SummonerSearcher-Backend`, [`RiotApiRateLimiter.kt`](../src/main/kotlin/com/pride/summoner_searcher_api/service/RiotApiRateLimiter.kt) is strictly an **in-JVM memory** rate limiter (`ConcurrentHashMap` inside the Spring Boot process).
+   - Live production callers (`RiotApiService`, `ChallengerLeagueService`, `LeaderboardUpdateService`, `ExampleCurationService`, `PatternDiscoveryService`, `/api/summoner/*`, `/api/matches/*`) **do not** consult any Redis/Valkey key or cross-process coordinator before dispatching requests with `RIOT_API_KEY`.
+
+3. **No-Effect Inventory of Existing Riot API Key Consumers (Audited Without Reading or Printing Any Secrets)**:
+   | Environment / Potential Consumer | Audited Status | Uses Real `RIOT_API_KEY`? | Quiescence Requirement Before Off-Prod CLI Run |
+   | :--- | :--- | :--- | :--- |
+   | **Antigravity Remote VM (`/home/antigravity`)** | `0` running `java`, `gradle`, `bootRun`, or `OffProdChallengerIdentityCompletionCli` processes (`ps -eo pid,comm,args` verified); `0` active background tasks. | **No** (`0` real keys accessed or read; tests use loopback mocks / `dummy-key`). | Already quiescent (`0` processes). |
+   | **GitHub Actions CI (`prideh/SummonerSearcher-Backend`)** | `.github/workflows/ci.yml` has `0` references to `secrets.RIOT_API_KEY`; unit tests inject `RIOT_API_KEY=dummy-key` ([`SummonerSearcherApiApplicationTests.kt:13`](../src/test/kotlin/com/pride/summoner_searcher_api/SummonerSearcherApiApplicationTests.kt#L13)) and 512 MiB container proofs use local self-signed TLS mocks (`/tmp/mockriot.crt`). All workflow runs are `completed` (`0` in progress). | **No** (never uses real Riot key). | None required (CI is offline-mocked). |
+   | **Render Cloud — Dev Environment** | Live Render project inventory shows Dev environment is **empty** (`0` services). | **No** (`0` deployed dev services). | Already quiescent. |
+   | **Render Cloud — Production Environment** | Contains only: `1` Backend Web Service (`SummonerSearcher-Backend`), `1` Static Frontend (`SummonerSearcher-Frontend`), `1` PostgreSQL instance, `1` Valkey instance; **`0` separate background worker or cron services**. | **Yes** (`SummonerSearcher-Backend` web service holds and uses the production `RIOT_API_KEY`). | Must use Render **Suspend Web Service** (not `Maintenance Mode`; see below) during the `<= 180s` run. |
+   | **Owner Local Workstation / External Dev Processes** | Not inspectable from the isolated remote VM; owner may have a local IDE `bootRun`, `.env`, or script configured with the key. | **Unknown to remote VM** (requires owner attestation). | Owner must confirm **`0` local `bootRun`/scripts/containers** are running with `RIOT_API_KEY` during the `<= 180s` window. |
+
+4. **Why Render `Suspend Web Service` Is Required (and Why Render `Maintenance Mode` Is Insufficient)**:
+   - Render's **Maintenance Mode** only blocks incoming public HTTP traffic at the edge proxy while **leaving the backend JVM container running**. Because `@EnableScheduling` is active inside the JVM, background scheduled tasks — specifically [`LeaderboardUpdateService.kt:45`](../src/main/kotlin/com/pride/summoner_searcher_api/service/LeaderboardUpdateService.kt#L45) (`@Scheduled(cron = "0 0 2 * * ?", zone = "CET")`), [`ExampleCurationService.kt:38`](../src/main/kotlin/com/pride/summoner_searcher_api/service/ExampleCurationService.kt#L38) (`@Scheduled(cron = "0 0 2 * * *")`), and [`PatternDiscoveryService.kt:31`](../src/main/kotlin/com/pride/summoner_searcher_api/service/PatternDiscoveryService.kt#L31) (`@Scheduled(cron = "0 0 3 * * SUN")`) — as well as any in-flight async match/timeline threads can still fire Riot API requests while Maintenance Mode is on.
+   - Render's **Suspend Web Service** (in Backend Settings) stops the running production backend container entirely (`0` JVM processes in Render), guaranteeing **complete cloud quiescence** (both public traffic and all `@Scheduled`/async background jobs stopped) for the `<= 180s` off-production execution window.
 
 ---
 
@@ -147,7 +158,7 @@
 1. **Off-Production Process & Secret-Safe Environment Invocation (`0` Secret CLI Args)**:
    - Executed on an operator workstation or ephemeral off-production runner (never inside the Render 512 MiB container) with JVM heap capped at `-Xms16m -Xmx96m`.
    - **Never pass `--db-pass` or `--riot-api-key` on the command line** (which would expose credentials in OS process lists `/proc/<pid>/cmdline`). [`OffProdChallengerIdentityCompletionCli`](../src/main/kotlin/com/pride/summoner_searcher_api/tools/OffProdChallengerIdentityCompletionCli.kt) reads `OFFPROD_JDBC_URL`, `OFFPROD_DB_USER`, `OFFPROD_DB_PASS`, and `OFFPROD_RIOT_API_KEY` directly from environment variables:
-     - **Stage 2 (Mandatory Dry-Run Precheck, `0` HTTP / `0` Writes, `< 5s` Budget)**:
+     - **Stage 2 (Mandatory Dry-Run Precheck, `0` HTTP / `0` Writes, `< 5s` Budget — Can Run Before Suspending Web Service)**:
        ```bash
        export OFFPROD_JDBC_URL="jdbc:postgresql://<db-host>:5432/<db-name>"
        export OFFPROD_DB_USER="offprod_identity_stager"
@@ -165,12 +176,15 @@
          --output-report-file=/tmp/precheck_dryrun_report.json
        ```
        - Verify `exitCode == 0`, `outcome == "DRY_RUN_DB_RECHECK_ONLY_COMPLETED"`, `presentWithBlankFieldInIndexedPlayersCount == 0`, and `absentFromIndexedPlayersCount + alreadyResolvedInDbCount == 191`. (If `presentWithBlankFieldInIndexedPlayersCount > 0`, CLI stops immediately with `exitCode = 1` and does not proceed.)
-     - **Stage 3 (Bounded Completion Run, Separate from DDL Stage, Hard `180s` / `191` Attempt Cap, Secrets via Env Only)**:
+     - **Stage 3 (Bounded Completion Run During Render `Suspend Web Service` Window, Hard `180s` / `191` Attempt Cap, Secrets via Env Only)**:
+       1. Confirm `0` local dev instances/scripts are running with the Riot API key.
+       2. In Render Dashboard -> Production Backend Settings -> click **Suspend Web Service** and wait until the container is stopped + `>= 125 seconds` so any rolling 2-minute Riot rate-limit window drains to `0`.
+       3. Run the bounded CLI (`<= 180s` wall-clock cap, `<= 191` HTTP attempts):
        ```bash
        export OFFPROD_JDBC_URL="jdbc:postgresql://<db-host>:5432/<db-name>"
        export OFFPROD_DB_USER="offprod_identity_stager"
        export OFFPROD_DB_PASS="<secret-from-vault-or-prompt>"
-       export OFFPROD_RIOT_API_KEY="<isolated-riot-app-key>"
+       export OFFPROD_RIOT_API_KEY="<existing-product-riot-api-key>"
 
        java -Xms16m -Xmx96m \
          -cp build/libs/summoner-searcher-api-0.0.1-SNAPSHOT-plain.jar:<runtime-classpath> \
@@ -181,8 +195,8 @@
          --network-enabled=true \
          --allow-durable-writes=true \
          --allow-indexed-players-blank-update=false \
-         --key-coordination-mode=EXCLUSIVE_KEY \
-         --coordination-attestation="isolated-riot-app-budget-sole-holder" \
+         --key-coordination-mode=COORDINATED_MAINTENANCE_WINDOW \
+         --coordination-attestation="render-prod-web-service-suspended-and-zero-local-consumers-confirmed" \
          --max-http-attempts=191 \
          --max-wall-time-ms=180000 \
          --db-timeout-ms=2500 \
@@ -193,6 +207,7 @@
          --output-report-file=/tmp/completion_report_pass1.json \
          --output-remaining-manifest-file=/tmp/remaining_manifest_pass1.json
        ```
+       4. Immediately click **Resume Web Service** in Render Dashboard once the CLI exits.
 2. **Deterministic Handling of Partial `404`, Omitted Fields, Rate/Budget Exhaustion & `unknown_commit`**:
    - **HTTP `404` (`ItemStatus.SKIPPED_NOT_FOUND_404`) & HTTP `200` with Omitted/Blank `gameName`/`tagLine` (`ItemStatus.SKIPPED_OMITTED_RIOT_ID_FIELDS`)**:
      - Executes **`0` DB writes** (never fabricates blank/sentinel rows). Recorded in `notFound404Count` / `omittedRiotIdFieldsCount` in `completion_report_pass1.json`.
@@ -218,7 +233,7 @@
      - When `remainingPendingCount == 0` and `dbFailureOrUnknownCommitCount == 0`, every single one of the 191 historical manifest PUUIDs is accounted for as either verified in DB (`alreadyResolvedInDbCount + durableIdentityTableUpsertsVerifiedCount + concurrentAlreadyCompleteVerifiedCount`) or upstream-unresolved (`notFound404Count + omittedRiotIdFieldsCount`), and `COUNT(*) FROM player_riot_identities` equals `durableIdentityTableUpsertsVerifiedCount` (`<= 191`).
 2. **Separate Live Challenger Roster Coverage Measurement (Not Promising `600/600` on Rotating Live Ladder)**:
    - While the synthetic qualification fixture deterministically proves `600/600` (`300/300` EUW1 + `300/300` KR) when the 300-player ladder matches the snapshot, the real live Challenger 300+300 ladder rotates over time as players promote/demote.
-   - Post-deployment verification therefore measures ** two distinct metrics**:
+   - Post-deployment verification therefore measures **two distinct metrics**:
      1. **Historical 191 Manifest Resolution**: How many of the 191 historical snapshot PUUIDs are now non-blank in `indexed_players UNION player_riot_identities` vs upstream `404`/omitted.
      2. **Current Live Ladder Hydrated Coverage**: Actual hydrated vs missing count on `GET /api/riot/leaderboards/challenger/euw1` and `GET /api/riot/leaderboards/challenger/kr` at refresh time (where any newly promoted Challenger PUUIDs that entered the top 300 after `2026-11-09T11:34:00Z` and are not yet in `indexed_players` will remain unhydrated until indexed or included in a future snapshot manifest, with `0` live Account-V1 fanout calls during leaderboard refresh).
 3. **Data-Preserving Rollback Plan**:
@@ -227,8 +242,12 @@
 
 ---
 
-## 3. Single Remaining Owner Decision
+## 3. Single Grounded Achievable Execution Route & Remaining Owner Permissions
 
-1. **Authorization & Key-Budget Coordination Decision**:
-   - **Option 1**: Provide a credential (`OFFPROD_RIOT_API_KEY` via env) backed by a **separate authorized Riot Developer application/project rate-limit budget** (`--key-coordination-mode=EXCLUSIVE_KEY`) + the least-privilege table-scoped PostgreSQL grant (`GRANT SELECT ON TABLE public.indexed_players`, `GRANT SELECT, INSERT, UPDATE ON TABLE public.player_riot_identities`), **OR**
-   - **Option 2 (Explicit Blocker)**: Keep off-production network execution **blocked** (unless the owner explicitly authorizes a production maintenance stop **and** confirms zero other processes/users invoke the shared Riot application key during the `<= 180s` CLI window).
+Because official Riot Developer policy (`https://developer.riotgames.com/docs/faqs`) prohibits creating multiple applications for the same product to bypass rate limits, the **only policy-compliant, grounded achievable route** is:
+1. **Temporary Narrow PostgreSQL Schema/Write Grant**:
+   - Apply `CREATE TABLE IF NOT EXISTS public.player_riot_identities` (`<= 15s` `statement_timeout`) and grant temporary `SELECT` on `public.indexed_players` + `SELECT, INSERT, UPDATE` on `public.player_riot_identities` (`0` write privileges on `indexed_players`).
+2. **Owner Downtime Permission via Render `Suspend Web Service` + Local Consumer Quiescence Confirmation (`--key-coordination-mode=COORDINATED_MAINTENANCE_WINDOW`)**:
+   - Do **not** create a second Riot application/project and do **not** regenerate the existing Riot API key.
+   - Run Stage 2 dry-run precheck (`0` network calls) while production is still up.
+   - Authorize a short (`~5 min` total: `125s` rate-limit window drain + `<= 180s` bounded CLI execution) Render **Suspend Web Service** window on the single Production Backend service (not `Maintenance Mode`, so `@Scheduled` jobs in `LeaderboardUpdateService`, `ExampleCurationService`, and `PatternDiscoveryService` are also stopped), **and** confirm that **`0` local developer workstation processes/scripts** are running with `RIOT_API_KEY` during that window.
