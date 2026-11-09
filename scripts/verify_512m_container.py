@@ -160,6 +160,7 @@ CHALLENGER_300_BYTES_BY_REGION = {
     "kr": build_raw_challenger_league_json("kr", 300),
     "na1": build_raw_challenger_league_json("na1", 300),
 }
+OVERSIZED_CHALLENGER_640K_BYTES = build_raw_challenger_league_json("na1", 4500)
 
 MOCK_LOCK = threading.Lock()
 # Modes per region: "OK_300", "CHUNKED_OVERSIZE_640K", "STALL_6_5S", "HTTP_503", "HTTP_429"
@@ -217,10 +218,11 @@ class MockRiotHandler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.wfile.flush()
 
-    def _send_chunked_oversized(self, total_bytes: int = 655_360, chunk_size: int = 16_384):
+    def _send_chunked_oversized(self, chunk_size: int = 16_384):
         """
-        Streams an HTTP/1.1 chunked response exceeding the 512 KiB (524,288 bytes) cap without Content-Length,
-        exercising RiotApiService.readBoundedBody mid-stream abort inside the 512 MiB container.
+        Streams a valid >640 KiB JSON payload using HTTP/1.1 Transfer-Encoding: chunked without Content-Length,
+        exercising RiotApiService.BoundedLeagueInputStream mid-stream abort (> 524,288 bytes -> RESPONSE_TOO_LARGE)
+        inside the 512 MiB container.
         """
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -231,19 +233,14 @@ class MockRiotHandler(http.server.BaseHTTPRequestHandler):
         self.send_header("X-Method-Rate-Limit-Count", "1:10,1:600")
         self.end_headers()
 
-        prefix = b'{"tier":"CHALLENGER","leagueId":"oversized","queue":"RANKED_SOLO_5x5","name":"Oversized","entries":['
-        filler = b'{"puuid":"puuid-oversize","leaguePoints":1000,"rank":"I","wins":100,"losses":100},' * 200
-        sent = 0
+        payload = OVERSIZED_CHALLENGER_640K_BYTES
+        offset = 0
         try:
-            first_chunk = prefix + filler[: max(0, chunk_size - len(prefix))]
-            self.wfile.write(f"{len(first_chunk):x}\r\n".encode("ascii") + first_chunk + b"\r\n")
-            self.wfile.flush()
-            sent += len(first_chunk)
-            while sent < total_bytes:
-                chunk = filler[:chunk_size]
+            while offset < len(payload):
+                chunk = payload[offset:offset + chunk_size]
                 self.wfile.write(f"{len(chunk):x}\r\n".encode("ascii") + chunk + b"\r\n")
                 self.wfile.flush()
-                sent += len(chunk)
+                offset += len(chunk)
             self.wfile.write(b"0\r\n\r\n")
             self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError, ssl.SSLError, OSError):
@@ -271,7 +268,7 @@ class MockRiotHandler(http.server.BaseHTTPRequestHandler):
                 payload = CHALLENGER_300_BYTES_BY_REGION.get(region_prefix, CHALLENGER_300_BYTES_BY_REGION["euw1"])
                 self._send_riot_json(payload, 200)
             elif mode == "CHUNKED_OVERSIZE_640K":
-                self._send_chunked_oversized(655_360, 16_384)
+                self._send_chunked_oversized(16_384)
             elif mode == "STALL_6_5S":
                 try:
                     time.sleep(6.5)
@@ -959,8 +956,8 @@ def main():
             REGION_BEHAVIOR["na1"] = {"mode": "CHUNKED_OVERSIZE_640K", "delaySec": 0.0}
 
         print(f"=== 3. Booting Candidate 512 MiB Container ({cand_image}, SHA {CANDIDATE_COMMIT_SHA}) ===", flush=True)
-        boot_started_mono = time.monotonic()
         cand_pid = start_backend_container(cand_image, db_pass)
+        boot_started_mono = time.monotonic()
         cand_pid_holder[0] = cand_pid
         egress_proof = verify_egress_deny_from_container_netns("ss-backend-512m", cand_pid)
         print("EGRESS DENY PROOF:", json.dumps(egress_proof), flush=True)
@@ -1260,9 +1257,10 @@ def main():
 
         # Verify container log contains the expected JDBC timeout/cancellation and >512 KiB stream abort evidence
         cand_log_text = open(os.path.join(artifact_dir, "candidate_5959a70_container.log"), "r", encoding="utf-8").read()
-        assert "exceeded maxResponseBytes 524288" in cand_log_text, "Expected >512 KiB stream abort log entry in container log"
+        assert "RESPONSE_TOO_LARGE" in cand_log_text, "Expected >512 KiB stream abort (RESPONSE_TOO_LARGE) log entry in container log"
         assert (
-            "Timed out waiting" in cand_log_text or "canceling statement due to user request" in cand_log_text
+            "Local DB identity lookup timed out after 1500ms" in cand_log_text
+            or "canceling statement due to user request" in cand_log_text
         ), "Expected bounded JDBC timeout / Statement.cancel() log entry in container log"
 
         # =========================================================================
