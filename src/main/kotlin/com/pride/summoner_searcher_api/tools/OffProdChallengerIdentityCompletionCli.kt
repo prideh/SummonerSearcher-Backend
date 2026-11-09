@@ -141,12 +141,75 @@ object OffProdChallengerIdentityCompletionCli {
             )
         }
 
-        val dryRun = flags["dry-run"]?.toBooleanStrictOrNull() ?: true
-        val networkEnabled = flags["network-enabled"]?.toBooleanStrictOrNull() ?: false
-        val allowDurableWrites = flags["allow-durable-writes"]?.toBooleanStrictOrNull() ?: false
-        val allowIndexedPlayersBlankUpdate = flags["allow-indexed-players-blank-update"]?.toBooleanStrictOrNull() ?: false
-        val applyAdditiveDdl = flags["apply-additive-ddl"]?.toBooleanStrictOrNull() ?: false
-        val allowLoopbackHttpForTesting = flags["allow-loopback-http-for-testing"]?.toBooleanStrictOrNull() ?: false
+        val dryRun: Boolean
+        val networkEnabled: Boolean
+        val allowDurableWrites: Boolean
+        val allowIndexedPlayersBlankUpdate: Boolean
+        val applyAdditiveDdl: Boolean
+        val allowLoopbackHttpForTesting: Boolean
+        val maxHttpAttempts: Int
+        val maxWallTimeMs: Long
+        val dbTimeoutMs: Long
+        val ddlTimeoutMs: Long
+        val connectTimeoutMs: Int
+        val readTimeoutMs: Int
+        val callDeadlineMs: Long
+        val maxBodyBytes: Int
+
+        try {
+            dryRun = parseBooleanFlag(flags, "dry-run", true)
+            networkEnabled = parseBooleanFlag(flags, "network-enabled", false)
+            allowDurableWrites = parseBooleanFlag(flags, "allow-durable-writes", false)
+            allowIndexedPlayersBlankUpdate = parseBooleanFlag(flags, "allow-indexed-players-blank-update", false)
+            applyAdditiveDdl = parseBooleanFlag(flags, "apply-additive-ddl", false)
+            allowLoopbackHttpForTesting = parseBooleanFlag(flags, "allow-loopback-http-for-testing", false)
+
+            maxHttpAttempts = parseIntFlag(
+                flags,
+                "max-http-attempts",
+                OffProdChallengerIdentityCompletionTool.MAX_ALLOWED_HTTP_ATTEMPTS
+            )
+            maxWallTimeMs = parseLongFlag(
+                flags,
+                "max-wall-time-ms",
+                OffProdChallengerIdentityCompletionTool.DEFAULT_MAX_WALL_TIME_MS
+            )
+            dbTimeoutMs = parseLongFlag(
+                flags,
+                "db-timeout-ms",
+                OffProdChallengerIdentityCompletionTool.DEFAULT_DB_OPERATION_TIMEOUT_MS
+            )
+            ddlTimeoutMs = parseLongFlag(flags, "ddl-timeout-ms", dbTimeoutMs)
+            connectTimeoutMs = parseIntFlag(
+                flags,
+                "http-connect-timeout-ms",
+                OffProdChallengerIdentityCompletionTool.DEFAULT_CONNECT_TIMEOUT_MS
+            )
+            readTimeoutMs = parseIntFlag(
+                flags,
+                "http-read-timeout-ms",
+                OffProdChallengerIdentityCompletionTool.DEFAULT_READ_TIMEOUT_MS
+            )
+            callDeadlineMs = parseLongFlag(
+                flags,
+                "http-call-deadline-ms",
+                OffProdChallengerIdentityCompletionTool.DEFAULT_CALL_DEADLINE_MS
+            )
+            maxBodyBytes = parseIntFlag(
+                flags,
+                "max-body-bytes",
+                OffProdChallengerIdentityCompletionTool.MAX_RESPONSE_BODY_BYTES
+            )
+        } catch (e: IllegalArgumentException) {
+            return CliExecutionResult(
+                exitCode = 2,
+                report = null,
+                ddlApplied = false,
+                outputReportPath = null,
+                outputRemainingManifestPath = null,
+                errorMessage = "Invalid CLI flag: ${e.message}"
+            )
+        }
 
         if (applyAdditiveDdl && (dryRun || !allowDurableWrites)) {
             return CliExecutionResult(
@@ -175,33 +238,6 @@ object OffProdChallengerIdentityCompletionCli {
         }
         val coordinationAttestation = flags["coordination-attestation"]?.trim().orEmpty()
 
-        val maxHttpAttempts = flags["max-http-attempts"]?.toIntOrNull()
-            ?: OffProdChallengerIdentityCompletionTool.MAX_ALLOWED_HTTP_ATTEMPTS
-        val maxWallTimeMs = flags["max-wall-time-ms"]?.toLongOrNull()
-            ?: OffProdChallengerIdentityCompletionTool.DEFAULT_MAX_WALL_TIME_MS
-        val dbTimeoutMs = flags["db-timeout-ms"]?.toLongOrNull()
-            ?: OffProdChallengerIdentityCompletionTool.DEFAULT_DB_OPERATION_TIMEOUT_MS
-        val ddlTimeoutMs = flags["ddl-timeout-ms"]?.toLongOrNull() ?: dbTimeoutMs
-        val connectTimeoutMs = flags["http-connect-timeout-ms"]?.toIntOrNull()
-            ?: OffProdChallengerIdentityCompletionTool.DEFAULT_CONNECT_TIMEOUT_MS
-        val readTimeoutMs = flags["http-read-timeout-ms"]?.toIntOrNull()
-            ?: OffProdChallengerIdentityCompletionTool.DEFAULT_READ_TIMEOUT_MS
-        val callDeadlineMs = flags["http-call-deadline-ms"]?.toLongOrNull()
-            ?: OffProdChallengerIdentityCompletionTool.DEFAULT_CALL_DEADLINE_MS
-        val maxBodyBytes = flags["max-body-bytes"]?.toIntOrNull()
-            ?: OffProdChallengerIdentityCompletionTool.MAX_RESPONSE_BODY_BYTES
-
-        if (maxWallTimeMs <= 0L || ddlTimeoutMs <= 0L) {
-            return CliExecutionResult(
-                exitCode = 2,
-                report = null,
-                ddlApplied = false,
-                outputReportPath = null,
-                outputRemainingManifestPath = null,
-                errorMessage = "Invalid execution options: maxWallTimeMs and ddlTimeoutMs must be > 0"
-            )
-        }
-
         val baseUrlByCluster = try {
             parseClusterUrlOverrides(flags["cluster-url-override"])
         } catch (e: IllegalArgumentException) {
@@ -215,6 +251,88 @@ object OffProdChallengerIdentityCompletionCli {
             )
         }
 
+        // Validate ALL execution options and timeouts BEFORE creating a DataSource or executing any DDL/SQL!
+        val validatedInitialOptions = try {
+            require(ddlTimeoutMs > 0L) { "ddlTimeoutMs ($ddlTimeoutMs) must be > 0" }
+            ExecutionOptions(
+                dryRun = dryRun,
+                networkEnabled = networkEnabled,
+                allowDurableWrites = allowDurableWrites,
+                enforceAbsentManifestScope = !allowIndexedPlayersBlankUpdate,
+                keyCoordinationMode = coordinationMode,
+                coordinationAttestation = coordinationAttestation,
+                maxTotalHttpAttempts = maxHttpAttempts,
+                maxWallTimeMs = maxWallTimeMs,
+                dbOperationTimeoutMs = dbTimeoutMs,
+                connectTimeoutMs = connectTimeoutMs,
+                readTimeoutMs = readTimeoutMs,
+                callDeadlineMs = callDeadlineMs,
+                maxBodyBytes = maxBodyBytes,
+                allowLoopbackHttpForTesting = allowLoopbackHttpForTesting,
+                baseUrlByCluster = baseUrlByCluster
+            )
+        } catch (e: IllegalArgumentException) {
+            return CliExecutionResult(
+                exitCode = 2,
+                report = null,
+                ddlApplied = false,
+                outputReportPath = null,
+                outputRemainingManifestPath = null,
+                errorMessage = "Invalid execution options: ${e.message}",
+                totalProcessBudgetMs = maxWallTimeMs.coerceAtLeast(0L)
+            )
+        }
+
+        val apiKey = flags["riot-api-key"]?.trim()?.takeIf { it.isNotEmpty() }
+            ?: env["OFFPROD_RIOT_API_KEY"]?.trim().orEmpty()
+
+        if (applyAdditiveDdl && networkEnabled) {
+            if (coordinationMode == KeyCoordinationMode.UNCOORDINATED || coordinationAttestation.isBlank()) {
+                return CliExecutionResult(
+                    exitCode = 2,
+                    report = null,
+                    ddlApplied = false,
+                    outputReportPath = null,
+                    outputRemainingManifestPath = null,
+                    errorMessage = "--apply-additive-ddl=true with --network-enabled=true requires valid --key-coordination-mode and non-blank --coordination-attestation before DDL",
+                    totalProcessBudgetMs = maxWallTimeMs
+                )
+            }
+            if (apiKey.isBlank()) {
+                return CliExecutionResult(
+                    exitCode = 2,
+                    report = null,
+                    ddlApplied = false,
+                    outputReportPath = null,
+                    outputRemainingManifestPath = null,
+                    errorMessage = "--apply-additive-ddl=true with --network-enabled=true requires non-blank --riot-api-key (or OFFPROD_RIOT_API_KEY) before DDL",
+                    totalProcessBudgetMs = maxWallTimeMs
+                )
+            }
+            try {
+                for (entry in manifest.entries) {
+                    val baseUrl = baseUrlByCluster[entry.routingCluster]?.trim()?.trimEnd('/')
+                        ?: throw IllegalArgumentException("Missing base URL for routing cluster '${entry.routingCluster}'")
+                    val targetUrl = "$baseUrl/riot/account/v1/accounts/by-puuid/${entry.normalizedPuuid}"
+                    OffProdChallengerIdentityCompletionTool.validateTargetUrlAndKeySafety(
+                        url = targetUrl,
+                        apiKey = apiKey,
+                        allowLoopbackHttpForTesting = allowLoopbackHttpForTesting
+                    )
+                }
+            } catch (e: IllegalArgumentException) {
+                return CliExecutionResult(
+                    exitCode = 2,
+                    report = null,
+                    ddlApplied = false,
+                    outputReportPath = null,
+                    outputRemainingManifestPath = null,
+                    errorMessage = "Invalid transport target or API key before DDL: ${e.message}",
+                    totalProcessBudgetMs = maxWallTimeMs
+                )
+            }
+        }
+
         val dataSource = try {
             dataSourceOverride ?: buildDataSourceFromFlagsOrEnv(flags, env)
         } catch (e: Exception) {
@@ -224,7 +342,8 @@ object OffProdChallengerIdentityCompletionCli {
                 ddlApplied = false,
                 outputReportPath = null,
                 outputRemainingManifestPath = null,
-                errorMessage = "Failed to configure JDBC DataSource: ${e.message}"
+                errorMessage = "Failed to configure JDBC DataSource: ${e.message}",
+                totalProcessBudgetMs = maxWallTimeMs
             )
         }
 
@@ -278,39 +397,7 @@ object OffProdChallengerIdentityCompletionCli {
             )
         }
 
-        val options = try {
-            ExecutionOptions(
-                dryRun = dryRun,
-                networkEnabled = networkEnabled,
-                allowDurableWrites = allowDurableWrites,
-                enforceAbsentManifestScope = !allowIndexedPlayersBlankUpdate,
-                keyCoordinationMode = coordinationMode,
-                coordinationAttestation = coordinationAttestation,
-                maxTotalHttpAttempts = maxHttpAttempts,
-                maxWallTimeMs = remainingWallTimeForRunMs,
-                dbOperationTimeoutMs = dbTimeoutMs,
-                connectTimeoutMs = connectTimeoutMs,
-                readTimeoutMs = readTimeoutMs,
-                callDeadlineMs = callDeadlineMs,
-                maxBodyBytes = maxBodyBytes,
-                allowLoopbackHttpForTesting = allowLoopbackHttpForTesting,
-                baseUrlByCluster = baseUrlByCluster
-            )
-        } catch (e: IllegalArgumentException) {
-            return CliExecutionResult(
-                exitCode = 2,
-                report = null,
-                ddlApplied = ddlApplied,
-                outputReportPath = null,
-                outputRemainingManifestPath = null,
-                errorMessage = "Invalid execution options: ${e.message}",
-                ddlStageBudgetMs = effectiveDdlStageBudgetMs,
-                ddlStageElapsedMs = ddlStageElapsedMs,
-                runStageBudgetMs = remainingWallTimeForRunMs,
-                totalProcessBudgetMs = maxWallTimeMs,
-                totalProcessElapsedMs = (monotonicClock.nowMs() - cliStartMonoMs).coerceAtLeast(0L)
-            )
-        }
+        val options = validatedInitialOptions.copy(maxWallTimeMs = remainingWallTimeForRunMs)
 
         val persistence = JdbcIdentityCompletionPersistenceAdapter(
             dataSource = dataSource,
@@ -323,9 +410,6 @@ object OffProdChallengerIdentityCompletionCli {
             monotonicClock = monotonicClock,
             wallClock = wallClock
         )
-
-        val apiKey = flags["riot-api-key"]?.trim()?.takeIf { it.isNotEmpty() }
-            ?: env["OFFPROD_RIOT_API_KEY"]?.trim().orEmpty()
 
         val report = try {
             tool.runBounded(
@@ -543,6 +627,24 @@ object OffProdChallengerIdentityCompletionCli {
             }
         }
         return result
+    }
+
+    private fun parseBooleanFlag(flags: Map<String, String>, key: String, defaultValue: Boolean): Boolean {
+        val raw = flags[key] ?: return defaultValue
+        return raw.lowercase(Locale.ROOT).toBooleanStrictOrNull()
+            ?: throw IllegalArgumentException("--$key must be 'true' or 'false' (was '$raw')")
+    }
+
+    private fun parseIntFlag(flags: Map<String, String>, key: String, defaultValue: Int): Int {
+        val raw = flags[key] ?: return defaultValue
+        return raw.toIntOrNull()
+            ?: throw IllegalArgumentException("--$key must be a valid 32-bit integer (was '$raw')")
+    }
+
+    private fun parseLongFlag(flags: Map<String, String>, key: String, defaultValue: Long): Long {
+        val raw = flags[key] ?: return defaultValue
+        return raw.toLongOrNull()
+            ?: throw IllegalArgumentException("--$key must be a valid 64-bit integer (was '$raw')")
     }
 
     private fun parseClusterUrlOverrides(rawOverride: String?): Map<String, String> {

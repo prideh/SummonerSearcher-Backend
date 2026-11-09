@@ -262,7 +262,9 @@ class OffProdChallengerIdentityCompletionTool(
             require(maxTotalHttpAttempts in 1..MAX_ALLOWED_HTTP_ATTEMPTS) {
                 "maxTotalHttpAttempts ($maxTotalHttpAttempts) must be within 1..$MAX_ALLOWED_HTTP_ATTEMPTS"
             }
-            require(maxWallTimeMs > 0L) { "maxWallTimeMs must be > 0" }
+            require(maxWallTimeMs in 1L..DEFAULT_MAX_WALL_TIME_MS) {
+                "maxWallTimeMs ($maxWallTimeMs) must be within 1..$DEFAULT_MAX_WALL_TIME_MS"
+            }
             require(connectTimeoutMs > 0) { "connectTimeoutMs must be > 0" }
             require(readTimeoutMs > 0) { "readTimeoutMs must be > 0" }
             require(callDeadlineMs > 0L) { "callDeadlineMs must be > 0" }

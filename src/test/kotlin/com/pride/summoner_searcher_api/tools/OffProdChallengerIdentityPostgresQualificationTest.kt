@@ -392,6 +392,68 @@ class OffProdChallengerIdentityPostgresQualificationTest {
                 }
             }
 
+            // 2b. Regression: invalid options combined with --apply-additive-ddl=true MUST be rejected BEFORE
+            //     opening any JDBC connection or executing CREATE TABLE (0 SQL connections, 0 DDL effects).
+            val invalidOptionSets = listOf(
+                listOf("--max-http-attempts=192"),
+                listOf("--max-http-attempts=0"),
+                listOf("--max-http-attempts=notanint"),
+                listOf("--max-body-bytes=4097"),
+                listOf("--max-body-bytes=0"),
+                listOf("--max-wall-time-ms=180001"),
+                listOf("--max-wall-time-ms=0"),
+                listOf("--http-connect-timeout-ms=0"),
+                listOf("--http-read-timeout-ms=0"),
+                listOf("--http-call-deadline-ms=0"),
+                listOf("--db-timeout-ms=0"),
+                listOf("--ddl-timeout-ms=0"),
+                listOf("--allow-loopback-http-for-testing=notabool"),
+                listOf("--network-enabled=true", "--key-coordination-mode=UNCOORDINATED"),
+                listOf(
+                    "--network-enabled=true",
+                    "--key-coordination-mode=EXCLUSIVE_KEY",
+                    "--coordination-attestation=test-lease",
+                    "--riot-api-key=RGAPI-test",
+                    "--cluster-url-override=europe=https://evil.example.com"
+                )
+            )
+            val preDdlConnectionsOpened = AtomicInteger(0)
+            val trackingDataSource = object : DataSource by pgDataSource {
+                override fun getConnection(): Connection {
+                    preDdlConnectionsOpened.incrementAndGet()
+                    return pgDataSource.connection
+                }
+            }
+            for (extraFlags in invalidOptionSets) {
+                val invalidResult = OffProdChallengerIdentityCompletionCli.runCli(
+                    args = listOf(
+                        "--manifest-file=${manifestFile.absolutePath}",
+                        "--jdbc-url=$jdbcUrl",
+                        "--db-user=postgres",
+                        "--db-pass=",
+                        "--dry-run=false",
+                        "--allow-durable-writes=true",
+                        "--apply-additive-ddl=true"
+                    ) + extraFlags,
+                    dataSourceOverride = trackingDataSource
+                )
+                assertEquals(
+                    2,
+                    invalidResult.exitCode,
+                    "Expected exitCode=2 for invalid flags $extraFlags, got ${invalidResult.exitCode} (${invalidResult.errorMessage})"
+                )
+                assertEquals(false, invalidResult.ddlApplied, "DDL must not be applied when options $extraFlags are invalid")
+            }
+            assertEquals(0, preDdlConnectionsOpened.get(), "Must open 0 JDBC connections when CLI options are invalid")
+            pgDataSource.connection.use { conn ->
+                conn.prepareStatement("SELECT to_regclass('public.player_riot_identities')").use { ps ->
+                    ps.executeQuery().use { rs ->
+                        assertTrue(rs.next())
+                        assertEquals(null, rs.getString(1), "Invalid options + --apply-additive-ddl=true must leave player_riot_identities absent (0 SQL executed)")
+                    }
+                }
+            }
+
             // 3. Run standalone CLI with --apply-additive-ddl=true and mocked Riot Account-V1 server for all 191 absent candidates (31 EUW + 160 KR)
             // Enforces absent-manifest scope (allowIndexedPlayersBlankUpdate = false by default) -> 0 indexed_players updates and exact 191 identity writes!
             val fixedVerifiedInstant = Instant.parse("2026-11-09T12:30:00Z")
@@ -674,6 +736,11 @@ class OffProdChallengerIdentityPostgresQualificationTest {
                     "--network-enabled=true",
                     "--allow-durable-writes=true",
                     "--apply-additive-ddl=true",
+                    "--key-coordination-mode=EXCLUSIVE_KEY",
+                    "--coordination-attestation=ddl-shared-budget-test",
+                    "--riot-api-key=${OffProdChallengerIdentityCompletionTool.LOOPBACK_TEST_API_KEY_PREFIX}ddl-budget",
+                    "--allow-loopback-http-for-testing=true",
+                    "--cluster-url-override=europe=http://127.0.0.1:$port,asia=http://127.0.0.1:$port",
                     "--ddl-timeout-ms=5000",
                     "--db-timeout-ms=5000",
                     "--max-wall-time-ms=1000"
