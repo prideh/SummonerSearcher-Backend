@@ -603,9 +603,19 @@ def start_backend_container(
     for _ in range(90):
         try:
             http_json(f"{target_base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=OP_HEADERS, timeout=5)
-            break
+            logs_proc = subprocess.run(
+                ["docker", "logs", container_name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=10,
+                check=False,
+            )
+            logs_out = logs_proc.stdout.decode("utf-8", errors="replace")
+            if "Scheduled cache check complete." in logs_out:
+                break
         except Exception:
-            time.sleep(1)
+            pass
+        time.sleep(0.5)
     else:
         subprocess.run(["docker", "logs", container_name])
         raise RuntimeError(f"Failed to boot {image_tag} in {container_name}")
