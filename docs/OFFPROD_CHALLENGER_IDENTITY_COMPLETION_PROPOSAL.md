@@ -75,6 +75,46 @@
    -- Read-only SELECT grant for the application service role (if distinct from table owner):
    GRANT SELECT ON TABLE public.player_riot_identities TO <app_db_role>;
    ```
+   - **Standalone Setup Wrapper (`OffProdAdditiveIdentitySchemaSetupCli`, `<= 10s` Readiness Separated from Unchanged `<= 2,500ms` SQL / `<= 2,000ms` Lock Fence, Shared `<= 15s` Total Cap, `<= 256 MiB` Heap Cap, All `fef2ed6` Code Files Unchanged)**:
+     - **Default Dry-Run Check (`0` DDL Executed, Read-Only)**:
+       ```bash
+       export OFFPROD_JDBC_URL="jdbc:postgresql://<db-host>:5432/<db-name>"
+       export OFFPROD_DB_USER="<db-user>"
+       export OFFPROD_DB_PASS="<secret-from-vault-or-prompt>"
+
+       java -Xms16m -Xmx128m -XX:MaxMetaspaceSize=96m -XX:+UseSerialGC \
+         -Dloader.main=com.pride.summoner_searcher_api.tools.OffProdAdditiveIdentitySchemaSetupCli \
+         -cp build/libs/summoner-searcher-api-0.0.1-SNAPSHOT.jar \
+         org.springframework.boot.loader.launch.PropertiesLauncher \
+         --dry-run=true \
+         --apply-ddl=false \
+         --readiness-timeout-ms=10000 \
+         --sql-timeout-ms=2500 \
+         --lock-timeout-ms=2000 \
+         --max-total-wall-time-ms=15000 \
+         --enforce-max-heap-256m=true \
+         --output-report-file=/tmp/setup_schema_dryrun_report.json
+       ```
+     - **Bounded Additive DDL Apply (`CREATE TABLE IF NOT EXISTS public.player_riot_identities` + Separate-Connection Verification)**:
+       ```bash
+       export OFFPROD_JDBC_URL="jdbc:postgresql://<db-host>:5432/<db-name>"
+       export OFFPROD_DB_USER="<db-user>"
+       export OFFPROD_DB_PASS="<secret-from-vault-or-prompt>"
+
+       java -Xms16m -Xmx128m -XX:MaxMetaspaceSize=96m -XX:+UseSerialGC \
+         -Dloader.main=com.pride.summoner_searcher_api.tools.OffProdAdditiveIdentitySchemaSetupCli \
+         -cp build/libs/summoner-searcher-api-0.0.1-SNAPSHOT.jar \
+         org.springframework.boot.loader.launch.PropertiesLauncher \
+         --apply-ddl=true \
+         --dry-run=false \
+         --allow-ddl-writes=true \
+         --readiness-timeout-ms=10000 \
+         --sql-timeout-ms=2500 \
+         --lock-timeout-ms=2000 \
+         --max-total-wall-time-ms=15000 \
+         --enforce-max-heap-256m=true \
+         --output-report-file=/tmp/setup_schema_apply_report.json
+       ```
 2. **Exact SQL Executed by Off-Production CLI (`--apply-additive-ddl=false`, Absent-Manifest `191`-Only Scope)**:
    - **Pre-Call Read-Only Recheck (`conn.isReadOnly = true`)**:
      ```sql
