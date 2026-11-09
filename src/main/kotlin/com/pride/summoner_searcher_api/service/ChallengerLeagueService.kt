@@ -749,101 +749,21 @@ class ChallengerLeagueService @Autowired constructor(
         }
 
         val future = try {
-            dbLookupExecutor.submit(java.util.concurrent.Callable<Map<String, Pair<String, String>>> {
-                if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
-                    workerDoneLatch.countDown()
-                    releasePermitParticipant()
-                    return@Callable emptyMap()
-                }
-                activeDbLookupWorkers.incrementAndGet()
-                workerThreadRef.set(Thread.currentThread())
-                var conn: Connection? = null
-                var stmt: PreparedStatement? = null
-                try {
-                    if (cancelled.get() || Thread.currentThread().isInterrupted) {
-                        return@Callable emptyMap()
-                    }
-                    val queryTimeoutSeconds = ((effectiveTimeoutMs + 999L) / 1000L).toInt().coerceAtLeast(1)
-                    val placeholders = candidatePuuids.joinToString(",") { "?" }
-                    val sql = "SELECT puuid, game_name, tag_line FROM indexed_players WHERE puuid IN ($placeholders)"
-                    val resolved = HashMap<String, Pair<String, String>>()
-
-                    runCatching {
-                        if (ds.loginTimeout <= 0) {
-                            ds.loginTimeout = queryTimeoutSeconds
-                        }
-                    }
-                    conn = ds.connection
-                    activeConnectionRef.set(conn)
-                    if (cancelled.get() || Thread.currentThread().isInterrupted) {
-                        return@Callable emptyMap()
-                    }
-                    runCatching { conn.isReadOnly = true }
-
-                    val jdbcUrl = runCatching { conn.metaData?.url?.lowercase().orEmpty() }.getOrDefault("")
-                    val isEmbeddedInMemoryH2 = jdbcUrl.startsWith("jdbc:h2:mem:")
-                    val networkTimeoutSupported = runCatching {
-                        conn.setNetworkTimeout(dbAbortExecutor, effectiveTimeoutMs.toInt().coerceAtLeast(1))
-                        true
-                    }.getOrElse { false }
-                    if (!networkTimeoutSupported && !isEmbeddedInMemoryH2) {
-                        logger.warn(
-                            "[ChallengerLeaderboard] JDBC Connection for {} does not support bounded setNetworkTimeout; failing closed and skipping optional DB lookup.",
-                            normalizedRegion
-                        )
-                        return@Callable emptyMap()
-                    }
-
-                    stmt = conn.prepareStatement(sql)
-                    activeStatementRef.set(stmt)
-                    val queryTimeoutSupported = runCatching {
-                        stmt.maxRows = candidatePuuids.size.coerceAtMost(MAX_LEADERBOARD_ENTRIES)
-                        stmt.queryTimeout = queryTimeoutSeconds
-                        stmt.queryTimeout == queryTimeoutSeconds
-                    }.getOrElse { false }
-                    if (!queryTimeoutSupported) {
-                        logger.warn(
-                            "[ChallengerLeaderboard] JDBC PreparedStatement for {} does not support bounded setQueryTimeout; failing closed and skipping optional DB lookup.",
-                            normalizedRegion
-                        )
-                        return@Callable emptyMap()
-                    }
-
-                    for (i in candidatePuuids.indices) {
-                        stmt.setString(i + 1, candidatePuuids[i])
-                    }
-                    if (cancelled.get() || Thread.currentThread().isInterrupted) {
-                        return@Callable emptyMap()
-                    }
-                    stmt.executeQuery().use { rs ->
-                        while (rs.next()) {
-                            if (cancelled.get() || Thread.currentThread().isInterrupted) {
-                                break
-                            }
-                            val p = rs.getString(1)?.trim().orEmpty()
-                            val gn = rs.getString(2)?.trim().orEmpty()
-                            val tl = rs.getString(3)?.trim().orEmpty()
-                            if (p.isNotBlank() && gn.isNotBlank() && tl.isNotBlank()) {
-                                resolved[p] = gn to tl
-                            }
-                        }
-                    }
-                    resolved
-                } finally {
-                    if (cancelled.get()) {
-                        runCatching { conn?.abort(dbAbortExecutor) }
-                    }
-                    runCatching { stmt?.close() }
-                    runCatching { conn?.close() }
-                    activeStatementRef.set(null)
-                    activeConnectionRef.set(null)
-                    workerThreadRef.set(null)
-                    activeDbLookupWorkers.decrementAndGet()
-                    Thread.interrupted()
-                    workerDoneLatch.countDown()
-                    releasePermitParticipant()
-                }
-            })
+            dbLookupExecutor.submit<Map<String, Pair<String, String>>> {
+                executeBoundedDbIdentityQuery(
+                    normalizedRegion = normalizedRegion,
+                    ds = ds,
+                    candidatePuuids = candidatePuuids,
+                    effectiveTimeoutMs = effectiveTimeoutMs,
+                    taskClaimedOrCancelled = taskClaimedOrCancelled,
+                    cancelled = cancelled,
+                    activeConnectionRef = activeConnectionRef,
+                    activeStatementRef = activeStatementRef,
+                    workerThreadRef = workerThreadRef,
+                    workerDoneLatch = workerDoneLatch,
+                    releasePermitParticipant = ::releasePermitParticipant
+                )
+            }
         } catch (e: java.util.concurrent.RejectedExecutionException) {
             if (permitReleased.compareAndSet(false, true)) {
                 dbLookupPermits.release()
@@ -875,6 +795,114 @@ class ChallengerLeagueService @Autowired constructor(
             workerDoneLatch.await(30L, java.util.concurrent.TimeUnit.MILLISECONDS)
             logger.warn("[ChallengerLeaderboard] Local DB identity lookup failed for {}: {}", normalizedRegion, e.message)
             emptyMap()
+        }
+    }
+
+    private fun executeBoundedDbIdentityQuery(
+        normalizedRegion: String,
+        ds: DataSource,
+        candidatePuuids: List<String>,
+        effectiveTimeoutMs: Long,
+        taskClaimedOrCancelled: java.util.concurrent.atomic.AtomicBoolean,
+        cancelled: java.util.concurrent.atomic.AtomicBoolean,
+        activeConnectionRef: AtomicReference<Connection?>,
+        activeStatementRef: AtomicReference<PreparedStatement?>,
+        workerThreadRef: AtomicReference<Thread?>,
+        workerDoneLatch: java.util.concurrent.CountDownLatch,
+        releasePermitParticipant: () -> Unit
+    ): Map<String, Pair<String, String>> {
+        if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
+            workerDoneLatch.countDown()
+            releasePermitParticipant()
+            return emptyMap()
+        }
+        activeDbLookupWorkers.incrementAndGet()
+        workerThreadRef.set(Thread.currentThread())
+        var conn: Connection? = null
+        var stmt: PreparedStatement? = null
+        try {
+            if (cancelled.get() || Thread.currentThread().isInterrupted) {
+                return emptyMap()
+            }
+            val queryTimeoutSeconds = ((effectiveTimeoutMs + 999L) / 1000L).toInt().coerceAtLeast(1)
+            val placeholders = candidatePuuids.joinToString(",") { "?" }
+            val sql = "SELECT puuid, game_name, tag_line FROM indexed_players WHERE puuid IN ($placeholders)"
+            val resolved = HashMap<String, Pair<String, String>>()
+
+            runCatching {
+                if (ds.loginTimeout <= 0) {
+                    ds.loginTimeout = queryTimeoutSeconds
+                }
+            }
+            conn = ds.connection
+            activeConnectionRef.set(conn)
+            if (cancelled.get() || Thread.currentThread().isInterrupted) {
+                return emptyMap()
+            }
+            runCatching { conn.isReadOnly = true }
+
+            val jdbcUrl = runCatching { conn.metaData?.url?.lowercase().orEmpty() }.getOrDefault("")
+            val isEmbeddedInMemoryH2 = jdbcUrl.startsWith("jdbc:h2:mem:")
+            val networkTimeoutSupported = runCatching {
+                conn.setNetworkTimeout(dbAbortExecutor, effectiveTimeoutMs.toInt().coerceAtLeast(1))
+                true
+            }.getOrElse { false }
+            if (!networkTimeoutSupported && !isEmbeddedInMemoryH2) {
+                logger.warn(
+                    "[ChallengerLeaderboard] JDBC Connection for {} does not support bounded setNetworkTimeout; failing closed and skipping optional DB lookup.",
+                    normalizedRegion
+                )
+                return emptyMap()
+            }
+
+            stmt = conn.prepareStatement(sql)
+            activeStatementRef.set(stmt)
+            val queryTimeoutSupported = runCatching {
+                stmt.maxRows = candidatePuuids.size.coerceAtMost(MAX_LEADERBOARD_ENTRIES)
+                stmt.queryTimeout = queryTimeoutSeconds
+                stmt.queryTimeout == queryTimeoutSeconds
+            }.getOrElse { false }
+            if (!queryTimeoutSupported) {
+                logger.warn(
+                    "[ChallengerLeaderboard] JDBC PreparedStatement for {} does not support bounded setQueryTimeout; failing closed and skipping optional DB lookup.",
+                    normalizedRegion
+                )
+                return emptyMap()
+            }
+
+            for (i in candidatePuuids.indices) {
+                stmt.setString(i + 1, candidatePuuids[i])
+            }
+            if (cancelled.get() || Thread.currentThread().isInterrupted) {
+                return emptyMap()
+            }
+            stmt.executeQuery().use { rs ->
+                while (rs.next()) {
+                    if (cancelled.get() || Thread.currentThread().isInterrupted) {
+                        break
+                    }
+                    val p = rs.getString(1)?.trim().orEmpty()
+                    val gn = rs.getString(2)?.trim().orEmpty()
+                    val tl = rs.getString(3)?.trim().orEmpty()
+                    if (p.isNotBlank() && gn.isNotBlank() && tl.isNotBlank()) {
+                        resolved[p] = gn to tl
+                    }
+                }
+            }
+            return resolved
+        } finally {
+            if (cancelled.get()) {
+                runCatching { conn?.abort(dbAbortExecutor) }
+            }
+            runCatching { stmt?.close() }
+            runCatching { conn?.close() }
+            activeStatementRef.set(null)
+            activeConnectionRef.set(null)
+            workerThreadRef.set(null)
+            activeDbLookupWorkers.decrementAndGet()
+            Thread.interrupted()
+            workerDoneLatch.countDown()
+            releasePermitParticipant()
         }
     }
 
