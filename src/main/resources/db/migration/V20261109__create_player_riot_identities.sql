@@ -10,7 +10,9 @@
 --      for O(log N) batched `WHERE puuid IN (...)` lookups and `ON CONFLICT (puuid)` upserts.
 --   4. 100% backward-compatible with rollback commit 139a7de48e67af9d664c08fd61ce131b6e63bd74
 --      (which ignores `player_riot_identities` and reads only `indexed_players`).
--- Rollback : DROP TABLE IF EXISTS player_riot_identities;
+-- Rollback : Data-preserving application rollback only (revert application to 139a7de48e67af9d664c08fd61ce131b6e63bd74
+--            or 5959a7036c9e281f72d17f0a0bd5003ba59476f8 and leave `player_riot_identities` table and verified rows intact;
+--            do NOT drop table or delete verified rows on rollback).
 -- ============================================================================
 
 CREATE TABLE IF NOT EXISTS player_riot_identities (

@@ -97,6 +97,7 @@ object OffProdChallengerIdentityCompletionCli {
         monotonicClock: MonotonicClock = SystemMonotonicClock,
         wallClock: WallClock = SystemUtcWallClock
     ): CliExecutionResult {
+        val cliStartMonoMs = monotonicClock.nowMs()
         val flags = parseFlags(args)
         val manifestPath = flags["manifest-file"]?.trim().orEmpty()
         if (manifestPath.isEmpty()) {
@@ -138,6 +139,7 @@ object OffProdChallengerIdentityCompletionCli {
         val dryRun = flags["dry-run"]?.toBooleanStrictOrNull() ?: true
         val networkEnabled = flags["network-enabled"]?.toBooleanStrictOrNull() ?: false
         val allowDurableWrites = flags["allow-durable-writes"]?.toBooleanStrictOrNull() ?: false
+        val allowIndexedPlayersBlankUpdate = flags["allow-indexed-players-blank-update"]?.toBooleanStrictOrNull() ?: false
         val applyAdditiveDdl = flags["apply-additive-ddl"]?.toBooleanStrictOrNull() ?: false
         val allowLoopbackHttpForTesting = flags["allow-loopback-http-for-testing"]?.toBooleanStrictOrNull() ?: false
 
@@ -183,6 +185,17 @@ object OffProdChallengerIdentityCompletionCli {
         val maxBodyBytes = flags["max-body-bytes"]?.toIntOrNull()
             ?: OffProdChallengerIdentityCompletionTool.MAX_RESPONSE_BODY_BYTES
 
+        if (maxWallTimeMs <= 0L) {
+            return CliExecutionResult(
+                exitCode = 2,
+                report = null,
+                ddlApplied = false,
+                outputReportPath = null,
+                outputRemainingManifestPath = null,
+                errorMessage = "Invalid execution options: maxWallTimeMs must be > 0"
+            )
+        }
+
         val baseUrlByCluster = try {
             parseClusterUrlOverrides(flags["cluster-url-override"])
         } catch (e: IllegalArgumentException) {
@@ -193,34 +206,6 @@ object OffProdChallengerIdentityCompletionCli {
                 outputReportPath = null,
                 outputRemainingManifestPath = null,
                 errorMessage = e.message
-            )
-        }
-
-        val options = try {
-            ExecutionOptions(
-                dryRun = dryRun,
-                networkEnabled = networkEnabled,
-                allowDurableWrites = allowDurableWrites,
-                keyCoordinationMode = coordinationMode,
-                coordinationAttestation = coordinationAttestation,
-                maxTotalHttpAttempts = maxHttpAttempts,
-                maxWallTimeMs = maxWallTimeMs,
-                dbOperationTimeoutMs = dbTimeoutMs,
-                connectTimeoutMs = connectTimeoutMs,
-                readTimeoutMs = readTimeoutMs,
-                callDeadlineMs = callDeadlineMs,
-                maxBodyBytes = maxBodyBytes,
-                allowLoopbackHttpForTesting = allowLoopbackHttpForTesting,
-                baseUrlByCluster = baseUrlByCluster
-            )
-        } catch (e: IllegalArgumentException) {
-            return CliExecutionResult(
-                exitCode = 2,
-                report = null,
-                ddlApplied = false,
-                outputReportPath = null,
-                outputRemainingManifestPath = null,
-                errorMessage = "Invalid execution options: ${e.message}"
             )
         }
 
@@ -239,10 +224,15 @@ object OffProdChallengerIdentityCompletionCli {
 
         var ddlApplied = false
         if (applyAdditiveDdl) {
-            val ddlResult = applyReviewedAdditiveDdlBounded(dataSource, dbTimeoutMs)
+            val elapsedBeforeDdlMs = (monotonicClock.nowMs() - cliStartMonoMs).coerceAtLeast(0L)
+            val remainingGlobalBeforeDdlMs = maxWallTimeMs - elapsedBeforeDdlMs
+            val effectiveDdlTimeoutMs = minOf(dbTimeoutMs, remainingGlobalBeforeDdlMs)
+            val ddlResult = applyReviewedAdditiveDdlBounded(dataSource, effectiveDdlTimeoutMs, monotonicClock)
             if (!ddlResult.first) {
+                val remainingGlobalAfterDdlMs = maxWallTimeMs - (monotonicClock.nowMs() - cliStartMonoMs).coerceAtLeast(0L)
+                val ddlExitCode = if (remainingGlobalAfterDdlMs <= 0L) 10 else 3
                 return CliExecutionResult(
-                    exitCode = 3,
+                    exitCode = ddlExitCode,
                     report = null,
                     ddlApplied = false,
                     outputReportPath = null,
@@ -253,7 +243,52 @@ object OffProdChallengerIdentityCompletionCli {
             ddlApplied = true
         }
 
-        val persistence = JdbcIdentityCompletionPersistenceAdapter(dataSource = dataSource)
+        val elapsedBeforeRunMs = (monotonicClock.nowMs() - cliStartMonoMs).coerceAtLeast(0L)
+        val remainingWallTimeForRunMs = maxWallTimeMs - elapsedBeforeRunMs
+        if (remainingWallTimeForRunMs <= 0L) {
+            return CliExecutionResult(
+                exitCode = 10,
+                report = null,
+                ddlApplied = ddlApplied,
+                outputReportPath = null,
+                outputRemainingManifestPath = null,
+                errorMessage = "Shared global wall-time budget (${maxWallTimeMs}ms) exhausted before runBounded stage"
+            )
+        }
+
+        val options = try {
+            ExecutionOptions(
+                dryRun = dryRun,
+                networkEnabled = networkEnabled,
+                allowDurableWrites = allowDurableWrites,
+                enforceAbsentManifestScope = !allowIndexedPlayersBlankUpdate,
+                keyCoordinationMode = coordinationMode,
+                coordinationAttestation = coordinationAttestation,
+                maxTotalHttpAttempts = maxHttpAttempts,
+                maxWallTimeMs = remainingWallTimeForRunMs,
+                dbOperationTimeoutMs = dbTimeoutMs,
+                connectTimeoutMs = connectTimeoutMs,
+                readTimeoutMs = readTimeoutMs,
+                callDeadlineMs = callDeadlineMs,
+                maxBodyBytes = maxBodyBytes,
+                allowLoopbackHttpForTesting = allowLoopbackHttpForTesting,
+                baseUrlByCluster = baseUrlByCluster
+            )
+        } catch (e: IllegalArgumentException) {
+            return CliExecutionResult(
+                exitCode = 2,
+                report = null,
+                ddlApplied = ddlApplied,
+                outputReportPath = null,
+                outputRemainingManifestPath = null,
+                errorMessage = "Invalid execution options: ${e.message}"
+            )
+        }
+
+        val persistence = JdbcIdentityCompletionPersistenceAdapter(
+            dataSource = dataSource,
+            allowIndexedPlayersBlankUpdate = allowIndexedPlayersBlankUpdate
+        )
         val transport = httpTransportOverride ?: HttpUrlConnectionAccountV1Transport()
         val tool = OffProdChallengerIdentityCompletionTool(
             persistencePort = persistence,
@@ -346,7 +381,8 @@ object OffProdChallengerIdentityCompletionCli {
 
     internal fun applyReviewedAdditiveDdlBounded(
         dataSource: DataSource,
-        timeoutMs: Long
+        timeoutMs: Long,
+        monotonicClock: MonotonicClock = SystemMonotonicClock
     ): Pair<Boolean, String> {
         if (timeoutMs <= 0L) {
             return false to "DDL timeout budget (${timeoutMs}ms) exhausted"
@@ -355,13 +391,17 @@ object OffProdChallengerIdentityCompletionCli {
         val connRef = AtomicReference<Connection?>(null)
         val stmtRef = AtomicReference<PreparedStatement?>(null)
         val cancelledOrTimedOut = AtomicBoolean(false)
+        val startMonoMs = monotonicClock.nowMs()
         val deadlineNano = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
 
-        fun isCancelledOrPastDeadline(): Boolean =
-            cancelledOrTimedOut.get() || Thread.currentThread().isInterrupted || System.nanoTime() >= deadlineNano
+        fun remainingBudgetMs(): Long {
+            val remNanoMs = TimeUnit.NANOSECONDS.toMillis(deadlineNano - System.nanoTime())
+            val remMonoMs = timeoutMs - (monotonicClock.nowMs() - startMonoMs)
+            return minOf(remNanoMs, remMonoMs)
+        }
 
-        fun remainingBudgetMs(): Long =
-            TimeUnit.NANOSECONDS.toMillis(deadlineNano - System.nanoTime())
+        fun isCancelledOrPastDeadline(): Boolean =
+            cancelledOrTimedOut.get() || Thread.currentThread().isInterrupted || remainingBudgetMs() <= 0L
 
         val netTimeoutExec = Executors.newSingleThreadExecutor { r ->
             Thread(r, "offprod-cli-ddl-net-timeout").apply { isDaemon = true }

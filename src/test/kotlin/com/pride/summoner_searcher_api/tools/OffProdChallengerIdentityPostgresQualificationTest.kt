@@ -88,7 +88,9 @@ class OffProdChallengerIdentityPostgresQualificationTest {
     @BeforeAll
     fun startIsolatedPostgres() {
         val binDir = findPostgresBinDir()
-        assumeTrue(binDir != null, "Local PostgreSQL binaries (/usr/lib/postgresql/*/bin/initdb) required for real PG qualification")
+        check(binDir != null) {
+            "Local PostgreSQL binaries (/usr/lib/postgresql/*/bin/initdb) required for real PG qualification; test skips are forbidden"
+        }
         pgBinDir = binDir
 
         val tempRoot = Files.createTempDirectory("offprod-pg-qual-")
@@ -187,7 +189,7 @@ class OffProdChallengerIdentityPostgresQualificationTest {
                 """.trimIndent()
             ).use { ps ->
                 val baseSeenAt = Instant.parse("2026-11-01T12:00:00Z")
-                // 269 complete EUW players (1..269)
+                // 269 complete EUW players (1..269), 31 absent (270..300)
                 for (i in 1..269) {
                     ps.setString(1, deterministicPuuid("euw1", i))
                     ps.setString(2, "EuwIndexed$i")
@@ -198,28 +200,8 @@ class OffProdChallengerIdentityPostgresQualificationTest {
                     ps.setTimestamp(7, Timestamp.from(baseSeenAt.plusSeconds(i.toLong())))
                     ps.addBatch()
                 }
-                // EUW candidate 270 has existing non-blank game_name ("PreservedEuw270") and blank tag_line ("")
-                // EUW candidate 271 has blank game_name ("") and existing non-blank tag_line ("PRESERVEDTAG")
-                // EUW candidates 272..300 are completely absent from indexed_players
-                ps.setString(1, deterministicPuuid("euw1", 270))
-                ps.setString(2, "PreservedEuw270")
-                ps.setString(3, "   ")
-                ps.setString(4, "euw1")
-                ps.setInt(5, 777)
-                ps.setLong(6, 888L)
-                ps.setTimestamp(7, Timestamp.from(baseSeenAt))
-                ps.addBatch()
 
-                ps.setString(1, deterministicPuuid("euw1", 271))
-                ps.setString(2, "")
-                ps.setString(3, "PRESERVEDTAG")
-                ps.setString(4, "euw1")
-                ps.setInt(5, 778)
-                ps.setLong(6, 889L)
-                ps.setTimestamp(7, Timestamp.from(baseSeenAt))
-                ps.addBatch()
-
-                // 140 complete KR players (1..140), 160 missing (141..300)
+                // 140 complete KR players (1..140), 160 absent (141..300)
                 for (i in 1..140) {
                     ps.setString(1, deterministicPuuid("kr", i))
                     ps.setString(2, "KrIndexed$i")
@@ -376,7 +358,7 @@ class OffProdChallengerIdentityPostgresQualificationTest {
             assertEquals(140, krPre!!.entries.count { !it.gameName.isNullOrBlank() && !it.tagLine.isNullOrBlank() })
 
             // 2. Standalone CLI default dry-run BEFORE migration exists:
-            // Verifies 0 HTTP attempts, 0 DB writes, missing-table compatibility on DB recheck, and 191 pending
+            // Verifies 0 HTTP attempts, 0 DB writes, missing-table compatibility on DB recheck, and all 191 absent from indexed_players
             val dryRunResult = OffProdChallengerIdentityCompletionCli.runCli(
                 args = listOf(
                     "--manifest-file=${manifestFile.absolutePath}",
@@ -392,9 +374,10 @@ class OffProdChallengerIdentityPostgresQualificationTest {
             assertEquals(RunOutcome.DRY_RUN_DB_RECHECK_ONLY_COMPLETED, dryRunReport.outcome)
             assertEquals(191, dryRunReport.manifestTotalCount)
             assertEquals(0, dryRunReport.alreadyResolvedInDbCount)
-            assertEquals(2, dryRunReport.presentWithBlankFieldInIndexedPlayersCount)
-            assertEquals(189, dryRunReport.absentFromIndexedPlayersCount)
+            assertEquals(0, dryRunReport.presentWithBlankFieldInIndexedPlayersCount)
+            assertEquals(191, dryRunReport.absentFromIndexedPlayersCount)
             assertEquals(0, dryRunReport.httpAttemptsMade)
+            assertEquals(0, dryRunReport.durableIndexedPlayerUpdatesVerifiedCount)
             assertEquals(0, dryRunReport.durableIdentityTableUpsertsVerifiedCount)
             assertEquals(191, dryRunReport.remainingPendingCount)
             assertTrue(dryRunReportFile.isFile)
@@ -409,7 +392,8 @@ class OffProdChallengerIdentityPostgresQualificationTest {
                 }
             }
 
-            // 3. Run standalone CLI with --apply-additive-ddl=true and mocked Riot Account-V1 server for all 191 candidates (31 EUW + 160 KR)
+            // 3. Run standalone CLI with --apply-additive-ddl=true and mocked Riot Account-V1 server for all 191 absent candidates (31 EUW + 160 KR)
+            // Enforces absent-manifest scope (allowIndexedPlayersBlankUpdate = false by default) -> 0 indexed_players updates and exact 191 identity writes!
             val fixedVerifiedInstant = Instant.parse("2026-11-09T12:30:00Z")
             val liveResult = OffProdChallengerIdentityCompletionCli.runCli(
                 args = listOf(
@@ -439,20 +423,21 @@ class OffProdChallengerIdentityPostgresQualificationTest {
             val liveReport = liveResult.report!!
             assertEquals(RunOutcome.STAGED_ALL_CANDIDATES, liveReport.outcome)
             assertEquals(191, liveReport.manifestTotalCount)
+            assertEquals(191, liveReport.absentFromIndexedPlayersCount)
+            assertEquals(0, liveReport.presentWithBlankFieldInIndexedPlayersCount)
             assertEquals(191, liveReport.httpAttemptsMade)
-            assertEquals(2, liveReport.durableIndexedPlayerUpdatesVerifiedCount)
-            assertEquals(191, liveReport.durableIdentityTableUpsertsVerifiedCount)
+            assertEquals(0, liveReport.durableIndexedPlayerUpdatesVerifiedCount, "Must execute 0 updates on indexed_players under absent-manifest scope")
+            assertEquals(191, liveReport.durableIdentityTableUpsertsVerifiedCount, "Must execute exact 191 verified upserts in player_riot_identities")
             assertEquals(0, liveReport.remainingPendingCount)
 
             val remainingAfterFull = OffProdChallengerIdentityCompletionCli.readSnapshotManifest(remainingManifestFile)
             assertEquals(0, remainingAfterFull.entries.size)
 
             // 4. Verify PostgreSQL state:
-            // - player_riot_identities has 191 rows (31 EUW + 160 KR) with verified_at = 2026-11-09T12:30:00Z
-            // - indexed_players still has 411 rows (269 complete EUW + 2 partial EUW repaired + 140 complete KR; 0 fabricated rows)
-            // - EUW 270 preserved "PreservedEuw270" and filled tag_line = "EUW"
-            // - EUW 271 filled game_name = "RiotEuw271" and preserved tag_line = "PRESERVEDTAG"
+            // - player_riot_identities has exact 191 rows (31 EUW + 160 KR) with verified_at = 2026-11-09T12:30:00Z
+            // - indexed_players still has exact 409 rows (269 complete EUW + 140 complete KR; 0 fabricated rows, 0 updates)
             // - CHECK constraint rejects blank game_name/tag_line in player_riot_identities
+            // - Seed 1 conflicting row into player_riot_identities for EUW rank 1 to prove indexed_players precedence in ChallengerLeagueService
             pgDataSource.connection.use { conn ->
                 conn.prepareStatement("SELECT COUNT(*) FROM player_riot_identities").use { ps ->
                     ps.executeQuery().use { rs ->
@@ -473,25 +458,7 @@ class OffProdChallengerIdentityPostgresQualificationTest {
                 conn.prepareStatement("SELECT COUNT(*) FROM indexed_players").use { ps ->
                     ps.executeQuery().use { rs ->
                         assertTrue(rs.next())
-                        assertEquals(411, rs.getInt(1), "Must never insert fabricated rows into indexed_players")
-                    }
-                }
-                conn.prepareStatement("SELECT game_name, tag_line, profile_icon_id, summoner_level FROM indexed_players WHERE puuid = ?").use { ps ->
-                    ps.setString(1, deterministicPuuid("euw1", 270))
-                    ps.executeQuery().use { rs ->
-                        assertTrue(rs.next())
-                        assertEquals("PreservedEuw270", rs.getString(1), "Must preserve existing non-blank game_name")
-                        assertEquals("EUW", rs.getString(2), "Must fill blank tag_line")
-                        assertEquals(777, rs.getInt(3), "Must not touch profile_icon_id")
-                        assertEquals(888L, rs.getLong(4), "Must not touch summoner_level")
-                    }
-                }
-                conn.prepareStatement("SELECT game_name, tag_line FROM indexed_players WHERE puuid = ?").use { ps ->
-                    ps.setString(1, deterministicPuuid("euw1", 271))
-                    ps.executeQuery().use { rs ->
-                        assertTrue(rs.next())
-                        assertEquals("RiotEuw271", rs.getString(1), "Must fill blank game_name")
-                        assertEquals("PRESERVEDTAG", rs.getString(2), "Must preserve existing non-blank tag_line")
+                        assertEquals(409, rs.getInt(1), "Must never insert fabricated rows or alter indexed_players count")
                     }
                 }
                 // Verify non-blank CHECK constraint in real PostgreSQL
@@ -503,10 +470,17 @@ class OffProdChallengerIdentityPostgresQualificationTest {
                         ps.executeUpdate()
                     }
                 }
+                // Insert conflicting identity into player_riot_identities for EUW rank 1 (which is already in indexed_players as EuwIndexed1#EUW)
+                conn.prepareStatement(
+                    "INSERT INTO player_riot_identities (puuid, platform_region, game_name, tag_line, verified_at) VALUES (?, 'euw1', 'ConflictingOverride1', 'WRONG', now())"
+                ).use { ps ->
+                    ps.setString(1, deterministicPuuid("euw1", 1))
+                    ps.executeUpdate()
+                }
             }
 
             // 5. Verify ChallengerLeagueService read consumer coverage on 600/600 fixture (300/300 EUW + 300/300 KR)
-            // with indexed-first precedence and 0 Account-V1 fanout calls
+            // with indexed-first precedence (EUW rank 1 resolves to EuwIndexed1#EUW from indexed_players, ignoring ConflictingOverride1#WRONG) and 0 Account-V1 fanout calls
             redisStore.clear()
             val euwPost = challengerService.getOrRefreshChallengerLeague("euw1", "RANKED_SOLO_5x5")
             val krPost = challengerService.getOrRefreshChallengerLeague("kr", "RANKED_SOLO_5x5")
@@ -514,8 +488,11 @@ class OffProdChallengerIdentityPostgresQualificationTest {
             assertNotNull(krPost)
             assertEquals(300, euwPost!!.entries.count { !it.gameName.isNullOrBlank() && !it.tagLine.isNullOrBlank() })
             assertEquals(300, krPost!!.entries.count { !it.gameName.isNullOrBlank() && !it.tagLine.isNullOrBlank() })
+            val entry1Euw = euwPost.entries.first { it.puuid == deterministicPuuid("euw1", 1) }
+            assertEquals("EuwIndexed1", entry1Euw.gameName, "indexed_players must take precedence over player_riot_identities")
+            assertEquals("EUW", entry1Euw.tagLine)
             val entry270 = euwPost.entries.first { it.puuid == deterministicPuuid("euw1", 270) }
-            assertEquals("PreservedEuw270", entry270.gameName, "indexed_players must take precedence over player_riot_identities")
+            assertEquals("RiotEuw270", entry270.gameName)
             assertEquals("EUW", entry270.tagLine)
             val entry300Euw = euwPost.entries.first { it.puuid == deterministicPuuid("euw1", 300) }
             assertEquals("RiotEuw300", entry300Euw.gameName)
@@ -593,6 +570,69 @@ class OffProdChallengerIdentityPostgresQualificationTest {
                     }
                 }
             }
+
+            // 8. Verify default CLI absent-manifest scope blocks any candidate present in indexed_players with blank field (0 HTTP calls, 0 indexed_players updates)
+            //    and verify shared global maxWallTimeMs budget across --apply-additive-ddl=true + runBounded
+            val pBlankIndexed = deterministicPuuid("euw1", 999)
+            pgDataSource.connection.use { conn ->
+                conn.prepareStatement(
+                    "INSERT INTO indexed_players (puuid, game_name, tag_line, region, profile_icon_id, summoner_level, last_seen_at) VALUES (?, 'ExistingName', '   ', 'euw1', 777, 888, now())"
+                ).use { ps ->
+                    ps.setString(1, pBlankIndexed)
+                    ps.executeUpdate()
+                }
+            }
+            val blankScopeFile = workDir.resolve("blank-scope-manifest.json").toFile()
+            OffProdChallengerIdentityCompletionCli.writeSnapshotManifest(
+                file = blankScopeFile,
+                snapshotCapturedAtUtc = "2026-11-09T11:34:00Z",
+                entries = listOf(ManifestEntry(pBlankIndexed, "euw1"))
+            )
+            val callsBeforeScopeCheck = httpCalls.get()
+            val blockedScopeResult = OffProdChallengerIdentityCompletionCli.runCli(
+                args = listOf(
+                    "--manifest-file=${blankScopeFile.absolutePath}",
+                    "--jdbc-url=$jdbcUrl",
+                    "--db-user=postgres",
+                    "--db-pass=",
+                    "--dry-run=false",
+                    "--network-enabled=true",
+                    "--allow-durable-writes=true",
+                    "--key-coordination-mode=EXCLUSIVE_KEY",
+                    "--coordination-attestation=offprod-pg-qual-scope-check",
+                    "--riot-api-key=${OffProdChallengerIdentityCompletionTool.LOOPBACK_TEST_API_KEY_PREFIX}pg-qual-scope"
+                )
+            )
+            assertEquals(1, blockedScopeResult.exitCode)
+            assertEquals(RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT, blockedScopeResult.report!!.outcome)
+            assertEquals(callsBeforeScopeCheck, httpCalls.get(), "Must make 0 HTTP calls when absent-manifest scope is violated")
+            assertEquals(0, blockedScopeResult.report!!.durableIndexedPlayerUpdatesVerifiedCount)
+
+            // Verify shared global wall-time budget across DDL + runBounded:
+            // (a) If DDL takes 50_000ms of a 180_000ms budget, runBounded receives the remaining 130_000ms budget;
+            // (b) If DDL consumes the entire 180_000ms budget, runCli halts with exitCode=10 and 0 HTTP calls.
+            val ddlExhaustClock = object : MonotonicClock {
+                private val currentMs = AtomicLong(1_000L)
+                override fun nowMs(): Long = currentMs.addAndGet(100L)
+                override fun sleepMs(durationMs: Long) {}
+            }
+            val sharedBudgetExhaustedResult = OffProdChallengerIdentityCompletionCli.runCli(
+                args = listOf(
+                    "--manifest-file=${manifestFile.absolutePath}",
+                    "--jdbc-url=$jdbcUrl",
+                    "--db-user=postgres",
+                    "--db-pass=",
+                    "--dry-run=false",
+                    "--network-enabled=true",
+                    "--allow-durable-writes=true",
+                    "--apply-additive-ddl=true",
+                    "--db-timeout-ms=5000",
+                    "--max-wall-time-ms=1000"
+                ),
+                monotonicClock = ddlExhaustClock
+            )
+            assertEquals(10, sharedBudgetExhaustedResult.exitCode, "Must exit with 10 when shared global wall-time budget is exhausted by DDL stage")
+            assertEquals(callsBeforeScopeCheck, httpCalls.get(), "Must make 0 HTTP calls when shared global budget is exhausted after DDL")
         } finally {
             server.stop(0)
             workDir.toFile().deleteRecursively()

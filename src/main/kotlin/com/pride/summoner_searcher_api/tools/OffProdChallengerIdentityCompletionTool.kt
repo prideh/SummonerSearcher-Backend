@@ -240,6 +240,7 @@ class OffProdChallengerIdentityCompletionTool(
         val dryRun: Boolean = true,
         val networkEnabled: Boolean = false,
         val allowDurableWrites: Boolean = false,
+        val enforceAbsentManifestScope: Boolean = false,
         val keyCoordinationMode: KeyCoordinationMode = KeyCoordinationMode.UNCOORDINATED,
         val coordinationAttestation: String = "",
         val maxTotalHttpAttempts: Int = MAX_ALLOWED_HTTP_ATTEMPTS,
@@ -486,6 +487,57 @@ class OffProdChallengerIdentityCompletionTool(
                     candidatesToFetch.add(entry)
                 }
             }
+        }
+
+        if (options.enforceAbsentManifestScope && presentWithBlankCount > 0) {
+            for (pending in candidatesToFetch) {
+                val state = dbStatesByPuuid[pending.normalizedPuuid] ?: PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS
+                itemResults.add(
+                    ItemResult(
+                        puuid = pending.normalizedPuuid,
+                        platformRegion = pending.normalizedPlatformRegion,
+                        routingCluster = pending.routingCluster,
+                        preCallDbState = state,
+                        status = if (state == PreCallDbState.PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD) {
+                            ItemStatus.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT
+                        } else {
+                            ItemStatus.PENDING_UNPROCESSED
+                        },
+                        httpAttempted = false,
+                        detail = "Blocked by enforceAbsentManifestScope=true: indexed_players UPDATE not permitted under 191-only player_riot_identities grant"
+                    )
+                )
+            }
+            return CompletionRunReport(
+                outcome = RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT,
+                manifestSha256 = manifestHash,
+                snapshotCapturedAtUtc = manifest.snapshotCapturedAtUtc,
+                dryRun = options.dryRun,
+                networkEnabled = options.networkEnabled,
+                allowDurableWrites = options.allowDurableWrites,
+                keyCoordinationMode = options.keyCoordinationMode,
+                manifestTotalCount = manifest.entries.size,
+                alreadyResolvedInDbCount = alreadyResolvedCount,
+                presentWithBlankFieldInIndexedPlayersCount = presentWithBlankCount,
+                absentFromIndexedPlayersCount = absentCount,
+                httpAttemptsMade = 0,
+                maxTotalHttpAttempts = options.maxTotalHttpAttempts,
+                totalWaitTimeMs = 0L,
+                elapsedWallTimeMs = monotonicClock.nowMs() - startMonoMs,
+                validatedIdentitiesCount = 0,
+                durableIndexedPlayerUpdatesVerifiedCount = 0,
+                durableIdentityTableUpsertsVerifiedCount = 0,
+                concurrentAlreadyCompleteVerifiedCount = 0,
+                dbFailureOrUnknownCommitCount = presentWithBlankCount,
+                notFound404Count = 0,
+                omittedRiotIdFieldsCount = 0,
+                puuidMismatchCount = 0,
+                remainingPendingCount = candidatesToFetch.size,
+                remainingEntries = candidatesToFetch,
+                itemResults = itemResults,
+                lastObservedClusterHeaders = emptyMap(),
+                abortReason = "Absent-manifest scope violated: found $presentWithBlankCount candidate(s) in indexed_players with blank fields while enforceAbsentManifestScope=true (no indexed_players UPDATE permitted)"
+            )
         }
 
         if (candidatesToFetch.isEmpty()) {
@@ -1562,7 +1614,8 @@ interface IdentityCompletionPersistencePort {
  */
 class JdbcIdentityCompletionPersistenceAdapter(
     private val dataSource: DataSource,
-    private val checkIdentityTableInPreCall: Boolean = true
+    private val checkIdentityTableInPreCall: Boolean = true,
+    private val allowIndexedPlayersBlankUpdate: Boolean = false
 ) : IdentityCompletionPersistencePort {
 
     companion object {
@@ -1954,6 +2007,13 @@ class JdbcIdentityCompletionPersistenceAdapter(
         if (trimmedRegion.isEmpty() || trimmedGameName.isEmpty() || trimmedTagLine.isEmpty()) {
             return DbWriteVerificationResult.FailureOrUnknownCommit(
                 "persistAndVerifyIdentityBounded requires non-blank platformRegion, gameName, and tagLine"
+            )
+        }
+        if (preCallDbState == OffProdChallengerIdentityCompletionTool.PreCallDbState.PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD &&
+            !allowIndexedPlayersBlankUpdate
+        ) {
+            return DbWriteVerificationResult.FailureOrUnknownCommit(
+                "Refusing to UPDATE indexed_players for '$validatedPuuid': absent-manifest / player_riot_identities-only grant scope enforced (allowIndexedPlayersBlankUpdate=false)"
             )
         }
         if (timeoutMs <= 0L) {
