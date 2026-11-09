@@ -9,6 +9,8 @@ import java.net.URI
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import java.sql.Connection
+import java.sql.PreparedStatement
+import java.sql.SQLException
 import java.sql.Timestamp
 import java.time.Instant
 import java.util.Locale
@@ -20,36 +22,50 @@ import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import javax.sql.DataSource
+import kotlin.math.ceil
 
 /**
- * Isolated off-production one-shot tool for bounded missing-only Challenger Riot ID completion.
+ * Isolated off-production one-shot tool for bounded missing-only Challenger Riot ID staging.
+ *
+ * IMPORTANT SCOPE & NON-COMPLETION NOTICE:
+ * - This class is an isolated library component ONLY (no Spring `@Service`/`@Component`/`@Scheduled`,
+ *   no CLI `main` entrypoint wired, no Flyway/schema migration applied, and `ChallengerLeagueService`
+ *   read path does NOT yet query `player_riot_identities`). Writing to `player_riot_identities`
+ *   stages verified identities off-production and does NOT by itself complete live Challenger
+ *   leaderboard resolution.
  *
  * SAFETY & ISOLATION GUARANTEES:
- * - NOT a Spring bean (@Service / @Component / @Scheduled are intentionally omitted). Never instantiated
- *   or scheduled inside the production JVM.
  * - Defaults to no-effects mode: [ExecutionOptions.dryRun] = true, [ExecutionOptions.networkEnabled] = false,
  *   [ExecutionOptions.allowDurableWrites] = false, [ExecutionOptions.keyCoordinationMode] = UNCOORDINATED.
- * - Single worker only (strictly serial loop, concurrency = 1), hard ceiling of 191 total HTTP attempts
- *   ([MAX_ALLOWED_HTTP_ATTEMPTS]), fixed 180s default wall-time budget ([DEFAULT_MAX_WALL_TIME_MS]),
- *   single attempt per PUUID (zero automatic retries), strict 4 KiB ([MAX_RESPONSE_BODY_BYTES]) payload cap,
- *   and explicit socket disconnect + stream close on timeout or oversized payload.
- * - Does NOT claim cross-process rate-limit headroom when sharing a Riot API key with production:
- *   requires explicit [KeyCoordinationMode.EXCLUSIVE_KEY] or [KeyCoordinationMode.COORDINATED_MAINTENANCE_WINDOW]
- *   attestation before any network call is permitted; stops immediately as [RunOutcome.BLOCKED_KEY_COORDINATION_REQUIRED]
- *   when uncoordinated.
- * - No assumed 20/s or 100/120 rate limits: routing cluster limits start UNVERIFIED, the first cluster
- *   discovery call counts against the 191 HTTP attempt cap, and any response missing valid
- *   X-App-Rate-Limit, X-App-Rate-Limit-Count, X-Method-Rate-Limit, or X-Method-Rate-Limit-Count headers
- *   aborts immediately ([RunOutcome.ABORTED_MISSING_OR_INVALID_RATE_HEADERS]).
- * - Persistence uses the dedicated identity-only table (`player_riot_identities`) instead of fabricating
- *   `profile_icon_id`, `summoner_level`, or `last_seen_at` in `indexed_players`. For rows that already
- *   exist in `indexed_players` with a blank `game_name` or `tag_line`, `UPDATE indexed_players` preserves
- *   each already-nonblank column independently.
+ * - Separates [MonotonicClock] (strictly for elapsed deadline/budget accounting and sleeps) from
+ *   [WallClock] (strictly for UTC `Instant` timestamps such as `verified_at`). Never derives UTC
+ *   timestamps from `System.nanoTime()`.
+ * - Strict 180s ([DEFAULT_MAX_WALL_TIME_MS]) wall-time budget covers ALL stages: JDBC `DataSource.getConnection()`,
+ *   pre-call read-only DB recheck, header-driven sleeps, HTTP Account-V1 attempts, durable DB writes,
+ *   and post-write read verification.
+ * - Fail-closed JDBC timeout configuration: if `Connection.setReadOnly`, `Connection.setNetworkTimeout`,
+ *   or `PreparedStatement.setQueryTimeout` throws or is unsupported by the driver, execution aborts
+ *   immediately ([RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT]) instead of silently running unbounded SQL.
+ * - No uncaught `SQLException` or timeout escapes [runBounded]: any DB failure during pre-call recheck,
+ *   write, or post-write verification returns a structured, resumable [CompletionRunReport].
+ * - Post-write verification proof: [ItemStatus.COMPLETED_DURABLE_WRITE_VERIFIED] is only emitted when
+ *   a write succeeds AND a bounded post-write read proves the non-blank identity is stored. If the
+ *   write affects 0 rows because a concurrent writer already populated a non-blank identity, the post-write
+ *   read classifies the item as [ItemStatus.CONCURRENT_ALREADY_COMPLETE_VERIFIED]. If post-write proof
+ *   cannot confirm a valid identity, the run aborts with [RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT].
+ * - Strict 78-char base64url PUUID validation (`^[A-Za-z0-9_-]{78}$`) on all manifest entries and
+ *   returned payloads, preventing malformed PUUIDs or URL path injection.
+ * - Production HTTP transport restricts requests strictly to `https://` on approved Riot regional routing
+ *   hosts (`europe.api.riotgames.com`, `asia.api.riotgames.com`, `americas.api.riotgames.com`,
+ *   `sea.api.riotgames.com`). Loopback `http://127.0.0.1` is rejected unless explicitly enabled for
+ *   unit tests via `allowLoopbackHttpForTesting = true`, which in turn blocks any non-test API key
+ *   (requiring prefix `TEST-LOOPBACK-ONLY-` and rejecting `RGAPI-*`) so real credentials can never leak.
  */
 class OffProdChallengerIdentityCompletionTool(
     private val persistencePort: IdentityCompletionPersistencePort,
     private val httpTransport: BoundedAccountV1Transport = HttpUrlConnectionAccountV1Transport(),
-    private val clock: MonotonicClock = SystemMonotonicClock,
+    private val monotonicClock: MonotonicClock = SystemMonotonicClock,
+    private val wallClock: WallClock = SystemUtcWallClock,
     private val objectMapper: ObjectMapper = defaultObjectMapper()
 ) {
 
@@ -60,8 +76,20 @@ class OffProdChallengerIdentityCompletionTool(
         const val DEFAULT_READ_TIMEOUT_MS: Int = 5_000
         const val DEFAULT_CALL_DEADLINE_MS: Long = 5_500L
         const val MAX_RESPONSE_BODY_BYTES: Int = 4_096
-        const val DB_QUERY_TIMEOUT_SECONDS: Int = 2
-        const val DB_NETWORK_TIMEOUT_MS: Int = 2_500
+        const val DEFAULT_DB_OPERATION_TIMEOUT_MS: Long = 2_500L
+        const val PUUID_EXACT_LENGTH: Int = 78
+
+        val OFFICIAL_PUUID_REGEX: Regex = Regex("^[A-Za-z0-9_-]{78}$")
+        val ACCOUNT_V1_PATH_REGEX: Regex = Regex("^/riot/account/v1/accounts/by-puuid/[A-Za-z0-9_-]{78}$")
+
+        val APPROVED_RIOT_CLUSTER_HOSTS: Set<String> = setOf(
+            "europe.api.riotgames.com",
+            "asia.api.riotgames.com",
+            "americas.api.riotgames.com",
+            "sea.api.riotgames.com"
+        )
+
+        const val LOOPBACK_TEST_API_KEY_PREFIX: String = "TEST-LOOPBACK-ONLY-"
 
         private val VALID_PLATFORM_TO_CLUSTER: Map<String, String> = mapOf(
             "euw1" to "europe",
@@ -80,10 +108,22 @@ class OffProdChallengerIdentityCompletionTool(
         fun defaultObjectMapper(): ObjectMapper =
             ObjectMapper().configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false)
 
+        fun isValidOfficialPuuid(candidate: String): Boolean =
+            candidate.length == PUUID_EXACT_LENGTH && OFFICIAL_PUUID_REGEX.matches(candidate)
+
+        fun validateOfficialPuuid(candidate: String, fieldName: String = "puuid"): String {
+            val trimmed = candidate.trim()
+            require(isValidOfficialPuuid(trimmed)) {
+                "Invalid $fieldName: must be an exact 78-character base64url string matching ^[A-Za-z0-9_-]{78}$ " +
+                    "(actual length=${trimmed.length})"
+            }
+            return trimmed
+        }
+
         fun computeManifestSha256(entries: List<ManifestEntry>): String {
             val digest = MessageDigest.getInstance("SHA-256")
             for (entry in entries) {
-                val canonicalLine = "${entry.platformRegion.trim().lowercase(Locale.ROOT)}:${entry.puuid.trim()}\n"
+                val canonicalLine = "${entry.normalizedPlatformRegion}:${entry.normalizedPuuid}\n"
                 digest.update(canonicalLine.toByteArray(StandardCharsets.UTF_8))
             }
             return digest.digest().joinToString("") { "%02x".format(it) }
@@ -93,6 +133,67 @@ class OffProdChallengerIdentityCompletionTool(
             val normalized = platformRegion.trim().lowercase(Locale.ROOT)
             return VALID_PLATFORM_TO_CLUSTER[normalized]
                 ?: throw IllegalArgumentException("Unsupported platform region for Account-V1 routing: '$platformRegion'")
+        }
+
+        /**
+         * Validates that [url] targets an approved `https` Riot Account-V1 regional cluster endpoint
+         * with an exact 78-char base64url PUUID path and no query/fragment/userInfo.
+         * When [allowLoopbackHttpForTesting] is true, permits `http://127.0.0.1:<port>` or `http://localhost:<port>`
+         * ONLY if [apiKey] starts with [LOOPBACK_TEST_API_KEY_PREFIX] and does NOT start with `RGAPI-`.
+         */
+        fun validateTargetUrlAndKeySafety(
+            url: String,
+            apiKey: String,
+            allowLoopbackHttpForTesting: Boolean
+        ): URI {
+            val uri = try {
+                URI.create(url)
+            } catch (e: Exception) {
+                throw IllegalArgumentException("Malformed target URI: '$url'", e)
+            }
+
+            val scheme = uri.scheme?.lowercase(Locale.ROOT)
+                ?: throw IllegalArgumentException("Target URI missing scheme: '$url'")
+            val host = uri.host?.lowercase(Locale.ROOT)
+                ?: throw IllegalArgumentException("Target URI missing host: '$url'")
+
+            require(uri.userInfo == null) { "Target URI must not contain userInfo" }
+            require(uri.rawQuery == null) { "Target URI must not contain query parameters" }
+            require(uri.rawFragment == null) { "Target URI must not contain fragment" }
+
+            val rawPath = uri.rawPath ?: throw IllegalArgumentException("Target URI missing path")
+            require(ACCOUNT_V1_PATH_REGEX.matches(rawPath)) {
+                "Target URI path must match ^/riot/account/v1/accounts/by-puuid/[A-Za-z0-9_-]{78}$ (was '$rawPath')"
+            }
+
+            if (scheme == "https") {
+                require(host in APPROVED_RIOT_CLUSTER_HOSTS) {
+                    "Disallowed HTTPS host '$host': must be one of $APPROVED_RIOT_CLUSTER_HOSTS"
+                }
+                require(uri.port == -1 || uri.port == 443) {
+                    "Disallowed HTTPS port ${uri.port} for approved Riot host '$host'"
+                }
+                return uri
+            }
+
+            if (scheme == "http" && allowLoopbackHttpForTesting) {
+                require(host == "127.0.0.1" || host == "localhost") {
+                    "Loopback test override only permits 127.0.0.1 or localhost (was '$host')"
+                }
+                val trimmedKey = apiKey.trim()
+                require(
+                    trimmedKey.startsWith(LOOPBACK_TEST_API_KEY_PREFIX) &&
+                        !trimmedKey.uppercase(Locale.ROOT).startsWith("RGAPI-") &&
+                        !trimmedKey.uppercase(Locale.ROOT).contains("RGAPI-")
+                ) {
+                    "Refusing to send non-test or RGAPI-* credential over loopback HTTP test override"
+                }
+                return uri
+            }
+
+            throw IllegalArgumentException(
+                "Disallowed URI scheme '$scheme' for host '$host': production transport requires https:// to $APPROVED_RIOT_CLUSTER_HOSTS"
+            )
         }
     }
 
@@ -109,13 +210,10 @@ class OffProdChallengerIdentityCompletionTool(
         val puuid: String,
         val platformRegion: String
     ) {
-        init {
-            require(puuid.isNotBlank()) { "Manifest entry puuid must not be blank" }
-            require(platformRegion.isNotBlank()) { "Manifest entry platformRegion must not be blank" }
+        val normalizedPuuid: String = validateOfficialPuuid(puuid, "ManifestEntry.puuid")
+        val normalizedPlatformRegion: String = platformRegion.trim().lowercase(Locale.ROOT).also {
+            require(it.isNotEmpty()) { "Manifest entry platformRegion must not be blank" }
         }
-
-        val normalizedPuuid: String = puuid.trim()
-        val normalizedPlatformRegion: String = platformRegion.trim().lowercase(Locale.ROOT)
         val routingCluster: String = mapPlatformToRoutingCluster(normalizedPlatformRegion)
     }
 
@@ -149,7 +247,9 @@ class OffProdChallengerIdentityCompletionTool(
         val connectTimeoutMs: Int = DEFAULT_CONNECT_TIMEOUT_MS,
         val readTimeoutMs: Int = DEFAULT_READ_TIMEOUT_MS,
         val callDeadlineMs: Long = DEFAULT_CALL_DEADLINE_MS,
+        val dbOperationTimeoutMs: Long = DEFAULT_DB_OPERATION_TIMEOUT_MS,
         val maxBodyBytes: Int = MAX_RESPONSE_BODY_BYTES,
+        val allowLoopbackHttpForTesting: Boolean = false,
         val baseUrlByCluster: Map<String, String> = mapOf(
             "europe" to "https://europe.api.riotgames.com",
             "asia" to "https://asia.api.riotgames.com",
@@ -165,6 +265,7 @@ class OffProdChallengerIdentityCompletionTool(
             require(connectTimeoutMs > 0) { "connectTimeoutMs must be > 0" }
             require(readTimeoutMs > 0) { "readTimeoutMs must be > 0" }
             require(callDeadlineMs > 0L) { "callDeadlineMs must be > 0" }
+            require(dbOperationTimeoutMs > 0L) { "dbOperationTimeoutMs must be > 0" }
             require(maxBodyBytes in 1..MAX_RESPONSE_BODY_BYTES) {
                 "maxBodyBytes ($maxBodyBytes) must be within 1..$MAX_RESPONSE_BODY_BYTES"
             }
@@ -174,22 +275,25 @@ class OffProdChallengerIdentityCompletionTool(
     enum class PreCallDbState {
         ALREADY_COMPLETE,
         PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD,
-        ABSENT_FROM_INDEXED_PLAYERS
+        ABSENT_FROM_INDEXED_PLAYERS,
+        UNCHECKED_BEFORE_RECHECK
     }
 
     enum class ItemStatus {
         SKIPPED_ALREADY_RESOLVED_IN_DB,
         VALIDATED_DRY_RUN_NO_WRITE,
-        COMPLETED_DURABLE_WRITE,
+        COMPLETED_DURABLE_WRITE_VERIFIED,
+        CONCURRENT_ALREADY_COMPLETE_VERIFIED,
         SKIPPED_NOT_FOUND_404,
         SKIPPED_OMITTED_RIOT_ID_FIELDS,
         REJECTED_PUUID_MISMATCH,
         ABORTED_ON_HTTP_FAILURE,
+        ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT,
         PENDING_UNPROCESSED
     }
 
     enum class RunOutcome {
-        COMPLETED_ALL_CANDIDATES,
+        STAGED_ALL_CANDIDATES,
         DRY_RUN_DB_RECHECK_ONLY_COMPLETED,
         BLOCKED_KEY_COORDINATION_REQUIRED,
         BLOCKED_DURABLE_WRITES_NOT_PERMITTED,
@@ -201,7 +305,9 @@ class OffProdChallengerIdentityCompletionTool(
         ABORTED_UNEXPECTED_HTTP_STATUS,
         ABORTED_TIMEOUT_OR_IO_ERROR,
         ABORTED_PAYLOAD_TOO_LARGE,
-        ABORTED_PUUID_MISMATCH
+        ABORTED_PUUID_MISMATCH,
+        ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT,
+        ABORTED_DISALLOWED_TRANSPORT_TARGET
     }
 
     data class ItemResult(
@@ -214,6 +320,7 @@ class OffProdChallengerIdentityCompletionTool(
         val httpStatusCode: Int? = null,
         val resolvedGameName: String? = null,
         val resolvedTagLine: String? = null,
+        val verifiedAtUtc: Instant? = null,
         val durableWriteTarget: String? = null,
         val detail: String? = null
     )
@@ -262,8 +369,10 @@ class OffProdChallengerIdentityCompletionTool(
         val totalWaitTimeMs: Long,
         val elapsedWallTimeMs: Long,
         val validatedIdentitiesCount: Int,
-        val durableIndexedPlayerUpdatesCount: Int,
-        val durableIdentityTableUpsertsCount: Int,
+        val durableIndexedPlayerUpdatesVerifiedCount: Int,
+        val durableIdentityTableUpsertsVerifiedCount: Int,
+        val concurrentAlreadyCompleteVerifiedCount: Int,
+        val dbFailureOrUnknownCommitCount: Int,
         val notFound404Count: Int,
         val omittedRiotIdFieldsCount: Int,
         val puuidMismatchCount: Int,
@@ -275,31 +384,73 @@ class OffProdChallengerIdentityCompletionTool(
     )
 
     /**
-     * Execute the bounded single-worker completion workflow against [manifest] with [options].
+     * Execute the bounded single-worker off-production staging workflow against [manifest] with [options].
+     * Never throws SQLException or timeout exceptions; always returns a structured [CompletionRunReport].
      */
     fun runBounded(
         manifest: SnapshotManifest,
         options: ExecutionOptions = ExecutionOptions(),
         riotApiKeyProvider: () -> String = { "" }
     ): CompletionRunReport {
-        val startMs = clock.nowMs()
+        val startMonoMs = monotonicClock.nowMs()
         var totalWaitMs = 0L
         val manifestHash = computeManifestSha256(manifest.entries)
 
+        fun remainingWallBudgetMs(): Long =
+            options.maxWallTimeMs - (monotonicClock.nowMs() - startMonoMs)
+
         if (!options.dryRun && !options.allowDurableWrites) {
-            return buildEarlyBlockedReport(
+            return buildEarlyReport(
                 outcome = RunOutcome.BLOCKED_DURABLE_WRITES_NOT_PERMITTED,
                 manifest = manifest,
                 manifestHash = manifestHash,
                 options = options,
-                elapsedMs = clock.nowMs() - startMs,
+                elapsedMs = monotonicClock.nowMs() - startMonoMs,
                 reason = "dryRun=false requires explicit allowDurableWrites=true and a write-capable DB credential"
             )
         }
 
-        // Step 1: Pre-call read-only DB recheck across indexed_players and player_riot_identities.
-        val dbStatesByPuuid: Map<String, PreCallDbState> =
-            persistencePort.recheckExistingIdentitiesBounded(manifest.entries)
+        val initialBudgetMs = remainingWallBudgetMs()
+        if (initialBudgetMs <= 0L) {
+            return buildEarlyReport(
+                outcome = RunOutcome.PARTIAL_COMPLETION_WALL_TIME_EXHAUSTED,
+                manifest = manifest,
+                manifestHash = manifestHash,
+                options = options,
+                elapsedMs = monotonicClock.nowMs() - startMonoMs,
+                reason = "Wall-time budget (${options.maxWallTimeMs}ms) exhausted before pre-call DB recheck"
+            )
+        }
+
+        // Step 1: Bounded pre-call read-only DB recheck (including connection acquisition) within remaining budget.
+        val recheckTimeoutMs = minOf(options.dbOperationTimeoutMs, initialBudgetMs)
+        val recheckResult: DbRecheckResult = try {
+            persistencePort.recheckExistingIdentitiesBounded(
+                entries = manifest.entries,
+                timeoutMs = recheckTimeoutMs
+            )
+        } catch (e: Exception) {
+            DbRecheckResult.Failure("Unhandled exception during pre-call DB recheck: ${e.javaClass.simpleName}: ${e.message}")
+        }
+
+        val dbStatesByPuuid: Map<String, PreCallDbState> = when (recheckResult) {
+            is DbRecheckResult.Success -> recheckResult.statesByPuuid
+            is DbRecheckResult.Failure -> {
+                val outcome = if (recheckResult.timedOutOrBudgetExhausted && remainingWallBudgetMs() <= 0L) {
+                    RunOutcome.PARTIAL_COMPLETION_WALL_TIME_EXHAUSTED
+                } else {
+                    RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT
+                }
+                return buildEarlyReport(
+                    outcome = outcome,
+                    manifest = manifest,
+                    manifestHash = manifestHash,
+                    options = options,
+                    elapsedMs = monotonicClock.nowMs() - startMonoMs,
+                    reason = recheckResult.reason
+                )
+            }
+        }
 
         val itemResults = ArrayList<ItemResult>(manifest.entries.size)
         val candidatesToFetch = ArrayList<ManifestEntry>(manifest.entries.size)
@@ -329,17 +480,17 @@ class OffProdChallengerIdentityCompletionTool(
                     presentWithBlankCount++
                     candidatesToFetch.add(entry)
                 }
-                PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS -> {
+                PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS,
+                PreCallDbState.UNCHECKED_BEFORE_RECHECK -> {
                     absentCount++
                     candidatesToFetch.add(entry)
                 }
             }
         }
 
-        // If all 191 items are already resolved in DB, complete immediately with 0 network calls.
         if (candidatesToFetch.isEmpty()) {
             return CompletionRunReport(
-                outcome = RunOutcome.COMPLETED_ALL_CANDIDATES,
+                outcome = RunOutcome.STAGED_ALL_CANDIDATES,
                 manifestSha256 = manifestHash,
                 snapshotCapturedAtUtc = manifest.snapshotCapturedAtUtc,
                 dryRun = options.dryRun,
@@ -353,10 +504,12 @@ class OffProdChallengerIdentityCompletionTool(
                 httpAttemptsMade = 0,
                 maxTotalHttpAttempts = options.maxTotalHttpAttempts,
                 totalWaitTimeMs = 0L,
-                elapsedWallTimeMs = clock.nowMs() - startMs,
+                elapsedWallTimeMs = monotonicClock.nowMs() - startMonoMs,
                 validatedIdentitiesCount = 0,
-                durableIndexedPlayerUpdatesCount = 0,
-                durableIdentityTableUpsertsCount = 0,
+                durableIndexedPlayerUpdatesVerifiedCount = 0,
+                durableIdentityTableUpsertsVerifiedCount = 0,
+                concurrentAlreadyCompleteVerifiedCount = 0,
+                dbFailureOrUnknownCommitCount = 0,
                 notFound404Count = 0,
                 omittedRiotIdFieldsCount = 0,
                 puuidMismatchCount = 0,
@@ -367,7 +520,6 @@ class OffProdChallengerIdentityCompletionTool(
             )
         }
 
-        // If networkEnabled is false (default), return the DB recheck diff without making any HTTP attempts.
         if (!options.networkEnabled) {
             for (pending in candidatesToFetch) {
                 val state = dbStatesByPuuid[pending.normalizedPuuid] ?: PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS
@@ -398,10 +550,12 @@ class OffProdChallengerIdentityCompletionTool(
                 httpAttemptsMade = 0,
                 maxTotalHttpAttempts = options.maxTotalHttpAttempts,
                 totalWaitTimeMs = 0L,
-                elapsedWallTimeMs = clock.nowMs() - startMs,
+                elapsedWallTimeMs = monotonicClock.nowMs() - startMonoMs,
                 validatedIdentitiesCount = 0,
-                durableIndexedPlayerUpdatesCount = 0,
-                durableIdentityTableUpsertsCount = 0,
+                durableIndexedPlayerUpdatesVerifiedCount = 0,
+                durableIdentityTableUpsertsVerifiedCount = 0,
+                concurrentAlreadyCompleteVerifiedCount = 0,
+                dbFailureOrUnknownCommitCount = 0,
                 notFound404Count = 0,
                 omittedRiotIdFieldsCount = 0,
                 puuidMismatchCount = 0,
@@ -413,8 +567,6 @@ class OffProdChallengerIdentityCompletionTool(
         }
 
         // Step 2: Enforce explicit key coordination before any HTTP call is made.
-        // Cross-process header inspection races with production traffic on a shared Riot key,
-        // so execution without explicit coordination is blocked upfront.
         if (options.keyCoordinationMode == KeyCoordinationMode.UNCOORDINATED ||
             options.coordinationAttestation.isBlank()
         ) {
@@ -447,10 +599,12 @@ class OffProdChallengerIdentityCompletionTool(
                 httpAttemptsMade = 0,
                 maxTotalHttpAttempts = options.maxTotalHttpAttempts,
                 totalWaitTimeMs = 0L,
-                elapsedWallTimeMs = clock.nowMs() - startMs,
+                elapsedWallTimeMs = monotonicClock.nowMs() - startMonoMs,
                 validatedIdentitiesCount = 0,
-                durableIndexedPlayerUpdatesCount = 0,
-                durableIdentityTableUpsertsCount = 0,
+                durableIndexedPlayerUpdatesVerifiedCount = 0,
+                durableIdentityTableUpsertsVerifiedCount = 0,
+                concurrentAlreadyCompleteVerifiedCount = 0,
+                dbFailureOrUnknownCommitCount = 0,
                 notFound404Count = 0,
                 omittedRiotIdFieldsCount = 0,
                 puuidMismatchCount = 0,
@@ -466,13 +620,13 @@ class OffProdChallengerIdentityCompletionTool(
         require(apiKey.isNotBlank()) { "Riot API key must not be blank when networkEnabled=true" }
 
         // Step 3: Single-worker serial Account-V1 loop.
-        // No assumed 20:1 or 100:120 defaults: cluster rate state starts empty (unverified).
-        // The first call to each cluster is the discovery call and counts against maxTotalHttpAttempts (<= 191).
         val verifiedClusterStates = LinkedHashMap<String, VerifiedClusterRateState>()
         var httpAttemptsMade = 0
         var validatedIdentitiesCount = 0
-        var durableIndexedPlayerUpdatesCount = 0
-        var durableIdentityTableUpsertsCount = 0
+        var durableIndexedPlayerUpdatesVerifiedCount = 0
+        var durableIdentityTableUpsertsVerifiedCount = 0
+        var concurrentAlreadyCompleteVerifiedCount = 0
+        var dbFailureOrUnknownCommitCount = 0
         var notFound404Count = 0
         var omittedRiotIdFieldsCount = 0
         var puuidMismatchCount = 0
@@ -486,24 +640,20 @@ class OffProdChallengerIdentityCompletionTool(
             val preCallState = dbStatesByPuuid[candidate.normalizedPuuid]
                 ?: PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS
 
-            // Check attempt ceiling before issuing call.
             if (httpAttemptsMade >= options.maxTotalHttpAttempts) {
                 terminalOutcome = RunOutcome.PARTIAL_COMPLETION_ATTEMPT_CAP_REACHED
                 abortReason = "Reached maxTotalHttpAttempts ceiling (${options.maxTotalHttpAttempts})"
                 break
             }
 
-            // Check header-driven wait requirement on the target routing cluster (if already discovered).
             val clusterState = verifiedClusterStates[candidate.routingCluster]
             val requiredWaitMs = clusterState?.requiredWaitMsBeforeNextAttempt() ?: 0L
 
-            val elapsedBeforeWaitMs = clock.nowMs() - startMs
-            val remainingWallTimeMs = options.maxWallTimeMs - elapsedBeforeWaitMs
-            // Require enough wall-time budget for any required header wait plus at least 1ms for dispatch.
-            if (remainingWallTimeMs <= 0L || requiredWaitMs >= remainingWallTimeMs) {
+            val remainingBeforeWaitMs = remainingWallBudgetMs()
+            if (remainingBeforeWaitMs <= 0L || requiredWaitMs >= remainingBeforeWaitMs) {
                 terminalOutcome = RunOutcome.PARTIAL_COMPLETION_WALL_TIME_EXHAUSTED
                 abortReason = if (requiredWaitMs > 0L) {
-                    "Required header-driven wait (${requiredWaitMs}ms) on cluster '${candidate.routingCluster}' exceeds remaining wall-time budget (${remainingWallTimeMs.coerceAtLeast(0L)}ms)"
+                    "Required header-driven wait (${requiredWaitMs}ms) on cluster '${candidate.routingCluster}' exceeds remaining wall-time budget (${remainingBeforeWaitMs.coerceAtLeast(0L)}ms)"
                 } else {
                     "Wall-time budget (${options.maxWallTimeMs}ms) exhausted"
                 }
@@ -511,34 +661,47 @@ class OffProdChallengerIdentityCompletionTool(
             }
 
             if (requiredWaitMs > 0L) {
-                // Single header-driven sleep (never tight polling).
-                clock.sleepMs(requiredWaitMs)
+                monotonicClock.sleepMs(requiredWaitMs)
                 totalWaitMs += requiredWaitMs
             }
 
-            // Re-check wall-time budget right before socket dispatch.
-            val elapsedBeforeCallMs = clock.nowMs() - startMs
-            val remainingForCallMs = options.maxWallTimeMs - elapsedBeforeCallMs
+            val remainingForCallMs = remainingWallBudgetMs()
             if (remainingForCallMs <= 0L) {
                 terminalOutcome = RunOutcome.PARTIAL_COMPLETION_WALL_TIME_EXHAUSTED
                 abortReason = "Wall-time budget (${options.maxWallTimeMs}ms) exhausted before HTTP dispatch"
                 break
             }
 
-            val baseUrl = options.baseUrlByCluster[candidate.routingCluster]
+            val baseUrl = options.baseUrlByCluster[candidate.routingCluster]?.trim()?.trimEnd('/')
                 ?: throw IllegalArgumentException("Missing base URL for routing cluster '${candidate.routingCluster}'")
+            val targetUrl = "$baseUrl/riot/account/v1/accounts/by-puuid/${candidate.normalizedPuuid}"
+
+            // Validate target URL scheme/host/path and loopback credential safety BEFORE counting or dispatching.
+            try {
+                validateTargetUrlAndKeySafety(
+                    url = targetUrl,
+                    apiKey = apiKey,
+                    allowLoopbackHttpForTesting = options.allowLoopbackHttpForTesting
+                )
+            } catch (e: IllegalArgumentException) {
+                terminalOutcome = RunOutcome.ABORTED_DISALLOWED_TRANSPORT_TARGET
+                abortReason = e.message ?: "Disallowed transport target or unsafe loopback credential"
+                break
+            }
+
             val effectiveDeadlineMs = minOf(options.callDeadlineMs, remainingForCallMs)
 
             // Every HTTP attempt (including the first discovery call per cluster) counts against the 191 ceiling.
             httpAttemptsMade++
 
             val transportResult = httpTransport.executeSingleGet(
-                url = "$baseUrl/riot/account/v1/accounts/by-puuid/${candidate.normalizedPuuid}",
+                url = targetUrl,
                 apiKey = apiKey,
                 connectTimeoutMs = minOf(options.connectTimeoutMs.toLong(), effectiveDeadlineMs).toInt().coerceAtLeast(1),
                 readTimeoutMs = minOf(options.readTimeoutMs.toLong(), effectiveDeadlineMs).toInt().coerceAtLeast(1),
                 callDeadlineMs = effectiveDeadlineMs,
-                maxBodyBytes = options.maxBodyBytes
+                maxBodyBytes = options.maxBodyBytes,
+                allowLoopbackHttpForTesting = options.allowLoopbackHttpForTesting
             )
 
             when (transportResult) {
@@ -583,7 +746,6 @@ class OffProdChallengerIdentityCompletionTool(
                     val status = transportResult.statusCode
                     val headers = transportResult.headersLowercase
 
-                    // Check for 429 or 5xx BEFORE proceeding. Zero automatic retries: abort immediately.
                     if (status == 429) {
                         val parsedHeaders = parseVerifiedClusterHeadersOrNull(candidate.routingCluster, headers)
                         if (parsedHeaders != null) {
@@ -628,7 +790,6 @@ class OffProdChallengerIdentityCompletionTool(
                         break
                     }
 
-                    // Enforce missing/invalid rate-limit header fail-safe on all non-429/5xx responses.
                     val verifiedHeaders = parseVerifiedClusterHeadersOrNull(candidate.routingCluster, headers)
                     if (verifiedHeaders == null) {
                         itemResults.add(
@@ -690,7 +851,7 @@ class OffProdChallengerIdentityCompletionTool(
                             }
 
                             val returnedPuuid = parsedPayload.puuid?.trim().orEmpty()
-                            if (returnedPuuid != candidate.normalizedPuuid) {
+                            if (!isValidOfficialPuuid(returnedPuuid) || returnedPuuid != candidate.normalizedPuuid) {
                                 puuidMismatchCount++
                                 itemResults.add(
                                     ItemResult(
@@ -701,7 +862,7 @@ class OffProdChallengerIdentityCompletionTool(
                                         status = ItemStatus.REJECTED_PUUID_MISMATCH,
                                         httpAttempted = true,
                                         httpStatusCode = 200,
-                                        detail = "Account-V1 returned mismatched puuid '$returnedPuuid'"
+                                        detail = "Account-V1 returned mismatched or invalid 78-char puuid '$returnedPuuid'"
                                     )
                                 )
                                 index++
@@ -713,8 +874,6 @@ class OffProdChallengerIdentityCompletionTool(
                             val gameName = parsedPayload.gameName?.trim().orEmpty()
                             val tagLine = parsedPayload.tagLine?.trim().orEmpty()
 
-                            // Official Riot Account-V1 schema allows omitted gameName/tagLine.
-                            // Never write blank strings; record explicit SKIPPED_OMITTED_RIOT_ID_FIELDS status.
                             if (gameName.isEmpty() || tagLine.isEmpty()) {
                                 omittedRiotIdFieldsCount++
                                 itemResults.add(
@@ -732,6 +891,8 @@ class OffProdChallengerIdentityCompletionTool(
                                 index++
                             } else {
                                 validatedIdentitiesCount++
+                                val verifiedAtUtc: Instant = wallClock.nowInstant()
+
                                 if (options.dryRun) {
                                     itemResults.add(
                                         ItemResult(
@@ -744,64 +905,112 @@ class OffProdChallengerIdentityCompletionTool(
                                             httpStatusCode = 200,
                                             resolvedGameName = gameName,
                                             resolvedTagLine = tagLine,
+                                            verifiedAtUtc = verifiedAtUtc,
                                             durableWriteTarget = "NONE_DRY_RUN",
                                             detail = "Validated non-blank Riot ID in dryRun mode (0 writes executed)"
                                         )
                                     )
+                                    index++
                                 } else {
-                                    val writeTime = Instant.ofEpochMilli(clock.nowMs())
-                                    val writeTarget = when (preCallState) {
-                                        PreCallDbState.PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD -> {
-                                            val updated = persistencePort.updateBlankFieldsOnExistingIndexedPlayer(
-                                                puuid = candidate.normalizedPuuid,
-                                                gameName = gameName,
-                                                tagLine = tagLine
-                                            )
-                                            if (updated) durableIndexedPlayerUpdatesCount++
-                                            // Also record verified identity in the dedicated identity-only table
-                                            // without overwriting any concurrent newer/non-blank verified identity.
-                                            val upserted = persistencePort.upsertVerifiedIdentityOnly(
-                                                puuid = candidate.normalizedPuuid,
-                                                platformRegion = candidate.normalizedPlatformRegion,
-                                                gameName = gameName,
-                                                tagLine = tagLine,
-                                                verifiedAt = writeTime
-                                            )
-                                            if (upserted) durableIdentityTableUpsertsCount++
-                                            "INDEXED_PLAYERS_BLANK_ONLY_AND_PLAYER_RIOT_IDENTITIES"
-                                        }
-
-                                        PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS,
-                                        PreCallDbState.ALREADY_COMPLETE -> {
-                                            val upserted = persistencePort.upsertVerifiedIdentityOnly(
-                                                puuid = candidate.normalizedPuuid,
-                                                platformRegion = candidate.normalizedPlatformRegion,
-                                                gameName = gameName,
-                                                tagLine = tagLine,
-                                                verifiedAt = writeTime
-                                            )
-                                            if (upserted) durableIdentityTableUpsertsCount++
-                                            "PLAYER_RIOT_IDENTITIES_ONLY"
-                                        }
+                                    // Check remaining wall-time budget BEFORE starting the durable DB write!
+                                    val remainingForWriteMs = remainingWallBudgetMs()
+                                    if (remainingForWriteMs <= 0L) {
+                                        // Do not start write after budget exhaustion; leave current candidate in remainingEntries!
+                                        terminalOutcome = RunOutcome.PARTIAL_COMPLETION_WALL_TIME_EXHAUSTED
+                                        abortReason = "Wall-time budget (${options.maxWallTimeMs}ms) exhausted before durable DB write for '${candidate.normalizedPuuid}'"
+                                        break
                                     }
 
-                                    itemResults.add(
-                                        ItemResult(
+                                    val effectiveDbWriteTimeoutMs = minOf(options.dbOperationTimeoutMs, remainingForWriteMs)
+                                    val writeVerification = try {
+                                        persistencePort.persistAndVerifyIdentityBounded(
                                             puuid = candidate.normalizedPuuid,
                                             platformRegion = candidate.normalizedPlatformRegion,
-                                            routingCluster = candidate.routingCluster,
+                                            gameName = gameName,
+                                            tagLine = tagLine,
+                                            verifiedAt = verifiedAtUtc,
                                             preCallDbState = preCallState,
-                                            status = ItemStatus.COMPLETED_DURABLE_WRITE,
-                                            httpAttempted = true,
-                                            httpStatusCode = 200,
-                                            resolvedGameName = gameName,
-                                            resolvedTagLine = tagLine,
-                                            durableWriteTarget = writeTarget,
-                                            detail = "Durable identity persisted without fabricating match metadata"
+                                            timeoutMs = effectiveDbWriteTimeoutMs
                                         )
-                                    )
+                                    } catch (e: Exception) {
+                                        DbWriteVerificationResult.FailureOrUnknownCommit(
+                                            reason = "Unhandled DB write exception: ${e.javaClass.simpleName}: ${e.message}"
+                                        )
+                                    }
+
+                                    when (writeVerification) {
+                                        is DbWriteVerificationResult.WrittenAndVerified -> {
+                                            if (writeVerification.indexedPlayerBlankFieldUpdated) {
+                                                durableIndexedPlayerUpdatesVerifiedCount++
+                                            }
+                                            if (writeVerification.identityOnlyTableUpserted) {
+                                                durableIdentityTableUpsertsVerifiedCount++
+                                            }
+                                            itemResults.add(
+                                                ItemResult(
+                                                    puuid = candidate.normalizedPuuid,
+                                                    platformRegion = candidate.normalizedPlatformRegion,
+                                                    routingCluster = candidate.routingCluster,
+                                                    preCallDbState = preCallState,
+                                                    status = ItemStatus.COMPLETED_DURABLE_WRITE_VERIFIED,
+                                                    httpAttempted = true,
+                                                    httpStatusCode = 200,
+                                                    resolvedGameName = writeVerification.verifiedGameName,
+                                                    resolvedTagLine = writeVerification.verifiedTagLine,
+                                                    verifiedAtUtc = writeVerification.verifiedAtUtc,
+                                                    durableWriteTarget = writeVerification.writeTargetDescription,
+                                                    detail = "Durable write verified by post-write read"
+                                                )
+                                            )
+                                            index++
+                                        }
+
+                                        is DbWriteVerificationResult.ConcurrentAlreadyCompleteVerified -> {
+                                            concurrentAlreadyCompleteVerifiedCount++
+                                            itemResults.add(
+                                                ItemResult(
+                                                    puuid = candidate.normalizedPuuid,
+                                                    platformRegion = candidate.normalizedPlatformRegion,
+                                                    routingCluster = candidate.routingCluster,
+                                                    preCallDbState = preCallState,
+                                                    status = ItemStatus.CONCURRENT_ALREADY_COMPLETE_VERIFIED,
+                                                    httpAttempted = true,
+                                                    httpStatusCode = 200,
+                                                    resolvedGameName = writeVerification.verifiedGameName,
+                                                    resolvedTagLine = writeVerification.verifiedTagLine,
+                                                    verifiedAtUtc = writeVerification.verifiedAtUtc,
+                                                    durableWriteTarget = "PRESERVED_CONCURRENT_COMPLETE_ROW",
+                                                    detail = "0 rows mutated; post-write read verified complete non-blank identity already present"
+                                                )
+                                            )
+                                            index++
+                                        }
+
+                                        is DbWriteVerificationResult.FailureOrUnknownCommit -> {
+                                            dbFailureOrUnknownCommitCount++
+                                            itemResults.add(
+                                                ItemResult(
+                                                    puuid = candidate.normalizedPuuid,
+                                                    platformRegion = candidate.normalizedPlatformRegion,
+                                                    routingCluster = candidate.routingCluster,
+                                                    preCallDbState = preCallState,
+                                                    status = ItemStatus.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT,
+                                                    httpAttempted = true,
+                                                    httpStatusCode = 200,
+                                                    resolvedGameName = gameName,
+                                                    resolvedTagLine = tagLine,
+                                                    verifiedAtUtc = verifiedAtUtc,
+                                                    durableWriteTarget = "FAILED_OR_UNKNOWN_COMMIT",
+                                                    detail = writeVerification.reason
+                                                )
+                                            )
+                                            index++
+                                            terminalOutcome = RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT
+                                            abortReason = writeVerification.reason
+                                            break
+                                        }
+                                    }
                                 }
-                                index++
                             }
                         }
 
@@ -828,7 +1037,6 @@ class OffProdChallengerIdentityCompletionTool(
             }
         }
 
-        // Record any remaining unprocessed candidates as PENDING_UNPROCESSED for resumable reporting.
         val remainingEntries = ArrayList<ManifestEntry>()
         while (index < candidatesToFetch.size) {
             val pending = candidatesToFetch[index]
@@ -848,7 +1056,7 @@ class OffProdChallengerIdentityCompletionTool(
             index++
         }
 
-        val finalOutcome = terminalOutcome ?: RunOutcome.COMPLETED_ALL_CANDIDATES
+        val finalOutcome = terminalOutcome ?: RunOutcome.STAGED_ALL_CANDIDATES
 
         return CompletionRunReport(
             outcome = finalOutcome,
@@ -865,10 +1073,12 @@ class OffProdChallengerIdentityCompletionTool(
             httpAttemptsMade = httpAttemptsMade,
             maxTotalHttpAttempts = options.maxTotalHttpAttempts,
             totalWaitTimeMs = totalWaitMs,
-            elapsedWallTimeMs = clock.nowMs() - startMs,
+            elapsedWallTimeMs = monotonicClock.nowMs() - startMonoMs,
             validatedIdentitiesCount = validatedIdentitiesCount,
-            durableIndexedPlayerUpdatesCount = durableIndexedPlayerUpdatesCount,
-            durableIdentityTableUpsertsCount = durableIdentityTableUpsertsCount,
+            durableIndexedPlayerUpdatesVerifiedCount = durableIndexedPlayerUpdatesVerifiedCount,
+            durableIdentityTableUpsertsVerifiedCount = durableIdentityTableUpsertsVerifiedCount,
+            concurrentAlreadyCompleteVerifiedCount = concurrentAlreadyCompleteVerifiedCount,
+            dbFailureOrUnknownCommitCount = dbFailureOrUnknownCommitCount,
             notFound404Count = notFound404Count,
             omittedRiotIdFieldsCount = omittedRiotIdFieldsCount,
             puuidMismatchCount = puuidMismatchCount,
@@ -880,7 +1090,7 @@ class OffProdChallengerIdentityCompletionTool(
         )
     }
 
-    private fun buildEarlyBlockedReport(
+    private fun buildEarlyReport(
         outcome: RunOutcome,
         manifest: SnapshotManifest,
         manifestHash: String,
@@ -893,7 +1103,7 @@ class OffProdChallengerIdentityCompletionTool(
                 puuid = entry.normalizedPuuid,
                 platformRegion = entry.normalizedPlatformRegion,
                 routingCluster = entry.routingCluster,
-                preCallDbState = PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS,
+                preCallDbState = PreCallDbState.UNCHECKED_BEFORE_RECHECK,
                 status = ItemStatus.PENDING_UNPROCESSED,
                 httpAttempted = false,
                 detail = reason
@@ -910,14 +1120,16 @@ class OffProdChallengerIdentityCompletionTool(
             manifestTotalCount = manifest.entries.size,
             alreadyResolvedInDbCount = 0,
             presentWithBlankFieldInIndexedPlayersCount = 0,
-            absentFromIndexedPlayersCount = manifest.entries.size,
+            absentFromIndexedPlayersCount = 0,
             httpAttemptsMade = 0,
             maxTotalHttpAttempts = options.maxTotalHttpAttempts,
             totalWaitTimeMs = 0L,
             elapsedWallTimeMs = elapsedMs,
             validatedIdentitiesCount = 0,
-            durableIndexedPlayerUpdatesCount = 0,
-            durableIdentityTableUpsertsCount = 0,
+            durableIndexedPlayerUpdatesVerifiedCount = 0,
+            durableIdentityTableUpsertsVerifiedCount = 0,
+            concurrentAlreadyCompleteVerifiedCount = 0,
+            dbFailureOrUnknownCommitCount = if (outcome == RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT) 1 else 0,
             notFound404Count = 0,
             omittedRiotIdFieldsCount = 0,
             puuidMismatchCount = 0,
@@ -944,15 +1156,6 @@ class OffProdChallengerIdentityCompletionTool(
         }
     }
 
-    /**
-     * Strictly parses all 4 required rate-limit headers:
-     * - X-App-Rate-Limit
-     * - X-App-Rate-Limit-Count
-     * - X-Method-Rate-Limit
-     * - X-Method-Rate-Limit-Count
-     *
-     * Returns null if any header is missing, blank, malformed, or if count windows do not align with limit windows.
-     */
     internal fun parseVerifiedClusterHeadersOrNull(
         routingCluster: String,
         headersLowercase: Map<String, String>
@@ -1020,7 +1223,8 @@ class OffProdChallengerIdentityCompletionTool(
 }
 
 /**
- * Clock abstraction for deterministic wall-time and header-driven wait testing without real sleeps.
+ * Monotonic clock strictly for elapsed wall-time budget and sleep accounting.
+ * Must NEVER be converted to a calendar/UTC [Instant].
  */
 interface MonotonicClock {
     fun nowMs(): Long
@@ -1037,8 +1241,16 @@ object SystemMonotonicClock : MonotonicClock {
 }
 
 /**
- * Result of a single bounded HTTP GET to Account-V1.
+ * UTC wall clock strictly for stamping `verified_at` timestamps (`Instant.now()`).
  */
+fun interface WallClock {
+    fun nowInstant(): Instant
+}
+
+object SystemUtcWallClock : WallClock {
+    override fun nowInstant(): Instant = Instant.now()
+}
+
 sealed class TransportResult {
     data class HttpResponse(
         val statusCode: Int,
@@ -1063,15 +1275,19 @@ fun interface BoundedAccountV1Transport {
         connectTimeoutMs: Int,
         readTimeoutMs: Int,
         callDeadlineMs: Long,
-        maxBodyBytes: Int
+        maxBodyBytes: Int,
+        allowLoopbackHttpForTesting: Boolean
     ): TransportResult
 }
 
 /**
- * Production-safe single-attempt HTTP transport that enforces:
+ * Single-attempt HTTP transport that enforces:
+ * - Strict URI host/scheme/path allowlist (`https://` to approved Riot regional clusters by default;
+ *   `http://127.0.0.1` permitted ONLY when `allowLoopbackHttpForTesting = true` AND `apiKey` starts with
+ *   `TEST-LOOPBACK-ONLY-` and contains no `RGAPI-` prefix).
  * - Zero automatic retries (`instanceFollowRedirects = false`)
  * - Strict connect and read socket timeouts
- * - Off-thread wall-clock deadline that actively calls `HttpURLConnection.disconnect()` and closes streams
+ * - Off-thread wall-clock deadline that actively closes the stream and calls `HttpURLConnection.disconnect()`
  * - Strict `maxBodyBytes` (4 KiB) cap while reading the response stream
  */
 class HttpUrlConnectionAccountV1Transport : BoundedAccountV1Transport {
@@ -1082,8 +1298,19 @@ class HttpUrlConnectionAccountV1Transport : BoundedAccountV1Transport {
         connectTimeoutMs: Int,
         readTimeoutMs: Int,
         callDeadlineMs: Long,
-        maxBodyBytes: Int
+        maxBodyBytes: Int,
+        allowLoopbackHttpForTesting: Boolean
     ): TransportResult {
+        val validatedUri = try {
+            OffProdChallengerIdentityCompletionTool.validateTargetUrlAndKeySafety(
+                url = url,
+                apiKey = apiKey,
+                allowLoopbackHttpForTesting = allowLoopbackHttpForTesting
+            )
+        } catch (e: IllegalArgumentException) {
+            return TransportResult.TimeoutOrIoError("Rejected transport target: ${e.message}")
+        }
+
         val connRef = AtomicReference<HttpURLConnection?>(null)
         val streamRef = AtomicReference<InputStream?>(null)
         val cancelled = AtomicBoolean(false)
@@ -1095,7 +1322,7 @@ class HttpUrlConnectionAccountV1Transport : BoundedAccountV1Transport {
         val future: Future<TransportResult> = executor.submit(Callable {
             var connection: HttpURLConnection? = null
             try {
-                connection = (URI.create(url).toURL().openConnection() as HttpURLConnection).apply {
+                connection = (validatedUri.toURL().openConnection() as HttpURLConnection).apply {
                     requestMethod = "GET"
                     instanceFollowRedirects = false
                     useCaches = false
@@ -1200,44 +1427,68 @@ class HttpUrlConnectionAccountV1Transport : BoundedAccountV1Transport {
     }
 }
 
+sealed class DbRecheckResult {
+    data class Success(
+        val statesByPuuid: Map<String, OffProdChallengerIdentityCompletionTool.PreCallDbState>
+    ) : DbRecheckResult()
+
+    data class Failure(
+        val reason: String,
+        val timedOutOrBudgetExhausted: Boolean = false
+    ) : DbRecheckResult()
+}
+
+sealed class DbWriteVerificationResult {
+    data class WrittenAndVerified(
+        val indexedPlayerBlankFieldUpdated: Boolean,
+        val identityOnlyTableUpserted: Boolean,
+        val verifiedGameName: String,
+        val verifiedTagLine: String,
+        val verifiedAtUtc: Instant,
+        val writeTargetDescription: String
+    ) : DbWriteVerificationResult()
+
+    data class ConcurrentAlreadyCompleteVerified(
+        val verifiedGameName: String,
+        val verifiedTagLine: String,
+        val verifiedAtUtc: Instant?
+    ) : DbWriteVerificationResult()
+
+    data class FailureOrUnknownCommit(
+        val reason: String
+    ) : DbWriteVerificationResult()
+}
+
 /**
- * Persistence boundary for pre-call read-only recheck and race-safe identity-only durable writes.
- *
- * Notice there are ZERO methods that insert into `indexed_players` or fabricate `profile_icon_id`,
- * `summoner_level`, or `last_seen_at`.
+ * Persistence boundary for bounded pre-call read-only recheck and race-safe durable writes
+ * with mandatory post-write read verification.
  */
 interface IdentityCompletionPersistencePort {
     fun recheckExistingIdentitiesBounded(
-        entries: List<OffProdChallengerIdentityCompletionTool.ManifestEntry>
-    ): Map<String, OffProdChallengerIdentityCompletionTool.PreCallDbState>
+        entries: List<OffProdChallengerIdentityCompletionTool.ManifestEntry>,
+        timeoutMs: Long
+    ): DbRecheckResult
 
-    /**
-     * For rows that ALREADY exist in `indexed_players` with at least one blank identity column,
-     * fills ONLY the blank column(s) while preserving any already-nonblank column and all match metadata.
-     */
-    fun updateBlankFieldsOnExistingIndexedPlayer(
-        puuid: String,
-        gameName: String,
-        tagLine: String
-    ): Boolean
-
-    /**
-     * Inserts or updates a row in the dedicated `player_riot_identities` table without fabricating
-     * `indexed_players` metadata and without overwriting any concurrent newer or already-nonblank
-     * verified identity.
-     */
-    fun upsertVerifiedIdentityOnly(
+    fun persistAndVerifyIdentityBounded(
         puuid: String,
         platformRegion: String,
         gameName: String,
         tagLine: String,
-        verifiedAt: Instant
-    ): Boolean
+        verifiedAt: Instant,
+        preCallDbState: OffProdChallengerIdentityCompletionTool.PreCallDbState,
+        timeoutMs: Long
+    ): DbWriteVerificationResult
 }
 
 /**
- * JDBC implementation of [IdentityCompletionPersistencePort] with race-safe SQL statements
- * and bounded query/network timeouts.
+ * JDBC implementation of [IdentityCompletionPersistencePort] that:
+ * 1. Bounds `dataSource.getConnection()`, statement execution, and post-write verification within `timeoutMs`
+ *    using an off-thread deadline executor that actively closes stalled connections/statements.
+ * 2. Fails closed if `Connection.setReadOnly`, `Connection.setNetworkTimeout`, or `PreparedStatement.setQueryTimeout`
+ *    throws an exception (never silently ignoring unsupported timeout/readOnly settings).
+ * 3. Executes post-write read verification so `WrittenAndVerified` is only returned when the DB row is proven
+ *    to hold a complete non-blank identity, distinguishing `ConcurrentAlreadyCompleteVerified` (when 0 rows were
+ *    mutated because a concurrent writer already completed the row) from `FailureOrUnknownCommit`.
  */
 class JdbcIdentityCompletionPersistenceAdapter(
     private val dataSource: DataSource,
@@ -1247,7 +1498,7 @@ class JdbcIdentityCompletionPersistenceAdapter(
     companion object {
         val DDL_CREATE_IDENTITY_ONLY_TABLE: String = """
             CREATE TABLE IF NOT EXISTS player_riot_identities (
-                puuid           VARCHAR(255) PRIMARY KEY,
+                puuid           VARCHAR(78)  PRIMARY KEY,
                 platform_region VARCHAR(16)  NOT NULL,
                 game_name       VARCHAR(255) NOT NULL,
                 tag_line        VARCHAR(255) NOT NULL,
@@ -1257,13 +1508,6 @@ class JdbcIdentityCompletionPersistenceAdapter(
             )
         """.trimIndent()
 
-        /**
-         * Race-safe blank-only update on existing `indexed_players` rows:
-         * - Preserves `game_name` if `game_name` is already non-blank.
-         * - Preserves `tag_line` if `tag_line` is already non-blank.
-         * - Never modifies `region`, `profile_icon_id`, `summoner_level`, or `last_seen_at`.
-         * - Affects 0 rows if both `game_name` and `tag_line` are already non-blank.
-         */
         val SQL_UPDATE_INDEXED_PLAYERS_BLANK_FIELDS_ONLY: String = """
             UPDATE indexed_players
             SET game_name = CASE WHEN BTRIM(COALESCE(game_name, '')) = '' THEN ? ELSE game_name END,
@@ -1274,15 +1518,6 @@ class JdbcIdentityCompletionPersistenceAdapter(
               AND BTRIM(COALESCE(?, '')) <> ''
         """.trimIndent()
 
-        /**
-         * Race-safe upsert into the dedicated identity-only table `player_riot_identities`:
-         * - On conflict (`puuid`), NEVER overwrites a concurrent row that already has non-blank
-         *   `game_name` AND non-blank `tag_line` when `player_riot_identities.verified_at >= EXCLUDED.verified_at`
-         *   (and in missing-only mode, preserves any already-nonblank field unless strictly newer AND non-blank).
-         * - Preserves each already-nonblank column if a partial row existed, or updates only when
-         *   a field was blank or `EXCLUDED.verified_at > player_riot_identities.verified_at` while existing
-         *   is older, and never regresses `verified_at`.
-         */
         val SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE: String = """
             INSERT INTO player_riot_identities (
                 puuid,
@@ -1312,168 +1547,345 @@ class JdbcIdentityCompletionPersistenceAdapter(
             AND BTRIM(COALESCE(EXCLUDED.game_name, '')) <> ''
             AND BTRIM(COALESCE(EXCLUDED.tag_line, '')) <> ''
         """.trimIndent()
+
+        val SQL_SELECT_VERIFY_IDENTITY_ONLY_BY_PUUID: String = """
+            SELECT game_name, tag_line, verified_at
+            FROM player_riot_identities
+            WHERE puuid = ?
+        """.trimIndent()
+
+        val SQL_SELECT_VERIFY_INDEXED_PLAYER_BY_PUUID: String = """
+            SELECT game_name, tag_line
+            FROM indexed_players
+            WHERE puuid = ?
+        """.trimIndent()
     }
 
     override fun recheckExistingIdentitiesBounded(
-        entries: List<OffProdChallengerIdentityCompletionTool.ManifestEntry>
-    ): Map<String, OffProdChallengerIdentityCompletionTool.PreCallDbState> {
-        if (entries.isEmpty()) return emptyMap()
-        val puuids = entries.map { it.normalizedPuuid }.distinct()
-        val result = LinkedHashMap<String, OffProdChallengerIdentityCompletionTool.PreCallDbState>(puuids.size)
-        for (p in puuids) {
-            result[p] = OffProdChallengerIdentityCompletionTool.PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS
+        entries: List<OffProdChallengerIdentityCompletionTool.ManifestEntry>,
+        timeoutMs: Long
+    ): DbRecheckResult {
+        if (entries.isEmpty()) return DbRecheckResult.Success(emptyMap())
+        if (timeoutMs <= 0L) {
+            return DbRecheckResult.Failure(
+                reason = "DB recheck timeout budget (${timeoutMs}ms) exhausted before connection acquisition",
+                timedOutOrBudgetExhausted = true
+            )
         }
 
-        val placeholders = puuids.joinToString(",") { "?" }
-        val indexedPlayersSql =
-            "SELECT puuid, game_name, tag_line FROM indexed_players WHERE puuid IN ($placeholders)"
-
-        val networkTimeoutExecutor = Executors.newSingleThreadExecutor { r ->
+        val puuids = entries.map { it.normalizedPuuid }.distinct()
+        val connRef = AtomicReference<Connection?>(null)
+        val stmtRef = AtomicReference<PreparedStatement?>(null)
+        val netTimeoutExec = Executors.newSingleThreadExecutor { r ->
             Thread(r, "offprod-db-net-timeout").apply { isDaemon = true }
         }
+        val callExec = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "offprod-db-recheck-call").apply { isDaemon = true }
+        }
 
-        try {
-            dataSource.connection.use { conn ->
-                applyBoundedConnectionSettings(conn, readOnly = true, networkTimeoutExecutor)
-                conn.prepareStatement(indexedPlayersSql).use { ps ->
-                    ps.queryTimeout = OffProdChallengerIdentityCompletionTool.DB_QUERY_TIMEOUT_SECONDS
-                    for ((idx, puuid) in puuids.withIndex()) {
-                        ps.setString(idx + 1, puuid)
-                    }
-                    ps.executeQuery().use { rs ->
-                        while (rs.next()) {
-                            val p = rs.getString("puuid")?.trim().orEmpty()
-                            if (p.isEmpty()) continue
-                            val gn = rs.getString("game_name")?.trim().orEmpty()
-                            val tl = rs.getString("tag_line")?.trim().orEmpty()
-                            result[p] = if (gn.isNotEmpty() && tl.isNotEmpty()) {
-                                OffProdChallengerIdentityCompletionTool.PreCallDbState.ALREADY_COMPLETE
-                            } else {
-                                OffProdChallengerIdentityCompletionTool.PreCallDbState.PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD
+        val queryTimeoutSeconds = ceil(timeoutMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
+        val networkTimeoutMs = timeoutMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt().coerceAtLeast(1)
+
+        val future = callExec.submit(Callable<DbRecheckResult> {
+            val result = LinkedHashMap<String, OffProdChallengerIdentityCompletionTool.PreCallDbState>(puuids.size)
+            for (p in puuids) {
+                result[p] = OffProdChallengerIdentityCompletionTool.PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS
+            }
+
+            val placeholders = puuids.joinToString(",") { "?" }
+            val indexedPlayersSql =
+                "SELECT puuid, game_name, tag_line FROM indexed_players WHERE puuid IN ($placeholders)"
+
+            try {
+                dataSource.connection.use { conn ->
+                    connRef.set(conn)
+                    applyBoundedConnectionSettingsFailClosed(
+                        conn = conn,
+                        readOnly = true,
+                        networkTimeoutMs = networkTimeoutMs,
+                        executor = netTimeoutExec
+                    )
+
+                    conn.prepareStatement(indexedPlayersSql).use { ps ->
+                        stmtRef.set(ps)
+                        ps.queryTimeout = queryTimeoutSeconds
+                        for ((idx, puuid) in puuids.withIndex()) {
+                            ps.setString(idx + 1, puuid)
+                        }
+                        ps.executeQuery().use { rs ->
+                            while (rs.next()) {
+                                val p = rs.getString("puuid")?.trim().orEmpty()
+                                if (p.isEmpty()) continue
+                                val gn = rs.getString("game_name")?.trim().orEmpty()
+                                val tl = rs.getString("tag_line")?.trim().orEmpty()
+                                result[p] = if (gn.isNotEmpty() && tl.isNotEmpty()) {
+                                    OffProdChallengerIdentityCompletionTool.PreCallDbState.ALREADY_COMPLETE
+                                } else {
+                                    OffProdChallengerIdentityCompletionTool.PreCallDbState.PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD
+                                }
                             }
                         }
                     }
-                }
 
-                if (checkIdentityTableInPreCall) {
-                    val unresolvedPuuids = result.entries
-                        .filter { it.value != OffProdChallengerIdentityCompletionTool.PreCallDbState.ALREADY_COMPLETE }
-                        .map { it.key }
-                    if (unresolvedPuuids.isNotEmpty()) {
-                        val idPlaceholders = unresolvedPuuids.joinToString(",") { "?" }
-                        val identitySql =
-                            "SELECT puuid, game_name, tag_line FROM player_riot_identities WHERE puuid IN ($idPlaceholders)"
-                        conn.prepareStatement(identitySql).use { ps ->
-                            ps.queryTimeout = OffProdChallengerIdentityCompletionTool.DB_QUERY_TIMEOUT_SECONDS
-                            for ((idx, puuid) in unresolvedPuuids.withIndex()) {
-                                ps.setString(idx + 1, puuid)
-                            }
-                            ps.executeQuery().use { rs ->
-                                while (rs.next()) {
-                                    val p = rs.getString("puuid")?.trim().orEmpty()
-                                    val gn = rs.getString("game_name")?.trim().orEmpty()
-                                    val tl = rs.getString("tag_line")?.trim().orEmpty()
-                                    if (p.isNotEmpty() && gn.isNotEmpty() && tl.isNotEmpty()) {
-                                        result[p] = OffProdChallengerIdentityCompletionTool.PreCallDbState.ALREADY_COMPLETE
+                    if (checkIdentityTableInPreCall) {
+                        val unresolvedPuuids = result.entries
+                            .filter { it.value != OffProdChallengerIdentityCompletionTool.PreCallDbState.ALREADY_COMPLETE }
+                            .map { it.key }
+                        if (unresolvedPuuids.isNotEmpty()) {
+                            val idPlaceholders = unresolvedPuuids.joinToString(",") { "?" }
+                            val identitySql =
+                                "SELECT puuid, game_name, tag_line FROM player_riot_identities WHERE puuid IN ($idPlaceholders)"
+                            conn.prepareStatement(identitySql).use { ps ->
+                                stmtRef.set(ps)
+                                ps.queryTimeout = queryTimeoutSeconds
+                                for ((idx, puuid) in unresolvedPuuids.withIndex()) {
+                                    ps.setString(idx + 1, puuid)
+                                }
+                                ps.executeQuery().use { rs ->
+                                    while (rs.next()) {
+                                        val p = rs.getString("puuid")?.trim().orEmpty()
+                                        val gn = rs.getString("game_name")?.trim().orEmpty()
+                                        val tl = rs.getString("tag_line")?.trim().orEmpty()
+                                        if (p.isNotEmpty() && gn.isNotEmpty() && tl.isNotEmpty()) {
+                                            result[p] = OffProdChallengerIdentityCompletionTool.PreCallDbState.ALREADY_COMPLETE
+                                        }
                                     }
                                 }
                             }
                         }
                     }
                 }
+                DbRecheckResult.Success(result)
+            } catch (e: Exception) {
+                DbRecheckResult.Failure(
+                    reason = "Pre-call DB recheck failed (${e.javaClass.simpleName}): ${e.message}",
+                    timedOutOrBudgetExhausted = false
+                )
+            } finally {
+                stmtRef.set(null)
+                connRef.set(null)
             }
-        } finally {
-            networkTimeoutExecutor.shutdownNow()
-        }
+        })
 
-        return result
-    }
-
-    override fun updateBlankFieldsOnExistingIndexedPlayer(
-        puuid: String,
-        gameName: String,
-        tagLine: String
-    ): Boolean {
-        val trimmedPuuid = puuid.trim()
-        val trimmedGameName = gameName.trim()
-        val trimmedTagLine = tagLine.trim()
-        require(trimmedPuuid.isNotEmpty() && trimmedGameName.isNotEmpty() && trimmedTagLine.isNotEmpty()) {
-            "updateBlankFieldsOnExistingIndexedPlayer requires non-blank puuid, gameName, and tagLine"
-        }
-
-        val networkTimeoutExecutor = Executors.newSingleThreadExecutor { r ->
-            Thread(r, "offprod-db-net-timeout").apply { isDaemon = true }
-        }
         return try {
-            dataSource.connection.use { conn ->
-                applyBoundedConnectionSettings(conn, readOnly = false, networkTimeoutExecutor)
-                conn.prepareStatement(SQL_UPDATE_INDEXED_PLAYERS_BLANK_FIELDS_ONLY).use { ps ->
-                    ps.queryTimeout = OffProdChallengerIdentityCompletionTool.DB_QUERY_TIMEOUT_SECONDS
-                    ps.setString(1, trimmedGameName)
-                    ps.setString(2, trimmedTagLine)
-                    ps.setString(3, trimmedPuuid)
-                    ps.setString(4, trimmedGameName)
-                    ps.setString(5, trimmedTagLine)
-                    ps.executeUpdate() > 0
-                }
-            }
+            future.get(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: TimeoutException) {
+            future.cancel(true)
+            cancelAndCloseQuietly(stmtRef.getAndSet(null), connRef.getAndSet(null))
+            DbRecheckResult.Failure(
+                reason = "Pre-call DB recheck (including connection acquisition) exceeded ${timeoutMs}ms deadline",
+                timedOutOrBudgetExhausted = true
+            )
+        } catch (e: Exception) {
+            future.cancel(true)
+            cancelAndCloseQuietly(stmtRef.getAndSet(null), connRef.getAndSet(null))
+            DbRecheckResult.Failure(
+                reason = "Pre-call DB recheck interrupted/failed: ${e.message}",
+                timedOutOrBudgetExhausted = false
+            )
         } finally {
-            networkTimeoutExecutor.shutdownNow()
+            callExec.shutdownNow()
+            netTimeoutExec.shutdownNow()
         }
     }
 
-    override fun upsertVerifiedIdentityOnly(
+    override fun persistAndVerifyIdentityBounded(
         puuid: String,
         platformRegion: String,
         gameName: String,
         tagLine: String,
-        verifiedAt: Instant
-    ): Boolean {
-        val trimmedPuuid = puuid.trim()
+        verifiedAt: Instant,
+        preCallDbState: OffProdChallengerIdentityCompletionTool.PreCallDbState,
+        timeoutMs: Long
+    ): DbWriteVerificationResult {
+        val validatedPuuid = OffProdChallengerIdentityCompletionTool.validateOfficialPuuid(puuid, "puuid")
         val trimmedRegion = platformRegion.trim().lowercase(Locale.ROOT)
         val trimmedGameName = gameName.trim()
         val trimmedTagLine = tagLine.trim()
-        require(
-            trimmedPuuid.isNotEmpty() &&
-                trimmedRegion.isNotEmpty() &&
-                trimmedGameName.isNotEmpty() &&
-                trimmedTagLine.isNotEmpty()
-        ) {
-            "upsertVerifiedIdentityOnly requires non-blank puuid, platformRegion, gameName, and tagLine"
+        if (trimmedRegion.isEmpty() || trimmedGameName.isEmpty() || trimmedTagLine.isEmpty()) {
+            return DbWriteVerificationResult.FailureOrUnknownCommit(
+                "persistAndVerifyIdentityBounded requires non-blank platformRegion, gameName, and tagLine"
+            )
+        }
+        if (timeoutMs <= 0L) {
+            return DbWriteVerificationResult.FailureOrUnknownCommit(
+                "DB write timeout budget (${timeoutMs}ms) exhausted before connection acquisition"
+            )
         }
 
-        val networkTimeoutExecutor = Executors.newSingleThreadExecutor { r ->
-            Thread(r, "offprod-db-net-timeout").apply { isDaemon = true }
+        val connRef = AtomicReference<Connection?>(null)
+        val stmtRef = AtomicReference<PreparedStatement?>(null)
+        val netTimeoutExec = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "offprod-db-write-net-timeout").apply { isDaemon = true }
         }
-        return try {
-            dataSource.connection.use { conn ->
-                applyBoundedConnectionSettings(conn, readOnly = false, networkTimeoutExecutor)
-                conn.prepareStatement(SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE).use { ps ->
-                    ps.queryTimeout = OffProdChallengerIdentityCompletionTool.DB_QUERY_TIMEOUT_SECONDS
-                    ps.setString(1, trimmedPuuid)
-                    ps.setString(2, trimmedRegion)
-                    ps.setString(3, trimmedGameName)
-                    ps.setString(4, trimmedTagLine)
-                    ps.setTimestamp(5, Timestamp.from(verifiedAt))
-                    ps.executeUpdate() > 0
+        val callExec = Executors.newSingleThreadExecutor { r ->
+            Thread(r, "offprod-db-write-call").apply { isDaemon = true }
+        }
+
+        val queryTimeoutSeconds = ceil(timeoutMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
+        val networkTimeoutMs = timeoutMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt().coerceAtLeast(1)
+
+        val future = callExec.submit(Callable<DbWriteVerificationResult> {
+            try {
+                dataSource.connection.use { conn ->
+                    connRef.set(conn)
+                    applyBoundedConnectionSettingsFailClosed(
+                        conn = conn,
+                        readOnly = false,
+                        networkTimeoutMs = networkTimeoutMs,
+                        executor = netTimeoutExec
+                    )
+
+                    var indexedUpdated = false
+                    if (preCallDbState == OffProdChallengerIdentityCompletionTool.PreCallDbState.PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD) {
+                        conn.prepareStatement(SQL_UPDATE_INDEXED_PLAYERS_BLANK_FIELDS_ONLY).use { ps ->
+                            stmtRef.set(ps)
+                            ps.queryTimeout = queryTimeoutSeconds
+                            ps.setString(1, trimmedGameName)
+                            ps.setString(2, trimmedTagLine)
+                            ps.setString(3, validatedPuuid)
+                            ps.setString(4, trimmedGameName)
+                            ps.setString(5, trimmedTagLine)
+                            indexedUpdated = ps.executeUpdate() > 0
+                        }
+                    }
+
+                    val identityUpserted: Boolean = conn.prepareStatement(SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE).use { ps ->
+                        stmtRef.set(ps)
+                        ps.queryTimeout = queryTimeoutSeconds
+                        ps.setString(1, validatedPuuid)
+                        ps.setString(2, trimmedRegion)
+                        ps.setString(3, trimmedGameName)
+                        ps.setString(4, trimmedTagLine)
+                        ps.setTimestamp(5, Timestamp.from(verifiedAt))
+                        ps.executeUpdate() > 0
+                    }
+
+                    // Mandatory post-write verification read on player_riot_identities (and indexed_players if targeted)
+                    var verifiedIdentityGn = ""
+                    var verifiedIdentityTl = ""
+                    var verifiedIdentityTs: Instant? = null
+
+                    conn.prepareStatement(SQL_SELECT_VERIFY_IDENTITY_ONLY_BY_PUUID).use { ps ->
+                        stmtRef.set(ps)
+                        ps.queryTimeout = queryTimeoutSeconds
+                        ps.setString(1, validatedPuuid)
+                        ps.executeQuery().use { rs ->
+                            if (rs.next()) {
+                                verifiedIdentityGn = rs.getString("game_name")?.trim().orEmpty()
+                                verifiedIdentityTl = rs.getString("tag_line")?.trim().orEmpty()
+                                verifiedIdentityTs = rs.getTimestamp("verified_at")?.toInstant()
+                            }
+                        }
+                    }
+
+                    if (preCallDbState == OffProdChallengerIdentityCompletionTool.PreCallDbState.PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD) {
+                        var indexedGn = ""
+                        var indexedTl = ""
+                        conn.prepareStatement(SQL_SELECT_VERIFY_INDEXED_PLAYER_BY_PUUID).use { ps ->
+                            stmtRef.set(ps)
+                            ps.queryTimeout = queryTimeoutSeconds
+                            ps.setString(1, validatedPuuid)
+                            ps.executeQuery().use { rs ->
+                                if (rs.next()) {
+                                    indexedGn = rs.getString("game_name")?.trim().orEmpty()
+                                    indexedTl = rs.getString("tag_line")?.trim().orEmpty()
+                                }
+                            }
+                        }
+                        if (indexedGn.isEmpty() || indexedTl.isEmpty()) {
+                            return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                                "Post-write verification failed: indexed_players row for '$validatedPuuid' still has blank game_name or tag_line"
+                            )
+                        }
+                    }
+
+                    if (verifiedIdentityGn.isEmpty() || verifiedIdentityTl.isEmpty() || verifiedIdentityTs == null) {
+                        return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                            "Post-write verification failed: player_riot_identities row for '$validatedPuuid' missing or blank after upsert"
+                        )
+                    }
+
+                    if (indexedUpdated || identityUpserted) {
+                        val targetDesc = if (preCallDbState == OffProdChallengerIdentityCompletionTool.PreCallDbState.PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD) {
+                            "INDEXED_PLAYERS_BLANK_ONLY_AND_PLAYER_RIOT_IDENTITIES"
+                        } else {
+                            "PLAYER_RIOT_IDENTITIES_ONLY"
+                        }
+                        DbWriteVerificationResult.WrittenAndVerified(
+                            indexedPlayerBlankFieldUpdated = indexedUpdated,
+                            identityOnlyTableUpserted = identityUpserted,
+                            verifiedGameName = verifiedIdentityGn,
+                            verifiedTagLine = verifiedIdentityTl,
+                            verifiedAtUtc = verifiedIdentityTs!!,
+                            writeTargetDescription = targetDesc
+                        )
+                    } else {
+                        // 0 rows mutated, but post-write read proved a complete non-blank identity is stored in DB!
+                        DbWriteVerificationResult.ConcurrentAlreadyCompleteVerified(
+                            verifiedGameName = verifiedIdentityGn,
+                            verifiedTagLine = verifiedIdentityTl,
+                            verifiedAtUtc = verifiedIdentityTs
+                        )
+                    }
                 }
+            } catch (e: Exception) {
+                DbWriteVerificationResult.FailureOrUnknownCommit(
+                    "DB write or post-write verification failed (${e.javaClass.simpleName}): ${e.message} (commit state unknown if failure occurred during commit)"
+                )
+            } finally {
+                stmtRef.set(null)
+                connRef.set(null)
             }
+        })
+
+        return try {
+            future.get(timeoutMs, TimeUnit.MILLISECONDS)
+        } catch (_: TimeoutException) {
+            future.cancel(true)
+            cancelAndCloseQuietly(stmtRef.getAndSet(null), connRef.getAndSet(null))
+            DbWriteVerificationResult.FailureOrUnknownCommit(
+                "DB write/verification for '$validatedPuuid' exceeded ${timeoutMs}ms deadline; connection closed, commit state unknown"
+            )
+        } catch (e: Exception) {
+            future.cancel(true)
+            cancelAndCloseQuietly(stmtRef.getAndSet(null), connRef.getAndSet(null))
+            DbWriteVerificationResult.FailureOrUnknownCommit(
+                "DB write/verification interrupted for '$validatedPuuid': ${e.message}; commit state unknown"
+            )
         } finally {
-            networkTimeoutExecutor.shutdownNow()
+            callExec.shutdownNow()
+            netTimeoutExec.shutdownNow()
         }
     }
 
-    private fun applyBoundedConnectionSettings(
+    /**
+     * Applies readOnly and networkTimeout settings in fail-closed mode:
+     * any SQLException, SQLFeatureNotSupportedException, or UnsupportedOperationException
+     * propagates immediately instead of being swallowed.
+     */
+    @Throws(SQLException::class)
+    private fun applyBoundedConnectionSettingsFailClosed(
         conn: Connection,
         readOnly: Boolean,
+        networkTimeoutMs: Int,
         executor: java.util.concurrent.Executor
     ) {
+        conn.isReadOnly = readOnly
+        conn.setNetworkTimeout(executor, networkTimeoutMs)
+    }
+
+    private fun cancelAndCloseQuietly(stmt: PreparedStatement?, conn: Connection?) {
         try {
-            conn.isReadOnly = readOnly
+            stmt?.cancel()
         } catch (_: Exception) {
         }
         try {
-            conn.setNetworkTimeout(executor, OffProdChallengerIdentityCompletionTool.DB_NETWORK_TIMEOUT_MS)
+            stmt?.close()
+        } catch (_: Exception) {
+        }
+        try {
+            conn?.close()
         } catch (_: Exception) {
         }
     }

@@ -21,17 +21,29 @@ import java.nio.charset.StandardCharsets
 import java.sql.Connection
 import java.sql.PreparedStatement
 import java.sql.ResultSet
+import java.sql.SQLException
+import java.sql.SQLFeatureNotSupportedException
+import java.sql.Timestamp
 import java.time.Instant
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import javax.sql.DataSource
 
+/**
+ * Generates a deterministic, valid 78-character base64url Riot PUUID (`^[A-Za-z0-9_-]{78}$`) for testing.
+ */
+private fun validPuuid78(seed: String): String {
+    val sanitized = seed.replace(Regex("[^A-Za-z0-9_-]"), "_")
+    require(sanitized.length <= 78) { "Seed too long: ${sanitized.length}" }
+    return sanitized.padEnd(78, 'x')
+}
+
 class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
 
-    Given("the 191 missing Challenger snapshot manifest (31 EUW + 160 KR) and default no-effects options") {
-        val entries191 = (1..31).map { ManifestEntry(puuid = "euw-missing-$it", platformRegion = "euw1") } +
-            (1..160).map { ManifestEntry(puuid = "kr-missing-$it", platformRegion = "kr") }
+    Given("official 78-char base64url PUUID validation and the 191 missing Challenger snapshot manifest (31 EUW + 160 KR)") {
+        val entries191 = (1..31).map { ManifestEntry(puuid = validPuuid78("euw_missing_$it"), platformRegion = "euw1") } +
+            (1..160).map { ManifestEntry(puuid = validPuuid78("kr_missing_$it"), platformRegion = "kr") }
 
         val manifest191 = SnapshotManifest(
             snapshotCapturedAtUtc = "2026-11-09T00:46:00Z",
@@ -39,36 +51,33 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             entries = entries191
         )
 
-        Then("it enforces historical snapshot rules, <= 191 cap, and deterministic SHA-256 manifest hashing") {
+        Then("it enforces exact 78-char base64url PUUID format and rejects short, oversized, or URL-path-traversal strings") {
             manifest191.entries shouldHaveSize 191
-            val hash1 = OffProdChallengerIdentityCompletionTool.computeManifestSha256(manifest191.entries)
-            val hash2 = OffProdChallengerIdentityCompletionTool.computeManifestSha256(manifest191.entries)
-            hash1 shouldBe hash2
-            hash1.length shouldBe 64
+            manifest191.entries.all { it.normalizedPuuid.length == 78 } shouldBe true
 
-            // Reject claiming historical snapshot is current live ladder
+            // Reject short PUUID
             shouldThrow<IllegalArgumentException> {
-                SnapshotManifest(
-                    snapshotCapturedAtUtc = "2026-11-09T00:46:00Z",
-                    isLiveLadder = true,
-                    entries = entries191
-                )
+                ManifestEntry(puuid = "short-puuid", platformRegion = "euw1")
             }
 
-            // Reject > 191 entries
+            // Reject 79-char PUUID
             shouldThrow<IllegalArgumentException> {
-                SnapshotManifest(
-                    snapshotCapturedAtUtc = "2026-11-09T00:46:00Z",
-                    isLiveLadder = false,
-                    entries = entries191 + ManifestEntry("extra-192", "euw1")
-                )
+                ManifestEntry(puuid = "a".repeat(79), platformRegion = "euw1")
+            }
+
+            // Reject 78-char string containing URL path traversal or query characters ('/', '.', '?')
+            shouldThrow<IllegalArgumentException> {
+                ManifestEntry(puuid = "../admin/".padEnd(78, 'a'), platformRegion = "euw1")
+            }
+            shouldThrow<IllegalArgumentException> {
+                ManifestEntry(puuid = ("?query=1").padEnd(78, 'a'), platformRegion = "kr")
             }
         }
 
         Then("default ExecutionOptions run in DB-recheck-only dryRun mode with 0 HTTP attempts and 0 DB writes") {
             val persistence = FakeRaceSafeIdentityPersistence()
             val transportCalls = AtomicInteger(0)
-            val transport = BoundedAccountV1Transport { _, _, _, _, _, _ ->
+            val transport = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
                 transportCalls.incrementAndGet()
                 error("Transport must not be called when networkEnabled=false")
             }
@@ -76,7 +85,7 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             val tool = OffProdChallengerIdentityCompletionTool(
                 persistencePort = persistence,
                 httpTransport = transport,
-                clock = FakeMonotonicClock()
+                monotonicClock = FakeMonotonicClock()
             )
 
             val report = tool.runBounded(manifest191)
@@ -88,25 +97,82 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             report.manifestTotalCount shouldBe 191
             report.absentFromIndexedPlayersCount shouldBe 191
             report.httpAttemptsMade shouldBe 0
-            report.durableIndexedPlayerUpdatesCount shouldBe 0
-            report.durableIdentityTableUpsertsCount shouldBe 0
+            report.durableIndexedPlayerUpdatesVerifiedCount shouldBe 0
+            report.durableIdentityTableUpsertsVerifiedCount shouldBe 0
             report.remainingPendingCount shouldBe 191
             report.remainingEntries shouldHaveSize 191
             transportCalls.get() shouldBe 0
         }
     }
 
-    Given("uncoordinated shared Riot API key execution") {
+    Given("WallClock vs MonotonicClock separation") {
+        val p1 = validPuuid78("clock_sep_1")
         val manifest = SnapshotManifest(
             snapshotCapturedAtUtc = "2026-11-09T00:45:00Z",
             isLiveLadder = false,
-            entries = listOf(ManifestEntry("euw-1", "euw1"))
+            entries = listOf(ManifestEntry(p1, "euw1"))
         )
 
-        Then("it stops immediately as BLOCKED_KEY_COORDINATION_REQUIRED with 0 HTTP attempts") {
+        Then("verified_at uses UTC WallClock Instant and NEVER derives timestamps from MonotonicClock.nowMs()") {
+            val persistence = FakeRaceSafeIdentityPersistence()
+            // MonotonicClock starts at 42ms (simulating JVM nanoTime uptime near zero)
+            val monoClock = FakeMonotonicClock(initialMs = 42L)
+            // WallClock returns a real 2026 UTC epoch Instant
+            val expectedUtcInstant = Instant.parse("2026-11-09T11:15:30Z")
+            val utcWallClock = WallClock { expectedUtcInstant }
+
+            val transport = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
+                TransportResult.HttpResponse(
+                    statusCode = 200,
+                    headersLowercase = mapOf(
+                        "x-app-rate-limit" to "20:1,100:120",
+                        "x-app-rate-limit-count" to "1:1,1:120",
+                        "x-method-rate-limit" to "1000:60",
+                        "x-method-rate-limit-count" to "1:60"
+                    ),
+                    bodyBytes = """{"puuid":"$p1","gameName":"ClockUser","tagLine":"UTC"}""".toByteArray()
+                )
+            }
+
+            val tool = OffProdChallengerIdentityCompletionTool(
+                persistencePort = persistence,
+                httpTransport = transport,
+                monotonicClock = monoClock,
+                wallClock = utcWallClock
+            )
+
+            val report = tool.runBounded(
+                manifest = manifest,
+                options = ExecutionOptions(
+                    dryRun = false,
+                    networkEnabled = true,
+                    allowDurableWrites = true,
+                    keyCoordinationMode = KeyCoordinationMode.EXCLUSIVE_KEY,
+                    coordinationAttestation = "Exclusive off-prod key"
+                ),
+                riotApiKeyProvider = { "RGAPI-isolated-key" }
+            )
+
+            report.outcome shouldBe RunOutcome.STAGED_ALL_CANDIDATES
+            report.durableIdentityTableUpsertsVerifiedCount shouldBe 1
+            val stored = persistence.identitiesOnly[p1]!!
+            stored.verifiedAt shouldBe expectedUtcInstant
+            report.itemResults.single().verifiedAtUtc shouldBe expectedUtcInstant
+        }
+    }
+
+    Given("uncoordinated shared Riot API key execution and HTTPS cluster transport host/credential guards") {
+        val p1 = validPuuid78("guard_test_1")
+        val manifest = SnapshotManifest(
+            snapshotCapturedAtUtc = "2026-11-09T00:45:00Z",
+            isLiveLadder = false,
+            entries = listOf(ManifestEntry(p1, "euw1"))
+        )
+
+        Then("it stops immediately as BLOCKED_KEY_COORDINATION_REQUIRED with 0 HTTP attempts when uncoordinated") {
             val persistence = FakeRaceSafeIdentityPersistence()
             val transportCalls = AtomicInteger(0)
-            val transport = BoundedAccountV1Transport { _, _, _, _, _, _ ->
+            val transport = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
                 transportCalls.incrementAndGet()
                 error("Must not dispatch HTTP without key coordination attestation")
             }
@@ -114,7 +180,7 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             val tool = OffProdChallengerIdentityCompletionTool(
                 persistencePort = persistence,
                 httpTransport = transport,
-                clock = FakeMonotonicClock()
+                monotonicClock = FakeMonotonicClock()
             )
 
             val report = tool.runBounded(
@@ -132,40 +198,107 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             report.remainingPendingCount shouldBe 1
             transportCalls.get() shouldBe 0
         }
+
+        Then("it rejects non-HTTPS or unapproved hosts in production mode, and blocks RGAPI-* keys on loopback HTTP test override") {
+            val persistence = FakeRaceSafeIdentityPersistence()
+            val transportCalls = AtomicInteger(0)
+            val transport = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
+                transportCalls.incrementAndGet()
+                error("Transport must not be reached when URL or loopback credential check fails")
+            }
+
+            val tool = OffProdChallengerIdentityCompletionTool(
+                persistencePort = persistence,
+                httpTransport = transport,
+                monotonicClock = FakeMonotonicClock()
+            )
+
+            // 1. Disallowed host even over https
+            val badHostReport = tool.runBounded(
+                manifest = manifest,
+                options = ExecutionOptions(
+                    dryRun = true,
+                    networkEnabled = true,
+                    keyCoordinationMode = KeyCoordinationMode.EXCLUSIVE_KEY,
+                    coordinationAttestation = "Test",
+                    baseUrlByCluster = mapOf("europe" to "https://evil.example.com")
+                ),
+                riotApiKeyProvider = { "RGAPI-secret" }
+            )
+            badHostReport.outcome shouldBe RunOutcome.ABORTED_DISALLOWED_TRANSPORT_TARGET
+            badHostReport.httpAttemptsMade shouldBe 0
+            transportCalls.get() shouldBe 0
+
+            // 2. Loopback HTTP without allowLoopbackHttpForTesting=true is rejected
+            val loopbackDisabledReport = tool.runBounded(
+                manifest = manifest,
+                options = ExecutionOptions(
+                    dryRun = true,
+                    networkEnabled = true,
+                    keyCoordinationMode = KeyCoordinationMode.EXCLUSIVE_KEY,
+                    coordinationAttestation = "Test",
+                    allowLoopbackHttpForTesting = false,
+                    baseUrlByCluster = mapOf("europe" to "http://127.0.0.1:18080")
+                ),
+                riotApiKeyProvider = { "TEST-LOOPBACK-ONLY-mock" }
+            )
+            loopbackDisabledReport.outcome shouldBe RunOutcome.ABORTED_DISALLOWED_TRANSPORT_TARGET
+            loopbackDisabledReport.httpAttemptsMade shouldBe 0
+
+            // 3. Loopback HTTP with allowLoopbackHttpForTesting=true STILL blocks any real-looking RGAPI-* key!
+            val realKeyLeakAttemptReport = tool.runBounded(
+                manifest = manifest,
+                options = ExecutionOptions(
+                    dryRun = true,
+                    networkEnabled = true,
+                    keyCoordinationMode = KeyCoordinationMode.EXCLUSIVE_KEY,
+                    coordinationAttestation = "Test",
+                    allowLoopbackHttpForTesting = true,
+                    baseUrlByCluster = mapOf("europe" to "http://127.0.0.1:18080")
+                ),
+                riotApiKeyProvider = { "RGAPI-real-production-secret-key" }
+            )
+            realKeyLeakAttemptReport.outcome shouldBe RunOutcome.ABORTED_DISALLOWED_TRANSPORT_TARGET
+            realKeyLeakAttemptReport.httpAttemptsMade shouldBe 0
+            transportCalls.get() shouldBe 0
+        }
     }
 
     Given("cluster rate-limit discovery, missing-header fail-safe, and header-driven pacing under the 180s wall-time cap") {
-        val entries = listOf(
-            ManifestEntry("euw-1", "euw1"),
-            ManifestEntry("euw-2", "euw1"),
-            ManifestEntry("kr-1", "kr")
-        )
-        val manifest = SnapshotManifest(
-            snapshotCapturedAtUtc = "2026-11-09T00:45:00Z",
-            isLiveLadder = false,
-            entries = entries
-        )
+        val pEuw1 = validPuuid78("euw_rate_1")
+        val pEuw2 = validPuuid78("euw_rate_2")
+        val pEuw3 = validPuuid78("euw_rate_3")
+        val pKr1 = validPuuid78("kr_rate_1")
 
         Then("it aborts immediately after attempt #1 if rate headers are missing or malformed (no assumed 20:1 or 100:120 defaults)") {
             val persistence = FakeRaceSafeIdentityPersistence()
             val transportCalls = AtomicInteger(0)
-            val transport = BoundedAccountV1Transport { _, _, _, _, _, _ ->
+            val transport = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
                 transportCalls.incrementAndGet()
-                // Missing X-Method-Rate-Limit and X-Method-Rate-Limit-Count
                 TransportResult.HttpResponse(
                     statusCode = 200,
                     headersLowercase = mapOf(
                         "x-app-rate-limit" to "20:1,100:120",
                         "x-app-rate-limit-count" to "1:1,1:120"
                     ),
-                    bodyBytes = """{"puuid":"euw-1","gameName":"PlayerOne","tagLine":"EUW"}""".toByteArray()
+                    bodyBytes = """{"puuid":"$pEuw1","gameName":"PlayerOne","tagLine":"EUW"}""".toByteArray()
                 )
             }
+
+            val manifest = SnapshotManifest(
+                snapshotCapturedAtUtc = "2026-11-09T00:45:00Z",
+                isLiveLadder = false,
+                entries = listOf(
+                    ManifestEntry(pEuw1, "euw1"),
+                    ManifestEntry(pEuw2, "euw1"),
+                    ManifestEntry(pKr1, "kr")
+                )
+            )
 
             val tool = OffProdChallengerIdentityCompletionTool(
                 persistencePort = persistence,
                 httpTransport = transport,
-                clock = FakeMonotonicClock()
+                monotonicClock = FakeMonotonicClock()
             )
 
             val report = tool.runBounded(
@@ -184,7 +317,7 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             transportCalls.get() shouldBe 1
             report.validatedIdentitiesCount shouldBe 0
             report.remainingPendingCount shouldBe 2
-            report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf("euw-2", "kr-1")
+            report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(pEuw2, pKr1)
         }
 
         Then("first cluster discovery call counts against the attempt cap, header-driven waits are applied, and exceeding the 180s wall-time budget halts honestly without sleeping") {
@@ -192,12 +325,11 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             val clock = FakeMonotonicClock()
             val transportCalls = AtomicInteger(0)
 
-            val transport = BoundedAccountV1Transport { url, _, _, _, _, _ ->
+            val transport = BoundedAccountV1Transport { url, _, _, _, _, _, _ ->
                 val callNum = transportCalls.incrementAndGet()
                 when (callNum) {
                     1 -> {
-                        // First call to EUROPE discovers headers and reports the 10s method window is now exhausted (5:10)
-                        url shouldContain "/by-puuid/euw-1"
+                        url shouldContain "/by-puuid/$pEuw1"
                         TransportResult.HttpResponse(
                             statusCode = 200,
                             headersLowercase = mapOf(
@@ -206,13 +338,11 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                                 "x-method-rate-limit" to "5:10",
                                 "x-method-rate-limit-count" to "5:10"
                             ),
-                            bodyBytes = """{"puuid":"euw-1","gameName":"EuwOne","tagLine":"EUW"}""".toByteArray()
+                            bodyBytes = """{"puuid":"$pEuw1","gameName":"EuwOne","tagLine":"EUW"}""".toByteArray()
                         )
                     }
                     2 -> {
-                        // Second call to EUROPE happens after a single 10_000ms header-driven sleep, and now reports
-                        // a 600s app window exhaustion (500:600), which exceeds the 180s default wall-time cap!
-                        url shouldContain "/by-puuid/euw-2"
+                        url shouldContain "/by-puuid/$pEuw2"
                         TransportResult.HttpResponse(
                             statusCode = 200,
                             headersLowercase = mapOf(
@@ -221,7 +351,7 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                                 "x-method-rate-limit" to "5:10",
                                 "x-method-rate-limit-count" to "1:10"
                             ),
-                            bodyBytes = """{"puuid":"euw-2","gameName":"EuwTwo","tagLine":"EUW"}""".toByteArray()
+                            bodyBytes = """{"puuid":"$pEuw2","gameName":"EuwTwo","tagLine":"EUW"}""".toByteArray()
                         )
                     }
                     else -> error("Unexpected call $callNum")
@@ -232,16 +362,16 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 snapshotCapturedAtUtc = "2026-11-09T00:45:00Z",
                 isLiveLadder = false,
                 entries = listOf(
-                    ManifestEntry("euw-1", "euw1"),
-                    ManifestEntry("euw-2", "euw1"),
-                    ManifestEntry("euw-3", "euw1")
+                    ManifestEntry(pEuw1, "euw1"),
+                    ManifestEntry(pEuw2, "euw1"),
+                    ManifestEntry(pEuw3, "euw1")
                 )
             )
 
             val tool = OffProdChallengerIdentityCompletionTool(
                 persistencePort = persistence,
                 httpTransport = transport,
-                clock = clock
+                monotonicClock = clock
             )
 
             val report = tool.runBounded(
@@ -256,14 +386,13 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 riotApiKeyProvider = { "RGAPI-test" }
             )
 
-            // Attempt 1 (discovery) + 10s sleep + Attempt 2 (reports 600s wait needed before euw-3) -> halts immediately!
             report.outcome shouldBe RunOutcome.PARTIAL_COMPLETION_WALL_TIME_EXHAUSTED
             report.httpAttemptsMade shouldBe 2
             report.totalWaitTimeMs shouldBe 10_000L
-            clock.sleepsRecordedMs shouldBe listOf(10_000L) // Never slept the 600_000ms window!
+            clock.sleepsRecordedMs shouldBe listOf(10_000L)
             report.validatedIdentitiesCount shouldBe 2
             report.remainingPendingCount shouldBe 1
-            report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf("euw-3")
+            report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(pEuw3)
         }
     }
 
@@ -274,6 +403,12 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             "x-method-rate-limit" to "1000:60",
             "x-method-rate-limit-count" to "1:60"
         )
+        val p404 = validPuuid78("p_404")
+        val pOmittedName = validPuuid78("p_omitted_name")
+        val pBlankTag = validPuuid78("p_blank_tag")
+        val pMismatch = validPuuid78("p_mismatch")
+        val pWrongReturned = validPuuid78("p_wrong_returned")
+        val pAfterMismatch = validPuuid78("p_after_mismatch")
 
         Then("it records 404 and omitted Riot ID fields without writing, and aborts on PUUID mismatch") {
             val persistence = FakeRaceSafeIdentityPersistence()
@@ -281,35 +416,35 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 snapshotCapturedAtUtc = "2026-11-09T00:45:00Z",
                 isLiveLadder = false,
                 entries = listOf(
-                    ManifestEntry("p-404", "euw1"),
-                    ManifestEntry("p-omitted-name", "euw1"),
-                    ManifestEntry("p-blank-tag", "euw1"),
-                    ManifestEntry("p-mismatch", "euw1"),
-                    ManifestEntry("p-after-mismatch", "euw1")
+                    ManifestEntry(p404, "euw1"),
+                    ManifestEntry(pOmittedName, "euw1"),
+                    ManifestEntry(pBlankTag, "euw1"),
+                    ManifestEntry(pMismatch, "euw1"),
+                    ManifestEntry(pAfterMismatch, "euw1")
                 )
             )
 
-            val transport = BoundedAccountV1Transport { url, _, _, _, _, _ ->
+            val transport = BoundedAccountV1Transport { url, _, _, _, _, _, _ ->
                 when {
-                    url.endsWith("/p-404") -> TransportResult.HttpResponse(
+                    url.endsWith("/$p404") -> TransportResult.HttpResponse(
                         statusCode = 404,
                         headersLowercase = validHeaders,
                         bodyBytes = """{"status":{"message":"Data not found","status_code":404}}""".toByteArray()
                     )
-                    url.endsWith("/p-omitted-name") -> TransportResult.HttpResponse(
+                    url.endsWith("/$pOmittedName") -> TransportResult.HttpResponse(
                         statusCode = 200,
                         headersLowercase = validHeaders,
-                        bodyBytes = """{"puuid":"p-omitted-name","tagLine":"KR1"}""".toByteArray()
+                        bodyBytes = """{"puuid":"$pOmittedName","tagLine":"KR1"}""".toByteArray()
                     )
-                    url.endsWith("/p-blank-tag") -> TransportResult.HttpResponse(
+                    url.endsWith("/$pBlankTag") -> TransportResult.HttpResponse(
                         statusCode = 200,
                         headersLowercase = validHeaders,
-                        bodyBytes = """{"puuid":"p-blank-tag","gameName":"ValidName","tagLine":"   "}""".toByteArray()
+                        bodyBytes = """{"puuid":"$pBlankTag","gameName":"ValidName","tagLine":"   "}""".toByteArray()
                     )
-                    url.endsWith("/p-mismatch") -> TransportResult.HttpResponse(
+                    url.endsWith("/$pMismatch") -> TransportResult.HttpResponse(
                         statusCode = 200,
                         headersLowercase = validHeaders,
-                        bodyBytes = """{"puuid":"WRONG-PUUID","gameName":"Spoof","tagLine":"EUW"}""".toByteArray()
+                        bodyBytes = """{"puuid":"$pWrongReturned","gameName":"Spoof","tagLine":"EUW"}""".toByteArray()
                     )
                     else -> error("Should have aborted on PUUID mismatch before $url")
                 }
@@ -318,7 +453,7 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             val tool = OffProdChallengerIdentityCompletionTool(
                 persistencePort = persistence,
                 httpTransport = transport,
-                clock = FakeMonotonicClock()
+                monotonicClock = FakeMonotonicClock()
             )
 
             val report = tool.runBounded(
@@ -338,21 +473,23 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             report.notFound404Count shouldBe 1
             report.omittedRiotIdFieldsCount shouldBe 2
             report.puuidMismatchCount shouldBe 1
-            report.durableIndexedPlayerUpdatesCount shouldBe 0
-            report.durableIdentityTableUpsertsCount shouldBe 0
+            report.durableIndexedPlayerUpdatesVerifiedCount shouldBe 0
+            report.durableIdentityTableUpsertsVerifiedCount shouldBe 0
             report.remainingPendingCount shouldBe 1
-            report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf("p-after-mismatch")
+            report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(pAfterMismatch)
         }
 
         Then("it performs 0 retries and aborts immediately on HTTP 429 (including service 429) or HTTP 5xx") {
             val persistence = FakeRaceSafeIdentityPersistence()
+            val kr1 = validPuuid78("kr_429_1")
+            val kr2 = validPuuid78("kr_429_2")
             val manifest = SnapshotManifest(
                 snapshotCapturedAtUtc = "2026-11-09T00:45:00Z",
                 isLiveLadder = false,
-                entries = listOf(ManifestEntry("kr-1", "kr"), ManifestEntry("kr-2", "kr"))
+                entries = listOf(ManifestEntry(kr1, "kr"), ManifestEntry(kr2, "kr"))
             )
             val attempts = AtomicInteger(0)
-            val transport429 = BoundedAccountV1Transport { _, _, _, _, _, _ ->
+            val transport429 = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
                 attempts.incrementAndGet()
                 TransportResult.HttpResponse(
                     statusCode = 429,
@@ -367,7 +504,7 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             val tool = OffProdChallengerIdentityCompletionTool(
                 persistencePort = persistence,
                 httpTransport = transport429,
-                clock = FakeMonotonicClock()
+                monotonicClock = FakeMonotonicClock()
             )
 
             val report429 = tool.runBounded(
@@ -384,16 +521,17 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             report429.outcome shouldBe RunOutcome.ABORTED_HTTP_429
             report429.httpAttemptsMade shouldBe 1
             attempts.get() shouldBe 1
-            // Service 429 with 0s Retry-After enforces >= 10s minimum retryAfterSeconds in recorded cluster state
             report429.lastObservedClusterHeaders["asia"]?.retryAfterSeconds shouldBe 10L
             report429.remainingPendingCount shouldBe 1
         }
 
-        Then("HttpUrlConnectionAccountV1Transport enforces the 4 KiB body cap and socket deadline cancellation on a local loopback server") {
+        Then("HttpUrlConnectionAccountV1Transport enforces the 4 KiB body cap, socket deadline cancellation, and loopback credential guard on a local loopback server") {
+            val pOversized = validPuuid78("loopback_oversized")
+            val pStalled = validPuuid78("loopback_stalled")
             val releaseStalledHandler = CountDownLatch(1)
             val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
             try {
-                server.createContext("/riot/account/v1/accounts/by-puuid/oversized") { exchange ->
+                server.createContext("/riot/account/v1/accounts/by-puuid/$pOversized") { exchange ->
                     exchange.responseHeaders.add("X-App-Rate-Limit", "20:1,100:120")
                     exchange.responseHeaders.add("X-App-Rate-Limit-Count", "1:1,1:120")
                     exchange.responseHeaders.add("X-Method-Rate-Limit", "1000:60")
@@ -402,7 +540,7 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                     exchange.sendResponseHeaders(200, hugePayload.size.toLong())
                     exchange.responseBody.use { it.write(hugePayload) }
                 }
-                server.createContext("/riot/account/v1/accounts/by-puuid/stalled") { exchange ->
+                server.createContext("/riot/account/v1/accounts/by-puuid/$pStalled") { exchange ->
                     releaseStalledHandler.await(3, TimeUnit.SECONDS)
                     exchange.sendResponseHeaders(200, 2)
                     exchange.responseBody.use { it.write("{}".toByteArray(StandardCharsets.UTF_8)) }
@@ -412,22 +550,24 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 val realTransport = HttpUrlConnectionAccountV1Transport()
 
                 val oversizedResult = realTransport.executeSingleGet(
-                    url = "http://127.0.0.1:$port/riot/account/v1/accounts/by-puuid/oversized",
-                    apiKey = "test-key",
+                    url = "http://127.0.0.1:$port/riot/account/v1/accounts/by-puuid/$pOversized",
+                    apiKey = "TEST-LOOPBACK-ONLY-unit-test",
                     connectTimeoutMs = 1_000,
                     readTimeoutMs = 1_000,
                     callDeadlineMs = 1_500L,
-                    maxBodyBytes = 4_096
+                    maxBodyBytes = 4_096,
+                    allowLoopbackHttpForTesting = true
                 )
                 oversizedResult shouldBe TransportResult.PayloadTooLarge(statusCode = 200, maxBodyBytes = 4_096)
 
                 val timeoutResult = realTransport.executeSingleGet(
-                    url = "http://127.0.0.1:$port/riot/account/v1/accounts/by-puuid/stalled",
-                    apiKey = "test-key",
+                    url = "http://127.0.0.1:$port/riot/account/v1/accounts/by-puuid/$pStalled",
+                    apiKey = "TEST-LOOPBACK-ONLY-unit-test",
                     connectTimeoutMs = 200,
                     readTimeoutMs = 200,
                     callDeadlineMs = 250L,
-                    maxBodyBytes = 4_096
+                    maxBodyBytes = 4_096,
+                    allowLoopbackHttpForTesting = true
                 )
                 (timeoutResult is TransportResult.TimeoutOrIoError) shouldBe true
             } finally {
@@ -437,7 +577,7 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
         }
     }
 
-    Given("race-safe identity-only persistence and blank-field-only updates") {
+    Given("race-safe identity-only persistence, post-write read verification, and JDBC budget/fail-closed regression checks") {
         val validHeaders = mapOf(
             "x-app-rate-limit" to "20:1,100:120",
             "x-app-rate-limit-count" to "1:1,1:120",
@@ -445,13 +585,17 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             "x-method-rate-limit-count" to "1:60"
         )
 
-        Then("UPDATE blank fields on indexed_players preserves each already-nonblank column and never fabricates match metadata, while player_riot_identities ON CONFLICT never overwrites a concurrent non-blank identity") {
+        val pAlreadyComplete = validPuuid78("p_already_complete")
+        val pPartialBlankTag = validPuuid78("p_partial_blank_tag")
+        val pPartialBlankName = validPuuid78("p_partial_blank_name")
+        val pAbsentNew = validPuuid78("p_absent_new")
+        val pAbsentConcurrent = validPuuid78("p_absent_concurrent")
+
+        Then("UPDATE blank fields on indexed_players preserves each already-nonblank column, while concurrent completion on player_riot_identities is classified as CONCURRENT_ALREADY_COMPLETE_VERIFIED via post-write read") {
             val persistence = FakeRaceSafeIdentityPersistence()
 
-            // 1. Pre-populate an existing indexed_players row that already has a valid game_name ("OriginalMatchName")
-            //    and real match metadata (icon=42, level=500, lastSeenAt=T0), but a blank tag_line ("").
             persistence.seedIndexedPlayer(
-                puuid = "p-partial-blank-tag",
+                puuid = pPartialBlankTag,
                 region = "EUW1",
                 gameName = "OriginalMatchName",
                 tagLine = "   ",
@@ -460,10 +604,8 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 lastSeenAt = Instant.parse("2026-11-08T12:00:00Z")
             )
 
-            // 2. Pre-populate an existing indexed_players row that has a blank game_name ("")
-            //    but already has a valid non-blank tag_line ("ORIGTAG").
             persistence.seedIndexedPlayer(
-                puuid = "p-partial-blank-name",
+                puuid = pPartialBlankName,
                 region = "kr",
                 gameName = "",
                 tagLine = "ORIGTAG",
@@ -472,9 +614,8 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 lastSeenAt = Instant.parse("2026-11-08T15:00:00Z")
             )
 
-            // 3. Pre-populate a row in indexed_players that is ALREADY complete -> must be skipped in pre-call recheck (0 HTTP calls).
             persistence.seedIndexedPlayer(
-                puuid = "p-already-complete",
+                puuid = pAlreadyComplete,
                 region = "euw1",
                 gameName = "AlreadyComplete",
                 tagLine = "EUW",
@@ -483,41 +624,39 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 lastSeenAt = Instant.parse("2026-11-08T18:00:00Z")
             )
 
-            // 4. Simulate a concurrent writer that inserts a verified non-blank identity into player_riot_identities
-            //    AFTER the pre-call DB recheck but BEFORE p-absent-concurrent's upsert runs.
             val manifest = SnapshotManifest(
                 snapshotCapturedAtUtc = "2026-11-09T00:46:00Z",
                 isLiveLadder = false,
                 entries = listOf(
-                    ManifestEntry("p-already-complete", "euw1"),
-                    ManifestEntry("p-partial-blank-tag", "euw1"),
-                    ManifestEntry("p-partial-blank-name", "kr"),
-                    ManifestEntry("p-absent-new", "kr"),
-                    ManifestEntry("p-absent-concurrent", "kr")
+                    ManifestEntry(pAlreadyComplete, "euw1"),
+                    ManifestEntry(pPartialBlankTag, "euw1"),
+                    ManifestEntry(pPartialBlankName, "kr"),
+                    ManifestEntry(pAbsentNew, "kr"),
+                    ManifestEntry(pAbsentConcurrent, "kr")
                 )
             )
 
-            val transport = BoundedAccountV1Transport { url, _, _, _, _, _ ->
+            val transport = BoundedAccountV1Transport { url, _, _, _, _, _, _ ->
                 when {
-                    url.endsWith("/p-partial-blank-tag") -> TransportResult.HttpResponse(
+                    url.endsWith("/$pPartialBlankTag") -> TransportResult.HttpResponse(
                         statusCode = 200,
                         headersLowercase = validHeaders,
-                        bodyBytes = """{"puuid":"p-partial-blank-tag","gameName":"NewRiotName","tagLine":"FILLEDTAG"}""".toByteArray()
+                        bodyBytes = """{"puuid":"$pPartialBlankTag","gameName":"NewRiotName","tagLine":"FILLEDTAG"}""".toByteArray()
                     )
-                    url.endsWith("/p-partial-blank-name") -> TransportResult.HttpResponse(
+                    url.endsWith("/$pPartialBlankName") -> TransportResult.HttpResponse(
                         statusCode = 200,
                         headersLowercase = validHeaders,
-                        bodyBytes = """{"puuid":"p-partial-blank-name","gameName":"FilledName","tagLine":"NEWTAG"}""".toByteArray()
+                        bodyBytes = """{"puuid":"$pPartialBlankName","gameName":"FilledName","tagLine":"NEWTAG"}""".toByteArray()
                     )
-                    url.endsWith("/p-absent-new") -> TransportResult.HttpResponse(
+                    url.endsWith("/$pAbsentNew") -> TransportResult.HttpResponse(
                         statusCode = 200,
                         headersLowercase = validHeaders,
-                        bodyBytes = """{"puuid":"p-absent-new","gameName":"PureIdentity","tagLine":"KR1"}""".toByteArray()
+                        bodyBytes = """{"puuid":"$pAbsentNew","gameName":"PureIdentity","tagLine":"KR1"}""".toByteArray()
                     )
-                    url.endsWith("/p-absent-concurrent") -> {
-                        // Concurrent writer inserts a newer verified non-blank identity right before our write!
+                    url.endsWith("/$pAbsentConcurrent") -> {
+                        // Concurrent writer populates a newer verified non-blank identity right before our write!
                         persistence.seedIdentityOnlyRow(
-                            puuid = "p-absent-concurrent",
+                            puuid = pAbsentConcurrent,
                             platformRegion = "kr",
                             gameName = "ConcurrentWinner",
                             tagLine = "WIN",
@@ -526,7 +665,7 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                         TransportResult.HttpResponse(
                             statusCode = 200,
                             headersLowercase = validHeaders,
-                            bodyBytes = """{"puuid":"p-absent-concurrent","gameName":"StaleLoser","tagLine":"LOSE"}""".toByteArray()
+                            bodyBytes = """{"puuid":"$pAbsentConcurrent","gameName":"StaleLoser","tagLine":"LOSE"}""".toByteArray()
                         )
                     }
                     else -> error("Unexpected HTTP call for $url")
@@ -536,7 +675,8 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             val tool = OffProdChallengerIdentityCompletionTool(
                 persistencePort = persistence,
                 httpTransport = transport,
-                clock = FakeMonotonicClock(initialMs = Instant.parse("2026-11-09T03:00:00Z").toEpochMilli())
+                monotonicClock = FakeMonotonicClock(),
+                wallClock = WallClock { Instant.parse("2026-11-09T03:00:00Z") }
             )
 
             val report = tool.runBounded(
@@ -551,81 +691,192 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 riotApiKeyProvider = { "RGAPI-test" }
             )
 
-            report.outcome shouldBe RunOutcome.COMPLETED_ALL_CANDIDATES
+            report.outcome shouldBe RunOutcome.STAGED_ALL_CANDIDATES
             report.alreadyResolvedInDbCount shouldBe 1
-            report.httpAttemptsMade shouldBe 4 // p-already-complete skipped with 0 HTTP calls
+            report.httpAttemptsMade shouldBe 4
+            report.durableIndexedPlayerUpdatesVerifiedCount shouldBe 2
+            report.durableIdentityTableUpsertsVerifiedCount shouldBe 3 // pPartialBlankTag, pPartialBlankName, pAbsentNew
+            report.concurrentAlreadyCompleteVerifiedCount shouldBe 1 // pAbsentConcurrent (0 rows mutated, post-read verified)
 
-            // Verify Race Fix 1a: p-partial-blank-tag preserved "OriginalMatchName" and only filled "FILLEDTAG"
-            val updatedTagRow = persistence.indexedPlayers["p-partial-blank-tag"]!!
+            val concurrentItemResult = report.itemResults.first { it.puuid == pAbsentConcurrent }
+            concurrentItemResult.status shouldBe ItemStatus.CONCURRENT_ALREADY_COMPLETE_VERIFIED
+            concurrentItemResult.resolvedGameName shouldBe "ConcurrentWinner"
+            concurrentItemResult.resolvedTagLine shouldBe "WIN"
+
+            val updatedTagRow = persistence.indexedPlayers[pPartialBlankTag]!!
             updatedTagRow.gameName shouldBe "OriginalMatchName"
             updatedTagRow.tagLine shouldBe "FILLEDTAG"
-            updatedTagRow.region shouldBe "EUW1"
             updatedTagRow.profileIconId shouldBe 42
             updatedTagRow.summonerLevel shouldBe 500L
-            updatedTagRow.lastSeenAt shouldBe Instant.parse("2026-11-08T12:00:00Z")
 
-            // Verify Race Fix 1b: p-partial-blank-name filled "FilledName" and preserved "ORIGTAG"
-            val updatedNameRow = persistence.indexedPlayers["p-partial-blank-name"]!!
+            val updatedNameRow = persistence.indexedPlayers[pPartialBlankName]!!
             updatedNameRow.gameName shouldBe "FilledName"
             updatedNameRow.tagLine shouldBe "ORIGTAG"
-            updatedNameRow.profileIconId shouldBe 99
-            updatedNameRow.summonerLevel shouldBe 612L
 
-            // Verify p-absent-new was NOT inserted into indexed_players (no fake metadata!)
-            persistence.indexedPlayers.containsKey("p-absent-new") shouldBe false
-            val newIdentity = persistence.identitiesOnly["p-absent-new"]!!
-            newIdentity.gameName shouldBe "PureIdentity"
-            newIdentity.tagLine shouldBe "KR1"
-            newIdentity.platformRegion shouldBe "kr"
-
-            // Verify Race Fix 2: p-absent-concurrent in player_riot_identities was NOT overwritten by StaleLoser#LOSE!
-            val concurrentIdentity = persistence.identitiesOnly["p-absent-concurrent"]!!
-            concurrentIdentity.gameName shouldBe "ConcurrentWinner"
-            concurrentIdentity.tagLine shouldBe "WIN"
-            concurrentIdentity.verifiedAt shouldBe Instant.parse("2026-11-09T12:00:00Z")
+            persistence.indexedPlayers.containsKey(pAbsentNew) shouldBe false
+            persistence.identitiesOnly[pAbsentNew]!!.gameName shouldBe "PureIdentity"
         }
 
-        Then("JdbcIdentityCompletionPersistenceAdapter prepares the exact race-safe SQL statements with bounded query timeouts") {
-            val dataSource = mockk<DataSource>()
-            val connection = mockk<Connection>(relaxed = true)
-            val ps = mockk<PreparedStatement>(relaxed = true)
-            val rs = mockk<ResultSet>(relaxed = true)
+        Then("it checks remaining wall-time budget BEFORE starting a durable DB write and leaves the candidate in remainingEntries if budget is exhausted") {
+            val persistence = FakeRaceSafeIdentityPersistence()
+            val p1 = validPuuid78("write_budget_exhaust_1")
+            val p2 = validPuuid78("write_budget_exhaust_2")
+            val clock = FakeMonotonicClock(initialMs = 1_000L)
 
-            every { dataSource.connection } returns connection
-            every { connection.prepareStatement(any()) } returns ps
-            every { ps.executeQuery() } returns rs
-            every { rs.next() } returns false
-            every { ps.executeUpdate() } returns 1
-
-            val adapter = JdbcIdentityCompletionPersistenceAdapter(dataSource, checkIdentityTableInPreCall = true)
-
-            adapter.updateBlankFieldsOnExistingIndexedPlayer("puuid-1", "NameOne", "TAG1") shouldBe true
-            verify {
-                connection.prepareStatement(
-                    match { sql ->
-                        sql.contains("SET game_name = CASE WHEN BTRIM(COALESCE(game_name, '')) = '' THEN ? ELSE game_name END") &&
-                            sql.contains("tag_line  = CASE WHEN BTRIM(COALESCE(tag_line, '')) = ''  THEN ? ELSE tag_line  END")
-                    }
+            val transport = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
+                // Simulate the HTTP call consuming all remaining wall-time budget (180_000ms)
+                clock.advanceMs(180_000L)
+                TransportResult.HttpResponse(
+                    statusCode = 200,
+                    headersLowercase = validHeaders,
+                    bodyBytes = """{"puuid":"$p1","gameName":"LateArrival","tagLine":"EUW"}""".toByteArray()
                 )
             }
 
-            adapter.upsertVerifiedIdentityOnly(
-                puuid = "puuid-2",
-                platformRegion = "kr",
-                gameName = "NameTwo",
-                tagLine = "KR1",
-                verifiedAt = Instant.parse("2026-11-09T02:30:00Z")
-            ) shouldBe true
-            verify {
-                connection.prepareStatement(
-                    match { sql ->
-                        sql.contains("INSERT INTO player_riot_identities") &&
-                            sql.contains("ON CONFLICT (puuid) DO UPDATE") &&
-                            sql.contains("WHEN BTRIM(COALESCE(player_riot_identities.game_name, '')) = '' THEN EXCLUDED.game_name") &&
-                            sql.contains("WHEN BTRIM(COALESCE(player_riot_identities.tag_line, '')) = '' THEN EXCLUDED.tag_line") &&
-                            sql.contains("GREATEST(player_riot_identities.verified_at, EXCLUDED.verified_at)")
-                    }
+            val tool = OffProdChallengerIdentityCompletionTool(
+                persistencePort = persistence,
+                httpTransport = transport,
+                monotonicClock = clock
+            )
+
+            val report = tool.runBounded(
+                manifest = SnapshotManifest(
+                    snapshotCapturedAtUtc = "2026-11-09T00:46:00Z",
+                    isLiveLadder = false,
+                    entries = listOf(ManifestEntry(p1, "euw1"), ManifestEntry(p2, "euw1"))
+                ),
+                options = ExecutionOptions(
+                    dryRun = false,
+                    networkEnabled = true,
+                    allowDurableWrites = true,
+                    keyCoordinationMode = KeyCoordinationMode.EXCLUSIVE_KEY,
+                    coordinationAttestation = "Exclusive key",
+                    maxWallTimeMs = 180_000L
+                ),
+                riotApiKeyProvider = { "RGAPI-test" }
+            )
+
+            report.outcome shouldBe RunOutcome.PARTIAL_COMPLETION_WALL_TIME_EXHAUSTED
+            report.httpAttemptsMade shouldBe 1
+            report.durableIdentityTableUpsertsVerifiedCount shouldBe 0
+            persistence.identitiesOnly.isEmpty() shouldBe true
+            // Both p1 (whose write was skipped due to budget exhaustion) and p2 remain in remainingEntries!
+            report.remainingPendingCount shouldBe 2
+            report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(p1, p2)
+        }
+
+        Then("JdbcIdentityCompletionPersistenceAdapter bounds DataSource.getConnection(), fails closed when setNetworkTimeout/isReadOnly throws, and aborts when post-write verification finds 0 stored rows") {
+            val p1 = validPuuid78("jdbc_regression_1")
+            val p2 = validPuuid78("jdbc_regression_2")
+
+            // 1. Stalled DataSource.getConnection() is bounded by timeoutMs and never escapes as an unhandled exception
+            val releaseStalledConn = CountDownLatch(1)
+            val stalledDataSource = mockk<DataSource>()
+            every { stalledDataSource.connection } answers {
+                releaseStalledConn.await(3, TimeUnit.SECONDS)
+                throw SQLException("Connection acquisition timed out")
+            }
+
+            try {
+                val stalledAdapter = JdbcIdentityCompletionPersistenceAdapter(stalledDataSource)
+                val toolWithStalledDb = OffProdChallengerIdentityCompletionTool(
+                    persistencePort = stalledAdapter,
+                    httpTransport = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
+                        error("Must not reach HTTP when pre-call DB recheck times out")
+                    },
+                    monotonicClock = FakeMonotonicClock()
                 )
+
+                val stalledReport = toolWithStalledDb.runBounded(
+                    manifest = SnapshotManifest(
+                        snapshotCapturedAtUtc = "2026-11-09T00:46:00Z",
+                        isLiveLadder = false,
+                        entries = listOf(ManifestEntry(p1, "euw1"), ManifestEntry(p2, "kr"))
+                    ),
+                    options = ExecutionOptions(
+                        dryRun = true,
+                        networkEnabled = true,
+                        keyCoordinationMode = KeyCoordinationMode.EXCLUSIVE_KEY,
+                        coordinationAttestation = "Exclusive key",
+                        dbOperationTimeoutMs = 150L
+                    ),
+                    riotApiKeyProvider = { "RGAPI-test" }
+                )
+
+                stalledReport.outcome shouldBe RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT
+                stalledReport.httpAttemptsMade shouldBe 0
+                stalledReport.remainingPendingCount shouldBe 2
+            } finally {
+                releaseStalledConn.countDown()
+            }
+
+            // 2. Fail-closed when JDBC driver rejects setNetworkTimeout (SQLFeatureNotSupportedException)
+            val unsupportedTimeoutDs = mockk<DataSource>()
+            val unsupportedConn = mockk<Connection>(relaxed = true)
+            every { unsupportedTimeoutDs.connection } returns unsupportedConn
+            every { unsupportedConn.setNetworkTimeout(any(), any()) } throws SQLFeatureNotSupportedException("setNetworkTimeout unsupported")
+
+            val failClosedAdapter = JdbcIdentityCompletionPersistenceAdapter(unsupportedTimeoutDs)
+            val recheckFailure = failClosedAdapter.recheckExistingIdentitiesBounded(
+                entries = listOf(ManifestEntry(p1, "euw1")),
+                timeoutMs = 1_000L
+            )
+            (recheckFailure is DbRecheckResult.Failure) shouldBe true
+            (recheckFailure as DbRecheckResult.Failure).reason shouldContain "setNetworkTimeout unsupported"
+
+            // 3. Post-write verification failure when executeUpdate() returns 0 AND post-write SELECT returns empty ResultSet
+            val unverifiedWriteDs = mockk<DataSource>()
+            val writeConn = mockk<Connection>(relaxed = true)
+            val upsertPs = mockk<PreparedStatement>(relaxed = true)
+            val verifySelectPs = mockk<PreparedStatement>(relaxed = true)
+            val emptyRs = mockk<ResultSet>(relaxed = true)
+
+            every { unverifiedWriteDs.connection } returns writeConn
+            every {
+                writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE)
+            } returns upsertPs
+            every { upsertPs.executeUpdate() } returns 0
+
+            every {
+                writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_SELECT_VERIFY_IDENTITY_ONLY_BY_PUUID)
+            } returns verifySelectPs
+            every { verifySelectPs.executeQuery() } returns emptyRs
+            every { emptyRs.next() } returns false
+
+            val verifyAdapter = JdbcIdentityCompletionPersistenceAdapter(unverifiedWriteDs)
+            val writeResult = verifyAdapter.persistAndVerifyIdentityBounded(
+                puuid = p1,
+                platformRegion = "euw1",
+                gameName = "GhostName",
+                tagLine = "EUW",
+                verifiedAt = Instant.parse("2026-11-09T03:00:00Z"),
+                preCallDbState = PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS,
+                timeoutMs = 1_000L
+            )
+            (writeResult is DbWriteVerificationResult.FailureOrUnknownCommit) shouldBe true
+
+            // 4. Post-write verification success when executeUpdate() returns 1 AND post-write SELECT returns non-blank identity
+            val verifiedRs = mockk<ResultSet>(relaxed = true)
+            every { upsertPs.executeUpdate() } returns 1
+            every { verifySelectPs.executeQuery() } returns verifiedRs
+            every { verifiedRs.next() } returns true
+            every { verifiedRs.getString("game_name") } returns "VerifiedName"
+            every { verifiedRs.getString("tag_line") } returns "EUW"
+            every { verifiedRs.getTimestamp("verified_at") } returns Timestamp.from(Instant.parse("2026-11-09T03:00:00Z"))
+
+            val verifiedResult = verifyAdapter.persistAndVerifyIdentityBounded(
+                puuid = p1,
+                platformRegion = "euw1",
+                gameName = "VerifiedName",
+                tagLine = "EUW",
+                verifiedAt = Instant.parse("2026-11-09T03:00:00Z"),
+                preCallDbState = PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS,
+                timeoutMs = 1_000L
+            )
+            (verifiedResult is DbWriteVerificationResult.WrittenAndVerified) shouldBe true
+            verify {
+                writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE)
+                writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_SELECT_VERIFY_IDENTITY_ONLY_BY_PUUID)
             }
         }
     }
@@ -636,6 +887,10 @@ private class FakeMonotonicClock(initialMs: Long = 1_000_000L) : MonotonicClock 
     val sleepsRecordedMs = mutableListOf<Long>()
 
     override fun nowMs(): Long = currentMs
+
+    fun advanceMs(deltaMs: Long) {
+        currentMs += deltaMs
+    }
 
     override fun sleepMs(durationMs: Long) {
         if (durationMs > 0L) {
@@ -705,9 +960,13 @@ private class FakeRaceSafeIdentityPersistence : IdentityCompletionPersistencePor
     }
 
     override fun recheckExistingIdentitiesBounded(
-        entries: List<ManifestEntry>
-    ): Map<String, PreCallDbState> {
-        return entries.associate { entry ->
+        entries: List<ManifestEntry>,
+        timeoutMs: Long
+    ): DbRecheckResult {
+        if (timeoutMs <= 0L) {
+            return DbRecheckResult.Failure("Timeout budget <= 0", timedOutOrBudgetExhausted = true)
+        }
+        val map = entries.associate { entry ->
             val p = entry.normalizedPuuid
             val indexed = indexedPlayers[p]
             val idOnly = identitiesOnly[p]
@@ -723,35 +982,41 @@ private class FakeRaceSafeIdentityPersistence : IdentityCompletionPersistencePor
             }
             p to state
         }
+        return DbRecheckResult.Success(map)
     }
 
-    override fun updateBlankFieldsOnExistingIndexedPlayer(
-        puuid: String,
-        gameName: String,
-        tagLine: String
-    ): Boolean {
-        val existing = indexedPlayers[puuid] ?: return false
-        val existingGnBlank = existing.gameName.trim().isEmpty()
-        val existingTlBlank = existing.tagLine.trim().isEmpty()
-        if (!existingGnBlank && !existingTlBlank) {
-            return false
-        }
-        indexedPlayers[puuid] = existing.copy(
-            gameName = if (existingGnBlank) gameName.trim() else existing.gameName,
-            tagLine = if (existingTlBlank) tagLine.trim() else existing.tagLine
-        )
-        return true
-    }
-
-    override fun upsertVerifiedIdentityOnly(
+    override fun persistAndVerifyIdentityBounded(
         puuid: String,
         platformRegion: String,
         gameName: String,
         tagLine: String,
-        verifiedAt: Instant
-    ): Boolean {
-        val existing = identitiesOnly[puuid]
-        if (existing == null) {
+        verifiedAt: Instant,
+        preCallDbState: PreCallDbState,
+        timeoutMs: Long
+    ): DbWriteVerificationResult {
+        if (timeoutMs <= 0L) {
+            return DbWriteVerificationResult.FailureOrUnknownCommit("Timeout budget <= 0")
+        }
+
+        var indexedUpdated = false
+        if (preCallDbState == PreCallDbState.PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD) {
+            val existing = indexedPlayers[puuid]
+            if (existing != null) {
+                val existingGnBlank = existing.gameName.trim().isEmpty()
+                val existingTlBlank = existing.tagLine.trim().isEmpty()
+                if (existingGnBlank || existingTlBlank) {
+                    indexedPlayers[puuid] = existing.copy(
+                        gameName = if (existingGnBlank) gameName.trim() else existing.gameName,
+                        tagLine = if (existingTlBlank) tagLine.trim() else existing.tagLine
+                    )
+                    indexedUpdated = true
+                }
+            }
+        }
+
+        var identityUpserted = false
+        val existingIdOnly = identitiesOnly[puuid]
+        if (existingIdOnly == null) {
             identitiesOnly[puuid] = IdentityOnlyRow(
                 puuid = puuid,
                 platformRegion = platformRegion,
@@ -759,20 +1024,47 @@ private class FakeRaceSafeIdentityPersistence : IdentityCompletionPersistencePor
                 tagLine = tagLine.trim(),
                 verifiedAt = verifiedAt
             )
-            return true
+            identityUpserted = true
+        } else {
+            val gnBlank = existingIdOnly.gameName.trim().isEmpty()
+            val tlBlank = existingIdOnly.tagLine.trim().isEmpty()
+            if (gnBlank || tlBlank) {
+                identitiesOnly[puuid] = existingIdOnly.copy(
+                    gameName = if (gnBlank) gameName.trim() else existingIdOnly.gameName,
+                    tagLine = if (tlBlank) tagLine.trim() else existingIdOnly.tagLine,
+                    verifiedAt = if (verifiedAt.isAfter(existingIdOnly.verifiedAt)) verifiedAt else existingIdOnly.verifiedAt
+                )
+                identityUpserted = true
+            }
         }
-        val existingGnBlank = existing.gameName.trim().isEmpty()
-        val existingTlBlank = existing.tagLine.trim().isEmpty()
-        if (!existingGnBlank && !existingTlBlank) {
-            // Concurrent non-blank verified identity already exists -> do NOT overwrite!
-            return false
+
+        // Post-write read verification
+        val verifiedRow = identitiesOnly[puuid]
+            ?: return DbWriteVerificationResult.FailureOrUnknownCommit("Post-write read found no row in player_riot_identities")
+        if (verifiedRow.gameName.trim().isEmpty() || verifiedRow.tagLine.trim().isEmpty()) {
+            return DbWriteVerificationResult.FailureOrUnknownCommit("Post-write read found blank game_name or tag_line")
         }
-        identitiesOnly[puuid] = existing.copy(
-            gameName = if (existingGnBlank) gameName.trim() else existing.gameName,
-            tagLine = if (existingTlBlank) tagLine.trim() else existing.tagLine,
-            platformRegion = if (existing.platformRegion.trim().isEmpty()) platformRegion else existing.platformRegion,
-            verifiedAt = if (verifiedAt.isAfter(existing.verifiedAt)) verifiedAt else existing.verifiedAt
-        )
-        return true
+
+        return if (indexedUpdated || identityUpserted) {
+            val desc = if (preCallDbState == PreCallDbState.PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD) {
+                "INDEXED_PLAYERS_BLANK_ONLY_AND_PLAYER_RIOT_IDENTITIES"
+            } else {
+                "PLAYER_RIOT_IDENTITIES_ONLY"
+            }
+            DbWriteVerificationResult.WrittenAndVerified(
+                indexedPlayerBlankFieldUpdated = indexedUpdated,
+                identityOnlyTableUpserted = identityUpserted,
+                verifiedGameName = verifiedRow.gameName,
+                verifiedTagLine = verifiedRow.tagLine,
+                verifiedAtUtc = verifiedRow.verifiedAt,
+                writeTargetDescription = desc
+            )
+        } else {
+            DbWriteVerificationResult.ConcurrentAlreadyCompleteVerified(
+                verifiedGameName = verifiedRow.gameName,
+                verifiedTagLine = verifiedRow.tagLine,
+                verifiedAtUtc = verifiedRow.verifiedAt
+            )
+        }
     }
 }
