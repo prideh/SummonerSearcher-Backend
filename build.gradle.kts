@@ -17,6 +17,10 @@ java {
 	}
 }
 
+springBoot {
+	mainClass.set("com.pride.summoner_searcher_api.SummonerSearcherApiApplicationKt")
+}
+
 repositories {
 	mavenCentral()
 }
