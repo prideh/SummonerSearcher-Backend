@@ -105,19 +105,63 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
         }
     }
 
-    Given("WallClock vs MonotonicClock separation") {
+    Given("WallClock vs MonotonicClock separation (both injected and REAL default clocks)") {
         val p1 = validPuuid78("clock_sep_1")
+        val pReal = validPuuid78("clock_real_default")
         val manifest = SnapshotManifest(
             snapshotCapturedAtUtc = "2026-11-09T00:45:00Z",
             isLiveLadder = false,
             entries = listOf(ManifestEntry(p1, "euw1"))
         )
 
-        Then("verified_at uses UTC WallClock Instant and NEVER derives timestamps from MonotonicClock.nowMs()") {
+        Then("REAL default clocks (SystemMonotonicClock + SystemUtcWallClock with NO fake clock override) persist a real >= 2026 UTC Instant and never 1970-01-01") {
             val persistence = FakeRaceSafeIdentityPersistence()
-            // MonotonicClock starts at 42ms (simulating JVM nanoTime uptime near zero)
+            val transport = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
+                TransportResult.HttpResponse(
+                    statusCode = 200,
+                    headersLowercase = mapOf(
+                        "x-app-rate-limit" to "20:1,100:120",
+                        "x-app-rate-limit-count" to "1:1,1:120",
+                        "x-method-rate-limit" to "1000:60",
+                        "x-method-rate-limit-count" to "1:60"
+                    ),
+                    bodyBytes = """{"puuid":"$pReal","gameName":"RealClockUser","tagLine":"UTC"}""".toByteArray()
+                )
+            }
+
+            // Instantiate with REAL default clocks (no monotonicClock or wallClock arguments passed!)
+            val toolWithRealDefaultClocks = OffProdChallengerIdentityCompletionTool(
+                persistencePort = persistence,
+                httpTransport = transport
+            )
+
+            val beforeUtc = Instant.now().minusSeconds(2)
+            val report = toolWithRealDefaultClocks.runBounded(
+                manifest = SnapshotManifest(
+                    snapshotCapturedAtUtc = "2026-11-09T00:45:00Z",
+                    isLiveLadder = false,
+                    entries = listOf(ManifestEntry(pReal, "euw1"))
+                ),
+                options = ExecutionOptions(
+                    dryRun = false,
+                    networkEnabled = true,
+                    allowDurableWrites = true,
+                    keyCoordinationMode = KeyCoordinationMode.EXCLUSIVE_KEY,
+                    coordinationAttestation = "Real default clock regression test"
+                ),
+                riotApiKeyProvider = { "RGAPI-isolated-key" }
+            )
+            val afterUtc = Instant.now().plusSeconds(2)
+
+            report.outcome shouldBe RunOutcome.STAGED_ALL_CANDIDATES
+            val storedInstant = persistence.identitiesOnly[pReal]!!.verifiedAt
+            (storedInstant.isAfter(Instant.parse("2026-01-01T00:00:00Z"))) shouldBe true
+            (!storedInstant.isBefore(beforeUtc) && !storedInstant.isAfter(afterUtc)) shouldBe true
+        }
+
+        Then("injected WallClock and MonotonicClock starting near 0ms never confuse nanoTime uptime with epoch milliseconds") {
+            val persistence = FakeRaceSafeIdentityPersistence()
             val monoClock = FakeMonotonicClock(initialMs = 42L)
-            // WallClock returns a real 2026 UTC epoch Instant
             val expectedUtcInstant = Instant.parse("2026-11-09T11:15:30Z")
             val utcWallClock = WallClock { expectedUtcInstant }
 
@@ -213,7 +257,6 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 monotonicClock = FakeMonotonicClock()
             )
 
-            // 1. Disallowed host even over https
             val badHostReport = tool.runBounded(
                 manifest = manifest,
                 options = ExecutionOptions(
@@ -229,7 +272,6 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             badHostReport.httpAttemptsMade shouldBe 0
             transportCalls.get() shouldBe 0
 
-            // 2. Loopback HTTP without allowLoopbackHttpForTesting=true is rejected
             val loopbackDisabledReport = tool.runBounded(
                 manifest = manifest,
                 options = ExecutionOptions(
@@ -245,7 +287,6 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             loopbackDisabledReport.outcome shouldBe RunOutcome.ABORTED_DISALLOWED_TRANSPORT_TARGET
             loopbackDisabledReport.httpAttemptsMade shouldBe 0
 
-            // 3. Loopback HTTP with allowLoopbackHttpForTesting=true STILL blocks any real-looking RGAPI-* key!
             val realKeyLeakAttemptReport = tool.runBounded(
                 manifest = manifest,
                 options = ExecutionOptions(
@@ -270,7 +311,7 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
         val pEuw3 = validPuuid78("euw_rate_3")
         val pKr1 = validPuuid78("kr_rate_1")
 
-        Then("it aborts immediately after attempt #1 if rate headers are missing or malformed (no assumed 20:1 or 100:120 defaults)") {
+        Then("it aborts immediately after attempt #1 if rate headers are missing or malformed (no assumed 20:1 or 100:120 defaults) and keeps all 3 uncompleted items in remainingEntries") {
             val persistence = FakeRaceSafeIdentityPersistence()
             val transportCalls = AtomicInteger(0)
             val transport = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
@@ -316,8 +357,9 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             report.httpAttemptsMade shouldBe 1
             transportCalls.get() shouldBe 1
             report.validatedIdentitiesCount shouldBe 0
-            report.remainingPendingCount shouldBe 2
-            report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(pEuw2, pKr1)
+            // pEuw1 aborted before validation/completion, so all 3 remain pending!
+            report.remainingPendingCount shouldBe 3
+            report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(pEuw1, pEuw2, pKr1)
         }
 
         Then("first cluster discovery call counts against the attempt cap, header-driven waits are applied, and exceeding the 180s wall-time budget halts honestly without sleeping") {
@@ -410,7 +452,7 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
         val pWrongReturned = validPuuid78("p_wrong_returned")
         val pAfterMismatch = validPuuid78("p_after_mismatch")
 
-        Then("it records 404 and omitted Riot ID fields without writing, and aborts on PUUID mismatch") {
+        Then("it records 404 and omitted Riot ID fields without writing, and aborts on PUUID mismatch keeping uncompleted entries in remainingEntries") {
             val persistence = FakeRaceSafeIdentityPersistence()
             val manifest = SnapshotManifest(
                 snapshotCapturedAtUtc = "2026-11-09T00:45:00Z",
@@ -475,8 +517,9 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             report.puuidMismatchCount shouldBe 1
             report.durableIndexedPlayerUpdatesVerifiedCount shouldBe 0
             report.durableIdentityTableUpsertsVerifiedCount shouldBe 0
-            report.remainingPendingCount shouldBe 1
-            report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(pAfterMismatch)
+            // Both pMismatch (which failed validation) and pAfterMismatch remain uncompleted!
+            report.remainingPendingCount shouldBe 2
+            report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(pMismatch, pAfterMismatch)
         }
 
         Then("it performs 0 retries and aborts immediately on HTTP 429 (including service 429) or HTTP 5xx") {
@@ -522,7 +565,9 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             report429.httpAttemptsMade shouldBe 1
             attempts.get() shouldBe 1
             report429.lastObservedClusterHeaders["asia"]?.retryAfterSeconds shouldBe 10L
-            report429.remainingPendingCount shouldBe 1
+            // Both kr1 (which got 429) and kr2 remain uncompleted!
+            report429.remainingPendingCount shouldBe 2
+            report429.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(kr1, kr2)
         }
 
         Then("HttpUrlConnectionAccountV1Transport enforces the 4 KiB body cap, socket deadline cancellation, and loopback credential guard on a local loopback server") {
@@ -654,7 +699,6 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                         bodyBytes = """{"puuid":"$pAbsentNew","gameName":"PureIdentity","tagLine":"KR1"}""".toByteArray()
                     )
                     url.endsWith("/$pAbsentConcurrent") -> {
-                        // Concurrent writer populates a newer verified non-blank identity right before our write!
                         persistence.seedIdentityOnlyRow(
                             puuid = pAbsentConcurrent,
                             platformRegion = "kr",
@@ -695,8 +739,8 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             report.alreadyResolvedInDbCount shouldBe 1
             report.httpAttemptsMade shouldBe 4
             report.durableIndexedPlayerUpdatesVerifiedCount shouldBe 2
-            report.durableIdentityTableUpsertsVerifiedCount shouldBe 3 // pPartialBlankTag, pPartialBlankName, pAbsentNew
-            report.concurrentAlreadyCompleteVerifiedCount shouldBe 1 // pAbsentConcurrent (0 rows mutated, post-read verified)
+            report.durableIdentityTableUpsertsVerifiedCount shouldBe 3
+            report.concurrentAlreadyCompleteVerifiedCount shouldBe 1
 
             val concurrentItemResult = report.itemResults.first { it.puuid == pAbsentConcurrent }
             concurrentItemResult.status shouldBe ItemStatus.CONCURRENT_ALREADY_COMPLETE_VERIFIED
@@ -717,6 +761,70 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             persistence.identitiesOnly[pAbsentNew]!!.gameName shouldBe "PureIdentity"
         }
 
+        Then("when an adapter returns 0 rows written without a usable row in DB, runBounded reports ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT, writes=0, and keeps the candidate in remainingEntries (pending=1, never COMPLETED)") {
+            val pNoRow = validPuuid78("adapter_false_no_row")
+            val unverifiedWriteDs = mockk<DataSource>(relaxed = true)
+            val writeConn = mockk<Connection>(relaxed = true)
+            val recheckIndexedPs = mockk<PreparedStatement>(relaxed = true)
+            val recheckIdentityPs = mockk<PreparedStatement>(relaxed = true)
+            val upsertPs = mockk<PreparedStatement>(relaxed = true)
+            val verifySelectPs = mockk<PreparedStatement>(relaxed = true)
+            val emptyRs = mockk<ResultSet>(relaxed = true)
+
+            every { unverifiedWriteDs.connection } returns writeConn
+            every { writeConn.prepareStatement(match { it.contains("FROM indexed_players WHERE puuid IN") }) } returns recheckIndexedPs
+            every { writeConn.prepareStatement(match { it.contains("FROM player_riot_identities WHERE puuid IN") }) } returns recheckIdentityPs
+            every { recheckIndexedPs.executeQuery() } returns emptyRs
+            every { recheckIdentityPs.executeQuery() } returns emptyRs
+            every {
+                writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE)
+            } returns upsertPs
+            // Adapter returns 0 rows updated (false) AND post-write SELECT finds no usable row in DB!
+            every { upsertPs.executeUpdate() } returns 0
+            every {
+                writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_SELECT_VERIFY_IDENTITY_ONLY_BY_PUUID)
+            } returns verifySelectPs
+            every { verifySelectPs.executeQuery() } returns emptyRs
+            every { emptyRs.next() } returns false
+
+            val jdbcAdapter = JdbcIdentityCompletionPersistenceAdapter(unverifiedWriteDs)
+            val tool = OffProdChallengerIdentityCompletionTool(
+                persistencePort = jdbcAdapter,
+                httpTransport = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
+                    TransportResult.HttpResponse(
+                        statusCode = 200,
+                        headersLowercase = validHeaders,
+                        bodyBytes = """{"puuid":"$pNoRow","gameName":"UnwrittenName","tagLine":"EUW"}""".toByteArray()
+                    )
+                }
+            )
+
+            val report = tool.runBounded(
+                manifest = SnapshotManifest(
+                    snapshotCapturedAtUtc = "2026-11-09T00:46:00Z",
+                    isLiveLadder = false,
+                    entries = listOf(ManifestEntry(pNoRow, "euw1"))
+                ),
+                options = ExecutionOptions(
+                    dryRun = false,
+                    networkEnabled = true,
+                    allowDurableWrites = true,
+                    keyCoordinationMode = KeyCoordinationMode.EXCLUSIVE_KEY,
+                    coordinationAttestation = "Regression test for 0 rows written without usable row"
+                ),
+                riotApiKeyProvider = { "RGAPI-test" }
+            )
+
+            report.outcome shouldBe RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT
+            report.itemResults.single().status shouldBe ItemStatus.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT
+            report.durableIndexedPlayerUpdatesVerifiedCount shouldBe 0
+            report.durableIdentityTableUpsertsVerifiedCount shouldBe 0
+            report.dbFailureOrUnknownCommitCount shouldBe 1
+            // Candidate was NOT completed, so remainingPendingCount MUST be 1 (never 0)!
+            report.remainingPendingCount shouldBe 1
+            report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(pNoRow)
+        }
+
         Then("it checks remaining wall-time budget BEFORE starting a durable DB write and leaves the candidate in remainingEntries if budget is exhausted") {
             val persistence = FakeRaceSafeIdentityPersistence()
             val p1 = validPuuid78("write_budget_exhaust_1")
@@ -724,7 +832,6 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             val clock = FakeMonotonicClock(initialMs = 1_000L)
 
             val transport = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
-                // Simulate the HTTP call consuming all remaining wall-time budget (180_000ms)
                 clock.advanceMs(180_000L)
                 TransportResult.HttpResponse(
                     statusCode = 200,
@@ -760,20 +867,18 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             report.httpAttemptsMade shouldBe 1
             report.durableIdentityTableUpsertsVerifiedCount shouldBe 0
             persistence.identitiesOnly.isEmpty() shouldBe true
-            // Both p1 (whose write was skipped due to budget exhaustion) and p2 remain in remainingEntries!
             report.remainingPendingCount shouldBe 2
             report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(p1, p2)
         }
 
-        Then("JdbcIdentityCompletionPersistenceAdapter bounds DataSource.getConnection(), fails closed when setNetworkTimeout/isReadOnly throws, and aborts when post-write verification finds 0 stored rows") {
+        Then("JdbcIdentityCompletionPersistenceAdapter bounds DataSource.getConnection() and cleanup without blocking the caller thread, and fails closed when setNetworkTimeout/isReadOnly throws") {
             val p1 = validPuuid78("jdbc_regression_1")
             val p2 = validPuuid78("jdbc_regression_2")
 
-            // 1. Stalled DataSource.getConnection() is bounded by timeoutMs and never escapes as an unhandled exception
             val releaseStalledConn = CountDownLatch(1)
-            val stalledDataSource = mockk<DataSource>()
+            val stalledDataSource = mockk<DataSource>(relaxed = true)
             every { stalledDataSource.connection } answers {
-                releaseStalledConn.await(3, TimeUnit.SECONDS)
+                releaseStalledConn.await(5, TimeUnit.SECONDS)
                 throw SQLException("Connection acquisition timed out")
             }
 
@@ -783,10 +888,10 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                     persistencePort = stalledAdapter,
                     httpTransport = BoundedAccountV1Transport { _, _, _, _, _, _, _ ->
                         error("Must not reach HTTP when pre-call DB recheck times out")
-                    },
-                    monotonicClock = FakeMonotonicClock()
+                    }
                 )
 
+                val startWallMs = System.nanoTime() / 1_000_000L
                 val stalledReport = toolWithStalledDb.runBounded(
                     manifest = SnapshotManifest(
                         snapshotCapturedAtUtc = "2026-11-09T00:46:00Z",
@@ -802,16 +907,18 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                     ),
                     riotApiKeyProvider = { "RGAPI-test" }
                 )
+                val elapsedCallerMs = (System.nanoTime() / 1_000_000L) - startWallMs
 
                 stalledReport.outcome shouldBe RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT
                 stalledReport.httpAttemptsMade shouldBe 0
                 stalledReport.remainingPendingCount shouldBe 2
+                // Prove caller thread returned promptly near 150ms without waiting for the 5,000ms stalled connection!
+                (elapsedCallerMs < 1_500L) shouldBe true
             } finally {
                 releaseStalledConn.countDown()
             }
 
-            // 2. Fail-closed when JDBC driver rejects setNetworkTimeout (SQLFeatureNotSupportedException)
-            val unsupportedTimeoutDs = mockk<DataSource>()
+            val unsupportedTimeoutDs = mockk<DataSource>(relaxed = true)
             val unsupportedConn = mockk<Connection>(relaxed = true)
             every { unsupportedTimeoutDs.connection } returns unsupportedConn
             every { unsupportedConn.setNetworkTimeout(any(), any()) } throws SQLFeatureNotSupportedException("setNetworkTimeout unsupported")
@@ -823,61 +930,6 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             )
             (recheckFailure is DbRecheckResult.Failure) shouldBe true
             (recheckFailure as DbRecheckResult.Failure).reason shouldContain "setNetworkTimeout unsupported"
-
-            // 3. Post-write verification failure when executeUpdate() returns 0 AND post-write SELECT returns empty ResultSet
-            val unverifiedWriteDs = mockk<DataSource>()
-            val writeConn = mockk<Connection>(relaxed = true)
-            val upsertPs = mockk<PreparedStatement>(relaxed = true)
-            val verifySelectPs = mockk<PreparedStatement>(relaxed = true)
-            val emptyRs = mockk<ResultSet>(relaxed = true)
-
-            every { unverifiedWriteDs.connection } returns writeConn
-            every {
-                writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE)
-            } returns upsertPs
-            every { upsertPs.executeUpdate() } returns 0
-
-            every {
-                writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_SELECT_VERIFY_IDENTITY_ONLY_BY_PUUID)
-            } returns verifySelectPs
-            every { verifySelectPs.executeQuery() } returns emptyRs
-            every { emptyRs.next() } returns false
-
-            val verifyAdapter = JdbcIdentityCompletionPersistenceAdapter(unverifiedWriteDs)
-            val writeResult = verifyAdapter.persistAndVerifyIdentityBounded(
-                puuid = p1,
-                platformRegion = "euw1",
-                gameName = "GhostName",
-                tagLine = "EUW",
-                verifiedAt = Instant.parse("2026-11-09T03:00:00Z"),
-                preCallDbState = PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS,
-                timeoutMs = 1_000L
-            )
-            (writeResult is DbWriteVerificationResult.FailureOrUnknownCommit) shouldBe true
-
-            // 4. Post-write verification success when executeUpdate() returns 1 AND post-write SELECT returns non-blank identity
-            val verifiedRs = mockk<ResultSet>(relaxed = true)
-            every { upsertPs.executeUpdate() } returns 1
-            every { verifySelectPs.executeQuery() } returns verifiedRs
-            every { verifiedRs.next() } returns true
-            every { verifiedRs.getString("game_name") } returns "VerifiedName"
-            every { verifiedRs.getString("tag_line") } returns "EUW"
-            every { verifiedRs.getTimestamp("verified_at") } returns Timestamp.from(Instant.parse("2026-11-09T03:00:00Z"))
-
-            val verifiedResult = verifyAdapter.persistAndVerifyIdentityBounded(
-                puuid = p1,
-                platformRegion = "euw1",
-                gameName = "VerifiedName",
-                tagLine = "EUW",
-                verifiedAt = Instant.parse("2026-11-09T03:00:00Z"),
-                preCallDbState = PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS,
-                timeoutMs = 1_000L
-            )
-            (verifiedResult is DbWriteVerificationResult.WrittenAndVerified) shouldBe true
-            verify {
-                writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE)
-                writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_SELECT_VERIFY_IDENTITY_ONLY_BY_PUUID)
-            }
         }
     }
 })

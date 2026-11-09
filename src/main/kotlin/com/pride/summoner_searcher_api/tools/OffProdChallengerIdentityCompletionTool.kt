@@ -717,7 +717,7 @@ class OffProdChallengerIdentityCompletionTool(
                             detail = transportResult.message
                         )
                     )
-                    index++
+                    // Do NOT increment index: candidate did not complete and must remain in remainingEntries!
                     terminalOutcome = RunOutcome.ABORTED_TIMEOUT_OR_IO_ERROR
                     abortReason = transportResult.message
                     break
@@ -736,7 +736,6 @@ class OffProdChallengerIdentityCompletionTool(
                             detail = "Response body exceeded ${options.maxBodyBytes} bytes cap"
                         )
                     )
-                    index++
                     terminalOutcome = RunOutcome.ABORTED_PAYLOAD_TOO_LARGE
                     abortReason = "Response body for PUUID '${candidate.normalizedPuuid}' exceeded ${options.maxBodyBytes} bytes cap"
                     break
@@ -765,7 +764,6 @@ class OffProdChallengerIdentityCompletionTool(
                                 detail = "HTTP 429 (type=${rateLimitType ?: "unknown"}, Retry-After=${retryAfterHeader ?: "none"})"
                             )
                         )
-                        index++
                         terminalOutcome = RunOutcome.ABORTED_HTTP_429
                         abortReason = "Aborted on HTTP 429 for cluster '${candidate.routingCluster}' (type=${rateLimitType ?: "unknown"}, Retry-After=${retryAfterHeader ?: "none"})"
                         break
@@ -784,7 +782,6 @@ class OffProdChallengerIdentityCompletionTool(
                                 detail = "HTTP $status server error"
                             )
                         )
-                        index++
                         terminalOutcome = RunOutcome.ABORTED_HTTP_5XX
                         abortReason = "Aborted on HTTP $status from cluster '${candidate.routingCluster}'"
                         break
@@ -804,7 +801,6 @@ class OffProdChallengerIdentityCompletionTool(
                                 detail = "Missing or malformed X-App-Rate-Limit* or X-Method-Rate-Limit* headers"
                             )
                         )
-                        index++
                         terminalOutcome = RunOutcome.ABORTED_MISSING_OR_INVALID_RATE_HEADERS
                         abortReason = "Missing or malformed X-App-Rate-Limit* / X-Method-Rate-Limit* headers on cluster '${candidate.routingCluster}'"
                         break
@@ -844,7 +840,6 @@ class OffProdChallengerIdentityCompletionTool(
                                         detail = "Malformed JSON body from Account-V1"
                                     )
                                 )
-                                index++
                                 terminalOutcome = RunOutcome.ABORTED_TIMEOUT_OR_IO_ERROR
                                 abortReason = "Malformed JSON body returned on HTTP 200 for PUUID '${candidate.normalizedPuuid}'"
                                 break
@@ -865,7 +860,6 @@ class OffProdChallengerIdentityCompletionTool(
                                         detail = "Account-V1 returned mismatched or invalid 78-char puuid '$returnedPuuid'"
                                     )
                                 )
-                                index++
                                 terminalOutcome = RunOutcome.ABORTED_PUUID_MISMATCH
                                 abortReason = "Account-V1 PUUID mismatch: requested '${candidate.normalizedPuuid}', received '$returnedPuuid'"
                                 break
@@ -1004,7 +998,8 @@ class OffProdChallengerIdentityCompletionTool(
                                                     detail = writeVerification.reason
                                                 )
                                             )
-                                            index++
+                                            // Do NOT increment index: this candidate did NOT complete durable persistence
+                                            // and must remain in remainingEntries (pending >= 1)!
                                             terminalOutcome = RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT
                                             abortReason = writeVerification.reason
                                             break
@@ -1027,7 +1022,6 @@ class OffProdChallengerIdentityCompletionTool(
                                     detail = "Unexpected HTTP status $status"
                                 )
                             )
-                            index++
                             terminalOutcome = RunOutcome.ABORTED_UNEXPECTED_HTTP_STATUS
                             abortReason = "Unexpected HTTP status $status on cluster '${candidate.routingCluster}'"
                             break
@@ -1037,22 +1031,25 @@ class OffProdChallengerIdentityCompletionTool(
             }
         }
 
+        val alreadyRecordedPuuids = itemResults.map { it.puuid }.toHashSet()
         val remainingEntries = ArrayList<ManifestEntry>()
         while (index < candidatesToFetch.size) {
             val pending = candidatesToFetch[index]
-            val state = dbStatesByPuuid[pending.normalizedPuuid] ?: PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS
             remainingEntries.add(pending)
-            itemResults.add(
-                ItemResult(
-                    puuid = pending.normalizedPuuid,
-                    platformRegion = pending.normalizedPlatformRegion,
-                    routingCluster = pending.routingCluster,
-                    preCallDbState = state,
-                    status = ItemStatus.PENDING_UNPROCESSED,
-                    httpAttempted = false,
-                    detail = abortReason ?: "Unprocessed due to budget stop"
+            if (pending.normalizedPuuid !in alreadyRecordedPuuids) {
+                val state = dbStatesByPuuid[pending.normalizedPuuid] ?: PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS
+                itemResults.add(
+                    ItemResult(
+                        puuid = pending.normalizedPuuid,
+                        platformRegion = pending.normalizedPlatformRegion,
+                        routingCluster = pending.routingCluster,
+                        preCallDbState = state,
+                        status = ItemStatus.PENDING_UNPROCESSED,
+                        httpAttempted = false,
+                        detail = abortReason ?: "Unprocessed due to budget stop"
+                    )
                 )
-            )
+            }
             index++
         }
 
@@ -1597,6 +1594,7 @@ class JdbcIdentityCompletionPersistenceAdapter(
                 "SELECT puuid, game_name, tag_line FROM indexed_players WHERE puuid IN ($placeholders)"
 
             try {
+                dataSource.loginTimeout = queryTimeoutSeconds
                 dataSource.connection.use { conn ->
                     connRef.set(conn)
                     applyBoundedConnectionSettingsFailClosed(
@@ -1671,21 +1669,21 @@ class JdbcIdentityCompletionPersistenceAdapter(
             future.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
             future.cancel(true)
-            cancelAndCloseQuietly(stmtRef.getAndSet(null), connRef.getAndSet(null))
+            triggerNonBlockingAsyncAbortAndClose(stmtRef.getAndSet(null), connRef.getAndSet(null), netTimeoutExec)
             DbRecheckResult.Failure(
-                reason = "Pre-call DB recheck (including connection acquisition) exceeded ${timeoutMs}ms deadline",
+                reason = "Pre-call DB recheck (including connection acquisition and cleanup) exceeded ${timeoutMs}ms deadline",
                 timedOutOrBudgetExhausted = true
             )
         } catch (e: Exception) {
             future.cancel(true)
-            cancelAndCloseQuietly(stmtRef.getAndSet(null), connRef.getAndSet(null))
+            triggerNonBlockingAsyncAbortAndClose(stmtRef.getAndSet(null), connRef.getAndSet(null), netTimeoutExec)
             DbRecheckResult.Failure(
                 reason = "Pre-call DB recheck interrupted/failed: ${e.message}",
                 timedOutOrBudgetExhausted = false
             )
         } finally {
             callExec.shutdownNow()
-            netTimeoutExec.shutdownNow()
+            netTimeoutExec.shutdown()
         }
     }
 
@@ -1727,6 +1725,7 @@ class JdbcIdentityCompletionPersistenceAdapter(
 
         val future = callExec.submit(Callable<DbWriteVerificationResult> {
             try {
+                dataSource.loginTimeout = queryTimeoutSeconds
                 dataSource.connection.use { conn ->
                     connRef.set(conn)
                     applyBoundedConnectionSettingsFailClosed(
@@ -1821,7 +1820,6 @@ class JdbcIdentityCompletionPersistenceAdapter(
                             writeTargetDescription = targetDesc
                         )
                     } else {
-                        // 0 rows mutated, but post-write read proved a complete non-blank identity is stored in DB!
                         DbWriteVerificationResult.ConcurrentAlreadyCompleteVerified(
                             verifiedGameName = verifiedIdentityGn,
                             verifiedTagLine = verifiedIdentityTl,
@@ -1843,19 +1841,19 @@ class JdbcIdentityCompletionPersistenceAdapter(
             future.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
             future.cancel(true)
-            cancelAndCloseQuietly(stmtRef.getAndSet(null), connRef.getAndSet(null))
+            triggerNonBlockingAsyncAbortAndClose(stmtRef.getAndSet(null), connRef.getAndSet(null), netTimeoutExec)
             DbWriteVerificationResult.FailureOrUnknownCommit(
-                "DB write/verification for '$validatedPuuid' exceeded ${timeoutMs}ms deadline; connection closed, commit state unknown"
+                "DB write/verification for '$validatedPuuid' exceeded ${timeoutMs}ms deadline; connection aborted asynchronously, commit state unknown"
             )
         } catch (e: Exception) {
             future.cancel(true)
-            cancelAndCloseQuietly(stmtRef.getAndSet(null), connRef.getAndSet(null))
+            triggerNonBlockingAsyncAbortAndClose(stmtRef.getAndSet(null), connRef.getAndSet(null), netTimeoutExec)
             DbWriteVerificationResult.FailureOrUnknownCommit(
                 "DB write/verification interrupted for '$validatedPuuid': ${e.message}; commit state unknown"
             )
         } finally {
             callExec.shutdownNow()
-            netTimeoutExec.shutdownNow()
+            netTimeoutExec.shutdown()
         }
     }
 
@@ -1875,18 +1873,36 @@ class JdbcIdentityCompletionPersistenceAdapter(
         conn.setNetworkTimeout(executor, networkTimeoutMs)
     }
 
-    private fun cancelAndCloseQuietly(stmt: PreparedStatement?, conn: Connection?) {
-        try {
-            stmt?.cancel()
-        } catch (_: Exception) {
-        }
-        try {
-            stmt?.close()
-        } catch (_: Exception) {
-        }
-        try {
-            conn?.close()
-        } catch (_: Exception) {
+    /**
+     * Dispatches JDBC statement cancellation and connection abort/close on a daemon thread
+     * so that the caller thread NEVER blocks past its deadline waiting on a driver mutex.
+     */
+    private fun triggerNonBlockingAsyncAbortAndClose(
+        stmt: PreparedStatement?,
+        conn: Connection?,
+        abortExecutor: java.util.concurrent.Executor
+    ) {
+        if (stmt == null && conn == null) return
+        Thread({
+            try {
+                stmt?.cancel()
+            } catch (_: Exception) {
+            }
+            try {
+                conn?.abort(abortExecutor)
+            } catch (_: Exception) {
+            }
+            try {
+                stmt?.close()
+            } catch (_: Exception) {
+            }
+            try {
+                conn?.close()
+            } catch (_: Exception) {
+            }
+        }, "offprod-db-async-abort").apply {
+            isDaemon = true
+            start()
         }
     }
 }
