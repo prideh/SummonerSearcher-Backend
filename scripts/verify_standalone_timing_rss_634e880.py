@@ -150,7 +150,7 @@ def main():
         if use_systemd_256m_scope:
             env_flags = [f"--setenv={k}={v}" for k, v in env_vars.items()]
             cmd = [
-                "sudo", "systemd-run", "--scope", "--quiet",
+                "sudo", "systemd-run", "--scope", "--quiet", f"--uid={os.getuid()}",
                 "-p", "MemoryMax=256M", "-p", "MemorySwapMax=0"
             ] + env_flags + base_cmd
         else:
@@ -269,7 +269,7 @@ def main():
         "OFFPROD_DB_PASS": ""
     }
     riot_env = dict(db_env)
-    riot_env["OFFPROD_RIOT_API_KEY"] = "TEST-LOOPBACK-STANDALONE-KEY"
+    riot_env["OFFPROD_RIOT_API_KEY"] = "TEST-LOOPBACK-ONLY-STANDALONE-PROOF"
 
     setup_cls = "com.pride.summoner_searcher_api.tools.OffProdAdditiveIdentitySchemaSetupCli"
     comp_cls = "com.pride.summoner_searcher_api.tools.OffProdPrewarmedChallengerIdentityCompletionCli"
@@ -468,7 +468,7 @@ def main():
     assert s5_wjson["distinctWriteAndVerifyPidsVerified"] is True
     assert s5_wjson["writeBackendPid"] != s5_wjson["readVerifyBackendPid"]
     assert s5_wjson["connectionsClosedCleanly"] is True
-    assert s5_cjson["outcome"] == "PARTIAL_COMPLETION_HTTP_BUDGET_EXHAUSTED"
+    assert s5_cjson["outcome"] == "PARTIAL_COMPLETION_ATTEMPT_CAP_REACHED"
     assert s5_cjson["httpAttemptsMade"] == 50
     assert s5_cjson["durableIdentityTableUpsertsVerifiedCount"] == 50
     assert s5_cjson["remainingPendingCount"] == 141
@@ -566,7 +566,7 @@ def main():
     assert s7_wjson["physicalConnectionsOpened"] == 2
     assert s7_wjson["distinctWriteAndVerifyPidsVerified"] is True
     assert s7_wjson["connectionsClosedCleanly"] is True
-    assert s7_cjson["outcome"] == "COMPLETED_ALL_CANDIDATES"
+    assert s7_cjson["outcome"] == "STAGED_ALL_CANDIDATES"
     assert s7_cjson["httpAttemptsMade"] == 141
     assert s7_cjson["durableIdentityTableUpsertsVerifiedCount"] == 141
     assert s7_cjson["remainingPendingCount"] == 0
@@ -623,7 +623,7 @@ def main():
     assert s8_wjson["physicalConnectionsOpened"] == 2
     assert s8_wjson["distinctWriteAndVerifyPidsVerified"] is True
     assert s8_wjson["connectionsClosedCleanly"] is True
-    assert s8_cjson["outcome"] == "COMPLETED_ALL_CANDIDATES"
+    assert s8_cjson["outcome"] == "STAGED_ALL_CANDIDATES"
     assert s8_cjson["httpAttemptsMade"] == 191
     assert s8_cjson["durableIdentityTableUpsertsVerifiedCount"] == 191
     assert s8_cjson["durableIndexedPlayerUpdatesVerifiedCount"] == 0
