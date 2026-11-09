@@ -570,10 +570,11 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             report429.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(kr1, kr2)
         }
 
-        Then("HttpUrlConnectionAccountV1Transport enforces the 4 KiB body cap, socket deadline cancellation, and loopback credential guard on a local loopback server") {
+        Then("HttpUrlConnectionAccountV1Transport enforces the 4 KiB body cap, off-caller async socket abort on deadline, and loopback credential guard on a local loopback server") {
             val pOversized = validPuuid78("loopback_oversized")
             val pStalled = validPuuid78("loopback_stalled")
             val releaseStalledHandler = CountDownLatch(1)
+            val asyncAbortTriggeredLatch = CountDownLatch(1)
             val server = HttpServer.create(InetSocketAddress("127.0.0.1", 0), 0)
             try {
                 server.createContext("/riot/account/v1/accounts/by-puuid/$pOversized") { exchange ->
@@ -592,7 +593,9 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 }
                 server.start()
                 val port = server.address.port
-                val realTransport = HttpUrlConnectionAccountV1Transport()
+                val realTransport = HttpUrlConnectionAccountV1Transport(
+                    onAsyncAbortInvoked = { asyncAbortTriggeredLatch.countDown() }
+                )
 
                 val oversizedResult = realTransport.executeSingleGet(
                     url = "http://127.0.0.1:$port/riot/account/v1/accounts/by-puuid/$pOversized",
@@ -605,16 +608,20 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 )
                 oversizedResult shouldBe TransportResult.PayloadTooLarge(statusCode = 200, maxBodyBytes = 4_096)
 
+                val startMs = System.nanoTime() / 1_000_000L
                 val timeoutResult = realTransport.executeSingleGet(
                     url = "http://127.0.0.1:$port/riot/account/v1/accounts/by-puuid/$pStalled",
                     apiKey = "TEST-LOOPBACK-ONLY-unit-test",
-                    connectTimeoutMs = 200,
-                    readTimeoutMs = 200,
-                    callDeadlineMs = 250L,
+                    connectTimeoutMs = 2_000,
+                    readTimeoutMs = 2_000,
+                    callDeadlineMs = 150L,
                     maxBodyBytes = 4_096,
                     allowLoopbackHttpForTesting = true
                 )
+                val elapsedMs = (System.nanoTime() / 1_000_000L) - startMs
                 (timeoutResult is TransportResult.TimeoutOrIoError) shouldBe true
+                (elapsedMs < 1_000L) shouldBe true
+                asyncAbortTriggeredLatch.await(2, TimeUnit.SECONDS) shouldBe true
             } finally {
                 releaseStalledHandler.countDown()
                 server.stop(0)
@@ -771,6 +778,7 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             val verifySelectPs = mockk<PreparedStatement>(relaxed = true)
             val emptyRs = mockk<ResultSet>(relaxed = true)
 
+            every { writeConn.autoCommit } returns true
             every { unverifiedWriteDs.connection } returns writeConn
             every { writeConn.prepareStatement(match { it.contains("FROM indexed_players WHERE puuid IN") }) } returns recheckIndexedPs
             every { writeConn.prepareStatement(match { it.contains("FROM player_riot_identities WHERE puuid IN") }) } returns recheckIdentityPs
@@ -779,7 +787,6 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             every {
                 writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE)
             } returns upsertPs
-            // Adapter returns 0 rows updated (false) AND post-write SELECT finds no usable row in DB!
             every { upsertPs.executeUpdate() } returns 0
             every {
                 writeConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_SELECT_VERIFY_IDENTITY_ONLY_BY_PUUID)
@@ -820,9 +827,137 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
             report.durableIndexedPlayerUpdatesVerifiedCount shouldBe 0
             report.durableIdentityTableUpsertsVerifiedCount shouldBe 0
             report.dbFailureOrUnknownCommitCount shouldBe 1
-            // Candidate was NOT completed, so remainingPendingCount MUST be 1 (never 0)!
             report.remainingPendingCount shouldBe 1
             report.remainingEntries.map { it.normalizedPuuid } shouldBe listOf(pNoRow)
+        }
+
+        Then("delayed DataSource.getConnection() that ignores interruption and resolves AFTER caller timeout executes ZERO SQL statements or writes and closes/aborts the late connection") {
+            val pLate = validPuuid78("delayed_acquire_ignores_interrupt")
+            val releaseDelayedAcquireLatch = CountDownLatch(1)
+            val lateConnClosedOrAbortedLatch = CountDownLatch(1)
+            val sqlStatementsExecutedAfterTimeout = AtomicInteger(0)
+
+            val lateConn = mockk<Connection>(relaxed = true)
+            every { lateConn.autoCommit } returns true
+            every { lateConn.prepareStatement(any()) } answers {
+                sqlStatementsExecutedAfterTimeout.incrementAndGet()
+                error("Late-acquired connection MUST NOT prepare or execute any SQL after caller timeout!")
+            }
+            every { lateConn.close() } answers {
+                lateConnClosedOrAbortedLatch.countDown()
+            }
+            every { lateConn.abort(any()) } answers {
+                lateConnClosedOrAbortedLatch.countDown()
+            }
+
+            val delayedDataSource = mockk<DataSource>(relaxed = true)
+            every { delayedDataSource.connection } answers {
+                // Intentionally ignore InterruptedException to simulate a JDBC pool/socket blocking uninterruptibly!
+                val deadlineMs = System.currentTimeMillis() + 5_000L
+                while (System.currentTimeMillis() < deadlineMs) {
+                    try {
+                        if (releaseDelayedAcquireLatch.await(10, TimeUnit.MILLISECONDS)) {
+                            break
+                        }
+                    } catch (_: InterruptedException) {
+                        // Swallow interrupt!
+                    }
+                }
+                lateConn
+            }
+
+            val adapter = JdbcIdentityCompletionPersistenceAdapter(delayedDataSource)
+
+            // 1. Trigger a 50ms timeout while DataSource.getConnection() is blocked ignoring interruption
+            val result = adapter.persistAndVerifyIdentityBounded(
+                puuid = pLate,
+                platformRegion = "euw1",
+                gameName = "NeverWritten",
+                tagLine = "EUW",
+                verifiedAt = Instant.parse("2026-11-09T03:30:00Z"),
+                preCallDbState = PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS,
+                timeoutMs = 50L
+            )
+            (result is DbWriteVerificationResult.FailureOrUnknownCommit) shouldBe true
+
+            // 2. Now release the delayed getConnection() AFTER caller already returned FailureOrUnknownCommit!
+            releaseDelayedAcquireLatch.countDown()
+
+            // 3. Wait for the worker thread to receive lateConn and hit the post-acquisition cancellation/deadline fence
+            lateConnClosedOrAbortedLatch.await(2, TimeUnit.SECONDS) shouldBe true
+
+            // 4. Prove ZERO SQL statements were prepared or executed after timeout return!
+            sqlStatementsExecutedAfterTimeout.get() shouldBe 0
+            verify(exactly = 0) { lateConn.prepareStatement(any()) }
+        }
+
+        Then("same-connection post-write read with autoCommit=false is rejected as FailureOrUnknownCommit, while autoCommit=true or explicit commit + distinct read connection succeeds") {
+            val pAutoCommit = validPuuid78("autocommit_proof_1")
+            val verifiedTs = Instant.parse("2026-11-09T03:30:00Z")
+
+            // Case A: Write connection has autoCommit=false AND DataSource returns the SAME uncommitted Connection instance for verification -> MUST FAIL CLOSED!
+            val uncommittedSameConnDs = mockk<DataSource>(relaxed = true)
+            val uncommittedConn = mockk<Connection>(relaxed = true)
+            val upsertPs = mockk<PreparedStatement>(relaxed = true)
+
+            every { uncommittedConn.autoCommit } returns false // Refuses autoCommit=true!
+            every { uncommittedSameConnDs.connection } returns uncommittedConn
+            every {
+                uncommittedConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE)
+            } returns upsertPs
+            every { upsertPs.executeUpdate() } returns 1
+
+            val uncommittedAdapter = JdbcIdentityCompletionPersistenceAdapter(uncommittedSameConnDs)
+            val uncommittedResult = uncommittedAdapter.persistAndVerifyIdentityBounded(
+                puuid = pAutoCommit,
+                platformRegion = "euw1",
+                gameName = "UncommittedName",
+                tagLine = "EUW",
+                verifiedAt = verifiedTs,
+                preCallDbState = PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS,
+                timeoutMs = 1_000L
+            )
+            (uncommittedResult is DbWriteVerificationResult.FailureOrUnknownCommit) shouldBe true
+            (uncommittedResult as DbWriteVerificationResult.FailureOrUnknownCommit).reason shouldContain "autoCommit=false"
+
+            // Case B: Write connection has autoCommit=false, executes explicit writeConn.commit(), AND DataSource provides a DISTINCT verifyConn -> SUCCEEDS!
+            val distinctConnDs = mockk<DataSource>(relaxed = true)
+            val manualWriteConn = mockk<Connection>(relaxed = true)
+            val distinctVerifyConn = mockk<Connection>(relaxed = true)
+            val verifyPs = mockk<PreparedStatement>(relaxed = true)
+            val verifyRs = mockk<ResultSet>(relaxed = true)
+
+            every { manualWriteConn.autoCommit } returns false
+            every { distinctVerifyConn.autoCommit } returns false
+            val connSeq = AtomicInteger(0)
+            every { distinctConnDs.connection } answers {
+                if (connSeq.incrementAndGet() == 1) manualWriteConn else distinctVerifyConn
+            }
+            every {
+                manualWriteConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE)
+            } returns upsertPs
+            every { upsertPs.executeUpdate() } returns 1
+            every {
+                distinctVerifyConn.prepareStatement(JdbcIdentityCompletionPersistenceAdapter.SQL_SELECT_VERIFY_IDENTITY_ONLY_BY_PUUID)
+            } returns verifyPs
+            every { verifyPs.executeQuery() } returns verifyRs
+            every { verifyRs.next() } returns true
+            every { verifyRs.getString("game_name") } returns "CommittedName"
+            every { verifyRs.getString("tag_line") } returns "EUW"
+            every { verifyRs.getTimestamp("verified_at") } returns Timestamp.from(verifiedTs)
+
+            val distinctAdapter = JdbcIdentityCompletionPersistenceAdapter(distinctConnDs)
+            val committedResult = distinctAdapter.persistAndVerifyIdentityBounded(
+                puuid = pAutoCommit,
+                platformRegion = "euw1",
+                gameName = "CommittedName",
+                tagLine = "EUW",
+                verifiedAt = verifiedTs,
+                preCallDbState = PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS,
+                timeoutMs = 1_000L
+            )
+            (committedResult is DbWriteVerificationResult.WrittenAndVerified) shouldBe true
+            verify(exactly = 1) { manualWriteConn.commit() }
         }
 
         Then("it checks remaining wall-time budget BEFORE starting a durable DB write and leaves the candidate in remainingEntries if budget is exhausted") {
@@ -912,7 +1047,6 @@ class OffProdChallengerIdentityCompletionToolTest : BehaviorSpec({
                 stalledReport.outcome shouldBe RunOutcome.ABORTED_DB_FAILURE_OR_UNKNOWN_COMMIT
                 stalledReport.httpAttemptsMade shouldBe 0
                 stalledReport.remainingPendingCount shouldBe 2
-                // Prove caller thread returned promptly near 150ms without waiting for the 5,000ms stalled connection!
                 (elapsedCallerMs < 1_500L) shouldBe true
             } finally {
                 releaseStalledConn.countDown()

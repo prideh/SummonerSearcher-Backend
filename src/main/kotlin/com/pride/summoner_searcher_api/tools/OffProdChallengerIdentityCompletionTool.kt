@@ -1287,7 +1287,9 @@ fun interface BoundedAccountV1Transport {
  * - Off-thread wall-clock deadline that actively closes the stream and calls `HttpURLConnection.disconnect()`
  * - Strict `maxBodyBytes` (4 KiB) cap while reading the response stream
  */
-class HttpUrlConnectionAccountV1Transport : BoundedAccountV1Transport {
+class HttpUrlConnectionAccountV1Transport(
+    private val onAsyncAbortInvoked: (() -> Unit)? = null
+) : BoundedAccountV1Transport {
 
     override fun executeSingleGet(
         url: String,
@@ -1310,13 +1312,20 @@ class HttpUrlConnectionAccountV1Transport : BoundedAccountV1Transport {
 
         val connRef = AtomicReference<HttpURLConnection?>(null)
         val streamRef = AtomicReference<InputStream?>(null)
-        val cancelled = AtomicBoolean(false)
+        val cancelledOrTimedOut = AtomicBoolean(false)
+        val deadlineNano = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(callDeadlineMs.coerceAtLeast(1L))
+
+        fun isCancelledOrPastDeadline(): Boolean =
+            cancelledOrTimedOut.get() || Thread.currentThread().isInterrupted || System.nanoTime() >= deadlineNano
 
         val executor = Executors.newSingleThreadExecutor { runnable ->
             Thread(runnable, "offprod-account-v1-single-call").apply { isDaemon = true }
         }
 
         val future: Future<TransportResult> = executor.submit(Callable {
+            if (isCancelledOrPastDeadline()) {
+                return@Callable TransportResult.TimeoutOrIoError("Cancelled or deadline expired before HTTP openConnection")
+            }
             var connection: HttpURLConnection? = null
             try {
                 connection = (validatedUri.toURL().openConnection() as HttpURLConnection).apply {
@@ -1330,12 +1339,18 @@ class HttpUrlConnectionAccountV1Transport : BoundedAccountV1Transport {
                     setRequestProperty("Connection", "close")
                 }
                 connRef.set(connection)
-                if (cancelled.get()) {
-                    connection.disconnect()
-                    return@Callable TransportResult.TimeoutOrIoError("Cancelled before connect")
+                if (isCancelledOrPastDeadline()) {
+                    connRef.set(null)
+                    triggerNonBlockingHttpAbortAndClose(null, connection)
+                    return@Callable TransportResult.TimeoutOrIoError("Cancelled or deadline expired before HTTP connect")
                 }
 
                 val statusCode = connection.responseCode
+                if (isCancelledOrPastDeadline()) {
+                    triggerNonBlockingHttpAbortAndClose(streamRef.getAndSet(null), connRef.getAndSet(null))
+                    return@Callable TransportResult.TimeoutOrIoError("Cancelled or deadline expired after HTTP responseCode")
+                }
+
                 val headersLower = LinkedHashMap<String, String>()
                 for ((key, values) in connection.headerFields) {
                     if (key != null && !values.isNullOrEmpty()) {
@@ -1349,12 +1364,30 @@ class HttpUrlConnectionAccountV1Transport : BoundedAccountV1Transport {
                     connection.errorStream
                 }
                 streamRef.set(rawStream)
+                if (isCancelledOrPastDeadline()) {
+                    triggerNonBlockingHttpAbortAndClose(streamRef.getAndSet(null), connRef.getAndSet(null))
+                    return@Callable TransportResult.TimeoutOrIoError("Cancelled or deadline expired before reading HTTP stream")
+                }
 
                 val bodyBytes = if (rawStream != null) {
-                    readBoundedStream(rawStream, maxBodyBytes)
-                        ?: return@Callable TransportResult.PayloadTooLarge(statusCode, maxBodyBytes)
+                    when (val readOutcome = readBoundedStreamFenced(rawStream, maxBodyBytes, ::isCancelledOrPastDeadline)) {
+                        is StreamReadOutcome.Success -> readOutcome.bytes
+                        is StreamReadOutcome.TooLarge -> {
+                            triggerNonBlockingHttpAbortAndClose(streamRef.getAndSet(null), connRef.getAndSet(null))
+                            return@Callable TransportResult.PayloadTooLarge(statusCode, maxBodyBytes)
+                        }
+                        is StreamReadOutcome.CancelledOrTimedOut -> {
+                            triggerNonBlockingHttpAbortAndClose(streamRef.getAndSet(null), connRef.getAndSet(null))
+                            return@Callable TransportResult.TimeoutOrIoError("Cancelled or deadline expired while reading HTTP stream")
+                        }
+                    }
                 } else {
                     ByteArray(0)
+                }
+
+                if (isCancelledOrPastDeadline()) {
+                    triggerNonBlockingHttpAbortAndClose(streamRef.getAndSet(null), connRef.getAndSet(null))
+                    return@Callable TransportResult.TimeoutOrIoError("Cancelled or deadline expired after reading HTTP body")
                 }
 
                 TransportResult.HttpResponse(
@@ -1365,13 +1398,10 @@ class HttpUrlConnectionAccountV1Transport : BoundedAccountV1Transport {
             } catch (e: Exception) {
                 TransportResult.TimeoutOrIoError("${e.javaClass.simpleName}: ${e.message ?: "HTTP transport failure"}")
             } finally {
-                try {
-                    streamRef.getAndSet(null)?.close()
-                } catch (_: Exception) {
-                }
-                try {
-                    connRef.getAndSet(null)?.disconnect()
-                } catch (_: Exception) {
+                val s = streamRef.getAndSet(null)
+                val c = connRef.getAndSet(null)
+                if (s != null || c != null) {
+                    triggerNonBlockingHttpAbortAndClose(s, c)
                 }
             }
         })
@@ -1379,48 +1409,78 @@ class HttpUrlConnectionAccountV1Transport : BoundedAccountV1Transport {
         return try {
             future.get(callDeadlineMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
-            cancelled.set(true)
+            cancelledOrTimedOut.set(true)
             future.cancel(true)
-            try {
-                streamRef.getAndSet(null)?.close()
-            } catch (_: Exception) {
-            }
-            try {
-                connRef.getAndSet(null)?.disconnect()
-            } catch (_: Exception) {
-            }
-            TransportResult.TimeoutOrIoError("Call deadline (${callDeadlineMs}ms) exceeded; socket disconnected")
+            triggerNonBlockingHttpAbortAndClose(streamRef.getAndSet(null), connRef.getAndSet(null))
+            TransportResult.TimeoutOrIoError("Call deadline (${callDeadlineMs}ms) exceeded; socket disconnect dispatched asynchronously")
         } catch (e: Exception) {
-            cancelled.set(true)
+            cancelledOrTimedOut.set(true)
             future.cancel(true)
-            try {
-                streamRef.getAndSet(null)?.close()
-            } catch (_: Exception) {
-            }
-            try {
-                connRef.getAndSet(null)?.disconnect()
-            } catch (_: Exception) {
-            }
+            triggerNonBlockingHttpAbortAndClose(streamRef.getAndSet(null), connRef.getAndSet(null))
             TransportResult.TimeoutOrIoError("Interrupted/failed waiting for HTTP call: ${e.message}")
         } finally {
             executor.shutdownNow()
         }
     }
 
-    private fun readBoundedStream(input: InputStream, maxBodyBytes: Int): ByteArray? {
+    private sealed class StreamReadOutcome {
+        data class Success(val bytes: ByteArray) : StreamReadOutcome()
+        object TooLarge : StreamReadOutcome()
+        object CancelledOrTimedOut : StreamReadOutcome()
+    }
+
+    private fun readBoundedStreamFenced(
+        input: InputStream,
+        maxBodyBytes: Int,
+        isCancelledOrPastDeadline: () -> Boolean
+    ): StreamReadOutcome {
         val out = ByteArrayOutputStream(minOf(maxBodyBytes, 1024))
         val buffer = ByteArray(1024)
         var total = 0
         while (true) {
+            if (isCancelledOrPastDeadline()) {
+                return StreamReadOutcome.CancelledOrTimedOut
+            }
             val read = input.read(buffer)
+            if (isCancelledOrPastDeadline()) {
+                return StreamReadOutcome.CancelledOrTimedOut
+            }
             if (read == -1) break
             total += read
             if (total > maxBodyBytes) {
-                return null
+                return StreamReadOutcome.TooLarge
             }
             out.write(buffer, 0, read)
         }
-        return out.toByteArray()
+        return StreamReadOutcome.Success(out.toByteArray())
+    }
+
+    /**
+     * Dispatches `HttpURLConnection.disconnect()` and `InputStream.close()` on a daemon thread
+     * so that the caller thread NEVER blocks past `callDeadlineMs` waiting on socket/stream teardown.
+     */
+    private fun triggerNonBlockingHttpAbortAndClose(
+        stream: InputStream?,
+        connection: HttpURLConnection?
+    ) {
+        if (stream == null && connection == null) return
+        Thread({
+            try {
+                onAsyncAbortInvoked?.invoke()
+            } catch (_: Exception) {
+            }
+            try {
+                connection?.disconnect()
+            } catch (_: Exception) {
+            }
+            try {
+                stream?.close()
+            } catch (_: Exception) {
+            }
+        }, "offprod-http-async-abort").apply {
+            isDaemon = true
+            start()
+        }
     }
 }
 
@@ -1479,13 +1539,15 @@ interface IdentityCompletionPersistencePort {
 
 /**
  * JDBC implementation of [IdentityCompletionPersistencePort] that:
- * 1. Bounds `dataSource.getConnection()`, statement execution, and post-write verification within `timeoutMs`
- *    using an off-thread deadline executor that actively closes stalled connections/statements.
- * 2. Fails closed if `Connection.setReadOnly`, `Connection.setNetworkTimeout`, or `PreparedStatement.setQueryTimeout`
- *    throws an exception (never silently ignoring unsupported timeout/readOnly settings).
- * 3. Executes post-write read verification so `WrittenAndVerified` is only returned when the DB row is proven
- *    to hold a complete non-blank identity, distinguishing `ConcurrentAlreadyCompleteVerified` (when 0 rows were
- *    mutated because a concurrent writer already completed the row) from `FailureOrUnknownCommit`.
+ * 1. Enforces strict cancellation and monotonic deadline fencing before `dataSource.connection`,
+ *    immediately after `dataSource.connection` (closing any late-acquired connection WITHOUT preparing
+ *    or executing any SQL if the deadline has already expired!), and before/between every SQL statement.
+ * 2. Fails closed if `DataSource.setLoginTimeout`, `Connection.setReadOnly`, `Connection.setNetworkTimeout`,
+ *    or `PreparedStatement.setQueryTimeout` throws an exception.
+ * 3. Proves durable commit: requires `writeConn.autoCommit = true` (verified via `writeConn.autoCommit == true`)
+ *    OR explicit `writeConn.commit()` followed by a post-commit verification `SELECT` on a separate
+ *    connection (`verifyConn !== writeConn`). A same-connection read with `autoCommit == false` is rejected
+ *    as [DbWriteVerificationResult.FailureOrUnknownCommit] because it would read uncommitted session state.
  */
 class JdbcIdentityCompletionPersistenceAdapter(
     private val dataSource: DataSource,
@@ -1573,6 +1635,15 @@ class JdbcIdentityCompletionPersistenceAdapter(
         val puuids = entries.map { it.normalizedPuuid }.distinct()
         val connRef = AtomicReference<Connection?>(null)
         val stmtRef = AtomicReference<PreparedStatement?>(null)
+        val cancelledOrTimedOut = AtomicBoolean(false)
+        val deadlineNano = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+
+        fun isCancelledOrPastDeadline(): Boolean =
+            cancelledOrTimedOut.get() || Thread.currentThread().isInterrupted || System.nanoTime() >= deadlineNano
+
+        fun remainingBudgetMs(): Long =
+            TimeUnit.NANOSECONDS.toMillis(deadlineNano - System.nanoTime())
+
         val netTimeoutExec = Executors.newSingleThreadExecutor { r ->
             Thread(r, "offprod-db-net-timeout").apply { isDaemon = true }
         }
@@ -1580,10 +1651,14 @@ class JdbcIdentityCompletionPersistenceAdapter(
             Thread(r, "offprod-db-recheck-call").apply { isDaemon = true }
         }
 
-        val queryTimeoutSeconds = ceil(timeoutMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
-        val networkTimeoutMs = timeoutMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt().coerceAtLeast(1)
-
         val future = callExec.submit(Callable<DbRecheckResult> {
+            if (isCancelledOrPastDeadline()) {
+                return@Callable DbRecheckResult.Failure(
+                    reason = "DB recheck cancelled or deadline expired before connection acquisition",
+                    timedOutOrBudgetExhausted = true
+                )
+            }
+
             val result = LinkedHashMap<String, OffProdChallengerIdentityCompletionTool.PreCallDbState>(puuids.size)
             for (p in puuids) {
                 result[p] = OffProdChallengerIdentityCompletionTool.PreCallDbState.ABSENT_FROM_INDEXED_PLAYERS
@@ -1594,24 +1669,75 @@ class JdbcIdentityCompletionPersistenceAdapter(
                 "SELECT puuid, game_name, tag_line FROM indexed_players WHERE puuid IN ($placeholders)"
 
             try {
-                dataSource.loginTimeout = queryTimeoutSeconds
-                dataSource.connection.use { conn ->
-                    connRef.set(conn)
+                val initialRemMs = remainingBudgetMs()
+                if (initialRemMs <= 0L || isCancelledOrPastDeadline()) {
+                    return@Callable DbRecheckResult.Failure(
+                        reason = "DB recheck deadline expired before getConnection",
+                        timedOutOrBudgetExhausted = true
+                    )
+                }
+                dataSource.loginTimeout = ceil(initialRemMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
+
+                val rawConn = dataSource.connection
+                connRef.set(rawConn)
+                // Critical fence immediately after connection acquisition:
+                if (isCancelledOrPastDeadline()) {
+                    connRef.set(null)
+                    triggerNonBlockingAsyncAbortAndClose(null, rawConn, netTimeoutExec)
+                    return@Callable DbRecheckResult.Failure(
+                        reason = "DB recheck connection acquired after deadline/cancellation; closed without SQL execution",
+                        timedOutOrBudgetExhausted = true
+                    )
+                }
+
+                rawConn.use { conn ->
+                    val remAfterAcquireMs = remainingBudgetMs()
+                    if (remAfterAcquireMs <= 0L || isCancelledOrPastDeadline()) {
+                        connRef.set(null)
+                        triggerNonBlockingAsyncAbortAndClose(null, conn, netTimeoutExec)
+                        return@Callable DbRecheckResult.Failure(
+                            reason = "DB recheck deadline expired immediately after connection acquisition",
+                            timedOutOrBudgetExhausted = true
+                        )
+                    }
+
                     applyBoundedConnectionSettingsFailClosed(
                         conn = conn,
                         readOnly = true,
-                        networkTimeoutMs = networkTimeoutMs,
+                        networkTimeoutMs = remAfterAcquireMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt().coerceAtLeast(1),
                         executor = netTimeoutExec
                     )
 
+                    if (isCancelledOrPastDeadline()) {
+                        return@Callable DbRecheckResult.Failure(
+                            reason = "DB recheck deadline expired after applying connection settings",
+                            timedOutOrBudgetExhausted = true
+                        )
+                    }
+
                     conn.prepareStatement(indexedPlayersSql).use { ps ->
                         stmtRef.set(ps)
-                        ps.queryTimeout = queryTimeoutSeconds
+                        val remQueryMs = remainingBudgetMs()
+                        if (remQueryMs <= 0L || isCancelledOrPastDeadline()) {
+                            stmtRef.set(null)
+                            triggerNonBlockingAsyncAbortAndClose(ps, conn, netTimeoutExec)
+                            return@Callable DbRecheckResult.Failure(
+                                reason = "DB recheck deadline expired before indexed_players query execution",
+                                timedOutOrBudgetExhausted = true
+                            )
+                        }
+                        ps.queryTimeout = ceil(remQueryMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
                         for ((idx, puuid) in puuids.withIndex()) {
                             ps.setString(idx + 1, puuid)
                         }
                         ps.executeQuery().use { rs ->
                             while (rs.next()) {
+                                if (isCancelledOrPastDeadline()) {
+                                    return@Callable DbRecheckResult.Failure(
+                                        reason = "DB recheck deadline expired while reading indexed_players ResultSet",
+                                        timedOutOrBudgetExhausted = true
+                                    )
+                                }
                                 val p = rs.getString("puuid")?.trim().orEmpty()
                                 if (p.isEmpty()) continue
                                 val gn = rs.getString("game_name")?.trim().orEmpty()
@@ -1623,6 +1749,7 @@ class JdbcIdentityCompletionPersistenceAdapter(
                                 }
                             }
                         }
+                        stmtRef.set(null)
                     }
 
                     if (checkIdentityTableInPreCall) {
@@ -1630,17 +1757,38 @@ class JdbcIdentityCompletionPersistenceAdapter(
                             .filter { it.value != OffProdChallengerIdentityCompletionTool.PreCallDbState.ALREADY_COMPLETE }
                             .map { it.key }
                         if (unresolvedPuuids.isNotEmpty()) {
+                            val remIdQueryMs = remainingBudgetMs()
+                            if (remIdQueryMs <= 0L || isCancelledOrPastDeadline()) {
+                                return@Callable DbRecheckResult.Failure(
+                                    reason = "DB recheck deadline expired before player_riot_identities query",
+                                    timedOutOrBudgetExhausted = true
+                                )
+                            }
                             val idPlaceholders = unresolvedPuuids.joinToString(",") { "?" }
                             val identitySql =
                                 "SELECT puuid, game_name, tag_line FROM player_riot_identities WHERE puuid IN ($idPlaceholders)"
                             conn.prepareStatement(identitySql).use { ps ->
                                 stmtRef.set(ps)
-                                ps.queryTimeout = queryTimeoutSeconds
+                                if (isCancelledOrPastDeadline()) {
+                                    stmtRef.set(null)
+                                    triggerNonBlockingAsyncAbortAndClose(ps, conn, netTimeoutExec)
+                                    return@Callable DbRecheckResult.Failure(
+                                        reason = "DB recheck cancelled before player_riot_identities executeQuery",
+                                        timedOutOrBudgetExhausted = true
+                                    )
+                                }
+                                ps.queryTimeout = ceil(remIdQueryMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
                                 for ((idx, puuid) in unresolvedPuuids.withIndex()) {
                                     ps.setString(idx + 1, puuid)
                                 }
                                 ps.executeQuery().use { rs ->
                                     while (rs.next()) {
+                                        if (isCancelledOrPastDeadline()) {
+                                            return@Callable DbRecheckResult.Failure(
+                                                reason = "DB recheck deadline expired while reading player_riot_identities ResultSet",
+                                                timedOutOrBudgetExhausted = true
+                                            )
+                                        }
                                         val p = rs.getString("puuid")?.trim().orEmpty()
                                         val gn = rs.getString("game_name")?.trim().orEmpty()
                                         val tl = rs.getString("tag_line")?.trim().orEmpty()
@@ -1649,15 +1797,23 @@ class JdbcIdentityCompletionPersistenceAdapter(
                                         }
                                     }
                                 }
+                                stmtRef.set(null)
                             }
                         }
                     }
                 }
-                DbRecheckResult.Success(result)
+                if (isCancelledOrPastDeadline()) {
+                    DbRecheckResult.Failure(
+                        reason = "DB recheck deadline expired upon completion",
+                        timedOutOrBudgetExhausted = true
+                    )
+                } else {
+                    DbRecheckResult.Success(result)
+                }
             } catch (e: Exception) {
                 DbRecheckResult.Failure(
                     reason = "Pre-call DB recheck failed (${e.javaClass.simpleName}): ${e.message}",
-                    timedOutOrBudgetExhausted = false
+                    timedOutOrBudgetExhausted = isCancelledOrPastDeadline()
                 )
             } finally {
                 stmtRef.set(null)
@@ -1668,6 +1824,7 @@ class JdbcIdentityCompletionPersistenceAdapter(
         return try {
             future.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
+            cancelledOrTimedOut.set(true)
             future.cancel(true)
             triggerNonBlockingAsyncAbortAndClose(stmtRef.getAndSet(null), connRef.getAndSet(null), netTimeoutExec)
             DbRecheckResult.Failure(
@@ -1675,6 +1832,7 @@ class JdbcIdentityCompletionPersistenceAdapter(
                 timedOutOrBudgetExhausted = true
             )
         } catch (e: Exception) {
+            cancelledOrTimedOut.set(true)
             future.cancel(true)
             triggerNonBlockingAsyncAbortAndClose(stmtRef.getAndSet(null), connRef.getAndSet(null), netTimeoutExec)
             DbRecheckResult.Failure(
@@ -1713,6 +1871,15 @@ class JdbcIdentityCompletionPersistenceAdapter(
 
         val connRef = AtomicReference<Connection?>(null)
         val stmtRef = AtomicReference<PreparedStatement?>(null)
+        val cancelledOrTimedOut = AtomicBoolean(false)
+        val deadlineNano = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
+
+        fun isCancelledOrPastDeadline(): Boolean =
+            cancelledOrTimedOut.get() || Thread.currentThread().isInterrupted || System.nanoTime() >= deadlineNano
+
+        fun remainingBudgetMs(): Long =
+            TimeUnit.NANOSECONDS.toMillis(deadlineNano - System.nanoTime())
+
         val netTimeoutExec = Executors.newSingleThreadExecutor { r ->
             Thread(r, "offprod-db-write-net-timeout").apply { isDaemon = true }
         }
@@ -1720,54 +1887,206 @@ class JdbcIdentityCompletionPersistenceAdapter(
             Thread(r, "offprod-db-write-call").apply { isDaemon = true }
         }
 
-        val queryTimeoutSeconds = ceil(timeoutMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
-        val networkTimeoutMs = timeoutMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt().coerceAtLeast(1)
-
         val future = callExec.submit(Callable<DbWriteVerificationResult> {
+            if (isCancelledOrPastDeadline()) {
+                return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                    "DB write cancelled or deadline expired before connection acquisition"
+                )
+            }
+
             try {
-                dataSource.loginTimeout = queryTimeoutSeconds
-                dataSource.connection.use { conn ->
-                    connRef.set(conn)
+                val initialRemMs = remainingBudgetMs()
+                if (initialRemMs <= 0L || isCancelledOrPastDeadline()) {
+                    return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                        "DB write deadline expired before getConnection"
+                    )
+                }
+                dataSource.loginTimeout = ceil(initialRemMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
+
+                var indexedUpdated = false
+                var identityUpserted = false
+                var writeConnWasAutoCommit = false
+                var writeConnIdentityRef: Connection? = null
+
+                val rawWriteConn = dataSource.connection
+                connRef.set(rawWriteConn)
+                // Critical fence immediately after connection acquisition:
+                // If caller already timed out while getConnection() was blocked, close immediately WITHOUT executing SQL!
+                if (isCancelledOrPastDeadline()) {
+                    connRef.set(null)
+                    triggerNonBlockingAsyncAbortAndClose(null, rawWriteConn, netTimeoutExec)
+                    return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                        "DB write connection acquired after deadline/cancellation; closed without executing any SQL write"
+                    )
+                }
+
+                rawWriteConn.use { writeConn ->
+                    writeConnIdentityRef = writeConn
+                    val remAfterAcquireMs = remainingBudgetMs()
+                    if (remAfterAcquireMs <= 0L || isCancelledOrPastDeadline()) {
+                        connRef.set(null)
+                        triggerNonBlockingAsyncAbortAndClose(null, writeConn, netTimeoutExec)
+                        return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                            "DB write deadline expired immediately after connection acquisition; closed without SQL write"
+                        )
+                    }
+
                     applyBoundedConnectionSettingsFailClosed(
-                        conn = conn,
+                        conn = writeConn,
                         readOnly = false,
-                        networkTimeoutMs = networkTimeoutMs,
+                        networkTimeoutMs = remAfterAcquireMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt().coerceAtLeast(1),
                         executor = netTimeoutExec
                     )
 
-                    var indexedUpdated = false
+                    // Ensure durable commit semantics: attempt autoCommit = true first.
+                    writeConn.autoCommit = true
+                    writeConnWasAutoCommit = writeConn.autoCommit
+
+                    if (isCancelledOrPastDeadline()) {
+                        connRef.set(null)
+                        triggerNonBlockingAsyncAbortAndClose(null, writeConn, netTimeoutExec)
+                        return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                            "DB write deadline expired after connection setup; closed without executing any SQL write"
+                        )
+                    }
+
                     if (preCallDbState == OffProdChallengerIdentityCompletionTool.PreCallDbState.PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD) {
-                        conn.prepareStatement(SQL_UPDATE_INDEXED_PLAYERS_BLANK_FIELDS_ONLY).use { ps ->
+                        val remUpdateMs = remainingBudgetMs()
+                        if (remUpdateMs <= 0L || isCancelledOrPastDeadline()) {
+                            connRef.set(null)
+                            triggerNonBlockingAsyncAbortAndClose(null, writeConn, netTimeoutExec)
+                            return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                                "DB write deadline expired before indexed_players UPDATE"
+                            )
+                        }
+                        writeConn.prepareStatement(SQL_UPDATE_INDEXED_PLAYERS_BLANK_FIELDS_ONLY).use { ps ->
                             stmtRef.set(ps)
-                            ps.queryTimeout = queryTimeoutSeconds
+                            if (isCancelledOrPastDeadline()) {
+                                stmtRef.set(null)
+                                connRef.set(null)
+                                triggerNonBlockingAsyncAbortAndClose(ps, writeConn, netTimeoutExec)
+                                return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                                    "DB write cancelled before indexed_players executeUpdate; 0 SQL writes executed"
+                                )
+                            }
+                            ps.queryTimeout = ceil(remUpdateMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
                             ps.setString(1, trimmedGameName)
                             ps.setString(2, trimmedTagLine)
                             ps.setString(3, validatedPuuid)
                             ps.setString(4, trimmedGameName)
                             ps.setString(5, trimmedTagLine)
                             indexedUpdated = ps.executeUpdate() > 0
+                            stmtRef.set(null)
                         }
                     }
 
-                    val identityUpserted: Boolean = conn.prepareStatement(SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE).use { ps ->
+                    val remUpsertMs = remainingBudgetMs()
+                    if (remUpsertMs <= 0L || isCancelledOrPastDeadline()) {
+                        connRef.set(null)
+                        triggerNonBlockingAsyncAbortAndClose(null, writeConn, netTimeoutExec)
+                        return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                            "DB write deadline expired before player_riot_identities UPSERT; commit state unknown if indexed_players updated"
+                        )
+                    }
+
+                    identityUpserted = writeConn.prepareStatement(SQL_UPSERT_PLAYER_RIOT_IDENTITIES_RACE_SAFE).use { ps ->
                         stmtRef.set(ps)
-                        ps.queryTimeout = queryTimeoutSeconds
+                        if (isCancelledOrPastDeadline()) {
+                            stmtRef.set(null)
+                            connRef.set(null)
+                            triggerNonBlockingAsyncAbortAndClose(ps, writeConn, netTimeoutExec)
+                            return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                                "DB write cancelled before player_riot_identities executeUpdate"
+                            )
+                        }
+                        ps.queryTimeout = ceil(remUpsertMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
                         ps.setString(1, validatedPuuid)
                         ps.setString(2, trimmedRegion)
                         ps.setString(3, trimmedGameName)
                         ps.setString(4, trimmedTagLine)
                         ps.setTimestamp(5, Timestamp.from(verifiedAt))
-                        ps.executeUpdate() > 0
+                        val updated = ps.executeUpdate() > 0
+                        stmtRef.set(null)
+                        updated
                     }
 
-                    // Mandatory post-write verification read on player_riot_identities (and indexed_players if targeted)
+                    // If the driver did not enable autoCommit=true, explicitly commit before post-commit verification!
+                    if (!writeConnWasAutoCommit) {
+                        if (isCancelledOrPastDeadline()) {
+                            connRef.set(null)
+                            triggerNonBlockingAsyncAbortAndClose(null, writeConn, netTimeoutExec)
+                            return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                                "DB write deadline expired before explicit commit; transaction rolled back/aborted"
+                            )
+                        }
+                        writeConn.commit()
+                    }
+                }
+                connRef.set(null)
+
+                // Mandatory post-commit verification read:
+                val remVerifyMs = remainingBudgetMs()
+                if (remVerifyMs <= 0L || isCancelledOrPastDeadline()) {
+                    return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                        "DB write completed but deadline expired before post-commit verification read; commit state unverified"
+                    )
+                }
+
+                dataSource.loginTimeout = ceil(remVerifyMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
+                val rawVerifyConn = dataSource.connection
+                connRef.set(rawVerifyConn)
+                if (isCancelledOrPastDeadline()) {
+                    connRef.set(null)
+                    triggerNonBlockingAsyncAbortAndClose(null, rawVerifyConn, netTimeoutExec)
+                    return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                        "Post-commit verification connection acquired after deadline; commit state unverified"
+                    )
+                }
+
+                rawVerifyConn.use { verifyConn ->
+                    // Durability proof invariant:
+                    // If the write connection had autoCommit == false, a post-write read on the SAME Connection instance
+                    // does NOT prove durable commit (it could read uncommitted session state if commit was a no-op).
+                    // Therefore, when writeConnWasAutoCommit is false, we require either verifyConn !== writeConnIdentityRef
+                    // OR verifyConn.autoCommit == true; otherwise fail closed!
+                    if (!writeConnWasAutoCommit && verifyConn === writeConnIdentityRef && !verifyConn.autoCommit) {
+                        return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                            "Post-commit durability proof failed: write connection had autoCommit=false and DataSource returned the same uncommitted Connection instance for verification"
+                        )
+                    }
+
+                    val remVerifyNetMs = remainingBudgetMs()
+                    if (remVerifyNetMs <= 0L || isCancelledOrPastDeadline()) {
+                        connRef.set(null)
+                        triggerNonBlockingAsyncAbortAndClose(null, verifyConn, netTimeoutExec)
+                        return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                            "Deadline expired before post-commit verification query"
+                        )
+                    }
+
+                    applyBoundedConnectionSettingsFailClosed(
+                        conn = verifyConn,
+                        readOnly = true,
+                        networkTimeoutMs = remVerifyNetMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt().coerceAtLeast(1),
+                        executor = netTimeoutExec
+                    )
+
                     var verifiedIdentityGn = ""
                     var verifiedIdentityTl = ""
                     var verifiedIdentityTs: Instant? = null
 
-                    conn.prepareStatement(SQL_SELECT_VERIFY_IDENTITY_ONLY_BY_PUUID).use { ps ->
+                    verifyConn.prepareStatement(SQL_SELECT_VERIFY_IDENTITY_ONLY_BY_PUUID).use { ps ->
                         stmtRef.set(ps)
-                        ps.queryTimeout = queryTimeoutSeconds
+                        val remSelectMs = remainingBudgetMs()
+                        if (remSelectMs <= 0L || isCancelledOrPastDeadline()) {
+                            stmtRef.set(null)
+                            connRef.set(null)
+                            triggerNonBlockingAsyncAbortAndClose(ps, verifyConn, netTimeoutExec)
+                            return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                                "Deadline expired before post-commit verification executeQuery"
+                            )
+                        }
+                        ps.queryTimeout = ceil(remSelectMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
                         ps.setString(1, validatedPuuid)
                         ps.executeQuery().use { rs ->
                             if (rs.next()) {
@@ -1776,14 +2095,24 @@ class JdbcIdentityCompletionPersistenceAdapter(
                                 verifiedIdentityTs = rs.getTimestamp("verified_at")?.toInstant()
                             }
                         }
+                        stmtRef.set(null)
                     }
 
                     if (preCallDbState == OffProdChallengerIdentityCompletionTool.PreCallDbState.PRESENT_IN_INDEXED_PLAYERS_WITH_BLANK_FIELD) {
                         var indexedGn = ""
                         var indexedTl = ""
-                        conn.prepareStatement(SQL_SELECT_VERIFY_INDEXED_PLAYER_BY_PUUID).use { ps ->
+                        verifyConn.prepareStatement(SQL_SELECT_VERIFY_INDEXED_PLAYER_BY_PUUID).use { ps ->
                             stmtRef.set(ps)
-                            ps.queryTimeout = queryTimeoutSeconds
+                            val remIdxSelectMs = remainingBudgetMs()
+                            if (remIdxSelectMs <= 0L || isCancelledOrPastDeadline()) {
+                                stmtRef.set(null)
+                                connRef.set(null)
+                                triggerNonBlockingAsyncAbortAndClose(ps, verifyConn, netTimeoutExec)
+                                return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                                    "Deadline expired before indexed_players post-commit verification executeQuery"
+                                )
+                            }
+                            ps.queryTimeout = ceil(remIdxSelectMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
                             ps.setString(1, validatedPuuid)
                             ps.executeQuery().use { rs ->
                                 if (rs.next()) {
@@ -1791,6 +2120,7 @@ class JdbcIdentityCompletionPersistenceAdapter(
                                     indexedTl = rs.getString("tag_line")?.trim().orEmpty()
                                 }
                             }
+                            stmtRef.set(null)
                         }
                         if (indexedGn.isEmpty() || indexedTl.isEmpty()) {
                             return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
@@ -1802,6 +2132,12 @@ class JdbcIdentityCompletionPersistenceAdapter(
                     if (verifiedIdentityGn.isEmpty() || verifiedIdentityTl.isEmpty() || verifiedIdentityTs == null) {
                         return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
                             "Post-write verification failed: player_riot_identities row for '$validatedPuuid' missing or blank after upsert"
+                        )
+                    }
+
+                    if (isCancelledOrPastDeadline()) {
+                        return@Callable DbWriteVerificationResult.FailureOrUnknownCommit(
+                            "Deadline expired during post-commit verification; conservative unknown commit status"
                         )
                     }
 
@@ -1840,12 +2176,14 @@ class JdbcIdentityCompletionPersistenceAdapter(
         return try {
             future.get(timeoutMs, TimeUnit.MILLISECONDS)
         } catch (_: TimeoutException) {
+            cancelledOrTimedOut.set(true)
             future.cancel(true)
             triggerNonBlockingAsyncAbortAndClose(stmtRef.getAndSet(null), connRef.getAndSet(null), netTimeoutExec)
             DbWriteVerificationResult.FailureOrUnknownCommit(
                 "DB write/verification for '$validatedPuuid' exceeded ${timeoutMs}ms deadline; connection aborted asynchronously, commit state unknown"
             )
         } catch (e: Exception) {
+            cancelledOrTimedOut.set(true)
             future.cancel(true)
             triggerNonBlockingAsyncAbortAndClose(stmtRef.getAndSet(null), connRef.getAndSet(null), netTimeoutExec)
             DbWriteVerificationResult.FailureOrUnknownCommit(
