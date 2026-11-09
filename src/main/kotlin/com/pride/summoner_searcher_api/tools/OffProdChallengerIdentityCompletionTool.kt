@@ -1566,6 +1566,8 @@ class JdbcIdentityCompletionPersistenceAdapter(
 ) : IdentityCompletionPersistencePort {
 
     companion object {
+        const val MIGRATION_RESOURCE_PATH: String = "/db/migration/V20261109__create_player_riot_identities.sql"
+
         val DDL_CREATE_IDENTITY_ONLY_TABLE: String = """
             CREATE TABLE IF NOT EXISTS player_riot_identities (
                 puuid           VARCHAR(78)  PRIMARY KEY,
@@ -1577,6 +1579,27 @@ class JdbcIdentityCompletionPersistenceAdapter(
                     CHECK (BTRIM(game_name) <> '' AND BTRIM(tag_line) <> '')
             )
         """.trimIndent()
+
+        fun loadReviewedAdditiveMigrationSql(): String {
+            val stream = JdbcIdentityCompletionPersistenceAdapter::class.java.getResourceAsStream(MIGRATION_RESOURCE_PATH)
+                ?: throw IllegalStateException("Missing additive migration resource on classpath: $MIGRATION_RESOURCE_PATH")
+            val rawSql = stream.bufferedReader(Charsets.UTF_8).use { it.readText() }
+            require(rawSql.contains("CREATE TABLE IF NOT EXISTS player_riot_identities")) {
+                "Migration resource $MIGRATION_RESOURCE_PATH does not contain player_riot_identities DDL"
+            }
+            require(rawSql.contains("chk_player_riot_identities_nonblank")) {
+                "Migration resource $MIGRATION_RESOURCE_PATH does not contain chk_player_riot_identities_nonblank constraint"
+            }
+            return rawSql
+        }
+
+        internal fun isMissingIdentityTableException(sqle: SQLException): Boolean {
+            val sqlState = sqle.sqlState.orEmpty()
+            val msgLower = sqle.message?.lowercase(Locale.ROOT).orEmpty()
+            return sqlState == "42P01" || sqlState == "42S02" ||
+                (msgLower.contains("player_riot_identities") &&
+                    (msgLower.contains("does not exist") || msgLower.contains("not found")))
+        }
 
         val SQL_UPDATE_INDEXED_PLAYERS_BLANK_FIELDS_ONLY: String = """
             UPDATE indexed_players
@@ -1808,58 +1831,66 @@ class JdbcIdentityCompletionPersistenceAdapter(
                             val idPlaceholders = unresolvedPuuids.joinToString(",") { "?" }
                             val identitySql =
                                 "SELECT puuid, game_name, tag_line FROM player_riot_identities WHERE puuid IN ($idPlaceholders)"
-                            conn.prepareStatement(identitySql).use { ps ->
-                                stmtRef.set(ps)
-                                val remIdSetupMs = remainingBudgetMs()
-                                if (remIdSetupMs <= 0L || isCancelledOrPastDeadline()) {
-                                    stmtRef.set(null)
-                                    connRef.set(null)
-                                    triggerNonBlockingAsyncAbortAndClose(ps, conn, netTimeoutExec)
-                                    return@Callable DbRecheckResult.Failure(
-                                        reason = "DB recheck cancelled before player_riot_identities statement setup",
-                                        timedOutOrBudgetExhausted = true
-                                    )
-                                }
-                                ps.queryTimeout = ceil(remIdSetupMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
-                                for ((idx, puuid) in unresolvedPuuids.withIndex()) {
+                            try {
+                                conn.prepareStatement(identitySql).use { ps ->
+                                    stmtRef.set(ps)
+                                    val remIdSetupMs = remainingBudgetMs()
+                                    if (remIdSetupMs <= 0L || isCancelledOrPastDeadline()) {
+                                        stmtRef.set(null)
+                                        connRef.set(null)
+                                        triggerNonBlockingAsyncAbortAndClose(ps, conn, netTimeoutExec)
+                                        return@Callable DbRecheckResult.Failure(
+                                            reason = "DB recheck cancelled before player_riot_identities statement setup",
+                                            timedOutOrBudgetExhausted = true
+                                        )
+                                    }
+                                    ps.queryTimeout = ceil(remIdSetupMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
+                                    for ((idx, puuid) in unresolvedPuuids.withIndex()) {
+                                        if (remainingBudgetMs() <= 0L || isCancelledOrPastDeadline()) {
+                                            stmtRef.set(null)
+                                            connRef.set(null)
+                                            triggerNonBlockingAsyncAbortAndClose(ps, conn, netTimeoutExec)
+                                            return@Callable DbRecheckResult.Failure(
+                                                reason = "DB recheck cancelled during player_riot_identities parameter setup",
+                                                timedOutOrBudgetExhausted = true
+                                            )
+                                        }
+                                        ps.setString(idx + 1, puuid)
+                                    }
+                                    // Critical fence AFTER all setup (queryTimeout + all setString calls) DIRECTLY BEFORE executeQuery():
                                     if (remainingBudgetMs() <= 0L || isCancelledOrPastDeadline()) {
                                         stmtRef.set(null)
                                         connRef.set(null)
                                         triggerNonBlockingAsyncAbortAndClose(ps, conn, netTimeoutExec)
                                         return@Callable DbRecheckResult.Failure(
-                                            reason = "DB recheck cancelled during player_riot_identities parameter setup",
+                                            reason = "DB recheck cancelled or deadline expired after statement setup directly before player_riot_identities executeQuery",
                                             timedOutOrBudgetExhausted = true
                                         )
                                     }
-                                    ps.setString(idx + 1, puuid)
-                                }
-                                // Critical fence AFTER all setup (queryTimeout + all setString calls) DIRECTLY BEFORE executeQuery():
-                                if (remainingBudgetMs() <= 0L || isCancelledOrPastDeadline()) {
-                                    stmtRef.set(null)
-                                    connRef.set(null)
-                                    triggerNonBlockingAsyncAbortAndClose(ps, conn, netTimeoutExec)
-                                    return@Callable DbRecheckResult.Failure(
-                                        reason = "DB recheck cancelled or deadline expired after statement setup directly before player_riot_identities executeQuery",
-                                        timedOutOrBudgetExhausted = true
-                                    )
-                                }
-                                ps.executeQuery().use { rs ->
-                                    while (rs.next()) {
-                                        if (isCancelledOrPastDeadline()) {
-                                            return@Callable DbRecheckResult.Failure(
-                                                reason = "DB recheck deadline expired while reading player_riot_identities ResultSet",
-                                                timedOutOrBudgetExhausted = true
-                                            )
-                                        }
-                                        val p = rs.getString("puuid")?.trim().orEmpty()
-                                        val gn = rs.getString("game_name")?.trim().orEmpty()
-                                        val tl = rs.getString("tag_line")?.trim().orEmpty()
-                                        if (p.isNotEmpty() && gn.isNotEmpty() && tl.isNotEmpty()) {
-                                            result[p] = OffProdChallengerIdentityCompletionTool.PreCallDbState.ALREADY_COMPLETE
+                                    ps.executeQuery().use { rs ->
+                                        while (rs.next()) {
+                                            if (isCancelledOrPastDeadline()) {
+                                                return@Callable DbRecheckResult.Failure(
+                                                    reason = "DB recheck deadline expired while reading player_riot_identities ResultSet",
+                                                    timedOutOrBudgetExhausted = true
+                                                )
+                                            }
+                                            val p = rs.getString("puuid")?.trim().orEmpty()
+                                            val gn = rs.getString("game_name")?.trim().orEmpty()
+                                            val tl = rs.getString("tag_line")?.trim().orEmpty()
+                                            if (p.isNotEmpty() && gn.isNotEmpty() && tl.isNotEmpty()) {
+                                                result[p] = OffProdChallengerIdentityCompletionTool.PreCallDbState.ALREADY_COMPLETE
+                                            }
                                         }
                                     }
+                                    stmtRef.set(null)
                                 }
+                            } catch (sqle: SQLException) {
                                 stmtRef.set(null)
+                                if (!isMissingIdentityTableException(sqle) || isCancelledOrPastDeadline()) {
+                                    throw sqle
+                                }
+                                // Missing-table compatibility on read-only pre-call recheck before additive migration is applied
                             }
                         }
                     }

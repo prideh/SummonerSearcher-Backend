@@ -1149,4 +1149,186 @@ class ChallengerLeagueServiceTest {
             server.stop(0)
         }
     }
+
+    @Test
+    fun `lookupDbIdentitiesBounded resolves 600 of 600 with indexed-first and missing-table compatibility`() = runBlocking {
+        val dbName = "challenger_identity_fallback_${System.nanoTime()}"
+        val h2DataSource = org.h2.jdbcx.JdbcDataSource().apply {
+            setURL("jdbc:h2:mem:$dbName;MODE=PostgreSQL;DATABASE_TO_LOWER=TRUE;DB_CLOSE_DELAY=-1")
+            user = "sa"
+            password = ""
+        }
+        h2DataSource.connection.use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute(
+                    """
+                    CREATE TABLE indexed_players (
+                        puuid VARCHAR(78) PRIMARY KEY,
+                        region VARCHAR(16) NOT NULL,
+                        game_name VARCHAR(255) NOT NULL,
+                        tag_line VARCHAR(255) NOT NULL,
+                        profile_icon_id INT NOT NULL,
+                        summoner_level BIGINT NOT NULL,
+                        last_seen_at TIMESTAMP WITH TIME ZONE NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+            conn.prepareStatement(
+                "INSERT INTO indexed_players (puuid, region, game_name, tag_line, profile_icon_id, summoner_level, last_seen_at) VALUES (?, ?, ?, ?, 1, 500, CURRENT_TIMESTAMP)"
+            ).use { ps ->
+                // 269 EUW players in indexed_players (1..269), 31 missing (270..300)
+                for (i in 1..269) {
+                    ps.setString(1, "euw1-p-$i")
+                    ps.setString(2, "euw1")
+                    ps.setString(3, "IndexedEuw$i")
+                    ps.setString(4, "EUW")
+                    ps.addBatch()
+                }
+                // 140 KR players in indexed_players (1..140), 160 missing (141..300)
+                for (i in 1..140) {
+                    ps.setString(1, "kr-p-$i")
+                    ps.setString(2, "kr")
+                    ps.setString(3, "IndexedKr$i")
+                    ps.setString(4, "KR1")
+                    ps.addBatch()
+                }
+                ps.executeBatch()
+            }
+        }
+
+        val clock = MutableClock()
+        val memoryProvider = MutableMemoryProvider()
+        val redisStore = ConcurrentHashMap<String, CachedLeaderboardDto>()
+        val redisCacheService = mockk<RedisCacheService>()
+        every { redisCacheService.get(any(), CachedLeaderboardDto::class.java) } answers {
+            redisStore[firstArg()]
+        }
+        every { redisCacheService.set(any(), any<CachedLeaderboardDto>(), any()) } answers {
+            redisStore[firstArg()] = secondArg()
+        }
+
+        val leagueCalls = AtomicInteger(0)
+        val riotApiService = mockk<RiotApiService>()
+        io.mockk.coEvery {
+            riotApiService.fetchChallengerLeagueBounded(
+                region = any(),
+                queue = any(),
+                priority = any(),
+                maxRetries = any(),
+                deadlineAtMs = any(),
+                maxResponseBytes = any(),
+                maxEntries = any(),
+                headroomGuard = any(),
+                httpAttemptCounter = any(),
+                failureReasonHolder = any()
+            )
+        } answers {
+            leagueCalls.incrementAndGet()
+            val region = arg<String>(0)
+            val entries = (1..300).map { i ->
+                LeagueEntryDto(
+                    puuid = "$region-p-$i",
+                    leaguePoints = 2000 - i,
+                    rank = "I",
+                    wins = 100,
+                    losses = 50,
+                    veteran = false,
+                    inactive = false,
+                    freshBlood = false,
+                    hotStreak = false,
+                    leagueId = "challenger-$region",
+                    queueType = "RANKED_SOLO_5x5",
+                    tier = "CHALLENGER",
+                    summonerName = "",
+                    gameName = null,
+                    tagLine = null
+                )
+            }
+            LeagueListDTO(
+                tier = "CHALLENGER",
+                leagueId = "challenger-$region",
+                queue = "RANKED_SOLO_5x5",
+                name = "Challenger $region",
+                entries = entries
+            )
+        }
+
+        val service = ChallengerLeagueService(
+            redisCacheService = redisCacheService,
+            riotApiService = riotApiService,
+            dataSource = h2DataSource,
+            timeProvider = clock,
+            memoryStatsProvider = memoryProvider
+        )
+
+        // Phase 1: Before player_riot_identities migration exists -> missing-table compatibility preserves 269/300 EUW and 140/300 KR
+        val euwPreMigration = service.getOrRefreshChallengerLeague("euw1", "RANKED_SOLO_5x5")
+        val krPreMigration = service.getOrRefreshChallengerLeague("kr", "RANKED_SOLO_5x5")
+        assertNotNull(euwPreMigration)
+        assertNotNull(krPreMigration)
+        assertEquals(269, euwPreMigration!!.entries.count { !it.gameName.isNullOrBlank() && !it.tagLine.isNullOrBlank() })
+        assertEquals(140, krPreMigration!!.entries.count { !it.gameName.isNullOrBlank() && !it.tagLine.isNullOrBlank() })
+
+        // Phase 2: Apply additive player_riot_identities table and populate 31 EUW + 160 KR missing + 1 overlapping row to test indexed-first precedence
+        h2DataSource.connection.use { conn ->
+            conn.createStatement().use { stmt ->
+                stmt.execute(
+                    """
+                    CREATE TABLE player_riot_identities (
+                        puuid VARCHAR(78) PRIMARY KEY,
+                        platform_region VARCHAR(16) NOT NULL,
+                        game_name VARCHAR(255) NOT NULL,
+                        tag_line VARCHAR(255) NOT NULL,
+                        verified_at TIMESTAMP WITH TIME ZONE NOT NULL
+                    )
+                    """.trimIndent()
+                )
+            }
+            conn.prepareStatement(
+                "INSERT INTO player_riot_identities (puuid, platform_region, game_name, tag_line, verified_at) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)"
+            ).use { ps ->
+                // Overlapping row for euw1-p-1 -> indexed_players ("IndexedEuw1#EUW") must win over player_riot_identities
+                ps.setString(1, "euw1-p-1")
+                ps.setString(2, "euw1")
+                ps.setString(3, "OverriddenIdentityEuw1")
+                ps.setString(4, "OVERRIDE")
+                ps.addBatch()
+                for (i in 270..300) {
+                    ps.setString(1, "euw1-p-$i")
+                    ps.setString(2, "euw1")
+                    ps.setString(3, "BackfilledEuw$i")
+                    ps.setString(4, "EUW")
+                    ps.addBatch()
+                }
+                for (i in 141..300) {
+                    ps.setString(1, "kr-p-$i")
+                    ps.setString(2, "kr")
+                    ps.setString(3, "BackfilledKr$i")
+                    ps.setString(4, "KR1")
+                    ps.addBatch()
+                }
+                ps.executeBatch()
+            }
+        }
+
+        redisStore.clear()
+        val euwPostMigration = service.getOrRefreshChallengerLeague("euw1", "RANKED_SOLO_5x5")
+        val krPostMigration = service.getOrRefreshChallengerLeague("kr", "RANKED_SOLO_5x5")
+        assertNotNull(euwPostMigration)
+        assertNotNull(krPostMigration)
+        assertEquals(300, euwPostMigration!!.entries.count { !it.gameName.isNullOrBlank() && !it.tagLine.isNullOrBlank() })
+        assertEquals(300, krPostMigration!!.entries.count { !it.gameName.isNullOrBlank() && !it.tagLine.isNullOrBlank() })
+        val topEuw = euwPostMigration.entries.first { it.puuid == "euw1-p-1" }
+        assertEquals("IndexedEuw1", topEuw.gameName, "indexed_players must take precedence over player_riot_identities")
+        assertEquals("EUW", topEuw.tagLine)
+        val backfilledEuw = euwPostMigration.entries.first { it.puuid == "euw1-p-300" }
+        assertEquals("BackfilledEuw300", backfilledEuw.gameName)
+        assertEquals("EUW", backfilledEuw.tagLine)
+        val backfilledKr = krPostMigration.entries.first { it.puuid == "kr-p-300" }
+        assertEquals("BackfilledKr300", backfilledKr.gameName)
+        assertEquals("KR1", backfilledKr.tagLine)
+        assertEquals(4, leagueCalls.get(), "Exactly 1 League-V4 call per refresh (4 refreshes total) and 0 Account-V1 fanout calls")
+    }
 }
+

@@ -818,10 +818,18 @@ class ChallengerLeagueService @Autowired constructor(
         }
         activeDbLookupWorkers.incrementAndGet()
         workerThreadRef.set(Thread.currentThread())
+        val deadlineNano = System.nanoTime() + java.util.concurrent.TimeUnit.MILLISECONDS.toNanos(effectiveTimeoutMs.coerceAtLeast(1L))
+
+        fun isCancelledOrPastDeadline(): Boolean =
+            cancelled.get() || Thread.currentThread().isInterrupted || System.nanoTime() >= deadlineNano
+
+        fun remainingBudgetMs(): Long =
+            java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(deadlineNano - System.nanoTime())
+
         var conn: Connection? = null
         var stmt: PreparedStatement? = null
         try {
-            if (cancelled.get() || Thread.currentThread().isInterrupted) {
+            if (isCancelledOrPastDeadline()) {
                 return emptyMap()
             }
             val queryTimeoutSeconds = ((effectiveTimeoutMs + 999L) / 1000L).toInt().coerceAtLeast(1)
@@ -834,9 +842,12 @@ class ChallengerLeagueService @Autowired constructor(
                     ds.loginTimeout = queryTimeoutSeconds
                 }
             }
+            if (isCancelledOrPastDeadline()) {
+                return emptyMap()
+            }
             conn = ds.connection
             activeConnectionRef.set(conn)
-            if (cancelled.get() || Thread.currentThread().isInterrupted) {
+            if (isCancelledOrPastDeadline()) {
                 return emptyMap()
             }
             runCatching { conn.isReadOnly = true }
@@ -854,13 +865,16 @@ class ChallengerLeagueService @Autowired constructor(
                 )
                 return emptyMap()
             }
+            if (isCancelledOrPastDeadline()) {
+                return emptyMap()
+            }
 
             stmt = conn.prepareStatement(sql)
             activeStatementRef.set(stmt)
             val queryTimeoutSupported = runCatching {
-                stmt.maxRows = candidatePuuids.size.coerceAtMost(MAX_LEADERBOARD_ENTRIES)
-                stmt.queryTimeout = queryTimeoutSeconds
-                stmt.queryTimeout == queryTimeoutSeconds
+                stmt!!.maxRows = candidatePuuids.size.coerceAtMost(MAX_LEADERBOARD_ENTRIES)
+                stmt!!.queryTimeout = queryTimeoutSeconds
+                stmt!!.queryTimeout == queryTimeoutSeconds
             }.getOrElse { false }
             if (!queryTimeoutSupported) {
                 logger.warn(
@@ -871,14 +885,18 @@ class ChallengerLeagueService @Autowired constructor(
             }
 
             for (i in candidatePuuids.indices) {
-                stmt.setString(i + 1, candidatePuuids[i])
+                if (isCancelledOrPastDeadline()) {
+                    return emptyMap()
+                }
+                stmt!!.setString(i + 1, candidatePuuids[i])
             }
-            if (cancelled.get() || Thread.currentThread().isInterrupted) {
+            // Direct pre-executeQuery cancellation/deadline fence after all setup:
+            if (isCancelledOrPastDeadline()) {
                 return emptyMap()
             }
-            stmt.executeQuery().use { rs ->
+            stmt!!.executeQuery().use { rs ->
                 while (rs.next()) {
-                    if (cancelled.get() || Thread.currentThread().isInterrupted) {
+                    if (isCancelledOrPastDeadline()) {
                         break
                     }
                     val p = rs.getString(1)?.trim().orEmpty()
@@ -889,7 +907,78 @@ class ChallengerLeagueService @Autowired constructor(
                     }
                 }
             }
-            return resolved
+            runCatching { stmt?.close() }
+            stmt = null
+            activeStatementRef.set(null)
+
+            // 2. Indexed-first fallback: only for PUUIDs still unresolved after querying `indexed_players`,
+            //    query the additive identity-only table `player_riot_identities` within the remaining deadline budget.
+            //    Preserves 100% compatibility when `player_riot_identities` has not been created yet (SQLState 42P01 / 42S02).
+            val unresolvedPuuids = candidatePuuids.filter { it !in resolved }
+            val remAfterIndexedMs = remainingBudgetMs()
+            if (unresolvedPuuids.isNotEmpty() && remAfterIndexedMs > 0L && !isCancelledOrPastDeadline()) {
+                val fallbackTimeoutSeconds = ((remAfterIndexedMs + 999L) / 1000L).toInt().coerceAtLeast(1)
+                val unresolvedPlaceholders = unresolvedPuuids.joinToString(",") { "?" }
+                val fallbackSql =
+                    "SELECT puuid, game_name, tag_line FROM player_riot_identities WHERE puuid IN ($unresolvedPlaceholders)"
+                try {
+                    val fallbackStmt = conn.prepareStatement(fallbackSql)
+                    stmt = fallbackStmt
+                    activeStatementRef.set(fallbackStmt)
+                    val fallbackTimeoutSupported = runCatching {
+                        fallbackStmt.maxRows = unresolvedPuuids.size.coerceAtMost(MAX_LEADERBOARD_ENTRIES)
+                        fallbackStmt.queryTimeout = fallbackTimeoutSeconds
+                        fallbackStmt.queryTimeout == fallbackTimeoutSeconds
+                    }.getOrElse { false }
+
+                    if (fallbackTimeoutSupported && !isCancelledOrPastDeadline()) {
+                        for (i in unresolvedPuuids.indices) {
+                            if (isCancelledOrPastDeadline()) break
+                            fallbackStmt.setString(i + 1, unresolvedPuuids[i])
+                        }
+                        // Direct pre-executeQuery cancellation/deadline fence after all setup:
+                        if (!isCancelledOrPastDeadline() && remainingBudgetMs() > 0L) {
+                            fallbackStmt.executeQuery().use { rs ->
+                                while (rs.next()) {
+                                    if (isCancelledOrPastDeadline()) {
+                                        break
+                                    }
+                                    val p = rs.getString(1)?.trim().orEmpty()
+                                    val gn = rs.getString(2)?.trim().orEmpty()
+                                    val tl = rs.getString(3)?.trim().orEmpty()
+                                    if (p.isNotBlank() && gn.isNotBlank() && tl.isNotBlank()) {
+                                        // putIfAbsent strictly guarantees indexed_players precedence (indexed-first)
+                                        resolved.putIfAbsent(p, gn to tl)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (sqle: java.sql.SQLException) {
+                    val sqlState = sqle.sqlState.orEmpty()
+                    val msgLower = sqle.message?.lowercase().orEmpty()
+                    val isMissingTable = sqlState == "42P01" || sqlState == "42S02" ||
+                        (msgLower.contains("player_riot_identities") &&
+                            (msgLower.contains("does not exist") || msgLower.contains("not found")))
+                    if (isMissingTable) {
+                        logger.debug(
+                            "[ChallengerLeaderboard] Optional table player_riot_identities not present yet for {}; continuing with indexed_players results ({} resolved).",
+                            normalizedRegion, resolved.size
+                        )
+                    } else if (!cancelled.get()) {
+                        logger.warn(
+                            "[ChallengerLeaderboard] Secondary identity lookup on player_riot_identities failed for {} (sqlState={}): {}; preserving {} indexed_players identities.",
+                            normalizedRegion, sqlState, sqle.message, resolved.size
+                        )
+                    }
+                } finally {
+                    runCatching { stmt?.close() }
+                    stmt = null
+                    activeStatementRef.set(null)
+                }
+            }
+
+            return if (cancelled.get()) emptyMap() else resolved
         } finally {
             if (cancelled.get()) {
                 runCatching { conn?.abort(dbAbortExecutor) }
