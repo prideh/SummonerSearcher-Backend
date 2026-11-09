@@ -264,7 +264,7 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         sanitized = sanitized.replace(Regex("(?i)(password|pass|pwd|secret|token|api[_-]?key)\\s*[:=]\\s*[^&\\s;,\"')]+"), "$1=[REDACTED]")
         sanitized = sanitized.replace(Regex("(?i)jdbc:postgresql://([^/\\s?]+)(\\?[^\\s\"')]*)?"), "jdbc:postgresql://[REDACTED_HOST]$2")
         sanitized = sanitized.replace(Regex("(?i)postgresql://[^@\\s]+@"), "postgresql://[REDACTED]@")
-        sanitized = sanitized.replace(Regex("RGAPI-[0-9a-fA-F-]+"), "RGAPI-[REDACTED]")
+        sanitized = sanitized.replace(Regex("RGAPI-[A-Za-z0-9_-]+"), "RGAPI-[REDACTED]")
         return sanitized
     }
 

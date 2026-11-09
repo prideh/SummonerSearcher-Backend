@@ -168,7 +168,7 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
         for (invalidArgs in invalidArgSets) {
             val res = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
                 args = invalidArgs,
-                env = mapOf("OFFPROD_JDBC_URL" to jdbcUrl, "OFFPROD_DB_PASS" to "TOP_SECRET_PW_999"),
+                env = mapOf("OFFPROD_JDBC_URL" to jdbcUrl, "OFFPROD_DB_PASS" to "NON_CREDENTIAL_TEST_DB_MARKER_ONLY"),
                 dataSourceOverride = countingDs,
                 maxHeapBytesProvider = { 128L * 1024L * 1024L }
             )
@@ -185,7 +185,7 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
                 OffProdAdditiveIdentitySchemaSetupCli.DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                 res.report.ddlCommitStatus
             )
-            assertFalse(res.report.sanitizedDetail.contains("TOP_SECRET_PW_999"))
+            assertFalse(res.report.sanitizedDetail.contains("NON_CREDENTIAL_TEST_DB_MARKER_ONLY"))
         }
 
         // Also verify standalone > 256 MiB heap cap rejection before any connection
@@ -544,8 +544,10 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
 
     @Test
     fun `in-flight DDL lock timeout or SQL exception reports UNKNOWN_COMMIT_RECHECK_REQUIRED and scrubs secrets`() {
-        val secretPassword = "SuperSecretDbPassword!2026"
-        val secretRiotKey = "RGAPI-11112222-3333-4444-5555-666677778888"
+        val explicitDbSecretMarker = "NON_CREDENTIAL_EXPLICIT_DB_MARKER_TEST_ONLY"
+        val explicitApiSecretMarker = "NON_CREDENTIAL_EXPLICIT_API_MARKER_TEST_ONLY"
+        val formatPrefixMarker = "RGAPI-NON_CREDENTIAL_FORMAT_MARKER_TEST_ONLY"
+        val formatKeyValueMarker = "NON_CREDENTIAL_KV_FORMAT_MARKER_TEST_ONLY"
 
         fun createConn(isVerifyConn: Boolean): Connection {
             return Proxy.newProxyInstance(
@@ -565,7 +567,8 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
                                 "executeUpdate" -> {
                                     if (isDdl) {
                                         throw SQLException(
-                                            "ERROR: canceling statement due to lock timeout on jdbc:postgresql://db.internal:5432/prod?password=$secretPassword token=$secretRiotKey",
+                                            "ERROR: canceling statement due to lock timeout on jdbc:postgresql://db.internal:5432/prod?password=$explicitDbSecretMarker " +
+                                                "explicit=$explicitApiSecretMarker prefix=$formatPrefixMarker api_key=$formatKeyValueMarker",
                                             "55P03"
                                         )
                                     }
@@ -623,8 +626,8 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
                     "--output-report-file=${reportFile.absolutePath}"
                 ),
                 env = mapOf(
-                    "OFFPROD_DB_PASS" to secretPassword,
-                    "OFFPROD_RIOT_API_KEY" to secretRiotKey
+                    "OFFPROD_DB_PASS" to explicitDbSecretMarker,
+                    "OFFPROD_RIOT_API_KEY" to explicitApiSecretMarker
                 ),
                 dataSourceOverride = ds,
                 maxHeapBytesProvider = { 128L * 1024L * 1024L }
@@ -640,14 +643,29 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
                 res.report.ddlCommitStatus
             )
             assertNotNull(res.report.recheckCommandHint)
-            assertFalse(res.report.sanitizedDetail.contains(secretPassword))
-            assertFalse(res.report.sanitizedDetail.contains(secretRiotKey))
+            assertFalse(res.report.sanitizedDetail.contains(explicitDbSecretMarker))
+            assertFalse(res.report.sanitizedDetail.contains(explicitApiSecretMarker))
+            assertFalse(res.report.sanitizedDetail.contains(formatPrefixMarker))
+            assertFalse(res.report.sanitizedDetail.contains(formatKeyValueMarker))
             assertFalse(res.report.sanitizedDetail.contains("db.internal"))
 
             val rawJson = reportFile.readText()
-            assertFalse(rawJson.contains(secretPassword))
-            assertFalse(rawJson.contains(secretRiotKey))
+            assertFalse(rawJson.contains(explicitDbSecretMarker))
+            assertFalse(rawJson.contains(explicitApiSecretMarker))
+            assertFalse(rawJson.contains(formatPrefixMarker))
+            assertFalse(rawJson.contains(formatKeyValueMarker))
             assertFalse(rawJson.contains("db.internal"))
+
+            // Separate direct format-matching redaction check with empty explicit secret list:
+            val formatOnlySanitized = OffProdAdditiveIdentitySchemaSetupCli.sanitizeErrorMessage(
+                raw = "postgresql://role_name:NON_CREDENTIAL_URL_MARKER@db.internal:5432/app prefix=$formatPrefixMarker api_key=$formatKeyValueMarker",
+                secretsToRedact = emptyList()
+            )
+            assertFalse(formatOnlySanitized.contains("NON_CREDENTIAL_URL_MARKER"))
+            assertFalse(formatOnlySanitized.contains(formatPrefixMarker))
+            assertFalse(formatOnlySanitized.contains(formatKeyValueMarker))
+            assertTrue(formatOnlySanitized.contains("RGAPI-[REDACTED]"))
+            assertTrue(formatOnlySanitized.contains("api_key=[REDACTED]"))
         } finally {
             reportFile.delete()
         }
