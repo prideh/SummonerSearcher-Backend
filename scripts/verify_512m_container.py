@@ -2,7 +2,7 @@
 """
 Isolated 512 MiB Container Proof for Challenger Leaderboard Cache Resilience, Bounded Off-Production
 Missing-Identity Completion (191 = 31 EUW + 160 KR), 600/600 Read Consumer Coverage, and Rollback Compatibility
-(Integrated Candidate c71e2bdd0d91cec8adad0eb52e79530cad4aa004 based on 5959a7036c9e281f72d17f0a0bd5003ba59476f8
+(Integrated Candidate 44e269a2c1a5dec41dc632a0e06883f756ce47b3 based on 5959a7036c9e281f72d17f0a0bd5003ba59476f8
 + Rollback Base 139a7de48e67af9d664c08fd61ce131b6e63bd74).
 
 Enforces:
@@ -58,7 +58,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
-CANDIDATE_COMMIT_SHA = "c71e2bdd0d91cec8adad0eb52e79530cad4aa004"
+CANDIDATE_COMMIT_SHA = "44e269a2c1a5dec41dc632a0e06883f756ce47b3"
 BASE_5959_COMMIT_SHA = "5959a7036c9e281f72d17f0a0bd5003ba59476f8"
 ROLLBACK_BASE_COMMIT_SHA = "139a7de48e67af9d664c08fd61ce131b6e63bd74"
 
@@ -993,7 +993,7 @@ def finalize_teardown(
 
 def main():
     db_pass = os.environ.get("DB_PASS", "").strip() or EPHEMERAL_DB_PASS
-    cand_image = os.environ.get("CAND_IMAGE", "ss-backend:cand-c71e2bd")
+    cand_image = os.environ.get("CAND_IMAGE", "ss-backend:cand-44e269a")
     base_image = os.environ.get("BASE_IMAGE", "ss-backend:base-139a7de")
     raw_dir = os.environ.get("RAW_ARTIFACT_DIR", "/tmp/challenger-leaderboard-512m-proof-raw")
     artifact_dir = os.environ.get("ARTIFACT_DIR", "/tmp/challenger-leaderboard-512m-proof-artifacts")
@@ -1472,9 +1472,9 @@ def main():
         record_sample("after_scenario6_all_3_regions_resident_and_chunked_abort")
 
         sampler.stop_and_join(check_errors=True)
-        capture_sanitized_container_log(artifact_dir, "ss-backend-512m", "candidate_c71e2bd_container.log")
+        capture_sanitized_container_log(artifact_dir, "ss-backend-512m", "candidate_44e269a_container.log")
 
-        cand_log_text = open(os.path.join(artifact_dir, "candidate_c71e2bd_container.log"), "r", encoding="utf-8").read()
+        cand_log_text = open(os.path.join(artifact_dir, "candidate_44e269a_container.log"), "r", encoding="utf-8").read()
         assert "RESPONSE_TOO_LARGE" in cand_log_text, "Expected >512 KiB stream abort (RESPONSE_TOO_LARGE) log entry in container log"
         assert (
             "Local DB identity lookup timed out after 1500ms" in cand_log_text
