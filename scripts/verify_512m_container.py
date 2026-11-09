@@ -1256,8 +1256,9 @@ def main():
             timeout=10
         )
         app_mem_headroom = collector_status.get("memoryHeadroom") or {}
-        assert app_mem_headroom.get("usedRatioPct", 100.0) < 78.0, f"App memoryHeadroom ratio >= 78%: {app_mem_headroom}"
-        assert app_mem_headroom.get("freeBytes", 0) >= MIN_FREE_HEADROOM_BYTES, f"App memoryHeadroom freeBytes < 64 MiB: {app_mem_headroom}"
+        assert app_mem_headroom.get("effectiveUtilizationRatio", 1.0) < 0.78, f"App memoryHeadroom ratio >= 0.78: {app_mem_headroom}"
+        assert app_mem_headroom.get("estimatedFreeHeadroomBytes", 0) >= MIN_FREE_HEADROOM_BYTES, f"App memoryHeadroom freeBytes < 64 MiB: {app_mem_headroom}"
+        assert app_mem_headroom.get("hasHeadroomForLowPriority") is True, f"Expected hasHeadroomForLowPriority=True: {app_mem_headroom}"
 
         record_sample("after_scenario6_all_3_regions_resident_and_chunked_abort")
 
