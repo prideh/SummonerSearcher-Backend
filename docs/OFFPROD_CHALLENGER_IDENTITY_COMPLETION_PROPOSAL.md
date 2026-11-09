@@ -176,10 +176,11 @@
          --output-report-file=/tmp/precheck_dryrun_report.json
        ```
        - Verify `exitCode == 0`, `outcome == "DRY_RUN_DB_RECHECK_ONLY_COMPLETED"`, `presentWithBlankFieldInIndexedPlayersCount == 0`, and `absentFromIndexedPlayersCount + alreadyResolvedInDbCount == 191`. (If `presentWithBlankFieldInIndexedPlayersCount > 0`, CLI stops immediately with `exitCode = 1` and does not proceed.)
-     - **Stage 3 (Bounded Completion Run During Render `Suspend Web Service` Window, Hard `180s` / `191` Attempt Cap, Secrets via Env Only)**:
-       1. Confirm `0` local dev instances/scripts are running with the Riot API key.
-       2. In Render Dashboard -> Production Backend Settings -> click **Suspend Web Service** and wait until the container is stopped + `>= 125 seconds` so any rolling 2-minute Riot rate-limit window drains to `0`.
-       3. Run the bounded CLI (`<= 180s` wall-clock cap, `<= 191` HTTP attempts):
+     - **Stage 3 (Conditional Single Bounded `<= 180s` Lookup Pass During Approved Render `Suspend Web Service` Window, Secrets via Env Only)**:
+       - **Note on Rate-Limit Windows & Variable Downtime**: Actual Riot API key rate-limit window lengths are unknown prior to receiving live `X-App-Rate-Limit*` / `X-Method-Rate-Limit*` response headers (do **not** assume a fixed 2-minute window, `125s` pre-drain, or `~5 min` total duration). The CLI executes a **single approved `<= 180s` lookup pass** that dynamically reads and paces from the actual `X-App-Rate-Limit*` and `X-Method-Rate-Limit*` headers returned by Riot and halts immediately on HTTP `429` or budget exhaustion with **`0` retries** (writing any remaining PUUIDs to `/tmp/remaining_manifest_pass1.json`). Render **Suspend Web Service**, **Resume Web Service**, and container startup/health checks add variable downtime around the `<= 180s` lookup pass.
+       1. Confirm `0` external or local dev instances/scripts are running with the Riot API key.
+       2. In Render Dashboard -> Production Backend Settings -> click **Suspend Web Service** and verify the production backend container has stopped.
+       3. Run the single bounded CLI lookup pass (`<= 180s` wall-clock cap, `<= 191` HTTP attempts):
        ```bash
        export OFFPROD_JDBC_URL="jdbc:postgresql://<db-host>:5432/<db-name>"
        export OFFPROD_DB_USER="offprod_identity_stager"
@@ -207,7 +208,7 @@
          --output-report-file=/tmp/completion_report_pass1.json \
          --output-remaining-manifest-file=/tmp/remaining_manifest_pass1.json
        ```
-       4. Immediately click **Resume Web Service** in Render Dashboard once the CLI exits.
+       4. Immediately click **Resume Web Service** in Render Dashboard once the CLI exits and wait for the backend container startup/health check to pass.
 2. **Deterministic Handling of Partial `404`, Omitted Fields, Rate/Budget Exhaustion & `unknown_commit`**:
    - **HTTP `404` (`ItemStatus.SKIPPED_NOT_FOUND_404`) & HTTP `200` with Omitted/Blank `gameName`/`tagLine` (`ItemStatus.SKIPPED_OMITTED_RIOT_ID_FIELDS`)**:
      - Executes **`0` DB writes** (never fabricates blank/sentinel rows). Recorded in `notFound404Count` / `omittedRiotIdFieldsCount` in `completion_report_pass1.json`.
@@ -242,12 +243,12 @@
 
 ---
 
-## 3. Single Grounded Achievable Execution Route & Remaining Owner Permissions
+## 3. Conditional Execution Route & Required Owner Decisions (Otherwise Do Not Execute)
 
-Because official Riot Developer policy (`https://developer.riotgames.com/docs/faqs`) prohibits creating multiple applications for the same product to bypass rate limits, the **only policy-compliant, grounded achievable route** is:
-1. **Temporary Narrow PostgreSQL Schema/Write Grant**:
-   - Apply `CREATE TABLE IF NOT EXISTS public.player_riot_identities` (`<= 15s` `statement_timeout`) and grant temporary `SELECT` on `public.indexed_players` + `SELECT, INSERT, UPDATE` on `public.player_riot_identities` (`0` write privileges on `indexed_players`).
-2. **Owner Downtime Permission via Render `Suspend Web Service` + Local Consumer Quiescence Confirmation (`--key-coordination-mode=COORDINATED_MAINTENANCE_WINDOW`)**:
+Because official Riot Developer policy (`https://developer.riotgames.com/docs/faqs`) prohibits creating multiple applications for the same product to bypass rate limits, off-production network execution is **only executable if** the owner explicitly approves all of the following conditions (if any condition is not acceptable or cannot be confirmed, **do not execute** the off-production network pass):
+1. **Temporary Narrow PostgreSQL Schema/Write Grant (`<= 2.5s` / `2500ms` DDL Timeout)**:
+   - Apply `CREATE TABLE IF NOT EXISTS public.player_riot_identities` (`SET lock_timeout = '2s'; SET statement_timeout = '2500ms';`) and grant temporary `SELECT` on `public.indexed_players` + `SELECT, INSERT, UPDATE` on `public.player_riot_identities` (`0` write privileges on `indexed_players`).
+2. **Owner Approval of Service-Suspension Downtime Allowance + Confirmation of Zero External Key Consumers (`--key-coordination-mode=COORDINATED_MAINTENANCE_WINDOW`)**:
    - Do **not** create a second Riot application/project and do **not** regenerate the existing Riot API key.
-   - Run Stage 2 dry-run precheck (`0` network calls) while production is still up.
-   - Authorize a short (`~5 min` total: `125s` rate-limit window drain + `<= 180s` bounded CLI execution) Render **Suspend Web Service** window on the single Production Backend service (not `Maintenance Mode`, so `@Scheduled` jobs in `LeaderboardUpdateService`, `ExampleCurationService`, and `PatternDiscoveryService` are also stopped), **and** confirm that **`0` local developer workstation processes/scripts** are running with `RIOT_API_KEY` during that window.
+   - Run Stage 2 dry-run precheck (`0` network calls, `< 5s` budget) while production is still up.
+   - Owner must explicitly approve a Render **Suspend Web Service** downtime window on the single Production Backend service (covering the single `<= 180s` bounded lookup pass — which paces from actual live `X-App-Rate-Limit*` / `X-Method-Rate-Limit*` response headers and stops immediately on `429` or budget exhaustion with `0` retries — **plus** variable Render suspend, resume, and Spring Boot startup/health-check time) **and** confirm that **`0` external or local developer workstation processes/scripts** are using `RIOT_API_KEY` during that window. If downtime or external key quiescence cannot be approved/confirmed, this route is **not recommended / blocked**.
