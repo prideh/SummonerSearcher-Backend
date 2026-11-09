@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.SerializationFeature
 import org.junit.jupiter.api.AfterAll
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
+import org.junit.jupiter.api.Assertions.assertNotEquals
 import org.junit.jupiter.api.Assertions.assertNotNull
 import org.junit.jupiter.api.Assertions.assertNull
 import org.junit.jupiter.api.Assertions.assertTrue
@@ -33,8 +34,8 @@ import javax.sql.DataSource
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
 class OffProdAdditiveIdentitySchemaSetupCliTest {
 
-    private var pgBinDir: File? = null
     private var pgTempDir: Path? = null
+    private var pgBinDir: File? = null
     private var pgPort: Int = 0
     private lateinit var jdbcUrl: String
     private lateinit var pgDataSource: PGSimpleDataSource
@@ -44,28 +45,21 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
         .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
         .disable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
 
-    private fun findPostgresBinDir(): File? {
-        val root = File("/usr/lib/postgresql")
-        if (!root.isDirectory) return null
-        return root.listFiles()
-            ?.filter { it.isDirectory && File(it, "bin/initdb").canExecute() && File(it, "bin/pg_ctl").canExecute() }
-            ?.sortedByDescending { it.name }
-            ?.firstOrNull()
-            ?.let { File(it, "bin") }
-    }
-
     @BeforeAll
     fun startIsolatedPostgres() {
-        val binDir = findPostgresBinDir()
-        check(binDir != null) {
-            "Local PostgreSQL binaries (/usr/lib/postgresql/*/bin/initdb) required for real PG setup qualification; test skips are forbidden"
-        }
+        val candidateBins = listOf(
+            File("/usr/lib/postgresql/15/bin"),
+            File("/usr/lib/postgresql/16/bin"),
+            File("/usr/lib/postgresql/14/bin")
+        )
+        val binDir = candidateBins.firstOrNull { File(it, "initdb").canExecute() && File(it, "pg_ctl").canExecute() }
+            ?: throw IllegalStateException("PostgreSQL binaries (initdb/pg_ctl) not found in /usr/lib/postgresql/*")
         pgBinDir = binDir
 
-        val tempRoot = Files.createTempDirectory("offprod-setup-pg-qual-")
+        val tempRoot = Files.createTempDirectory("offprod-setup-cli-pg-")
         pgTempDir = tempRoot
         val dataDir = tempRoot.resolve("data").toFile()
-        val socketDir = tempRoot.resolve("sock").toFile().apply { mkdirs() }
+        val socketDir = tempRoot.resolve("socket").toFile().apply { mkdirs() }
         val logFile = tempRoot.resolve("postgres.log").toFile()
 
         pgPort = ServerSocket(0).use { it.localPort }
@@ -76,7 +70,7 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
             "-U", "postgres",
             "-A", "trust",
             "--encoding=UTF8",
-            "--no-locale"
+            "--locale=C"
         ).redirectErrorStream(true).start()
         val initOut = initProc.inputStream.bufferedReader().readText()
         check(initProc.waitFor() == 0) { "initdb failed: $initOut" }
@@ -86,7 +80,7 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
             "-D", dataDir.absolutePath,
             "-l", logFile.absolutePath,
             "-w",
-            "-o", "-F -p $pgPort -h 127.0.0.1 -k ${socketDir.absolutePath}",
+            "-o", "-F -p $pgPort -k ${socketDir.absolutePath} -h 127.0.0.1",
             "start"
         ).redirectErrorStream(true).start()
         val startOut = startProc.inputStream.bufferedReader().readText()
@@ -160,6 +154,8 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
             listOf("--max-total-wall-time-ms=0"),
             listOf("--max-total-wall-time-ms=15001"),
             listOf("--max-total-wall-time-ms=1000", "--sql-timeout-ms=2500"),
+            listOf("--cleanup-timeout-ms=0"),
+            listOf("--cleanup-timeout-ms=5001"),
             listOf("--apply-ddl=true", "--dry-run=true", "--allow-ddl-writes=true"),
             listOf("--apply-ddl=true", "--dry-run=false", "--allow-ddl-writes=false"),
             listOf("--dry-run=false", "--apply-ddl=false", "--allow-ddl-writes=true")
@@ -219,8 +215,8 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
     }
 
     @Test
-    fun `shared 15s total wall-time cap bounds combined readiness and SQL stages and aborts with 0 SQL when exhausted before SQL stage`() {
-        val sqlExecutedCount = AtomicInteger(0)
+    fun `shared 15s total wall-time cap bounds combined readiness and SQL stages and aborts with 0 DDL when exhausted before SQL stage`() {
+        val ddlOrCheckSqlExecutedCount = AtomicInteger(0)
         var fakeNowMs = 1_000_000L
         val fakeClock = object : MonotonicClock {
             override fun nowMs(): Long = fakeNowMs
@@ -229,24 +225,57 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
             }
         }
 
-        val mockConn = Proxy.newProxyInstance(
-            Connection::class.java.classLoader,
-            arrayOf(Connection::class.java)
-        ) { proxy, method, args ->
-            when (method.name) {
-                "prepareStatement", "createStatement" -> {
-                    sqlExecutedCount.incrementAndGet()
-                    throw AssertionError("No SQL should be prepared when shared total wall-time budget is exhausted after readiness")
+        fun createReadinessOnlyConn(backendPid: Int, readOnlyDefault: Boolean): Connection {
+            return Proxy.newProxyInstance(
+                Connection::class.java.classLoader,
+                arrayOf(Connection::class.java)
+            ) { proxy, method, args ->
+                when (method.name) {
+                    "prepareStatement" -> {
+                        val sql = (args?.firstOrNull() as? String).orEmpty()
+                        if (sql.contains("pg_backend_pid")) {
+                            Proxy.newProxyInstance(
+                                PreparedStatement::class.java.classLoader,
+                                arrayOf(PreparedStatement::class.java)
+                            ) { _, psMethod, _ ->
+                                when (psMethod.name) {
+                                    "setQueryTimeout", "close", "cancel" -> null
+                                    "executeQuery" -> {
+                                        val served = AtomicBoolean(false)
+                                        Proxy.newProxyInstance(
+                                            ResultSet::class.java.classLoader,
+                                            arrayOf(ResultSet::class.java)
+                                        ) { _, rsMethod, _ ->
+                                            when (rsMethod.name) {
+                                                "next" -> served.compareAndSet(false, true)
+                                                "getInt" -> backendPid
+                                                "close" -> null
+                                                else -> null
+                                            }
+                                        } as ResultSet
+                                    }
+                                    else -> null
+                                }
+                            } as PreparedStatement
+                        } else {
+                            ddlOrCheckSqlExecutedCount.incrementAndGet()
+                            throw AssertionError("No Stage 2 SQL should be prepared when shared total wall-time budget is exhausted after readiness")
+                        }
+                    }
+                    "createStatement" -> {
+                        ddlOrCheckSqlExecutedCount.incrementAndGet()
+                        throw AssertionError("No Stage 2 Statement should be created when shared total wall-time budget is exhausted after readiness")
+                    }
+                    "isWrapperFor" -> false
+                    "getAutoCommit" -> true
+                    "isReadOnly" -> readOnlyDefault
+                    "setReadOnly", "setAutoCommit", "setNetworkTimeout", "close", "abort" -> null
+                    "equals" -> proxy === args?.firstOrNull()
+                    "hashCode" -> System.identityHashCode(proxy)
+                    else -> null
                 }
-                "isWrapperFor" -> false
-                "getAutoCommit" -> true
-                "isReadOnly" -> false
-                "setReadOnly", "setAutoCommit", "setNetworkTimeout", "close", "abort" -> null
-                "equals" -> proxy === args?.firstOrNull()
-                "hashCode" -> System.identityHashCode(proxy)
-                else -> null
-            }
-        } as Connection
+            } as Connection
+        }
 
         val connCalls = AtomicInteger(0)
         val ds = object : DataSource {
@@ -255,24 +284,11 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
                 // Advance monotonic clock by 1,500ms on each of the 2 readiness connections (total 3,000ms),
                 // exhausting maxTotalWallTimeMs = 3,000ms right as readiness finishes!
                 fakeNowMs += 1_500L
-                return if (c == 1) mockConn else Proxy.newProxyInstance(
-                    Connection::class.java.classLoader,
-                    arrayOf(Connection::class.java)
-                ) { proxy, method, args ->
-                    when (method.name) {
-                        "prepareStatement", "createStatement" -> {
-                            sqlExecutedCount.incrementAndGet()
-                            throw AssertionError("No SQL should be prepared on verifyConn when total budget exhausted")
-                        }
-                        "isWrapperFor" -> false
-                        "getAutoCommit" -> true
-                        "isReadOnly" -> true
-                        "setReadOnly", "setAutoCommit", "setNetworkTimeout", "close", "abort" -> null
-                        "equals" -> proxy === args?.firstOrNull()
-                        "hashCode" -> System.identityHashCode(proxy)
-                        else -> null
-                    }
-                } as Connection
+                return if (c == 1) {
+                    createReadinessOnlyConn(backendPid = 2001, readOnlyDefault = false)
+                } else {
+                    createReadinessOnlyConn(backendPid = 2002, readOnlyDefault = true)
+                }
             }
 
             override fun getConnection(username: String?, password: String?): Connection = getConnection()
@@ -310,7 +326,8 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
             OffProdAdditiveIdentitySchemaSetupCli.DdlCommitStatus.NOT_STARTED_ZERO_SQL,
             res.report.ddlCommitStatus
         )
-        assertEquals(0, sqlExecutedCount.get(), "Expected 0 SQL statements when shared total wall-time budget is exhausted")
+        assertTrue(res.report.connectionsClosedCleanly)
+        assertEquals(0, ddlOrCheckSqlExecutedCount.get(), "Expected 0 Stage 2 SQL statements when shared total wall-time budget is exhausted")
     }
 
     @Test
@@ -419,7 +436,7 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
         val ddlWorkerFinished = CountDownLatch(1)
         val ddlExecuteUpdateCalls = AtomicInteger(0)
 
-        fun createMockConnection(isVerifyConn: Boolean): Connection {
+        fun createMockConnection(isVerifyConn: Boolean, backendPid: Int): Connection {
             return Proxy.newProxyInstance(
                 Connection::class.java.classLoader,
                 arrayOf(Connection::class.java)
@@ -428,6 +445,8 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
                     "prepareStatement" -> {
                         val sql = (args?.firstOrNull() as? String).orEmpty()
                         val isDdl = sql.uppercase().contains("CREATE TABLE")
+                        val isPidQuery = sql.contains("pg_backend_pid")
+                        val isSearchPath = sql.uppercase().contains("SET SEARCH_PATH")
                         Proxy.newProxyInstance(
                             PreparedStatement::class.java.classLoader,
                             arrayOf(PreparedStatement::class.java)
@@ -450,8 +469,10 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
                                     null
                                 }
                                 "executeUpdate" -> {
-                                    ddlExecuteUpdateCalls.incrementAndGet()
-                                    1
+                                    if (isDdl) {
+                                        ddlExecuteUpdateCalls.incrementAndGet()
+                                    }
+                                    if (isSearchPath) 0 else 1
                                 }
                                 "executeQuery" -> {
                                     val rowServed = AtomicBoolean(false)
@@ -461,9 +482,15 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
                                     ) { _, rsMethod, rsArgs ->
                                         when (rsMethod.name) {
                                             "next" -> rowServed.compareAndSet(false, true)
-                                            "getBoolean" -> {
-                                                val col = (rsArgs?.firstOrNull() as? String).orEmpty()
-                                                col == "can_create"
+                                            "getInt" -> if (isPidQuery) backendPid else 0
+                                            "getString" -> "public"
+                                            "getObject", "getBoolean" -> {
+                                                when ((rsArgs?.firstOrNull() as? String).orEmpty()) {
+                                                    "table_present" -> false
+                                                    "can_create" -> true
+                                                    "table_shape_valid" -> true
+                                                    else -> false
+                                                }
                                             }
                                             "close" -> null
                                             else -> null
@@ -495,7 +522,7 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
         val ds = object : DataSource {
             override fun getConnection(): Connection {
                 val idx = connCounter.incrementAndGet()
-                return createMockConnection(isVerifyConn = idx > 1)
+                return createMockConnection(isVerifyConn = idx > 1, backendPid = 3000 + idx)
             }
 
             override fun getConnection(username: String?, password: String?): Connection = getConnection()
@@ -549,7 +576,7 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
         val formatPrefixMarker = "RGAPI-NON_CREDENTIAL_FORMAT_MARKER_TEST_ONLY"
         val formatKeyValueMarker = "NON_CREDENTIAL_KV_FORMAT_MARKER_TEST_ONLY"
 
-        fun createConn(isVerifyConn: Boolean): Connection {
+        fun createConn(isVerifyConn: Boolean, backendPid: Int): Connection {
             return Proxy.newProxyInstance(
                 Connection::class.java.classLoader,
                 arrayOf(Connection::class.java)
@@ -558,6 +585,7 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
                     "prepareStatement" -> {
                         val sql = (args?.firstOrNull() as? String).orEmpty()
                         val isDdl = sql.uppercase().contains("CREATE TABLE")
+                        val isPidQuery = sql.contains("pg_backend_pid")
                         Proxy.newProxyInstance(
                             PreparedStatement::class.java.classLoader,
                             arrayOf(PreparedStatement::class.java)
@@ -582,7 +610,16 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
                                     ) { _, rsMethod, rsArgs ->
                                         when (rsMethod.name) {
                                             "next" -> served.compareAndSet(false, true)
-                                            "getBoolean" -> (rsArgs?.firstOrNull() as? String) == "can_create"
+                                            "getInt" -> if (isPidQuery) backendPid else 0
+                                            "getString" -> "public"
+                                            "getObject", "getBoolean" -> {
+                                                when ((rsArgs?.firstOrNull() as? String).orEmpty()) {
+                                                    "table_present" -> false
+                                                    "can_create" -> true
+                                                    "table_shape_valid" -> true
+                                                    else -> false
+                                                }
+                                            }
                                             "close" -> null
                                             else -> null
                                         }
@@ -605,7 +642,10 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
 
         val count = AtomicInteger(0)
         val ds = object : DataSource {
-            override fun getConnection(): Connection = createConn(isVerifyConn = count.incrementAndGet() > 1)
+            override fun getConnection(): Connection {
+                val idx = count.incrementAndGet()
+                return createConn(isVerifyConn = idx > 1, backendPid = 4000 + idx)
+            }
             override fun getConnection(username: String?, password: String?): Connection = getConnection()
             override fun getLogWriter(): PrintWriter? = null
             override fun setLogWriter(out: PrintWriter?) {}
@@ -658,7 +698,7 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
 
             // Separate direct format-matching redaction check with empty explicit secret list:
             val formatOnlySanitized = OffProdAdditiveIdentitySchemaSetupCli.sanitizeErrorMessage(
-                raw = "postgresql://role_name:NON_CREDENTIAL_URL_MARKER@db.internal:5432/app prefix=$formatPrefixMarker api_key=$formatKeyValueMarker",
+                raw = "jdbc:postgresql://db.internal:5432/app?password=NON_CREDENTIAL_URL_MARKER prefix=$formatPrefixMarker api_key=$formatKeyValueMarker",
                 secretsToRedact = emptyList()
             )
             assertFalse(formatOnlySanitized.contains("NON_CREDENTIAL_URL_MARKER"))
@@ -668,6 +708,473 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
             assertTrue(formatOnlySanitized.contains("api_key=[REDACTED]"))
         } finally {
             reportFile.delete()
+        }
+    }
+
+    @Test
+    fun `unconditional physical PID separation rejects same Connection instance and distinct proxies wrapping same physical backend PID before DDL`() {
+        val ddlStatementsExecuted = AtomicInteger(0)
+
+        fun createProxyConnWithPid(backendPid: Int): Connection {
+            return Proxy.newProxyInstance(
+                Connection::class.java.classLoader,
+                arrayOf(Connection::class.java)
+            ) { proxy, method, args ->
+                when (method.name) {
+                    "prepareStatement" -> {
+                        val sql = (args?.firstOrNull() as? String).orEmpty()
+                        if (sql.uppercase().contains("CREATE TABLE")) {
+                            ddlStatementsExecuted.incrementAndGet()
+                            throw AssertionError("DDL must never be prepared when primaryConn and verifyConn share the same physical PID")
+                        }
+                        Proxy.newProxyInstance(
+                            PreparedStatement::class.java.classLoader,
+                            arrayOf(PreparedStatement::class.java)
+                        ) { _, psMethod, _ ->
+                            when (psMethod.name) {
+                                "setQueryTimeout", "close", "cancel" -> null
+                                "executeQuery" -> {
+                                    val served = AtomicBoolean(false)
+                                    Proxy.newProxyInstance(
+                                        ResultSet::class.java.classLoader,
+                                        arrayOf(ResultSet::class.java)
+                                    ) { _, rsMethod, _ ->
+                                        when (rsMethod.name) {
+                                            "next" -> served.compareAndSet(false, true)
+                                            "getInt" -> backendPid
+                                            "close" -> null
+                                            else -> null
+                                        }
+                                    } as ResultSet
+                                }
+                                else -> null
+                            }
+                        } as PreparedStatement
+                    }
+                    "isWrapperFor" -> false
+                    "getAutoCommit" -> true // autoCommit=true: previously made !c1AutoCommit check dead!
+                    "isReadOnly" -> false
+                    "setReadOnly", "setAutoCommit", "setNetworkTimeout", "close", "abort" -> null
+                    "equals" -> proxy === args?.firstOrNull()
+                    "hashCode" -> System.identityHashCode(proxy)
+                    else -> null
+                }
+            } as Connection
+        }
+
+        // Case 1: DataSource returns the exact same Connection instance with autoCommit = true
+        val singleConn = createProxyConnWithPid(backendPid = 7777)
+        val sameInstanceDs = object : DataSource {
+            override fun getConnection(): Connection = singleConn
+            override fun getConnection(username: String?, password: String?): Connection = singleConn
+            override fun getLogWriter(): PrintWriter? = null
+            override fun setLogWriter(out: PrintWriter?) {}
+            override fun setLoginTimeout(seconds: Int) {}
+            override fun getLoginTimeout(): Int = 0
+            override fun getParentLogger(): Logger = Logger.getGlobal()
+            override fun <T : Any?> unwrap(iface: Class<T>?): T = throw SQLException("Not a wrapper")
+            override fun isWrapperFor(iface: Class<*>?): Boolean = false
+        }
+
+        val sameInstanceRes = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
+            args = listOf("--apply-ddl=true", "--dry-run=false", "--allow-ddl-writes=true"),
+            env = emptyMap(),
+            dataSourceOverride = sameInstanceDs,
+            maxHeapBytesProvider = { 128L * 1024L * 1024L }
+        )
+        assertEquals(3, sameInstanceRes.exitCode)
+        assertEquals(
+            OffProdAdditiveIdentitySchemaSetupCli.SetupOutcome.ABORTED_READINESS_FAILURE_NO_SQL,
+            sameInstanceRes.report.outcome
+        )
+        assertEquals(
+            OffProdAdditiveIdentitySchemaSetupCli.DdlCommitStatus.NOT_STARTED_ZERO_SQL,
+            sameInstanceRes.report.ddlCommitStatus
+        )
+        assertEquals(0, ddlStatementsExecuted.get())
+
+        // Case 2: DataSource returns two DISTINCT Connection proxy objects (rawC2 !== c1) that share the same physical backend PID (7777)
+        val distinctProxiesSamePidDs = object : DataSource {
+            override fun getConnection(): Connection = createProxyConnWithPid(backendPid = 7777)
+            override fun getConnection(username: String?, password: String?): Connection = getConnection()
+            override fun getLogWriter(): PrintWriter? = null
+            override fun setLogWriter(out: PrintWriter?) {}
+            override fun setLoginTimeout(seconds: Int) {}
+            override fun getLoginTimeout(): Int = 0
+            override fun getParentLogger(): Logger = Logger.getGlobal()
+            override fun <T : Any?> unwrap(iface: Class<T>?): T = throw SQLException("Not a wrapper")
+            override fun isWrapperFor(iface: Class<*>?): Boolean = false
+        }
+
+        val samePidRes = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
+            args = listOf("--apply-ddl=true", "--dry-run=false", "--allow-ddl-writes=true"),
+            env = emptyMap(),
+            dataSourceOverride = distinctProxiesSamePidDs,
+            maxHeapBytesProvider = { 128L * 1024L * 1024L }
+        )
+        assertEquals(3, samePidRes.exitCode)
+        assertEquals(
+            OffProdAdditiveIdentitySchemaSetupCli.SetupOutcome.ABORTED_READINESS_FAILURE_NO_SQL,
+            samePidRes.report.outcome
+        )
+        assertEquals(
+            OffProdAdditiveIdentitySchemaSetupCli.DdlCommitStatus.NOT_STARTED_ZERO_SQL,
+            samePidRes.report.ddlCommitStatus
+        )
+        assertEquals(7777, samePidRes.report.primaryBackendPid)
+        assertEquals(7777, samePidRes.report.verifyBackendPid)
+        assertEquals(0, ddlStatementsExecuted.get())
+
+        // Case 3: Real PostgreSQL connection wrapped in two distinct Connection proxies delegating to the SAME physical PGConnection
+        pgDataSource.connection.use { sharedRealPgConn ->
+            val realSamePhysicalDs = object : DataSource by pgDataSource {
+                override fun getConnection(): Connection {
+                    return Proxy.newProxyInstance(
+                        Connection::class.java.classLoader,
+                        arrayOf(Connection::class.java)
+                    ) { proxy, method, args ->
+                        when (method.name) {
+                            "close", "abort" -> null // keep sharedRealPgConn open for outer .use
+                            "equals" -> proxy === args?.firstOrNull()
+                            "hashCode" -> System.identityHashCode(proxy)
+                            else -> if (args == null) {
+                                method.invoke(sharedRealPgConn)
+                            } else {
+                                method.invoke(sharedRealPgConn, *args)
+                            }
+                        }
+                    } as Connection
+                }
+            }
+
+            val realSamePidRes = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
+                args = listOf("--apply-ddl=true", "--dry-run=false", "--allow-ddl-writes=true"),
+                env = emptyMap(),
+                dataSourceOverride = realSamePhysicalDs,
+                maxHeapBytesProvider = { 128L * 1024L * 1024L }
+            )
+            assertEquals(3, realSamePidRes.exitCode)
+            assertEquals(
+                OffProdAdditiveIdentitySchemaSetupCli.SetupOutcome.ABORTED_READINESS_FAILURE_NO_SQL,
+                realSamePidRes.report.outcome
+            )
+            assertEquals(
+                OffProdAdditiveIdentitySchemaSetupCli.DdlCommitStatus.NOT_STARTED_ZERO_SQL,
+                realSamePidRes.report.ddlCommitStatus
+            )
+            assertNotNull(realSamePidRes.report.primaryBackendPid)
+            assertEquals(realSamePidRes.report.primaryBackendPid, realSamePidRes.report.verifyBackendPid)
+        }
+    }
+
+    @Test
+    fun `bounded awaited cleanup waits for delayed close before return and fails closed when close hangs past cleanupTimeoutMs`() {
+        // Part 1: Delayed close (120ms) within cleanupTimeoutMs (1,000ms) is awaited before runSetupCli returns
+        val closeCompletedBeforeReturn = AtomicBoolean(false)
+        val delayedCloseConn = Proxy.newProxyInstance(
+            Connection::class.java.classLoader,
+            arrayOf(Connection::class.java)
+        ) { proxy, method, args ->
+            when (method.name) {
+                "prepareStatement" -> {
+                    val sql = (args?.firstOrNull() as? String).orEmpty()
+                    val isPidQuery = sql.contains("pg_backend_pid")
+                    val isSearchPath = sql.uppercase().contains("SET SEARCH_PATH")
+                    Proxy.newProxyInstance(
+                        PreparedStatement::class.java.classLoader,
+                        arrayOf(PreparedStatement::class.java)
+                    ) { _, psMethod, _ ->
+                        when (psMethod.name) {
+                            "setQueryTimeout", "close", "cancel" -> null
+                            "executeUpdate" -> if (isSearchPath) 0 else 1
+                            "executeQuery" -> {
+                                val served = AtomicBoolean(false)
+                                Proxy.newProxyInstance(
+                                    ResultSet::class.java.classLoader,
+                                    arrayOf(ResultSet::class.java)
+                                ) { _, rsMethod, rsArgs ->
+                                    when (rsMethod.name) {
+                                        "next" -> served.compareAndSet(false, true)
+                                        "getInt" -> if (isPidQuery) 5001 else 0
+                                        "getString" -> "public"
+                                        "getObject", "getBoolean" -> {
+                                            when ((rsArgs?.firstOrNull() as? String).orEmpty()) {
+                                                "table_present" -> false
+                                                "can_create" -> true
+                                                else -> false
+                                            }
+                                        }
+                                        "close" -> null
+                                        else -> null
+                                    }
+                                } as ResultSet
+                            }
+                            else -> null
+                        }
+                    } as PreparedStatement
+                }
+                "close" -> {
+                    Thread.sleep(120L)
+                    closeCompletedBeforeReturn.set(true)
+                    null
+                }
+                "isWrapperFor" -> false
+                "getAutoCommit" -> true
+                "isReadOnly" -> true
+                "setReadOnly", "setAutoCommit", "setNetworkTimeout", "abort" -> null
+                "equals" -> proxy === args?.firstOrNull()
+                "hashCode" -> System.identityHashCode(proxy)
+                else -> null
+            }
+        } as Connection
+
+        val delayedCloseDs = object : DataSource {
+            override fun getConnection(): Connection = delayedCloseConn
+            override fun getConnection(username: String?, password: String?): Connection = delayedCloseConn
+            override fun getLogWriter(): PrintWriter? = null
+            override fun setLogWriter(out: PrintWriter?) {}
+            override fun setLoginTimeout(seconds: Int) {}
+            override fun getLoginTimeout(): Int = 0
+            override fun getParentLogger(): Logger = Logger.getGlobal()
+            override fun <T : Any?> unwrap(iface: Class<T>?): T = throw SQLException("Not a wrapper")
+            override fun isWrapperFor(iface: Class<*>?): Boolean = false
+        }
+
+        val okCleanupRes = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
+            args = listOf("--dry-run=true", "--cleanup-timeout-ms=1000"),
+            env = emptyMap(),
+            dataSourceOverride = delayedCloseDs,
+            maxHeapBytesProvider = { 128L * 1024L * 1024L }
+        )
+        assertTrue(
+            closeCompletedBeforeReturn.get(),
+            "Expected runSetupCli to await connection.close() completion before returning"
+        )
+        assertEquals(0, okCleanupRes.exitCode)
+        assertTrue(okCleanupRes.report.connectionsClosedCleanly)
+        assertFalse(okCleanupRes.report.cleanupTimedOut)
+        assertTrue(okCleanupRes.report.cleanupElapsedMs >= 100L)
+
+        // Part 2: Hung close exceeding cleanupTimeoutMs (80ms) fails closed with exitCode=3 and cleanupTimedOut=true
+        val releaseHungClose = CountDownLatch(1)
+        val fallbackAbortCalled = CountDownLatch(1)
+        val hungCloseConn = Proxy.newProxyInstance(
+            Connection::class.java.classLoader,
+            arrayOf(Connection::class.java)
+        ) { proxy, method, args ->
+            when (method.name) {
+                "prepareStatement" -> delayedCloseConn.prepareStatement((args?.firstOrNull() as? String).orEmpty())
+                "close" -> {
+                    var interrupted = false
+                    while (true) {
+                        try {
+                            if (releaseHungClose.await(5, TimeUnit.SECONDS)) break
+                            break
+                        } catch (_: InterruptedException) {
+                            interrupted = true
+                        }
+                    }
+                    if (interrupted) Thread.currentThread().interrupt()
+                    null
+                }
+                "abort" -> {
+                    fallbackAbortCalled.countDown()
+                    null
+                }
+                "isWrapperFor" -> false
+                "getAutoCommit" -> true
+                "isReadOnly" -> true
+                "setReadOnly", "setAutoCommit", "setNetworkTimeout" -> null
+                "equals" -> proxy === args?.firstOrNull()
+                "hashCode" -> System.identityHashCode(proxy)
+                else -> null
+            }
+        } as Connection
+
+        val hungCloseDs = object : DataSource {
+            override fun getConnection(): Connection = hungCloseConn
+            override fun getConnection(username: String?, password: String?): Connection = hungCloseConn
+            override fun getLogWriter(): PrintWriter? = null
+            override fun setLogWriter(out: PrintWriter?) {}
+            override fun setLoginTimeout(seconds: Int) {}
+            override fun getLoginTimeout(): Int = 0
+            override fun getParentLogger(): Logger = Logger.getGlobal()
+            override fun <T : Any?> unwrap(iface: Class<T>?): T = throw SQLException("Not a wrapper")
+            override fun isWrapperFor(iface: Class<*>?): Boolean = false
+        }
+
+        try {
+            val hungCleanupRes = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
+                args = listOf("--dry-run=true", "--cleanup-timeout-ms=80"),
+                env = emptyMap(),
+                dataSourceOverride = hungCloseDs,
+                maxHeapBytesProvider = { 128L * 1024L * 1024L }
+            )
+            assertEquals(3, hungCleanupRes.exitCode)
+            assertEquals(
+                OffProdAdditiveIdentitySchemaSetupCli.SetupOutcome.ABORTED_CLEANUP_FAILED_OR_TIMED_OUT,
+                hungCleanupRes.report.outcome
+            )
+            assertEquals(
+                OffProdAdditiveIdentitySchemaSetupCli.SetupStage.CLEANUP,
+                hungCleanupRes.report.stage
+            )
+            assertFalse(hungCleanupRes.report.connectionsClosedCleanly)
+            assertTrue(hungCleanupRes.report.cleanupTimedOut)
+            assertTrue(fallbackAbortCalled.await(1, TimeUnit.SECONDS), "Expected fallback abort() on hung close()")
+        } finally {
+            releaseHungClose.countDown()
+        }
+    }
+
+    @Test
+    fun `real PostgreSQL 15 search_path shadow protection and fail-closed rejection of incompatible existing table shapes`() {
+        pgDataSource.connection.use { conn ->
+            conn.createStatement().use { st ->
+                st.execute("DROP SCHEMA IF EXISTS shadow_schema CASCADE")
+                st.execute("DROP TABLE IF EXISTS public.player_riot_identities")
+                st.execute("CREATE SCHEMA shadow_schema")
+                // Create a conflicting/incompatible table in shadow_schema
+                st.execute("CREATE TABLE shadow_schema.player_riot_identities (wrong_col INT)")
+            }
+        }
+
+        // 1. Even when DataSource connections start with search_path = shadow_schema, public,
+        // OffProdAdditiveIdentitySchemaSetupCli binds SET search_path = public, pg_catalog before check/DDL/verify
+        // and creates/verifies public.player_riot_identities (not shadow_schema)!
+        val shadowedSearchPathDs = PGSimpleDataSource().apply {
+            setURL(jdbcUrl)
+            user = "postgres"
+            password = ""
+            this.options = "-c search_path=shadow_schema,public"
+        }
+
+        val shadowRes = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
+            args = listOf("--apply-ddl=true", "--dry-run=false", "--allow-ddl-writes=true"),
+            env = emptyMap(),
+            dataSourceOverride = shadowedSearchPathDs,
+            maxHeapBytesProvider = { 128L * 1024L * 1024L }
+        )
+        assertEquals(0, shadowRes.exitCode, "Expected exitCode=0: ${shadowRes.report.sanitizedDetail}")
+        assertEquals(
+            OffProdAdditiveIdentitySchemaSetupCli.SetupOutcome.APPLIED_AND_VERIFIED_DDL,
+            shadowRes.report.outcome
+        )
+        assertEquals(true, shadowRes.report.searchPathBoundToPublic)
+        assertEquals(false, shadowRes.report.tablePresentBefore)
+        assertEquals(true, shadowRes.report.tablePresentAfter)
+        assertEquals(true, shadowRes.report.tableShapeValid)
+        assertNotNull(shadowRes.report.primaryBackendPid)
+        assertNotNull(shadowRes.report.verifyBackendPid)
+        assertNotEquals(shadowRes.report.primaryBackendPid, shadowRes.report.verifyBackendPid)
+
+        // 2. Incompatible existing public.player_riot_identities shapes must fail closed (both dry-run and apply-ddl)!
+        val incompatibleTableDdls = listOf(
+            // Wrong VARCHAR length on puuid (64 instead of 78)
+            """
+            CREATE TABLE public.player_riot_identities (
+                puuid           VARCHAR(64)  PRIMARY KEY,
+                platform_region VARCHAR(16)  NOT NULL,
+                game_name       VARCHAR(255) NOT NULL,
+                tag_line        VARCHAR(255) NOT NULL,
+                verified_at     TIMESTAMPTZ  NOT NULL,
+                CONSTRAINT chk_player_riot_identities_nonblank
+                    CHECK (BTRIM(game_name) <> '' AND BTRIM(tag_line) <> '')
+            )
+            """.trimIndent(),
+            // Missing PRIMARY KEY on puuid
+            """
+            CREATE TABLE public.player_riot_identities (
+                puuid           VARCHAR(78)  NOT NULL,
+                platform_region VARCHAR(16)  NOT NULL,
+                game_name       VARCHAR(255) NOT NULL,
+                tag_line        VARCHAR(255) NOT NULL,
+                verified_at     TIMESTAMPTZ  NOT NULL,
+                CONSTRAINT chk_player_riot_identities_nonblank
+                    CHECK (BTRIM(game_name) <> '' AND BTRIM(tag_line) <> '')
+            )
+            """.trimIndent(),
+            // Missing chk_player_riot_identities_nonblank CHECK constraint
+            """
+            CREATE TABLE public.player_riot_identities (
+                puuid           VARCHAR(78)  PRIMARY KEY,
+                platform_region VARCHAR(16)  NOT NULL,
+                game_name       VARCHAR(255) NOT NULL,
+                tag_line        VARCHAR(255) NOT NULL,
+                verified_at     TIMESTAMPTZ  NOT NULL
+            )
+            """.trimIndent(),
+            // Same-name chk_player_riot_identities_nonblank with permissive OR true (would pass substring LIKE check!)
+            """
+            CREATE TABLE public.player_riot_identities (
+                puuid           VARCHAR(78)  PRIMARY KEY,
+                platform_region VARCHAR(16)  NOT NULL,
+                game_name       VARCHAR(255) NOT NULL,
+                tag_line        VARCHAR(255) NOT NULL,
+                verified_at     TIMESTAMPTZ  NOT NULL,
+                CONSTRAINT chk_player_riot_identities_nonblank
+                    CHECK ((BTRIM(game_name) <> '' AND BTRIM(tag_line) <> '') OR true)
+            )
+            """.trimIndent(),
+            // Same-name chk_player_riot_identities_nonblank added as NOT VALID (convalidated = false)
+            """
+            CREATE TABLE public.player_riot_identities (
+                puuid           VARCHAR(78)  PRIMARY KEY,
+                platform_region VARCHAR(16)  NOT NULL,
+                game_name       VARCHAR(255) NOT NULL,
+                tag_line        VARCHAR(255) NOT NULL,
+                verified_at     TIMESTAMPTZ  NOT NULL
+            );
+            ALTER TABLE public.player_riot_identities
+                ADD CONSTRAINT chk_player_riot_identities_nonblank
+                CHECK (BTRIM(game_name) <> '' AND BTRIM(tag_line) <> '') NOT VALID
+            """.trimIndent()
+        )
+
+        for (badDdl in incompatibleTableDdls) {
+            pgDataSource.connection.use { conn ->
+                conn.createStatement().use { st ->
+                    st.execute("DROP TABLE IF EXISTS public.player_riot_identities")
+                    st.execute(badDdl)
+                }
+            }
+
+            val dryRunBad = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
+                args = listOf("--dry-run=true"),
+                env = mapOf("OFFPROD_JDBC_URL" to jdbcUrl, "OFFPROD_DB_USER" to "postgres"),
+                maxHeapBytesProvider = { 128L * 1024L * 1024L }
+            )
+            assertEquals(3, dryRunBad.exitCode)
+            assertEquals(
+                OffProdAdditiveIdentitySchemaSetupCli.SetupOutcome.ABORTED_EXISTING_TABLE_INCOMPATIBLE_SCHEMA,
+                dryRunBad.report.outcome
+            )
+            assertEquals(true, dryRunBad.report.tablePresentBefore)
+            assertEquals(false, dryRunBad.report.tableShapeValid)
+
+            val applyBad = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
+                args = listOf("--apply-ddl=true", "--dry-run=false", "--allow-ddl-writes=true"),
+                env = mapOf("OFFPROD_JDBC_URL" to jdbcUrl, "OFFPROD_DB_USER" to "postgres"),
+                maxHeapBytesProvider = { 128L * 1024L * 1024L }
+            )
+            assertEquals(3, applyBad.exitCode)
+            assertEquals(
+                OffProdAdditiveIdentitySchemaSetupCli.SetupOutcome.ABORTED_EXISTING_TABLE_INCOMPATIBLE_SCHEMA,
+                applyBad.report.outcome
+            )
+            assertEquals(
+                OffProdAdditiveIdentitySchemaSetupCli.DdlCommitStatus.NOT_STARTED_ZERO_SQL,
+                applyBad.report.ddlCommitStatus
+            )
+            assertEquals(true, applyBad.report.tablePresentBefore)
+            assertEquals(false, applyBad.report.tableShapeValid)
+        }
+
+        pgDataSource.connection.use { conn ->
+            conn.createStatement().use { st ->
+                st.execute("DROP SCHEMA IF EXISTS shadow_schema CASCADE")
+                st.execute("DROP TABLE IF EXISTS public.player_riot_identities")
+            }
         }
     }
 
@@ -698,6 +1205,7 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
         assertEquals(false, dryRunRes.report.tablePresentBefore)
         assertEquals(false, dryRunRes.report.tablePresentAfter)
         assertEquals(true, dryRunRes.report.hasCreatePrivilege)
+        assertTrue(dryRunRes.report.connectionsClosedCleanly)
         dryRunReportFile.delete()
 
         pgDataSource.connection.use { conn ->
@@ -741,6 +1249,7 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
                 lockRes.report.ddlCommitStatus
             )
             assertTrue(lockRes.report.sqlElapsedMs < 1500L, "Expected lock_timeout to abort well under 1500ms SQL fence")
+            assertTrue(lockRes.report.connectionsClosedCleanly)
 
             lockHolderConn.rollback()
         }
@@ -790,6 +1299,11 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
         )
         assertEquals(false, slowWanRes.report.tablePresentBefore)
         assertEquals(true, slowWanRes.report.tablePresentAfter)
+        assertEquals(true, slowWanRes.report.tableShapeValid)
+        assertNotNull(slowWanRes.report.primaryBackendPid)
+        assertNotNull(slowWanRes.report.verifyBackendPid)
+        assertNotEquals(slowWanRes.report.primaryBackendPid, slowWanRes.report.verifyBackendPid)
+        assertTrue(slowWanRes.report.connectionsClosedCleanly)
         assertTrue(
             slowWanRes.report.readinessElapsedMs >= 3_000L,
             "Expected readinessElapsedMs >= 3000ms (was ${slowWanRes.report.readinessElapsedMs}ms)"
@@ -852,6 +1366,11 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
             )
             assertEquals(false, parsedReport.tablePresentBefore)
             assertEquals(true, parsedReport.tablePresentAfter)
+            assertEquals(true, parsedReport.tableShapeValid)
+            assertNotNull(parsedReport.primaryBackendPid)
+            assertNotNull(parsedReport.verifyBackendPid)
+            assertNotEquals(parsedReport.primaryBackendPid, parsedReport.verifyBackendPid)
+            assertTrue(parsedReport.connectionsClosedCleanly)
             assertTrue(
                 parsedReport.jvmMaxHeapBytes <= OffProdAdditiveIdentitySchemaSetupCli.MAX_STANDALONE_JVM_HEAP_BYTES,
                 "Expected jvmMaxHeapBytes <= 256 MiB (was ${parsedReport.jvmMaxHeapBytes})"
@@ -861,7 +1380,7 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
                 "Expected peak used heap <= 128 MiB (was ${parsedReport.jvmUsedHeapBytesPeak})"
             )
 
-            // Idempotent re-run when table is already present:
+            // Idempotent re-run when valid table is already present:
             val idempotentRes = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
                 args = listOf(
                     "--apply-ddl=true",
@@ -874,8 +1393,311 @@ class OffProdAdditiveIdentitySchemaSetupCliTest {
             assertEquals(0, idempotentRes.exitCode)
             assertEquals(true, idempotentRes.report.tablePresentBefore)
             assertEquals(true, idempotentRes.report.tablePresentAfter)
+            assertEquals(true, idempotentRes.report.tableShapeValid)
+            assertTrue(idempotentRes.report.connectionsClosedCleanly)
         } finally {
             subprocessReportFile.delete()
         }
+    }
+
+    @Test
+    fun `negative tests - fail closed on missing or invalid PID, schema, or table shape evidence and enforce total budget ceiling across awaited cleanup`() {
+        val ddlStatementsPrepared = AtomicInteger(0)
+
+        fun createConfigurableConn(
+            pidPsNull: Boolean = false,
+            pidRsNull: Boolean = false,
+            pidZeroRows: Boolean = false,
+            pidValue: Int = 5501,
+            searchPathPsNull: Boolean = false,
+            contractPsNull: Boolean = false,
+            contractRsNull: Boolean = false,
+            contractZeroRows: Boolean = false,
+            currentSchemaName: String? = "public",
+            tablePresent: Boolean? = true,
+            canCreate: Boolean? = true,
+            tableShapeValid: Boolean? = true,
+            allowDdlExecution: Boolean = false,
+            postVerifyPsNull: Boolean = false,
+            postVerifyRsNull: Boolean = false,
+            postVerifyZeroRows: Boolean = false,
+            postVerifySchemaName: String? = "public",
+            postVerifyTablePresent: Boolean? = true,
+            postVerifyTableShapeValid: Boolean? = true,
+            onClose: () -> Unit = {}
+        ): Connection {
+            return Proxy.newProxyInstance(
+                Connection::class.java.classLoader,
+                arrayOf(Connection::class.java)
+            ) { proxy, method, args ->
+                when (method.name) {
+                    "prepareStatement" -> {
+                        val sql = (args?.firstOrNull() as? String).orEmpty()
+                        when {
+                            sql.uppercase().contains("CREATE TABLE") -> {
+                                ddlStatementsPrepared.incrementAndGet()
+                                if (!allowDdlExecution) {
+                                    throw AssertionError("DDL must never be prepared when pre-DDL PID, schema, or table shape evidence is missing/invalid")
+                                }
+                                Proxy.newProxyInstance(
+                                    PreparedStatement::class.java.classLoader,
+                                    arrayOf(PreparedStatement::class.java)
+                                ) { _, psMethod, _ ->
+                                    when (psMethod.name) {
+                                        "setQueryTimeout", "close", "cancel" -> null
+                                        "executeUpdate" -> 0
+                                        else -> null
+                                    }
+                                } as PreparedStatement
+                            }
+                            sql.contains("pg_backend_pid") -> {
+                                if (pidPsNull) return@newProxyInstance null
+                                Proxy.newProxyInstance(
+                                    PreparedStatement::class.java.classLoader,
+                                    arrayOf(PreparedStatement::class.java)
+                                ) { _, psMethod, _ ->
+                                    when (psMethod.name) {
+                                        "setQueryTimeout", "close", "cancel" -> null
+                                        "executeQuery" -> {
+                                            if (pidRsNull) return@newProxyInstance null
+                                            val served = AtomicBoolean(false)
+                                            Proxy.newProxyInstance(
+                                                ResultSet::class.java.classLoader,
+                                                arrayOf(ResultSet::class.java)
+                                            ) { _, rsMethod, _ ->
+                                                when (rsMethod.name) {
+                                                    "next" -> if (pidZeroRows) false else served.compareAndSet(false, true)
+                                                    "getInt" -> pidValue
+                                                    "close" -> null
+                                                    else -> null
+                                                }
+                                            } as ResultSet
+                                        }
+                                        else -> null
+                                    }
+                                } as PreparedStatement
+                            }
+                            sql.uppercase().contains("SET SEARCH_PATH") -> {
+                                if (searchPathPsNull) return@newProxyInstance null
+                                Proxy.newProxyInstance(
+                                    PreparedStatement::class.java.classLoader,
+                                    arrayOf(PreparedStatement::class.java)
+                                ) { _, psMethod, _ ->
+                                    when (psMethod.name) {
+                                        "setQueryTimeout", "close", "cancel" -> null
+                                        "executeUpdate" -> 0
+                                        else -> null
+                                    }
+                                } as PreparedStatement
+                            }
+                            else -> {
+                                val isPreDdlCheck = sql.contains("can_create")
+                                if (isPreDdlCheck && contractPsNull) return@newProxyInstance null
+                                if (!isPreDdlCheck && postVerifyPsNull) return@newProxyInstance null
+                                Proxy.newProxyInstance(
+                                    PreparedStatement::class.java.classLoader,
+                                    arrayOf(PreparedStatement::class.java)
+                                ) { _, psMethod, _ ->
+                                    when (psMethod.name) {
+                                        "setQueryTimeout", "close", "cancel" -> null
+                                        "executeQuery" -> {
+                                            if (isPreDdlCheck && contractRsNull) return@newProxyInstance null
+                                            if (!isPreDdlCheck && postVerifyRsNull) return@newProxyInstance null
+                                            val served = AtomicBoolean(false)
+                                            Proxy.newProxyInstance(
+                                                ResultSet::class.java.classLoader,
+                                                arrayOf(ResultSet::class.java)
+                                            ) { _, rsMethod, rsArgs ->
+                                                when (rsMethod.name) {
+                                                    "next" -> {
+                                                        val zeroRows = if (isPreDdlCheck) contractZeroRows else postVerifyZeroRows
+                                                        if (zeroRows) false else served.compareAndSet(false, true)
+                                                    }
+                                                    "getString" -> if (isPreDdlCheck) currentSchemaName else postVerifySchemaName
+                                                    "getObject" -> when ((rsArgs?.firstOrNull() as? String).orEmpty()) {
+                                                        "table_present" -> if (isPreDdlCheck) tablePresent else postVerifyTablePresent
+                                                        "can_create" -> canCreate
+                                                        "table_shape_valid" -> if (isPreDdlCheck) tableShapeValid else postVerifyTableShapeValid
+                                                        else -> null
+                                                    }
+                                                    "close" -> null
+                                                    else -> null
+                                                }
+                                            } as ResultSet
+                                        }
+                                        else -> null
+                                    }
+                                } as PreparedStatement
+                            }
+                        }
+                    }
+                    "close" -> {
+                        onClose()
+                        null
+                    }
+                    "isWrapperFor" -> false
+                    "getAutoCommit" -> true
+                    "isReadOnly" -> false
+                    "setReadOnly", "setAutoCommit", "setNetworkTimeout", "abort" -> null
+                    "equals" -> proxy === args?.firstOrNull()
+                    "hashCode" -> System.identityHashCode(proxy)
+                    else -> null
+                }
+            } as Connection
+        }
+
+        fun dsFromFactory(factory: (Int) -> Connection): DataSource {
+            val counter = AtomicInteger(0)
+            return object : DataSource {
+                override fun getConnection(): Connection = factory(counter.incrementAndGet())
+                override fun getConnection(username: String?, password: String?): Connection = getConnection()
+                override fun getLogWriter(): PrintWriter? = null
+                override fun setLogWriter(out: PrintWriter?) {}
+                override fun setLoginTimeout(seconds: Int) {}
+                override fun getLoginTimeout(): Int = 0
+                override fun getParentLogger(): Logger = Logger.getGlobal()
+                override fun <T : Any?> unwrap(iface: Class<T>?): T = throw SQLException("Not a wrapper")
+                override fun isWrapperFor(iface: Class<*>?): Boolean = false
+            }
+        }
+
+        // 1. Missing/invalid PID evidence cases must NEVER fabricate 1001/1002 and must fail closed during readiness:
+        val invalidPidCases = listOf(
+            dsFromFactory { idx -> createConfigurableConn(pidPsNull = true, pidValue = 5000 + idx) },
+            dsFromFactory { idx -> createConfigurableConn(pidRsNull = true, pidValue = 5000 + idx) },
+            dsFromFactory { idx -> createConfigurableConn(pidZeroRows = true, pidValue = 5000 + idx) },
+            dsFromFactory { _ -> createConfigurableConn(pidValue = 0) },
+            dsFromFactory { _ -> createConfigurableConn(pidValue = -42) }
+        )
+
+        for (badPidDs in invalidPidCases) {
+            val res = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
+                args = listOf("--apply-ddl=true", "--dry-run=false", "--allow-ddl-writes=true"),
+                env = emptyMap(),
+                dataSourceOverride = badPidDs,
+                maxHeapBytesProvider = { 128L * 1024L * 1024L }
+            )
+            assertEquals(3, res.exitCode)
+            assertEquals(
+                OffProdAdditiveIdentitySchemaSetupCli.SetupOutcome.ABORTED_READINESS_FAILURE_NO_SQL,
+                res.report.outcome
+            )
+            assertNull(res.report.primaryBackendPid, "Must not fabricate fallback PID 1001 on missing/invalid PID evidence")
+            assertNull(res.report.verifyBackendPid, "Must not fabricate fallback PID 1002 on missing/invalid PID evidence")
+        }
+
+        // 2. Pre-DDL missing/invalid schema or table shape evidence cases must NEVER default to 'public' or true:
+        val invalidContractCases = listOf(
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6000 + idx, searchPathPsNull = true) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6000 + idx, contractPsNull = true) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6000 + idx, contractRsNull = true) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6000 + idx, contractZeroRows = true) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6000 + idx, currentSchemaName = null) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6000 + idx, currentSchemaName = "   ") },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6000 + idx, currentSchemaName = "shadow_schema") },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6000 + idx, tablePresent = null) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6000 + idx, canCreate = null) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6000 + idx, tablePresent = true, tableShapeValid = null) }
+        )
+
+        for (badContractDs in invalidContractCases) {
+            val res = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
+                args = listOf("--apply-ddl=true", "--dry-run=false", "--allow-ddl-writes=true"),
+                env = emptyMap(),
+                dataSourceOverride = badContractDs,
+                maxHeapBytesProvider = { 128L * 1024L * 1024L }
+            )
+            assertEquals(3, res.exitCode)
+            assertEquals(
+                OffProdAdditiveIdentitySchemaSetupCli.SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
+                res.report.outcome
+            )
+            assertEquals(
+                OffProdAdditiveIdentitySchemaSetupCli.DdlCommitStatus.NOT_STARTED_ZERO_SQL,
+                res.report.ddlCommitStatus
+            )
+            assertFalse(res.report.ddlExecutedAndVerified)
+        }
+        assertEquals(0, ddlStatementsPrepared.get(), "Expected 0 DDL statements prepared across all pre-DDL missing/invalid evidence cases")
+
+        // 2b. Post-DDL verification missing/invalid evidence cases must also fail closed (ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT, ddlExecutedAndVerified=false):
+        val invalidPostVerifyCases = listOf(
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6500 + idx, tablePresent = false, canCreate = true, allowDdlExecution = true, postVerifyPsNull = true) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6500 + idx, tablePresent = false, canCreate = true, allowDdlExecution = true, postVerifyRsNull = true) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6500 + idx, tablePresent = false, canCreate = true, allowDdlExecution = true, postVerifyZeroRows = true) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6500 + idx, tablePresent = false, canCreate = true, allowDdlExecution = true, postVerifySchemaName = null) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6500 + idx, tablePresent = false, canCreate = true, allowDdlExecution = true, postVerifySchemaName = "   ") },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6500 + idx, tablePresent = false, canCreate = true, allowDdlExecution = true, postVerifySchemaName = "shadow_schema") },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6500 + idx, tablePresent = false, canCreate = true, allowDdlExecution = true, postVerifyTablePresent = null) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6500 + idx, tablePresent = false, canCreate = true, allowDdlExecution = true, postVerifyTablePresent = false) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6500 + idx, tablePresent = false, canCreate = true, allowDdlExecution = true, postVerifyTablePresent = true, postVerifyTableShapeValid = null) },
+            dsFromFactory { idx -> createConfigurableConn(pidValue = 6500 + idx, tablePresent = false, canCreate = true, allowDdlExecution = true, postVerifyTablePresent = true, postVerifyTableShapeValid = false) }
+        )
+
+        for (badPostVerifyDs in invalidPostVerifyCases) {
+            val res = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
+                args = listOf("--apply-ddl=true", "--dry-run=false", "--allow-ddl-writes=true"),
+                env = emptyMap(),
+                dataSourceOverride = badPostVerifyDs,
+                maxHeapBytesProvider = { 128L * 1024L * 1024L }
+            )
+            assertEquals(3, res.exitCode)
+            assertEquals(
+                OffProdAdditiveIdentitySchemaSetupCli.SetupOutcome.ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT,
+                res.report.outcome
+            )
+            assertEquals(
+                OffProdAdditiveIdentitySchemaSetupCli.DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED,
+                res.report.ddlCommitStatus
+            )
+            assertFalse(res.report.ddlExecutedAndVerified)
+        }
+
+        // 3. Total wall-time budget includes awaited cleanup: when awaited cleanup pushes totalElapsed > maxTotalWallTimeMs,
+        // runSetupCli fails closed with exitCode=10 and ABORTED_TOTAL_BUDGET_EXHAUSTED:
+        var fakeClockMs = 10_000L
+        val fakeClock = object : MonotonicClock {
+            override fun nowMs(): Long = fakeClockMs
+            override fun sleepMs(ms: Long) {
+                fakeClockMs += ms
+            }
+        }
+        val cleanupOverBudgetDs = dsFromFactory { idx ->
+            createConfigurableConn(
+                pidValue = 7000 + idx,
+                tablePresent = false,
+                canCreate = true,
+                tableShapeValid = null,
+                onClose = {
+                    // Advance fake clock during awaited close() so total elapsed exceeds maxTotalWallTimeMs (3,000ms)
+                    fakeClockMs += 3_200L
+                }
+            )
+        }
+
+        val overBudgetCleanupRes = OffProdAdditiveIdentitySchemaSetupCli.runSetupCli(
+            args = listOf(
+                "--dry-run=true",
+                "--readiness-timeout-ms=2000",
+                "--sql-timeout-ms=1500",
+                "--lock-timeout-ms=1000",
+                "--cleanup-timeout-ms=1000",
+                "--max-total-wall-time-ms=3000"
+            ),
+            env = emptyMap(),
+            dataSourceOverride = cleanupOverBudgetDs,
+            monotonicClock = fakeClock,
+            maxHeapBytesProvider = { 128L * 1024L * 1024L }
+        )
+        assertEquals(10, overBudgetCleanupRes.exitCode)
+        assertEquals(
+            OffProdAdditiveIdentitySchemaSetupCli.SetupOutcome.ABORTED_TOTAL_BUDGET_EXHAUSTED,
+            overBudgetCleanupRes.report.outcome
+        )
+        assertEquals(
+            OffProdAdditiveIdentitySchemaSetupCli.SetupStage.CLEANUP,
+            overBudgetCleanupRes.report.stage
+        )
+        assertTrue(overBudgetCleanupRes.report.totalWallElapsedMs > overBudgetCleanupRes.report.totalWallBudgetMs)
     }
 }

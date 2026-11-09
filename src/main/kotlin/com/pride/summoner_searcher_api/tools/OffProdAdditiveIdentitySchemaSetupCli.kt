@@ -11,9 +11,13 @@ import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
 import java.sql.Connection
 import java.sql.PreparedStatement
+import java.sql.ResultSet
+import java.sql.SQLException
 import java.time.Instant
 import java.util.Locale
 import java.util.concurrent.Callable
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
@@ -30,32 +34,33 @@ import kotlin.system.exitProcess
  * 1. **Pre-Validation First (`0` Connections / `0` SQL on Invalid Options)**:
  *    - Validates all CLI flags, numeric/boolean types, timeout bounds (`readinessTimeoutMs in 1..10_000`,
  *      `sqlTimeoutMs in 1..2_500`, `lockTimeoutMs in 1..2_000` with `lockTimeoutMs <= sqlTimeoutMs`,
- *      `maxTotalWallTimeMs in 1..15_000` with `maxTotalWallTimeMs >= sqlTimeoutMs`), mode safety
- *      (`--apply-ddl=true` requires `--dry-run=false` and `--allow-ddl-writes=true`), standalone
- *      JVM heap ceiling (`<= 256 MiB` when enforced), and PostgreSQL JDBC target **before** constructing
- *      any [DataSource] or calling `getConnection()`.
+ *      `maxTotalWallTimeMs in 1..15_000` with `maxTotalWallTimeMs >= sqlTimeoutMs`,
+ *      `cleanupTimeoutMs in 1..5_000`), mode safety (`--apply-ddl=true` requires `--dry-run=false`
+ *      and `--allow-ddl-writes=true`), standalone JVM heap ceiling (`<= 256 MiB` when enforced),
+ *      and PostgreSQL JDBC target **before** constructing any [DataSource] or calling `getConnection()`.
  * 2. **Default Dry-Run Zero DDL (`--dry-run=true --apply-ddl=false`)**:
- *    - Opens a single read-only connection (`conn.isReadOnly = true`) during Readiness (`<= 10s`) and
- *      executes only a read-only schema/privilege check within the `<= 2,500ms` SQL fence (`0` DDL statements).
- * 3. **Bounded Connection Readiness (`<= 10,000ms`) Separated from Unchanged `<= 2,500ms` SQL/Lock Fence,
- *    Sharing `<= 15,000ms` Total Process Budget**:
- *    - Stage 1 (`CONNECTION_READINESS`, `<= 10,000ms`) pre-warms the JDBC connection(s) (in `--apply-ddl=true`
- *      mode: both `ddlConn` and a separate `verifyConn !== ddlConn` for post-commit verification) so that
- *      WAN TCP + TLS + SCRAM-SHA-256 authentication happens before the `2,500ms` SQL/lock clock starts.
- *    - If Stage 1 times out or is cancelled, any late-acquired connection is closed/aborted immediately
- *      without preparing or executing any SQL (`0` SQL statements executed, `NOT_STARTED_ZERO_SQL`).
- *    - Stage 2 (`SQL_AND_VERIFICATION`, `<= 2,500ms` and `<= remainingTotalWallTimeMs`) enforces a fresh
- *      `2,500ms` SQL/lock deadline (`lock_timeout <= 2,000ms`, `statement_timeout <= 2,500ms`) with strict
- *      cancellation/deadline fences before `prepareStatement`, before/after `setQueryTimeout`, and
- *      **DIRECTLY BEFORE** every `executeQuery()`, `executeUpdate()`, and `commit()` call.
- * 4. **Conservative `unknown_commit` Reporting & Secret Redaction**:
- *    - If a deadline or lock timeout occurs **before** `ddlPs.executeUpdate()` is invoked, reports
- *      `DdlCommitStatus.NOT_STARTED_ZERO_SQL`.
- *    - If a timeout, lock error, or verification failure occurs **after** `ddlPs.executeUpdate()` is
- *      invoked (or before separate-connection post-commit verification `SELECT to_regclass(...)` completes),
- *      reports `DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED` so the operator can recheck with
- *      `--dry-run=true`.
- *    - Scrubs passwords, URL credentials, and tokens from all error messages and JSON reports.
+ *    - Opens a single read-only connection (`conn.isReadOnly = true`) during Readiness (`<= 10s`),
+ *      verifies its physical backend PID (`SELECT pg_backend_pid()`), binds `SET search_path = public, pg_catalog`,
+ *      and executes only a read-only schema/contract/privilege check within the `<= 2,500ms` SQL fence (`0` DDL statements).
+ * 3. **Bounded Connection Readiness (`<= 10,000ms`) with Unconditional Physical PID Separation**:
+ *    - Stage 1 (`CONNECTION_READINESS`, `<= 10,000ms`) pre-warms the JDBC connection(s).
+ *    - When `--apply-ddl=true`, unconditionally enforces `verifyConn !== primaryConn`, distinct unwrapped
+ *      physical [PGConnection] instances (when supported), AND distinct PostgreSQL backend PIDs
+ *      (`primaryBackendPid != verifyBackendPid` via `SELECT pg_backend_pid()`) **before** any DDL is prepared or executed.
+ *    - If Stage 1 times out, fails, or returns connections sharing the same physical backend PID,
+ *      connections are closed with bounded await and `0` DDL statements are executed (`NOT_STARTED_ZERO_SQL`).
+ * 4. **Trusted Fixed `search_path` (`public, pg_catalog`) & Full Table Shape Contract Validation**:
+ *    - Explicitly executes `SET search_path = public, pg_catalog` on `primaryConn` and `verifyConn` and
+ *      verifies `current_schema() = 'public'` before pre-check, before unqualified `CREATE TABLE IF NOT EXISTS`,
+ *      and before post-commit verification, preventing `search_path` shadowing.
+ *    - Validates the full `public.player_riot_identities` schema contract (exact 5 columns, exact types/lengths,
+ *      `NOT NULL` on all 5 columns, `PRIMARY KEY (puuid)`, and `chk_player_riot_identities_nonblank`
+ *      `BTRIM(game_name) <> '' AND BTRIM(tag_line) <> ''`), failing closed (`ABORTED_EXISTING_TABLE_INCOMPATIBLE_SCHEMA`
+ *      or `ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT`) if an existing table in `public` has an incompatible shape.
+ * 5. **Bounded Awaited Connection Cleanup & Truthful Cleanup Status Reporting**:
+ *    - Awaits connection `close()`/`abort()` in `finally` up to `cleanupTimeoutMs` so standalone `exitProcess`
+ *      never terminates before close completes, and reports `connectionsClosedCleanly`, `cleanupTimedOut`,
+ *      and `cleanupElapsedMs` in [SetupExecutionReport].
  */
 object OffProdAdditiveIdentitySchemaSetupCli {
 
@@ -71,6 +76,9 @@ object OffProdAdditiveIdentitySchemaSetupCli {
     const val MAX_TOTAL_WALL_TIME_MS: Long = 15_000L
     const val DEFAULT_TOTAL_WALL_TIME_MS: Long = 15_000L
 
+    const val MAX_CLEANUP_TIMEOUT_MS: Long = 5_000L
+    const val DEFAULT_CLEANUP_TIMEOUT_MS: Long = 1_000L
+
     const val MAX_STANDALONE_JVM_HEAP_BYTES: Long = 256L * 1024L * 1024L
 
     val ALLOWED_FLAGS: Set<String> = setOf(
@@ -81,6 +89,7 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         "sql-timeout-ms",
         "lock-timeout-ms",
         "max-total-wall-time-ms",
+        "cleanup-timeout-ms",
         "enforce-max-heap-256m",
         "jdbc-url",
         "db-host",
@@ -91,19 +100,178 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         "output-report-file"
     )
 
+    const val SQL_SELECT_BACKEND_PID: String = "SELECT pg_backend_pid() AS backend_pid"
+
+    const val SQL_SET_TRUSTED_SEARCH_PATH: String = "SET search_path = public, pg_catalog"
+
     const val SQL_CHECK_TABLE_AND_CREATE_PRIVILEGE: String = """
-        SELECT to_regclass('public.player_riot_identities') IS NOT NULL AS table_present,
-               has_schema_privilege(current_user, 'public', 'CREATE') AS can_create
+        SELECT
+            to_regclass('public.player_riot_identities') IS NOT NULL AS table_present,
+            has_schema_privilege(current_user, 'public', 'CREATE') AS can_create,
+            current_schema() AS current_schema_name,
+            CASE
+                WHEN to_regclass('public.player_riot_identities') IS NULL THEN false
+                ELSE (
+                    (SELECT COUNT(*) FROM pg_catalog.pg_attribute
+                      WHERE attrelid = to_regclass('public.player_riot_identities')
+                        AND attnum > 0
+                        AND NOT attisdropped) = 5
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_attribute
+                         WHERE attrelid = to_regclass('public.player_riot_identities')
+                           AND attname = 'puuid'
+                           AND NOT attisdropped
+                           AND attnotnull = true
+                           AND pg_catalog.format_type(atttypid, atttypmod) = 'character varying(78)'
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_attribute
+                         WHERE attrelid = to_regclass('public.player_riot_identities')
+                           AND attname = 'platform_region'
+                           AND NOT attisdropped
+                           AND attnotnull = true
+                           AND pg_catalog.format_type(atttypid, atttypmod) = 'character varying(16)'
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_attribute
+                         WHERE attrelid = to_regclass('public.player_riot_identities')
+                           AND attname = 'game_name'
+                           AND NOT attisdropped
+                           AND attnotnull = true
+                           AND pg_catalog.format_type(atttypid, atttypmod) = 'character varying(255)'
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_attribute
+                         WHERE attrelid = to_regclass('public.player_riot_identities')
+                           AND attname = 'tag_line'
+                           AND NOT attisdropped
+                           AND attnotnull = true
+                           AND pg_catalog.format_type(atttypid, atttypmod) = 'character varying(255)'
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_attribute
+                         WHERE attrelid = to_regclass('public.player_riot_identities')
+                           AND attname = 'verified_at'
+                           AND NOT attisdropped
+                           AND attnotnull = true
+                           AND pg_catalog.format_type(atttypid, atttypmod) = 'timestamp with time zone'
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_constraint c
+                         WHERE c.conrelid = to_regclass('public.player_riot_identities')
+                           AND c.contype = 'p'
+                           AND c.convalidated = true
+                           AND c.conkey = ARRAY[
+                               (SELECT a.attnum FROM pg_catalog.pg_attribute a
+                                 WHERE a.attrelid = to_regclass('public.player_riot_identities')
+                                   AND a.attname = 'puuid'
+                                   AND NOT a.attisdropped)
+                           ]
+                    )
+                    AND (
+                        SELECT COUNT(*) FROM pg_catalog.pg_constraint c
+                         WHERE c.conrelid = to_regclass('public.player_riot_identities')
+                           AND c.contype = 'c'
+                    ) = 1
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_constraint c
+                         WHERE c.conrelid = to_regclass('public.player_riot_identities')
+                           AND c.contype = 'c'
+                           AND c.conname = 'chk_player_riot_identities_nonblank'
+                           AND c.convalidated = true
+                           AND regexp_replace(lower(pg_catalog.pg_get_constraintdef(c.oid, true)), '[\s()]', '', 'g') =
+                               'checkbtrimgame_name::text<>''''::textandbtrimtag_line::text<>''''::text'
+                    )
+                )
+            END AS table_shape_valid
     """
 
     const val SQL_VERIFY_TABLE_PRESENT: String = """
-        SELECT to_regclass('public.player_riot_identities') IS NOT NULL AS table_present
+        SELECT
+            to_regclass('public.player_riot_identities') IS NOT NULL AS table_present,
+            current_schema() AS current_schema_name,
+            CASE
+                WHEN to_regclass('public.player_riot_identities') IS NULL THEN false
+                ELSE (
+                    (SELECT COUNT(*) FROM pg_catalog.pg_attribute
+                      WHERE attrelid = to_regclass('public.player_riot_identities')
+                        AND attnum > 0
+                        AND NOT attisdropped) = 5
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_attribute
+                         WHERE attrelid = to_regclass('public.player_riot_identities')
+                           AND attname = 'puuid'
+                           AND NOT attisdropped
+                           AND attnotnull = true
+                           AND pg_catalog.format_type(atttypid, atttypmod) = 'character varying(78)'
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_attribute
+                         WHERE attrelid = to_regclass('public.player_riot_identities')
+                           AND attname = 'platform_region'
+                           AND NOT attisdropped
+                           AND attnotnull = true
+                           AND pg_catalog.format_type(atttypid, atttypmod) = 'character varying(16)'
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_attribute
+                         WHERE attrelid = to_regclass('public.player_riot_identities')
+                           AND attname = 'game_name'
+                           AND NOT attisdropped
+                           AND attnotnull = true
+                           AND pg_catalog.format_type(atttypid, atttypmod) = 'character varying(255)'
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_attribute
+                         WHERE attrelid = to_regclass('public.player_riot_identities')
+                           AND attname = 'tag_line'
+                           AND NOT attisdropped
+                           AND attnotnull = true
+                           AND pg_catalog.format_type(atttypid, atttypmod) = 'character varying(255)'
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_attribute
+                         WHERE attrelid = to_regclass('public.player_riot_identities')
+                           AND attname = 'verified_at'
+                           AND NOT attisdropped
+                           AND attnotnull = true
+                           AND pg_catalog.format_type(atttypid, atttypmod) = 'timestamp with time zone'
+                    )
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_constraint c
+                         WHERE c.conrelid = to_regclass('public.player_riot_identities')
+                           AND c.contype = 'p'
+                           AND c.convalidated = true
+                           AND c.conkey = ARRAY[
+                               (SELECT a.attnum FROM pg_catalog.pg_attribute a
+                                 WHERE a.attrelid = to_regclass('public.player_riot_identities')
+                                   AND a.attname = 'puuid'
+                                   AND NOT a.attisdropped)
+                           ]
+                    )
+                    AND (
+                        SELECT COUNT(*) FROM pg_catalog.pg_constraint c
+                         WHERE c.conrelid = to_regclass('public.player_riot_identities')
+                           AND c.contype = 'c'
+                    ) = 1
+                    AND EXISTS (
+                        SELECT 1 FROM pg_catalog.pg_constraint c
+                         WHERE c.conrelid = to_regclass('public.player_riot_identities')
+                           AND c.contype = 'c'
+                           AND c.conname = 'chk_player_riot_identities_nonblank'
+                           AND c.convalidated = true
+                           AND regexp_replace(lower(pg_catalog.pg_get_constraintdef(c.oid, true)), '[\s()]', '', 'g') =
+                               'checkbtrimgame_name::text<>''''::textandbtrimtag_line::text<>''''::text'
+                    )
+                )
+            END AS table_shape_valid
     """
 
     enum class SetupStage {
         OPTION_VALIDATION,
         CONNECTION_READINESS,
         SQL_AND_VERIFICATION,
+        CLEANUP,
         COMPLETED
     }
 
@@ -113,9 +281,11 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         ABORTED_INVALID_OPTIONS,
         ABORTED_READINESS_FAILURE_NO_SQL,
         ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
+        ABORTED_EXISTING_TABLE_INCOMPATIBLE_SCHEMA,
         ABORTED_SQL_LOCK_OR_DEADLINE_UNKNOWN_COMMIT,
         ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT,
-        ABORTED_TOTAL_BUDGET_EXHAUSTED
+        ABORTED_TOTAL_BUDGET_EXHAUSTED,
+        ABORTED_CLEANUP_FAILED_OR_TIMED_OUT
     }
 
     enum class DdlCommitStatus {
@@ -132,6 +302,7 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         val sqlTimeoutMs: Long = DEFAULT_SQL_TIMEOUT_MS,
         val lockTimeoutMs: Long = DEFAULT_LOCK_TIMEOUT_MS,
         val maxTotalWallTimeMs: Long = DEFAULT_TOTAL_WALL_TIME_MS,
+        val cleanupTimeoutMs: Long = DEFAULT_CLEANUP_TIMEOUT_MS,
         val enforceMaxHeap256m: Boolean = true
     ) {
         init {
@@ -152,6 +323,9 @@ object OffProdAdditiveIdentitySchemaSetupCli {
             }
             require(maxTotalWallTimeMs >= sqlTimeoutMs) {
                 "maxTotalWallTimeMs ($maxTotalWallTimeMs) must be >= sqlTimeoutMs ($sqlTimeoutMs)"
+            }
+            require(cleanupTimeoutMs in 1L..MAX_CLEANUP_TIMEOUT_MS) {
+                "cleanupTimeoutMs ($cleanupTimeoutMs) must be in 1..$MAX_CLEANUP_TIMEOUT_MS"
             }
             if (applyDdl) {
                 require(!dryRun && allowDdlWrites) {
@@ -174,9 +348,16 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         val dryRun: Boolean = true,
         val applyDdlRequested: Boolean = false,
         val ddlExecutedAndVerified: Boolean = false,
+        val primaryBackendPid: Int? = null,
+        val verifyBackendPid: Int? = null,
+        val searchPathBoundToPublic: Boolean? = null,
         val tablePresentBefore: Boolean? = null,
         val tablePresentAfter: Boolean? = null,
+        val tableShapeValid: Boolean? = null,
         val hasCreatePrivilege: Boolean? = null,
+        val connectionsClosedCleanly: Boolean = true,
+        val cleanupTimedOut: Boolean = false,
+        val cleanupElapsedMs: Long = 0L,
         val migrationResourcePath: String = JdbcIdentityCompletionPersistenceAdapter.MIGRATION_RESOURCE_PATH,
         val readinessBudgetMs: Long = 0L,
         val readinessElapsedMs: Long = 0L,
@@ -198,6 +379,13 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         val outputReportPath: String?
     )
 
+    internal data class CleanupStatus(
+        val connectionsClosedCleanly: Boolean,
+        val cleanupTimedOut: Boolean,
+        val cleanupElapsedMs: Long,
+        val cleanupError: String? = null
+    )
+
     private val objectMapper: ObjectMapper = ObjectMapper()
         .findAndRegisterModules()
         .disable(SerializationFeature.WRITE_DATES_AS_TIMESTAMPS)
@@ -209,13 +397,16 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         if (result.exitCode != 0) {
             System.err.println(
                 "[OffProdAdditiveIdentitySchemaSetupCli] ERROR (exit=${result.exitCode}, stage=${result.report.stage}, " +
-                    "outcome=${result.report.outcome}, commitStatus=${result.report.ddlCommitStatus}): ${result.report.sanitizedDetail}"
+                    "outcome=${result.report.outcome}, commitStatus=${result.report.ddlCommitStatus}, " +
+                    "closedCleanly=${result.report.connectionsClosedCleanly}): ${result.report.sanitizedDetail}"
             )
         } else {
             println(
                 "[OffProdAdditiveIdentitySchemaSetupCli] OK: outcome=${result.report.outcome}, " +
-                    "commitStatus=${result.report.ddlCommitStatus}, tablePresentBefore=${result.report.tablePresentBefore}, " +
-                    "tablePresentAfter=${result.report.tablePresentAfter}, readinessElapsedMs=${result.report.readinessElapsedMs}, " +
+                    "commitStatus=${result.report.ddlCommitStatus}, primaryPid=${result.report.primaryBackendPid}, " +
+                    "verifyPid=${result.report.verifyBackendPid}, tablePresentBefore=${result.report.tablePresentBefore}, " +
+                    "tablePresentAfter=${result.report.tablePresentAfter}, tableShapeValid=${result.report.tableShapeValid}, " +
+                    "closedCleanly=${result.report.connectionsClosedCleanly}, readinessElapsedMs=${result.report.readinessElapsedMs}, " +
                     "sqlElapsedMs=${result.report.sqlElapsedMs}, totalElapsedMs=${result.report.totalWallElapsedMs}"
             )
         }
@@ -316,13 +507,8 @@ object OffProdAdditiveIdentitySchemaSetupCli {
             val sqlTimeoutMs = parseLongFlag(flags, "sql-timeout-ms", DEFAULT_SQL_TIMEOUT_MS)
             val lockTimeoutMs = parseLongFlag(flags, "lock-timeout-ms", DEFAULT_LOCK_TIMEOUT_MS)
             val maxTotalWallTimeMs = parseLongFlag(flags, "max-total-wall-time-ms", DEFAULT_TOTAL_WALL_TIME_MS)
+            val cleanupTimeoutMs = parseLongFlag(flags, "cleanup-timeout-ms", DEFAULT_CLEANUP_TIMEOUT_MS)
             val enforceMaxHeap256m = parseBooleanFlag(flags, "enforce-max-heap-256m", true)
-
-            if (enforceMaxHeap256m && maxHeapBytes > MAX_STANDALONE_JVM_HEAP_BYTES) {
-                throw IllegalArgumentException(
-                    "Standalone JVM max heap ($maxHeapBytes bytes) exceeds 256 MiB cap ($MAX_STANDALONE_JVM_HEAP_BYTES bytes); run with -Xmx256m or lower"
-                )
-            }
 
             SetupOptions(
                 dryRun = dryRun,
@@ -332,11 +518,12 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                 sqlTimeoutMs = sqlTimeoutMs,
                 lockTimeoutMs = lockTimeoutMs,
                 maxTotalWallTimeMs = maxTotalWallTimeMs,
+                cleanupTimeoutMs = cleanupTimeoutMs,
                 enforceMaxHeap256m = enforceMaxHeap256m
             )
         } catch (e: IllegalArgumentException) {
             return buildInvalidOptionsResult(
-                errorMessage = sanitizeErrorMessage("Invalid CLI options: ${e.message}", candidateSecrets),
+                errorMessage = "Invalid CLI options: ${sanitizeErrorMessage(e.message, candidateSecrets)}",
                 outputReportFile = outputReportFile,
                 processStartMonoMs = processStartMonoMs,
                 monotonicClock = monotonicClock,
@@ -346,12 +533,24 @@ object OffProdAdditiveIdentitySchemaSetupCli {
             )
         }
 
-        // Validate exact reviewed migration SQL resource BEFORE creating any DataSource or opening any connection
+        if (options.enforceMaxHeap256m && maxHeapBytes > MAX_STANDALONE_JVM_HEAP_BYTES) {
+            return buildInvalidOptionsResult(
+                errorMessage = "Standalone JVM max heap ($maxHeapBytes bytes) exceeds 256 MiB ($MAX_STANDALONE_JVM_HEAP_BYTES bytes) cap; pass -Xmx128m or -Xmx256m",
+                outputReportFile = outputReportFile,
+                processStartMonoMs = processStartMonoMs,
+                monotonicClock = monotonicClock,
+                wallClock = wallClock,
+                maxHeapBytes = maxHeapBytes,
+                peakUsedHeapBytes = peakUsedHeapBytes,
+                options = options
+            )
+        }
+
         val validatedDdlSql = try {
             loadAndValidateExactAdditiveMigrationDdl()
         } catch (e: Exception) {
             return buildInvalidOptionsResult(
-                errorMessage = sanitizeErrorMessage("Invalid migration resource: ${e.message}", candidateSecrets),
+                errorMessage = "Failed to validate reviewed migration SQL resource: ${sanitizeErrorMessage(e.message, candidateSecrets)}",
                 outputReportFile = outputReportFile,
                 processStartMonoMs = processStartMonoMs,
                 monotonicClock = monotonicClock,
@@ -362,12 +561,11 @@ object OffProdAdditiveIdentitySchemaSetupCli {
             )
         }
 
-        // Validate JDBC configuration BEFORE any connection attempt
         val dataSource = try {
             dataSourceOverride ?: buildValidatedDataSourceFromFlagsOrEnv(flags, env, options, candidateSecrets)
         } catch (e: Exception) {
             return buildInvalidOptionsResult(
-                errorMessage = sanitizeErrorMessage("Invalid JDBC configuration: ${e.message}", candidateSecrets),
+                errorMessage = "Failed to configure PostgreSQL DataSource: ${sanitizeErrorMessage(e.message, candidateSecrets)}",
                 outputReportFile = outputReportFile,
                 processStartMonoMs = processStartMonoMs,
                 monotonicClock = monotonicClock,
@@ -378,11 +576,16 @@ object OffProdAdditiveIdentitySchemaSetupCli {
             )
         }
 
+        val totalDeadlineNano = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(options.maxTotalWallTimeMs)
         fun totalElapsedMs(): Long = (monotonicClock.nowMs() - processStartMonoMs).coerceAtLeast(0L)
-        fun remainingTotalBudgetMs(): Long = options.maxTotalWallTimeMs - totalElapsedMs()
+        fun remainingTotalBudgetMs(): Long {
+            val remMono = options.maxTotalWallTimeMs - totalElapsedMs()
+            val remNano = TimeUnit.NANOSECONDS.toMillis(totalDeadlineNano - System.nanoTime())
+            return minOf(remMono, remNano)
+        }
 
         // =========================================================================
-        // STAGE 1: Bounded Connection Readiness (<= 10,000ms, separated from SQL)
+        // STAGE 1: Bounded Connection Readiness (<= 10,000ms) + Physical PID Check
         // =========================================================================
         val readinessStartMonoMs = monotonicClock.nowMs()
         val effectiveReadinessBudgetMs = minOf(options.readinessTimeoutMs, remainingTotalBudgetMs()).coerceAtLeast(0L)
@@ -395,9 +598,6 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                 dryRun = options.dryRun,
                 applyDdlRequested = options.applyDdl,
                 ddlExecutedAndVerified = false,
-                tablePresentBefore = null,
-                tablePresentAfter = null,
-                hasCreatePrivilege = null,
                 migrationResourcePath = JdbcIdentityCompletionPersistenceAdapter.MIGRATION_RESOURCE_PATH,
                 readinessBudgetMs = 0L,
                 readinessElapsedMs = 0L,
@@ -420,6 +620,7 @@ object OffProdAdditiveIdentitySchemaSetupCli {
             dataSource = dataSource,
             needSeparateWriteAndVerify = options.applyDdl,
             readinessTimeoutMs = effectiveReadinessBudgetMs,
+            cleanupTimeoutMs = options.cleanupTimeoutMs,
             monotonicClock = monotonicClock,
             secretsToRedact = candidateSecrets
         )
@@ -442,9 +643,11 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                 dryRun = options.dryRun,
                 applyDdlRequested = options.applyDdl,
                 ddlExecutedAndVerified = false,
-                tablePresentBefore = null,
-                tablePresentAfter = null,
-                hasCreatePrivilege = null,
+                primaryBackendPid = readinessResult.primaryBackendPid,
+                verifyBackendPid = readinessResult.verifyBackendPid,
+                connectionsClosedCleanly = readinessResult.cleanupStatus.connectionsClosedCleanly,
+                cleanupTimedOut = readinessResult.cleanupStatus.cleanupTimedOut,
+                cleanupElapsedMs = readinessResult.cleanupStatus.cleanupElapsedMs,
                 migrationResourcePath = JdbcIdentityCompletionPersistenceAdapter.MIGRATION_RESOURCE_PATH,
                 readinessBudgetMs = effectiveReadinessBudgetMs,
                 readinessElapsedMs = readinessElapsedMs,
@@ -468,7 +671,14 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         // Check shared total wall-time budget before entering Stage 2 (SQL & Verification)
         val remainingBeforeSqlMs = remainingTotalBudgetMs()
         if (remainingBeforeSqlMs <= 0L) {
-            triggerNonBlockingConnectionClose(readyConns.primaryConn, readyConns.verifyConn, readyConns.netTimeoutExec)
+            val cleanupStatus = closeConnectionsBounded(
+                c1 = readyConns.primaryConn,
+                c2 = readyConns.verifyConn,
+                netTimeoutExec = readyConns.netTimeoutExec,
+                awaitTimeoutMs = options.cleanupTimeoutMs,
+                monotonicClock = monotonicClock,
+                forceAbortFirst = false
+            )
             val totalElapsed = totalElapsedMs()
             val report = SetupExecutionReport(
                 outcome = SetupOutcome.ABORTED_TOTAL_BUDGET_EXHAUSTED,
@@ -477,9 +687,11 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                 dryRun = options.dryRun,
                 applyDdlRequested = options.applyDdl,
                 ddlExecutedAndVerified = false,
-                tablePresentBefore = null,
-                tablePresentAfter = null,
-                hasCreatePrivilege = null,
+                primaryBackendPid = readyConns.primaryBackendPid,
+                verifyBackendPid = readyConns.verifyBackendPid,
+                connectionsClosedCleanly = cleanupStatus.connectionsClosedCleanly,
+                cleanupTimedOut = cleanupStatus.cleanupTimedOut,
+                cleanupElapsedMs = cleanupStatus.cleanupElapsedMs,
                 migrationResourcePath = JdbcIdentityCompletionPersistenceAdapter.MIGRATION_RESOURCE_PATH,
                 readinessBudgetMs = effectiveReadinessBudgetMs,
                 readinessElapsedMs = readinessElapsedMs,
@@ -491,7 +703,7 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                 jvmMaxHeapBytes = maxHeapBytes,
                 jvmUsedHeapBytesPeak = peakUsedHeapBytes,
                 recheckCommandHint = null,
-                sanitizedDetail = "Shared total wall-time budget (${options.maxTotalWallTimeMs}ms) exhausted after readiness stage before SQL execution (0 SQL executed)",
+                sanitizedDetail = "Shared total wall-time budget (${options.maxTotalWallTimeMs}ms) exhausted after readiness stage before SQL execution (0 DDL executed)",
                 completedAtUtc = wallClock.nowInstant()
             )
             val savedPath = writeReportBestEffort(outputReportFile, report)
@@ -501,10 +713,13 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         // =========================================================================
         // STAGE 2: Unchanged <= 2,500ms SQL / Lock Fence & Verification Stage
         // =========================================================================
-        val effectiveSqlBudgetMs = minOf(options.sqlTimeoutMs, remainingBeforeSqlMs).coerceAtLeast(1L)
+        val sqlStageAvailableFromTotalMs = (remainingBeforeSqlMs - options.cleanupTimeoutMs).coerceAtLeast(1L)
+        val effectiveSqlBudgetMs = minOf(options.sqlTimeoutMs, sqlStageAvailableFromTotalMs).coerceAtLeast(1L)
         val sqlStartMonoMs = monotonicClock.nowMs()
+        val sqlEndMonoRef = AtomicReference<Long>(sqlStartMonoMs)
+        var cleanupStatus = CleanupStatus(connectionsClosedCleanly = true, cleanupTimedOut = false, cleanupElapsedMs = 0L)
         val sqlStageOutcome = try {
-            executeSqlStageBounded(
+            val outcome = executeSqlStageBounded(
                 readyConns = readyConns,
                 options = options,
                 effectiveSqlBudgetMs = effectiveSqlBudgetMs,
@@ -512,31 +727,76 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                 monotonicClock = monotonicClock,
                 secretsToRedact = candidateSecrets
             )
+            sqlEndMonoRef.set(monotonicClock.nowMs())
+            outcome
         } finally {
-            triggerNonBlockingConnectionClose(readyConns.primaryConn, readyConns.verifyConn, readyConns.netTimeoutExec)
+            if (sqlEndMonoRef.get() == sqlStartMonoMs) {
+                sqlEndMonoRef.set(monotonicClock.nowMs())
+            }
+            cleanupStatus = closeConnectionsBounded(
+                c1 = readyConns.primaryConn,
+                c2 = readyConns.verifyConn,
+                netTimeoutExec = readyConns.netTimeoutExec,
+                awaitTimeoutMs = options.cleanupTimeoutMs,
+                monotonicClock = monotonicClock,
+                forceAbortFirst = false,
+                secretsToRedact = candidateSecrets
+            )
         }
         sampleHeap()
-        val sqlEndMonoMs = monotonicClock.nowMs()
-        val sqlElapsedMs = (sqlEndMonoMs - sqlStartMonoMs).coerceAtLeast(0L)
+        val sqlElapsedMs = (sqlEndMonoRef.get() - sqlStartMonoMs).coerceAtLeast(0L)
         val totalElapsed = totalElapsedMs()
+        val totalCeilingExceededAfterCleanup = totalElapsed > options.maxTotalWallTimeMs
+
+        val finalExitCode: Int
+        val finalOutcome: SetupOutcome
+        val finalStage: SetupStage
+        val rawFinalDetail: String
+        if (sqlStageOutcome.exitCode == 0 && !cleanupStatus.connectionsClosedCleanly) {
+            finalExitCode = 3
+            finalOutcome = SetupOutcome.ABORTED_CLEANUP_FAILED_OR_TIMED_OUT
+            finalStage = SetupStage.CLEANUP
+            rawFinalDetail = "${sqlStageOutcome.sanitizedDetail}; however connection cleanup failed or timed out: ${cleanupStatus.cleanupError ?: "cleanup did not complete cleanly"}"
+        } else if (sqlStageOutcome.exitCode == 0 && totalCeilingExceededAfterCleanup) {
+            finalExitCode = 10
+            finalOutcome = SetupOutcome.ABORTED_TOTAL_BUDGET_EXHAUSTED
+            finalStage = SetupStage.CLEANUP
+            rawFinalDetail = "${sqlStageOutcome.sanitizedDetail}; however total wall-time including awaited cleanup (${totalElapsed}ms) exceeded shared total budget (${options.maxTotalWallTimeMs}ms)"
+        } else {
+            finalExitCode = sqlStageOutcome.exitCode
+            finalOutcome = sqlStageOutcome.outcome
+            finalStage = if (sqlStageOutcome.exitCode == 0) SetupStage.COMPLETED else SetupStage.SQL_AND_VERIFICATION
+            rawFinalDetail = if (!cleanupStatus.connectionsClosedCleanly && cleanupStatus.cleanupError != null) {
+                "${sqlStageOutcome.sanitizedDetail} (cleanup warning: ${cleanupStatus.cleanupError})"
+            } else {
+                sqlStageOutcome.sanitizedDetail
+            }
+        }
+        val finalDetail = sanitizeErrorMessage(rawFinalDetail, candidateSecrets)
 
         val recheckHint = if (sqlStageOutcome.ddlCommitStatus == DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED) {
-            "Run OffProdAdditiveIdentitySchemaSetupCli with --dry-run=true --apply-ddl=false to recheck whether public.player_riot_identities committed"
+            "Run OffProdAdditiveIdentitySchemaSetupCli with --dry-run=true --apply-ddl=false to recheck whether public.player_riot_identities committed with valid schema"
         } else {
             null
         }
 
-        val finalStage = if (sqlStageOutcome.exitCode == 0) SetupStage.COMPLETED else SetupStage.SQL_AND_VERIFICATION
         val report = SetupExecutionReport(
-            outcome = sqlStageOutcome.outcome,
+            outcome = finalOutcome,
             stage = finalStage,
             ddlCommitStatus = sqlStageOutcome.ddlCommitStatus,
             dryRun = options.dryRun,
             applyDdlRequested = options.applyDdl,
-            ddlExecutedAndVerified = sqlStageOutcome.ddlExecutedAndVerified,
+            ddlExecutedAndVerified = sqlStageOutcome.ddlExecutedAndVerified && cleanupStatus.connectionsClosedCleanly && !totalCeilingExceededAfterCleanup,
+            primaryBackendPid = readyConns.primaryBackendPid,
+            verifyBackendPid = readyConns.verifyBackendPid,
+            searchPathBoundToPublic = sqlStageOutcome.searchPathBoundToPublic,
             tablePresentBefore = sqlStageOutcome.tablePresentBefore,
             tablePresentAfter = sqlStageOutcome.tablePresentAfter,
+            tableShapeValid = sqlStageOutcome.tableShapeValid,
             hasCreatePrivilege = sqlStageOutcome.hasCreatePrivilege,
+            connectionsClosedCleanly = cleanupStatus.connectionsClosedCleanly,
+            cleanupTimedOut = cleanupStatus.cleanupTimedOut,
+            cleanupElapsedMs = cleanupStatus.cleanupElapsedMs,
             migrationResourcePath = JdbcIdentityCompletionPersistenceAdapter.MIGRATION_RESOURCE_PATH,
             readinessBudgetMs = effectiveReadinessBudgetMs,
             readinessElapsedMs = readinessElapsedMs,
@@ -548,12 +808,12 @@ object OffProdAdditiveIdentitySchemaSetupCli {
             jvmMaxHeapBytes = maxHeapBytes,
             jvmUsedHeapBytesPeak = peakUsedHeapBytes,
             recheckCommandHint = recheckHint,
-            sanitizedDetail = sqlStageOutcome.sanitizedDetail,
+            sanitizedDetail = finalDetail,
             completedAtUtc = wallClock.nowInstant()
         )
         val savedPath = writeReportBestEffort(outputReportFile, report)
         return SetupCliResult(
-            exitCode = sqlStageOutcome.exitCode,
+            exitCode = finalExitCode,
             report = report,
             outputReportPath = savedPath
         )
@@ -563,24 +823,141 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         data class Success(
             val primaryConn: Connection,
             val verifyConn: Connection?,
+            val primaryBackendPid: Int,
+            val verifyBackendPid: Int?,
             val primaryConnWasAutoCommit: Boolean,
-            val netTimeoutExec: java.util.concurrent.ExecutorService
+            val netTimeoutExec: ExecutorService
         ) : ReadinessOutcome()
 
         data class Failure(
-            val sanitizedReason: String
+            val sanitizedReason: String,
+            val primaryBackendPid: Int? = null,
+            val verifyBackendPid: Int? = null,
+            val cleanupStatus: CleanupStatus = CleanupStatus(
+                connectionsClosedCleanly = true,
+                cleanupTimedOut = false,
+                cleanupElapsedMs = 0L
+            )
         ) : ReadinessOutcome()
+    }
+
+    internal fun queryBackendPidBounded(
+        conn: Connection,
+        remainingMsProvider: () -> Long,
+        isCancelledProvider: () -> Boolean
+    ): Int {
+        if (isCancelledProvider() || remainingMsProvider() <= 0L) {
+            throw TimeoutException("Readiness deadline expired before SELECT pg_backend_pid()")
+        }
+        val pgWrapperPid = runCatching {
+            if (conn.isWrapperFor(PGConnection::class.java)) {
+                conn.unwrap(PGConnection::class.java).backendPID
+            } else {
+                0
+            }
+        }.getOrDefault(0)
+
+        val stmt = conn.prepareStatement(SQL_SELECT_BACKEND_PID)
+            ?: throw SQLException("SELECT pg_backend_pid() failed: prepareStatement returned null (failing closed on unverifiable PID)")
+        stmt.use { ps ->
+            val remMs = remainingMsProvider()
+            if (remMs <= 0L || isCancelledProvider()) {
+                throw TimeoutException("Readiness deadline expired before pg_backend_pid() setQueryTimeout")
+            }
+            ps.queryTimeout = ceil(remMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
+            if (remainingMsProvider() <= 0L || isCancelledProvider()) {
+                throw TimeoutException("Readiness deadline expired directly before pg_backend_pid() executeQuery")
+            }
+            val rs = ps.executeQuery()
+                ?: throw SQLException("SELECT pg_backend_pid() failed: executeQuery returned null (failing closed on unverifiable PID)")
+            rs.use {
+                val hasRow = runCatching { rs.next() }.getOrElse { ex ->
+                    if (ex is SQLException) throw ex else false
+                }
+                if (!hasRow) {
+                    throw SQLException("SELECT pg_backend_pid() failed: ResultSet returned 0 rows (failing closed on unverifiable PID)")
+                }
+                val byName = runCatching { rs.getInt("backend_pid") }.getOrElse { ex ->
+                    if (ex is SQLException) throw ex else 0
+                }
+                val queriedPid = if (byName > 0) {
+                    byName
+                } else {
+                    runCatching { rs.getInt(1) }.getOrElse { ex ->
+                        if (ex is SQLException) throw ex else 0
+                    }
+                }
+                if (queriedPid <= 0) {
+                    throw SQLException("SELECT pg_backend_pid() returned non-positive or null PID ($queriedPid)")
+                }
+                if (pgWrapperPid > 0 && pgWrapperPid != queriedPid) {
+                    throw SQLException(
+                        "PGConnection.backendPID ($pgWrapperPid) does not match SELECT pg_backend_pid() ($queriedPid)"
+                    )
+                }
+                return queriedPid
+            }
+        }
+    }
+
+    internal data class TableContractRow(
+        val currentSchema: String,
+        val tablePresent: Boolean,
+        val tableShapeValid: Boolean?,
+        val canCreate: Boolean?
+    )
+
+    internal fun readTableContractRowStrict(
+        rs: java.sql.ResultSet?,
+        requireCanCreate: Boolean
+    ): TableContractRow {
+        if (rs == null) {
+            throw SQLException("Schema contract query returned null ResultSet; failing closed on unverifiable schema evidence")
+        }
+        val hasRow = runCatching { rs.next() }.getOrElse { ex ->
+            if (ex is SQLException) throw ex else false
+        }
+        if (!hasRow) {
+            throw SQLException("Schema contract query returned 0 rows; failing closed on unverifiable schema evidence")
+        }
+        val rawSchema = rs.getString("current_schema_name")?.trim().orEmpty()
+        if (rawSchema.isEmpty()) {
+            throw SQLException("Schema contract query returned null or blank current_schema_name; failing closed on unverifiable schema evidence")
+        }
+        val presentObj = rs.getObject("table_present") as? Boolean
+            ?: throw SQLException("Schema contract query returned null or non-boolean table_present; failing closed on unverifiable schema evidence")
+        val canCreateObj: Boolean? = if (requireCanCreate) {
+            rs.getObject("can_create") as? Boolean
+                ?: throw SQLException("Schema contract query returned null or non-boolean can_create; failing closed on unverifiable schema evidence")
+        } else {
+            null
+        }
+        val shapeValidObj: Boolean? = if (presentObj) {
+            rs.getObject("table_shape_valid") as? Boolean
+                ?: throw SQLException("Schema contract query returned null or non-boolean table_shape_valid when table_present=true; failing closed on unverifiable schema evidence")
+        } else {
+            null
+        }
+        return TableContractRow(
+            currentSchema = rawSchema,
+            tablePresent = presentObj,
+            tableShapeValid = shapeValidObj,
+            canCreate = canCreateObj
+        )
     }
 
     private fun acquireReadyConnectionsBounded(
         dataSource: DataSource,
         needSeparateWriteAndVerify: Boolean,
         readinessTimeoutMs: Long,
+        cleanupTimeoutMs: Long,
         monotonicClock: MonotonicClock,
         secretsToRedact: List<String>
     ): ReadinessOutcome {
         val primaryConnRef = AtomicReference<Connection?>(null)
         val verifyConnRef = AtomicReference<Connection?>(null)
+        val primaryPidRef = AtomicReference<Int?>(null)
+        val verifyPidRef = AtomicReference<Int?>(null)
         val cancelledOrTimedOut = AtomicBoolean(false)
         val startMonoMs = monotonicClock.nowMs()
         val deadlineNano = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(readinessTimeoutMs)
@@ -605,12 +982,14 @@ object OffProdAdditiveIdentitySchemaSetupCli {
             try {
                 val initialRemMs = remainingMs()
                 if (initialRemMs <= 0L || isCancelledOrPastDeadline()) {
+                    netTimeoutExec.shutdown()
                     return@Callable ReadinessOutcome.Failure(
                         "Connection readiness deadline (${readinessTimeoutMs}ms) expired before getConnection (0 SQL executed)"
                     )
                 }
                 dataSource.loginTimeout = ceil(initialRemMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
                 if (remainingMs() <= 0L || isCancelledOrPastDeadline()) {
+                    netTimeoutExec.shutdown()
                     return@Callable ReadinessOutcome.Failure(
                         "Connection readiness deadline (${readinessTimeoutMs}ms) expired after setLoginTimeout before getConnection (0 SQL executed)"
                     )
@@ -620,18 +999,20 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                 primaryConnRef.set(c1)
                 if (isCancelledOrPastDeadline()) {
                     primaryConnRef.set(null)
-                    triggerNonBlockingConnectionClose(c1, null, netTimeoutExec)
+                    val cs = closeConnectionsBounded(c1, null, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = true, secretsToRedact = secretsToRedact)
                     return@Callable ReadinessOutcome.Failure(
-                        "Primary connection acquired after readiness deadline (${readinessTimeoutMs}ms); closed immediately without executing any SQL"
+                        sanitizedReason = "Primary connection acquired after readiness deadline (${readinessTimeoutMs}ms); closed immediately without executing any SQL",
+                        cleanupStatus = cs
                     )
                 }
 
                 val remAfterC1Ms = remainingMs()
                 if (remAfterC1Ms <= 0L || isCancelledOrPastDeadline()) {
                     primaryConnRef.set(null)
-                    triggerNonBlockingConnectionClose(c1, null, netTimeoutExec)
+                    val cs = closeConnectionsBounded(c1, null, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = true, secretsToRedact = secretsToRedact)
                     return@Callable ReadinessOutcome.Failure(
-                        "Connection readiness deadline (${readinessTimeoutMs}ms) expired immediately after primary connection acquisition; closed without SQL"
+                        sanitizedReason = "Connection readiness deadline (${readinessTimeoutMs}ms) expired immediately after primary connection acquisition; closed without SQL",
+                        cleanupStatus = cs
                     )
                 }
 
@@ -642,28 +1023,41 @@ object OffProdAdditiveIdentitySchemaSetupCli {
 
                 if (isCancelledOrPastDeadline()) {
                     primaryConnRef.set(null)
-                    triggerNonBlockingConnectionClose(c1, null, netTimeoutExec)
+                    val cs = closeConnectionsBounded(c1, null, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = true, secretsToRedact = secretsToRedact)
                     return@Callable ReadinessOutcome.Failure(
-                        "Connection readiness deadline (${readinessTimeoutMs}ms) expired after primary connection setup; closed without SQL"
+                        sanitizedReason = "Connection readiness deadline (${readinessTimeoutMs}ms) expired after primary connection setup; closed without SQL",
+                        cleanupStatus = cs
                     )
                 }
 
+                val c1Pid = queryBackendPidBounded(
+                    conn = c1,
+                    remainingMsProvider = ::remainingMs,
+                    isCancelledProvider = ::isCancelledOrPastDeadline
+                )
+                primaryPidRef.set(c1Pid)
+
                 var c2: Connection? = null
+                var c2Pid: Int? = null
                 if (needSeparateWriteAndVerify) {
                     val remBeforeC2Ms = remainingMs()
                     if (remBeforeC2Ms <= 0L || isCancelledOrPastDeadline()) {
                         primaryConnRef.set(null)
-                        triggerNonBlockingConnectionClose(c1, null, netTimeoutExec)
+                        val cs = closeConnectionsBounded(c1, null, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = true, secretsToRedact = secretsToRedact)
                         return@Callable ReadinessOutcome.Failure(
-                            "Connection readiness deadline (${readinessTimeoutMs}ms) expired before verification connection acquisition; closed without SQL"
+                            sanitizedReason = "Connection readiness deadline (${readinessTimeoutMs}ms) expired before verification connection acquisition; closed without DDL",
+                            primaryBackendPid = c1Pid,
+                            cleanupStatus = cs
                         )
                     }
                     dataSource.loginTimeout = ceil(remBeforeC2Ms.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
                     if (remainingMs() <= 0L || isCancelledOrPastDeadline()) {
                         primaryConnRef.set(null)
-                        triggerNonBlockingConnectionClose(c1, null, netTimeoutExec)
+                        val cs = closeConnectionsBounded(c1, null, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = true, secretsToRedact = secretsToRedact)
                         return@Callable ReadinessOutcome.Failure(
-                            "Connection readiness deadline (${readinessTimeoutMs}ms) expired after setLoginTimeout before verification connection acquisition; closed without SQL"
+                            sanitizedReason = "Connection readiness deadline (${readinessTimeoutMs}ms) expired after setLoginTimeout before verification connection acquisition; closed without DDL",
+                            primaryBackendPid = c1Pid,
+                            cleanupStatus = cs
                         )
                     }
                     val rawC2 = dataSource.connection
@@ -671,18 +1065,46 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                     if (isCancelledOrPastDeadline()) {
                         primaryConnRef.set(null)
                         verifyConnRef.set(null)
-                        triggerNonBlockingConnectionClose(c1, rawC2, netTimeoutExec)
+                        val cs = closeConnectionsBounded(c1, rawC2, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = true, secretsToRedact = secretsToRedact)
                         return@Callable ReadinessOutcome.Failure(
-                            "Verification connection acquired after readiness deadline (${readinessTimeoutMs}ms); closed immediately without executing any SQL"
+                            sanitizedReason = "Verification connection acquired after readiness deadline (${readinessTimeoutMs}ms); closed immediately without executing any DDL",
+                            primaryBackendPid = c1Pid,
+                            cleanupStatus = cs
                         )
                     }
 
-                    if (!c1AutoCommit && rawC2 === c1 && !rawC2.autoCommit) {
+                    // Unconditional object-identity check (never gated on !c1AutoCommit):
+                    if (rawC2 === c1) {
                         primaryConnRef.set(null)
                         verifyConnRef.set(null)
-                        triggerNonBlockingConnectionClose(c1, rawC2, netTimeoutExec)
+                        val cs = closeConnectionsBounded(c1, rawC2, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = false, secretsToRedact = secretsToRedact)
                         return@Callable ReadinessOutcome.Failure(
-                            "Readiness durability check failed: DDL connection has autoCommit=false and DataSource returned the same Connection instance for verification (0 SQL executed)"
+                            sanitizedReason = "Readiness physical session check failed: DataSource returned the exact same Connection instance for primaryConn and verifyConn (0 DDL executed)",
+                            primaryBackendPid = c1Pid,
+                            verifyBackendPid = c1Pid,
+                            cleanupStatus = cs
+                        )
+                    }
+
+                    // Unconditional unwrapped PGConnection identity check:
+                    val sameUnwrappedPg = runCatching {
+                        if (c1.isWrapperFor(PGConnection::class.java) && rawC2.isWrapperFor(PGConnection::class.java)) {
+                            val pg1 = c1.unwrap(PGConnection::class.java)
+                            val pg2 = rawC2.unwrap(PGConnection::class.java)
+                            pg1 === pg2 || (pg1.backendPID > 0 && pg1.backendPID == pg2.backendPID)
+                        } else {
+                            false
+                        }
+                    }.getOrDefault(false)
+                    if (sameUnwrappedPg) {
+                        primaryConnRef.set(null)
+                        verifyConnRef.set(null)
+                        val cs = closeConnectionsBounded(c1, rawC2, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = false, secretsToRedact = secretsToRedact)
+                        return@Callable ReadinessOutcome.Failure(
+                            sanitizedReason = "Readiness physical session check failed: primaryConn and verifyConn unwrap to the same physical PGConnection/PID ($c1Pid) (0 DDL executed)",
+                            primaryBackendPid = c1Pid,
+                            verifyBackendPid = c1Pid,
+                            cleanupStatus = cs
                         )
                     }
 
@@ -690,9 +1112,11 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                     if (remAfterC2Ms <= 0L || isCancelledOrPastDeadline()) {
                         primaryConnRef.set(null)
                         verifyConnRef.set(null)
-                        triggerNonBlockingConnectionClose(c1, rawC2, netTimeoutExec)
+                        val cs = closeConnectionsBounded(c1, rawC2, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = true, secretsToRedact = secretsToRedact)
                         return@Callable ReadinessOutcome.Failure(
-                            "Connection readiness deadline (${readinessTimeoutMs}ms) expired immediately after verification connection acquisition; closed without SQL"
+                            sanitizedReason = "Connection readiness deadline (${readinessTimeoutMs}ms) expired immediately after verification connection acquisition; closed without DDL",
+                            primaryBackendPid = c1Pid,
+                            cleanupStatus = cs
                         )
                     }
 
@@ -703,29 +1127,55 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                     if (isCancelledOrPastDeadline()) {
                         primaryConnRef.set(null)
                         verifyConnRef.set(null)
-                        triggerNonBlockingConnectionClose(c1, rawC2, netTimeoutExec)
+                        val cs = closeConnectionsBounded(c1, rawC2, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = true, secretsToRedact = secretsToRedact)
                         return@Callable ReadinessOutcome.Failure(
-                            "Connection readiness deadline (${readinessTimeoutMs}ms) expired after verification connection setup; closed without SQL"
+                            sanitizedReason = "Connection readiness deadline (${readinessTimeoutMs}ms) expired after verification connection setup; closed without DDL",
+                            primaryBackendPid = c1Pid,
+                            cleanupStatus = cs
+                        )
+                    }
+
+                    val queriedC2Pid = queryBackendPidBounded(
+                        conn = rawC2,
+                        remainingMsProvider = ::remainingMs,
+                        isCancelledProvider = ::isCancelledOrPastDeadline
+                    )
+                    verifyPidRef.set(queriedC2Pid)
+                    if (queriedC2Pid == c1Pid) {
+                        primaryConnRef.set(null)
+                        verifyConnRef.set(null)
+                        val cs = closeConnectionsBounded(c1, rawC2, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = false, secretsToRedact = secretsToRedact)
+                        return@Callable ReadinessOutcome.Failure(
+                            sanitizedReason = "Readiness physical session check failed: primaryBackendPid ($c1Pid) and verifyBackendPid ($queriedC2Pid) must be distinct positive PostgreSQL backend PIDs before DDL (0 DDL executed)",
+                            primaryBackendPid = c1Pid,
+                            verifyBackendPid = queriedC2Pid,
+                            cleanupStatus = cs
                         )
                     }
                     c2 = rawC2
+                    c2Pid = queriedC2Pid
                 }
 
                 ReadinessOutcome.Success(
                     primaryConn = c1,
                     verifyConn = c2,
+                    primaryBackendPid = c1Pid,
+                    verifyBackendPid = c2Pid,
                     primaryConnWasAutoCommit = c1AutoCommit,
                     netTimeoutExec = netTimeoutExec
                 )
             } catch (e: Exception) {
                 val c1 = primaryConnRef.getAndSet(null)
                 val c2 = verifyConnRef.getAndSet(null)
-                triggerNonBlockingConnectionClose(c1, c2, netTimeoutExec)
+                val cs = closeConnectionsBounded(c1, c2, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = true, secretsToRedact = secretsToRedact)
                 ReadinessOutcome.Failure(
-                    sanitizeErrorMessage(
-                        "Connection readiness failed (${e.javaClass.simpleName}): ${e.message} (0 SQL executed)",
+                    sanitizedReason = sanitizeErrorMessage(
+                        "Connection readiness failed (${e.javaClass.simpleName}): ${e.message} (0 DDL executed)",
                         secretsToRedact
-                    )
+                    ),
+                    primaryBackendPid = primaryPidRef.get(),
+                    verifyBackendPid = verifyPidRef.get(),
+                    cleanupStatus = cs
                 )
             }
         })
@@ -737,21 +1187,27 @@ object OffProdAdditiveIdentitySchemaSetupCli {
             future.cancel(true)
             val c1 = primaryConnRef.getAndSet(null)
             val c2 = verifyConnRef.getAndSet(null)
-            triggerNonBlockingConnectionClose(c1, c2, netTimeoutExec)
+            val cs = closeConnectionsBounded(c1, c2, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = true, secretsToRedact = secretsToRedact)
             ReadinessOutcome.Failure(
-                "Connection readiness exceeded ${readinessTimeoutMs}ms deadline; late connections fenced and closed without executing any SQL"
+                sanitizedReason = "Connection readiness exceeded ${readinessTimeoutMs}ms deadline; late connections fenced and closed without executing any SQL",
+                primaryBackendPid = primaryPidRef.get(),
+                verifyBackendPid = verifyPidRef.get(),
+                cleanupStatus = cs
             )
         } catch (e: Exception) {
             cancelledOrTimedOut.set(true)
             future.cancel(true)
             val c1 = primaryConnRef.getAndSet(null)
             val c2 = verifyConnRef.getAndSet(null)
-            triggerNonBlockingConnectionClose(c1, c2, netTimeoutExec)
+            val cs = closeConnectionsBounded(c1, c2, netTimeoutExec, cleanupTimeoutMs, monotonicClock, forceAbortFirst = true, secretsToRedact = secretsToRedact)
             ReadinessOutcome.Failure(
-                sanitizeErrorMessage(
+                sanitizedReason = sanitizeErrorMessage(
                     "Connection readiness interrupted/failed: ${e.message} (0 SQL executed)",
                     secretsToRedact
-                )
+                ),
+                primaryBackendPid = primaryPidRef.get(),
+                verifyBackendPid = verifyPidRef.get(),
+                cleanupStatus = cs
             )
         } finally {
             readinessExec.shutdownNow()
@@ -763,11 +1219,42 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         val outcome: SetupOutcome,
         val ddlCommitStatus: DdlCommitStatus,
         val ddlExecutedAndVerified: Boolean,
+        val searchPathBoundToPublic: Boolean?,
         val tablePresentBefore: Boolean?,
         val tablePresentAfter: Boolean?,
+        val tableShapeValid: Boolean?,
         val hasCreatePrivilege: Boolean?,
         val sanitizedDetail: String
     )
+
+    private fun bindTrustedPublicSearchPathBounded(
+        conn: Connection,
+        activeStmtRef: AtomicReference<PreparedStatement?>,
+        remainingSqlMs: () -> Long,
+        isCancelledOrPastDeadline: () -> Boolean
+    ) {
+        val remMs = remainingSqlMs()
+        if (remMs <= 0L || isCancelledOrPastDeadline()) {
+            throw TimeoutException("SQL stage deadline expired before SET search_path = public, pg_catalog")
+        }
+        val ps = conn.prepareStatement(SQL_SET_TRUSTED_SEARCH_PATH)
+            ?: throw SQLException("Failed to prepare SET search_path = public, pg_catalog (prepareStatement returned null)")
+        ps.use { stmt ->
+            activeStmtRef.set(stmt)
+            val remSetupMs = remainingSqlMs()
+            if (remSetupMs <= 0L || isCancelledOrPastDeadline()) {
+                activeStmtRef.set(null)
+                throw TimeoutException("SQL stage deadline expired before SET search_path setQueryTimeout")
+            }
+            stmt.queryTimeout = ceil(remSetupMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
+            if (remainingSqlMs() <= 0L || isCancelledOrPastDeadline()) {
+                activeStmtRef.set(null)
+                throw TimeoutException("SQL stage deadline expired directly before SET search_path executeUpdate")
+            }
+            stmt.executeUpdate()
+            activeStmtRef.set(null)
+        }
+    }
 
     private fun executeSqlStageBounded(
         readyConns: ReadinessOutcome.Success,
@@ -780,7 +1267,9 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         val activeStmtRef = AtomicReference<PreparedStatement?>(null)
         val cancelledOrTimedOut = AtomicBoolean(false)
         val inFlightDdlStarted = AtomicBoolean(false)
+        val searchPathBoundRef = AtomicReference<Boolean?>(null)
         val tablePresentBeforeRef = AtomicReference<Boolean?>(null)
+        val tableShapeValidRef = AtomicReference<Boolean?>(null)
         val hasCreatePrivilegeRef = AtomicReference<Boolean?>(null)
 
         val startMonoMs = monotonicClock.nowMs()
@@ -808,8 +1297,10 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                         outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
                         ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                         ddlExecutedAndVerified = false,
+                        searchPathBoundToPublic = null,
                         tablePresentBefore = null,
                         tablePresentAfter = null,
+                        tableShapeValid = null,
                         hasCreatePrivilege = null,
                         sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired before statement preparation (0 SQL executed)"
                     )
@@ -824,6 +1315,22 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                     initialRemMs.coerceAtMost(Int.MAX_VALUE.toLong()).toInt().coerceAtLeast(1)
                 )
 
+                // Bind exact trusted search_path (public, pg_catalog) on primaryConn and verifyConn BEFORE any check or DDL!
+                bindTrustedPublicSearchPathBounded(
+                    conn = readyConns.primaryConn,
+                    activeStmtRef = activeStmtRef,
+                    remainingSqlMs = ::remainingSqlMs,
+                    isCancelledOrPastDeadline = ::isCancelledOrPastDeadline
+                )
+                if (readyConns.verifyConn != null) {
+                    bindTrustedPublicSearchPathBounded(
+                        conn = readyConns.verifyConn,
+                        activeStmtRef = activeStmtRef,
+                        remainingSqlMs = ::remainingSqlMs,
+                        isCancelledOrPastDeadline = ::isCancelledOrPastDeadline
+                    )
+                }
+
                 if (options.dryRun) {
                     // Default Dry-Run Mode: read-only check only, 0 DDL statements executed
                     if (isCancelledOrPastDeadline()) {
@@ -832,16 +1339,18 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                             outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
                             ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                             ddlExecutedAndVerified = false,
+                            searchPathBoundToPublic = null,
                             tablePresentBefore = null,
                             tablePresentAfter = null,
+                            tableShapeValid = null,
                             hasCreatePrivilege = null,
-                            sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired before dry-run prepareStatement (0 SQL executed)"
+                            sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired before dry-run prepareStatement (0 DDL executed)"
                         )
                     }
 
-                    var present = false
-                    var canCreate = false
-                    readyConns.primaryConn.prepareStatement(SQL_CHECK_TABLE_AND_CREATE_PRIVILEGE.trimIndent()).use { ps ->
+                    val dryRunPs = readyConns.primaryConn.prepareStatement(SQL_CHECK_TABLE_AND_CREATE_PRIVILEGE.trimIndent())
+                        ?: throw SQLException("Dry-run schema check failed: prepareStatement returned null")
+                    val contractRow = dryRunPs.use { ps ->
                         activeStmtRef.set(ps)
                         val remBeforeSetupMs = remainingSqlMs()
                         if (remBeforeSetupMs <= 0L || isCancelledOrPastDeadline()) {
@@ -851,10 +1360,12 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                                 outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
                                 ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                                 ddlExecutedAndVerified = false,
+                                searchPathBoundToPublic = null,
                                 tablePresentBefore = null,
                                 tablePresentAfter = null,
+                                tableShapeValid = null,
                                 hasCreatePrivilege = null,
-                                sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired before dry-run setQueryTimeout (0 SQL executed)"
+                                sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired before dry-run setQueryTimeout (0 DDL executed)"
                             )
                         }
                         ps.queryTimeout = ceil(remBeforeSetupMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
@@ -866,33 +1377,30 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                                 outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
                                 ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                                 ddlExecutedAndVerified = false,
+                                searchPathBoundToPublic = null,
                                 tablePresentBefore = null,
                                 tablePresentAfter = null,
+                                tableShapeValid = null,
                                 hasCreatePrivilege = null,
-                                sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired after statement setup directly before dry-run executeQuery (0 SQL executed)"
+                                sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired after statement setup directly before dry-run executeQuery (0 DDL executed)"
                             )
                         }
-                        ps.executeQuery().use { rs ->
-                            if (rs.next()) {
-                                if (isCancelledOrPastDeadline()) {
-                                    activeStmtRef.set(null)
-                                    return@Callable SqlStageOutcome(
-                                        exitCode = 3,
-                                        outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
-                                        ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
-                                        ddlExecutedAndVerified = false,
-                                        tablePresentBefore = null,
-                                        tablePresentAfter = null,
-                                        hasCreatePrivilege = null,
-                                        sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired while reading dry-run ResultSet (0 DDL executed)"
-                                    )
-                                }
-                                present = rs.getBoolean("table_present")
-                                canCreate = rs.getBoolean("can_create")
-                            }
+                        val row = ps.executeQuery().use { rs ->
+                            readTableContractRowStrict(rs, requireCanCreate = true)
                         }
                         activeStmtRef.set(null)
+                        row
                     }
+
+                    val present = contractRow.tablePresent
+                    val canCreate = requireNotNull(contractRow.canCreate)
+                    val currentSchema = contractRow.currentSchema
+                    val shapeValid = contractRow.tableShapeValid
+                    val schemaIsPublic = currentSchema.equals("public", ignoreCase = true)
+                    searchPathBoundRef.set(schemaIsPublic)
+                    tablePresentBeforeRef.set(present)
+                    tableShapeValidRef.set(shapeValid)
+                    hasCreatePrivilegeRef.set(canCreate)
 
                     if (isCancelledOrPastDeadline()) {
                         return@Callable SqlStageOutcome(
@@ -900,10 +1408,42 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                             outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
                             ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                             ddlExecutedAndVerified = false,
+                            searchPathBoundToPublic = schemaIsPublic,
                             tablePresentBefore = present,
                             tablePresentAfter = present,
+                            tableShapeValid = shapeValid,
                             hasCreatePrivilege = canCreate,
                             sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired upon dry-run completion (0 DDL executed)"
+                        )
+                    }
+
+                    if (!schemaIsPublic) {
+                        return@Callable SqlStageOutcome(
+                            exitCode = 3,
+                            outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
+                            ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
+                            ddlExecutedAndVerified = false,
+                            searchPathBoundToPublic = false,
+                            tablePresentBefore = present,
+                            tablePresentAfter = present,
+                            tableShapeValid = shapeValid,
+                            hasCreatePrivilege = canCreate,
+                            sanitizedDetail = "Failed to bind search_path to 'public' (current_schema='$currentSchema'); aborting fail-closed"
+                        )
+                    }
+
+                    if (present && shapeValid != true) {
+                        return@Callable SqlStageOutcome(
+                            exitCode = 3,
+                            outcome = SetupOutcome.ABORTED_EXISTING_TABLE_INCOMPATIBLE_SCHEMA,
+                            ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
+                            ddlExecutedAndVerified = false,
+                            searchPathBoundToPublic = true,
+                            tablePresentBefore = true,
+                            tablePresentAfter = true,
+                            tableShapeValid = false,
+                            hasCreatePrivilege = canCreate,
+                            sanitizedDetail = "Existing table public.player_riot_identities does not match expected columns/types/PRIMARY KEY/non-blank CHECK constraint; failing closed"
                         )
                     }
 
@@ -912,8 +1452,10 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                         outcome = SetupOutcome.DRY_RUN_READINESS_AND_SCHEMA_CHECK_OK,
                         ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                         ddlExecutedAndVerified = false,
+                        searchPathBoundToPublic = true,
                         tablePresentBefore = present,
                         tablePresentAfter = present,
+                        tableShapeValid = if (present) true else null,
                         hasCreatePrivilege = canCreate,
                         sanitizedDetail = "Dry-run readiness and schema check completed within ${effectiveSqlBudgetMs}ms SQL fence (0 DDL executed)"
                     )
@@ -921,18 +1463,19 @@ object OffProdAdditiveIdentitySchemaSetupCli {
 
                 // =========================================================================
                 // Apply-DDL Mode:
-                // 1. Pre-check table_present & can_create on read-only verifyConn
-                // 2. Enforce session lock_timeout + statement_timeout on real PGConnection
+                // 1. Pre-check table_present, table_shape_valid & can_create on read-only verifyConn
+                //    (fail closed BEFORE DDL if existing public.player_riot_identities has wrong shape!)
+                // 2. Enforce session lock_timeout + statement_timeout + search_path on primaryConn
                 // 3. Execute CREATE TABLE IF NOT EXISTS on primaryConn with pre-execute fence
-                // 4. Verify table_present == true on separate verifyConn within the 2,500ms fence
+                // 4. Verify table_present == true AND table_shape_valid == true on separate verifyConn
                 // =========================================================================
                 val verifyConn = requireNotNull(readyConns.verifyConn) {
                     "Separate verification connection required for --apply-ddl=true"
                 }
 
-                var presentBefore = false
-                var canCreate = true
-                verifyConn.prepareStatement(SQL_CHECK_TABLE_AND_CREATE_PRIVILEGE.trimIndent()).use { ps ->
+                val preCheckPs = verifyConn.prepareStatement(SQL_CHECK_TABLE_AND_CREATE_PRIVILEGE.trimIndent())
+                    ?: throw SQLException("Pre-DDL schema check failed: prepareStatement returned null")
+                val preCheckRow = preCheckPs.use { ps ->
                     activeStmtRef.set(ps)
                     val remPreCheckMs = remainingSqlMs()
                     if (remPreCheckMs <= 0L || isCancelledOrPastDeadline()) {
@@ -942,8 +1485,10 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                             outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
                             ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                             ddlExecutedAndVerified = false,
+                            searchPathBoundToPublic = null,
                             tablePresentBefore = null,
                             tablePresentAfter = null,
+                            tableShapeValid = null,
                             hasCreatePrivilege = null,
                             sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired before pre-DDL schema check setup (0 DDL executed)"
                         )
@@ -957,24 +1502,63 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                             outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
                             ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                             ddlExecutedAndVerified = false,
+                            searchPathBoundToPublic = null,
                             tablePresentBefore = null,
                             tablePresentAfter = null,
+                            tableShapeValid = null,
                             hasCreatePrivilege = null,
                             sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired directly before pre-DDL schema check executeQuery (0 DDL executed)"
                         )
                     }
-                    ps.executeQuery().use { rs ->
-                        if (rs.next()) {
-                            presentBefore = rs.getBoolean("table_present")
-                            canCreate = rs.getBoolean("can_create")
-                        }
+                    val row = ps.executeQuery().use { rs ->
+                        readTableContractRowStrict(rs, requireCanCreate = true)
                     }
                     activeStmtRef.set(null)
+                    row
                 }
+
+                val presentBefore = preCheckRow.tablePresent
+                val canCreate = requireNotNull(preCheckRow.canCreate)
+                val currentSchemaBefore = preCheckRow.currentSchema
+                val shapeValidBefore = preCheckRow.tableShapeValid
+                val schemaBoundBefore = currentSchemaBefore.equals("public", ignoreCase = true)
+                searchPathBoundRef.set(schemaBoundBefore)
                 tablePresentBeforeRef.set(presentBefore)
+                tableShapeValidRef.set(shapeValidBefore)
                 hasCreatePrivilegeRef.set(canCreate)
 
-                // On real PostgreSQL connections, apply server-side lock_timeout and statement_timeout
+                if (!schemaBoundBefore) {
+                    return@Callable SqlStageOutcome(
+                        exitCode = 3,
+                        outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
+                        ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
+                        ddlExecutedAndVerified = false,
+                        searchPathBoundToPublic = false,
+                        tablePresentBefore = presentBefore,
+                        tablePresentAfter = presentBefore,
+                        tableShapeValid = shapeValidBefore,
+                        hasCreatePrivilege = canCreate,
+                        sanitizedDetail = "Pre-DDL check failed: current_schema() is '$currentSchemaBefore' instead of trusted 'public' (0 DDL executed)"
+                    )
+                }
+
+                // Fail closed BEFORE DDL if public.player_riot_identities already exists with an incompatible shape!
+                if (presentBefore && shapeValidBefore != true) {
+                    return@Callable SqlStageOutcome(
+                        exitCode = 3,
+                        outcome = SetupOutcome.ABORTED_EXISTING_TABLE_INCOMPATIBLE_SCHEMA,
+                        ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
+                        ddlExecutedAndVerified = false,
+                        searchPathBoundToPublic = true,
+                        tablePresentBefore = true,
+                        tablePresentAfter = true,
+                        tableShapeValid = false,
+                        hasCreatePrivilege = canCreate,
+                        sanitizedDetail = "Existing table public.player_riot_identities has incompatible schema (wrong columns, types, nullability, PRIMARY KEY, or non-blank CHECK constraint); aborting fail-closed with 0 DDL executed"
+                    )
+                }
+
+                // On real PostgreSQL connections, apply server-side search_path, lock_timeout, and statement_timeout
                 val isRealPg = runCatching { readyConns.primaryConn.isWrapperFor(PGConnection::class.java) }.getOrDefault(false)
                 if (isRealPg) {
                     val remLockSetupMs = remainingSqlMs()
@@ -984,29 +1568,37 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                             outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
                             ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                             ddlExecutedAndVerified = false,
+                            searchPathBoundToPublic = true,
                             tablePresentBefore = presentBefore,
                             tablePresentAfter = presentBefore,
+                            tableShapeValid = if (presentBefore) true else null,
                             hasCreatePrivilege = canCreate,
                             sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired before SET lock_timeout/statement_timeout (0 DDL executed)"
                         )
                     }
                     val stmtTimeoutMs = minOf(options.sqlTimeoutMs, remLockSetupMs).coerceAtLeast(1L)
                     val effectiveLockMs = minOf(options.lockTimeoutMs, stmtTimeoutMs).coerceAtLeast(1L)
-                    readyConns.primaryConn.createStatement().use { st ->
-                        st.queryTimeout = ceil(remLockSetupMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
+                    val st = readyConns.primaryConn.createStatement()
+                        ?: throw SQLException("Failed to createStatement for SET lock_timeout/statement_timeout")
+                    st.use { stmt ->
+                        stmt.queryTimeout = ceil(remLockSetupMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
                         if (remainingSqlMs() <= 0L || isCancelledOrPastDeadline()) {
                             return@Callable SqlStageOutcome(
                                 exitCode = 3,
                                 outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
                                 ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                                 ddlExecutedAndVerified = false,
+                                searchPathBoundToPublic = true,
                                 tablePresentBefore = presentBefore,
                                 tablePresentAfter = presentBefore,
+                                tableShapeValid = if (presentBefore) true else null,
                                 hasCreatePrivilege = canCreate,
                                 sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired directly before SET lock_timeout/statement_timeout (0 DDL executed)"
                             )
                         }
-                        st.execute("SET lock_timeout = '${effectiveLockMs}ms'; SET statement_timeout = '${stmtTimeoutMs}ms'")
+                        stmt.execute(
+                            "SET search_path = public, pg_catalog; SET lock_timeout = '${effectiveLockMs}ms'; SET statement_timeout = '${stmtTimeoutMs}ms'"
+                        )
                     }
                 }
 
@@ -1016,14 +1608,18 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                         outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
                         ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                         ddlExecutedAndVerified = false,
+                        searchPathBoundToPublic = true,
                         tablePresentBefore = presentBefore,
                         tablePresentAfter = presentBefore,
+                        tableShapeValid = if (presentBefore) true else null,
                         hasCreatePrivilege = canCreate,
                         sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired before DDL prepareStatement (0 DDL executed)"
                     )
                 }
 
-                readyConns.primaryConn.prepareStatement(validatedDdlSql).use { ddlPs ->
+                val rawDdlPs = readyConns.primaryConn.prepareStatement(validatedDdlSql)
+                    ?: throw SQLException("DDL prepareStatement returned null (0 DDL executed)")
+                rawDdlPs.use { ddlPs ->
                     activeStmtRef.set(ddlPs)
                     val remDdlSetupMs = remainingSqlMs()
                     if (remDdlSetupMs <= 0L || isCancelledOrPastDeadline()) {
@@ -1033,8 +1629,10 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                             outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
                             ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                             ddlExecutedAndVerified = false,
+                            searchPathBoundToPublic = true,
                             tablePresentBefore = presentBefore,
                             tablePresentAfter = presentBefore,
+                            tableShapeValid = if (presentBefore) true else null,
                             hasCreatePrivilege = canCreate,
                             sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired before DDL setQueryTimeout (0 DDL executed)"
                         )
@@ -1049,8 +1647,10 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                             outcome = SetupOutcome.ABORTED_SQL_FENCE_BEFORE_EXECUTE_NO_SQL,
                             ddlCommitStatus = DdlCommitStatus.NOT_STARTED_ZERO_SQL,
                             ddlExecutedAndVerified = false,
+                            searchPathBoundToPublic = true,
                             tablePresentBefore = presentBefore,
                             tablePresentAfter = presentBefore,
+                            tableShapeValid = if (presentBefore) true else null,
                             hasCreatePrivilege = canCreate,
                             sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired or cancelled after setter setup directly before DDL executeUpdate (0 DDL executed)"
                         )
@@ -1070,8 +1670,10 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                             outcome = SetupOutcome.ABORTED_SQL_LOCK_OR_DEADLINE_UNKNOWN_COMMIT,
                             ddlCommitStatus = DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED,
                             ddlExecutedAndVerified = false,
+                            searchPathBoundToPublic = true,
                             tablePresentBefore = presentBefore,
                             tablePresentAfter = null,
+                            tableShapeValid = null,
                             hasCreatePrivilege = canCreate,
                             sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired directly before explicit DDL commit; rollback attempted, recheck required"
                         )
@@ -1087,52 +1689,93 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                         outcome = SetupOutcome.ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT,
                         ddlCommitStatus = DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED,
                         ddlExecutedAndVerified = false,
+                        searchPathBoundToPublic = true,
                         tablePresentBefore = presentBefore,
                         tablePresentAfter = null,
+                        tableShapeValid = null,
                         hasCreatePrivilege = canCreate,
                         sanitizedDetail = "DDL executeUpdate completed but SQL stage deadline (${effectiveSqlBudgetMs}ms) expired before separate-connection post-commit verification read"
                     )
                 }
 
-                var presentAfter = false
-                verifyConn.prepareStatement(SQL_VERIFY_TABLE_PRESENT.trimIndent()).use { verifyPs ->
-                    activeStmtRef.set(verifyPs)
-                    val remVerifySetupMs = remainingSqlMs()
-                    if (remVerifySetupMs <= 0L || isCancelledOrPastDeadline()) {
-                        activeStmtRef.set(null)
-                        return@Callable SqlStageOutcome(
-                            exitCode = 3,
-                            outcome = SetupOutcome.ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT,
-                            ddlCommitStatus = DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED,
-                            ddlExecutedAndVerified = false,
-                            tablePresentBefore = presentBefore,
-                            tablePresentAfter = null,
-                            hasCreatePrivilege = canCreate,
-                            sanitizedDetail = "DDL executeUpdate completed but deadline expired before verification setQueryTimeout"
-                        )
-                    }
-                    verifyPs.queryTimeout = ceil(remVerifySetupMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
-                    // Critical fence AFTER all setup DIRECTLY BEFORE verification executeQuery():
-                    if (remainingSqlMs() <= 0L || isCancelledOrPastDeadline()) {
-                        activeStmtRef.set(null)
-                        return@Callable SqlStageOutcome(
-                            exitCode = 3,
-                            outcome = SetupOutcome.ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT,
-                            ddlCommitStatus = DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED,
-                            ddlExecutedAndVerified = false,
-                            tablePresentBefore = presentBefore,
-                            tablePresentAfter = null,
-                            hasCreatePrivilege = canCreate,
-                            sanitizedDetail = "DDL executeUpdate completed but deadline expired directly before verification executeQuery"
-                        )
-                    }
-                    verifyPs.executeQuery().use { rs ->
-                        if (rs.next()) {
-                            presentAfter = rs.getBoolean("table_present")
+                val rawVerifyPs = verifyConn.prepareStatement(SQL_VERIFY_TABLE_PRESENT.trimIndent())
+                    ?: return@Callable SqlStageOutcome(
+                        exitCode = 3,
+                        outcome = SetupOutcome.ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT,
+                        ddlCommitStatus = DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED,
+                        ddlExecutedAndVerified = false,
+                        searchPathBoundToPublic = true,
+                        tablePresentBefore = presentBefore,
+                        tablePresentAfter = null,
+                        tableShapeValid = null,
+                        hasCreatePrivilege = canCreate,
+                        sanitizedDetail = "Post-commit verification failed: prepareStatement returned null on separate connection"
+                    )
+                val postVerifyRow = try {
+                    rawVerifyPs.use { verifyPs ->
+                        activeStmtRef.set(verifyPs)
+                        val remVerifySetupMs = remainingSqlMs()
+                        if (remVerifySetupMs <= 0L || isCancelledOrPastDeadline()) {
+                            activeStmtRef.set(null)
+                            return@Callable SqlStageOutcome(
+                                exitCode = 3,
+                                outcome = SetupOutcome.ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT,
+                                ddlCommitStatus = DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED,
+                                ddlExecutedAndVerified = false,
+                                searchPathBoundToPublic = true,
+                                tablePresentBefore = presentBefore,
+                                tablePresentAfter = null,
+                                tableShapeValid = null,
+                                hasCreatePrivilege = canCreate,
+                                sanitizedDetail = "DDL executeUpdate completed but deadline expired before verification setQueryTimeout"
+                            )
                         }
+                        verifyPs.queryTimeout = ceil(remVerifySetupMs.toDouble() / 1_000.0).toInt().coerceAtLeast(1)
+                        // Critical fence AFTER all setup DIRECTLY BEFORE verification executeQuery():
+                        if (remainingSqlMs() <= 0L || isCancelledOrPastDeadline()) {
+                            activeStmtRef.set(null)
+                            return@Callable SqlStageOutcome(
+                                exitCode = 3,
+                                outcome = SetupOutcome.ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT,
+                                ddlCommitStatus = DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED,
+                                ddlExecutedAndVerified = false,
+                                searchPathBoundToPublic = true,
+                                tablePresentBefore = presentBefore,
+                                tablePresentAfter = null,
+                                tableShapeValid = null,
+                                hasCreatePrivilege = canCreate,
+                                sanitizedDetail = "DDL executeUpdate completed but deadline expired directly before verification executeQuery"
+                            )
+                        }
+                        val row = verifyPs.executeQuery().use { rs ->
+                            readTableContractRowStrict(rs, requireCanCreate = false)
+                        }
+                        activeStmtRef.set(null)
+                        row
                     }
+                } catch (verifyEx: Exception) {
                     activeStmtRef.set(null)
+                    return@Callable SqlStageOutcome(
+                        exitCode = 3,
+                        outcome = SetupOutcome.ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT,
+                        ddlCommitStatus = DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED,
+                        ddlExecutedAndVerified = false,
+                        searchPathBoundToPublic = searchPathBoundRef.get(),
+                        tablePresentBefore = presentBefore,
+                        tablePresentAfter = null,
+                        tableShapeValid = null,
+                        hasCreatePrivilege = canCreate,
+                        sanitizedDetail = sanitizeErrorMessage(
+                            "Post-commit verification failed (${verifyEx.javaClass.simpleName}): ${verifyEx.message}",
+                            secretsToRedact
+                        )
+                    )
                 }
+
+                val presentAfter = postVerifyRow.tablePresent
+                val currentSchemaAfter = postVerifyRow.currentSchema
+                val shapeValidAfter = postVerifyRow.tableShapeValid == true
+                tableShapeValidRef.set(postVerifyRow.tableShapeValid)
 
                 if (isCancelledOrPastDeadline()) {
                     return@Callable SqlStageOutcome(
@@ -1140,23 +1783,27 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                         outcome = SetupOutcome.ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT,
                         ddlCommitStatus = DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED,
                         ddlExecutedAndVerified = false,
+                        searchPathBoundToPublic = currentSchemaAfter.equals("public", ignoreCase = true),
                         tablePresentBefore = presentBefore,
                         tablePresentAfter = null,
+                        tableShapeValid = null,
                         hasCreatePrivilege = canCreate,
                         sanitizedDetail = "SQL stage deadline (${effectiveSqlBudgetMs}ms) expired during post-commit verification read"
                     )
                 }
 
-                if (!presentAfter) {
+                if (!presentAfter || !shapeValidAfter || !currentSchemaAfter.equals("public", ignoreCase = true)) {
                     return@Callable SqlStageOutcome(
                         exitCode = 3,
                         outcome = SetupOutcome.ABORTED_VERIFICATION_FAILED_UNKNOWN_COMMIT,
                         ddlCommitStatus = DdlCommitStatus.UNKNOWN_COMMIT_RECHECK_REQUIRED,
                         ddlExecutedAndVerified = false,
+                        searchPathBoundToPublic = currentSchemaAfter.equals("public", ignoreCase = true),
                         tablePresentBefore = presentBefore,
-                        tablePresentAfter = false,
+                        tablePresentAfter = presentAfter,
+                        tableShapeValid = postVerifyRow.tableShapeValid,
                         hasCreatePrivilege = canCreate,
-                        sanitizedDetail = "Post-commit verification read on separate connection returned table_present=false after DDL execution"
+                        sanitizedDetail = "Post-commit verification on separate connection (PID=${readyConns.verifyBackendPid}) failed: table_present=$presentAfter, table_shape_valid=${postVerifyRow.tableShapeValid}, current_schema='$currentSchemaAfter'"
                     )
                 }
 
@@ -1165,10 +1812,12 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                     outcome = SetupOutcome.APPLIED_AND_VERIFIED_DDL,
                     ddlCommitStatus = DdlCommitStatus.COMMITTED_AND_VERIFIED,
                     ddlExecutedAndVerified = true,
+                    searchPathBoundToPublic = true,
                     tablePresentBefore = presentBefore,
                     tablePresentAfter = true,
+                    tableShapeValid = true,
                     hasCreatePrivilege = canCreate,
-                    sanitizedDetail = "Applied reviewed additive migration ${JdbcIdentityCompletionPersistenceAdapter.MIGRATION_RESOURCE_PATH} and verified table presence on separate connection within ${effectiveSqlBudgetMs}ms SQL fence"
+                    sanitizedDetail = "Applied reviewed additive migration ${JdbcIdentityCompletionPersistenceAdapter.MIGRATION_RESOURCE_PATH} on PID=${readyConns.primaryBackendPid} and verified full public.player_riot_identities schema contract on separate connection PID=${readyConns.verifyBackendPid} within ${effectiveSqlBudgetMs}ms SQL fence"
                 )
             } catch (e: Exception) {
                 val started = inFlightDdlStarted.get()
@@ -1187,8 +1836,10 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                     outcome = outcome,
                     ddlCommitStatus = commitStatus,
                     ddlExecutedAndVerified = false,
+                    searchPathBoundToPublic = searchPathBoundRef.get(),
                     tablePresentBefore = tablePresentBeforeRef.get(),
                     tablePresentAfter = null,
+                    tableShapeValid = tableShapeValidRef.get(),
                     hasCreatePrivilege = hasCreatePrivilegeRef.get(),
                     sanitizedDetail = sanitizeErrorMessage(
                         "SQL stage failed (${e.javaClass.simpleName}): ${e.message}",
@@ -1229,8 +1880,10 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                     DdlCommitStatus.NOT_STARTED_ZERO_SQL
                 },
                 ddlExecutedAndVerified = false,
+                searchPathBoundToPublic = searchPathBoundRef.get(),
                 tablePresentBefore = tablePresentBeforeRef.get(),
                 tablePresentAfter = null,
+                tableShapeValid = tableShapeValidRef.get(),
                 hasCreatePrivilege = hasCreatePrivilegeRef.get(),
                 sanitizedDetail = if (started) {
                     "SQL/lock execution exceeded ${effectiveSqlBudgetMs}ms deadline while DDL or post-commit verification was in flight; commit status unknown, run --dry-run=true to recheck"
@@ -1255,8 +1908,10 @@ object OffProdAdditiveIdentitySchemaSetupCli {
                     DdlCommitStatus.NOT_STARTED_ZERO_SQL
                 },
                 ddlExecutedAndVerified = false,
+                searchPathBoundToPublic = searchPathBoundRef.get(),
                 tablePresentBefore = tablePresentBeforeRef.get(),
                 tablePresentAfter = null,
+                tableShapeValid = tableShapeValidRef.get(),
                 hasCreatePrivilege = hasCreatePrivilegeRef.get(),
                 sanitizedDetail = sanitizeErrorMessage(
                     "SQL stage interrupted/failed: ${e.message}",
@@ -1268,23 +1923,91 @@ object OffProdAdditiveIdentitySchemaSetupCli {
         }
     }
 
-    private fun triggerNonBlockingConnectionClose(
+    internal fun closeConnectionsBounded(
         c1: Connection?,
         c2: Connection?,
-        netTimeoutExec: java.util.concurrent.ExecutorService?
-    ) {
-        Thread({
-            if (netTimeoutExec != null) {
-                runCatching { c1?.abort(netTimeoutExec) }
-                runCatching { c2?.abort(netTimeoutExec) }
-            }
-            runCatching { c1?.close() }
-            runCatching { c2?.close() }
+        netTimeoutExec: ExecutorService?,
+        awaitTimeoutMs: Long,
+        monotonicClock: MonotonicClock,
+        forceAbortFirst: Boolean = false,
+        secretsToRedact: List<String> = emptyList()
+    ): CleanupStatus {
+        if (c1 == null && c2 == null) {
             runCatching { netTimeoutExec?.shutdown() }
+            return CleanupStatus(
+                connectionsClosedCleanly = true,
+                cleanupTimedOut = false,
+                cleanupElapsedMs = 0L
+            )
+        }
+
+        val startMonoMs = monotonicClock.nowMs()
+        val doneLatch = CountDownLatch(1)
+        val closeErrorRef = AtomicReference<String?>(null)
+
+        val closeThread = Thread({
+            try {
+                if (forceAbortFirst && netTimeoutExec != null) {
+                    runCatching { c1?.abort(netTimeoutExec) }
+                    runCatching { if (c2 != null && c2 !== c1) c2.abort(netTimeoutExec) }
+                }
+                val err1 = runCatching { c1?.close() }.exceptionOrNull()
+                val err2 = runCatching { if (c2 != null && c2 !== c1) c2.close() }.exceptionOrNull()
+                val firstErr = err1 ?: err2
+                if (firstErr != null) {
+                    closeErrorRef.set(
+                        sanitizeErrorMessage("${firstErr.javaClass.simpleName}: ${firstErr.message}", secretsToRedact)
+                    )
+                    if (netTimeoutExec != null) {
+                        runCatching { c1?.abort(netTimeoutExec) }
+                        runCatching { if (c2 != null && c2 !== c1) c2.abort(netTimeoutExec) }
+                    }
+                }
+            } finally {
+                runCatching { netTimeoutExec?.shutdown() }
+                doneLatch.countDown()
+            }
         }, "offprod-setup-conn-close").apply {
             isDaemon = true
             start()
         }
+
+        val boundedWaitMs = awaitTimeoutMs.coerceIn(1L, MAX_CLEANUP_TIMEOUT_MS)
+        val finishedInTime = try {
+            doneLatch.await(boundedWaitMs, TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        val elapsedMs = (monotonicClock.nowMs() - startMonoMs).coerceAtLeast(0L)
+
+        if (!finishedInTime) {
+            closeThread.interrupt()
+            Thread({
+                if (netTimeoutExec != null) {
+                    runCatching { c1?.abort(netTimeoutExec) }
+                    runCatching { if (c2 != null && c2 !== c1) c2.abort(netTimeoutExec) }
+                }
+                runCatching { netTimeoutExec?.shutdownNow() }
+            }, "offprod-setup-conn-close-fallback-abort").apply {
+                isDaemon = true
+                start()
+            }
+            return CleanupStatus(
+                connectionsClosedCleanly = false,
+                cleanupTimedOut = true,
+                cleanupElapsedMs = elapsedMs,
+                cleanupError = "Connection close did not finish within ${boundedWaitMs}ms bounded cleanup window"
+            )
+        }
+
+        val err = closeErrorRef.get()
+        return CleanupStatus(
+            connectionsClosedCleanly = err == null,
+            cleanupTimedOut = false,
+            cleanupElapsedMs = elapsedMs,
+            cleanupError = err
+        )
     }
 
     private fun buildInvalidOptionsResult(
@@ -1305,9 +2028,6 @@ object OffProdAdditiveIdentitySchemaSetupCli {
             dryRun = options?.dryRun ?: true,
             applyDdlRequested = options?.applyDdl ?: false,
             ddlExecutedAndVerified = false,
-            tablePresentBefore = null,
-            tablePresentAfter = null,
-            hasCreatePrivilege = null,
             migrationResourcePath = JdbcIdentityCompletionPersistenceAdapter.MIGRATION_RESOURCE_PATH,
             readinessBudgetMs = options?.readinessTimeoutMs ?: DEFAULT_READINESS_TIMEOUT_MS,
             readinessElapsedMs = 0L,
@@ -1429,7 +2149,7 @@ object OffProdAdditiveIdentitySchemaSetupCli {
             password = dbPass
             connectTimeout = readinessSec
             socketTimeout = maxOf(readinessSec, sqlSec)
-            this.options = "-c lock_timeout=${setupOptions.lockTimeoutMs}ms -c statement_timeout=${setupOptions.sqlTimeoutMs}ms"
+            this.options = "-c search_path=public,pg_catalog -c lock_timeout=${setupOptions.lockTimeoutMs}ms -c statement_timeout=${setupOptions.sqlTimeoutMs}ms"
         }
     }
 }
