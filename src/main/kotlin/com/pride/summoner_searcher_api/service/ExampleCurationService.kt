@@ -52,6 +52,14 @@ class ExampleCurationService(
         val qualityScores = mutableListOf<Double>()
         
         candidates.forEach { interaction ->
+            if (
+                AiAnalysisService.containsCs10TheoreticalMaxMislabeling(interaction.aiResponse) ||
+                AiAnalysisService.containsCs10TheoreticalMaxMislabeling(interaction.userQuestion)
+            ) {
+                logger.info("Skipping candidate interaction {} due to CS@10 theoretical-maximum mislabeling", interaction.id)
+                return@forEach
+            }
+
             val qualityScore = calculateQualityScore(interaction)
             
             // Only add high-quality examples (score > 80)

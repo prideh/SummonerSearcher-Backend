@@ -30,8 +30,8 @@ data class CohortPercentileDistributionDto(
  *
  * - [laneCsAt10]: Primary CS@10 metric in RAW lane minions (`challenges.laneMinionsFirst10Minutes`
  *   or timeline 10m `minionsKilled`), never percentages and never mixed with jungle camps.
- *   Carries [CohortPercentileDistributionDto.theoreticalSupplyCeiling] (`114` pre-16.1, `120` for 16.1+/26.1+)
- *   as the lane-only theoretical spawn cutoff, while bands (`p25`, `median`, `p75`) are chosen purely from
+ *   Carries [CohortPercentileDistributionDto.theoreticalSupplyCeiling] (`114` for `TOP`/`BOTTOM`; `120` for `MIDDLE` on 16.1+/26.1+, `114` pre-16.1)
+ *   strictly as the lane-only theoretical maximum spawn ceiling (never an empirical target/benchmark or missed-CS baseline), while bands (`p25`, `median`, `p75`) are chosen purely from
  *   sufficient actual `(tier, role)` data (never fixed guesses).
  * - [laneOnlyCsPerMin]: End-of-game lane minions per minute (`totalMinionsKilled / durationMin`).
  * - [totalCsPerMinWithCamps] & [timelineTotalCsAt10WithCamps]: Separate total-CS reference metrics that include
