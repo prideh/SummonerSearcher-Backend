@@ -1246,6 +1246,194 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
             }
         }
     }
+
+    Given("Issue #38 natural player-language sample naming without losing separate game counts/win rates, causality limits, or invited-roast behavior") {
+        val service = createService()
+        val constructPromptMethod = AiAnalysisService::class.java.getDeclaredMethod(
+            "constructPrompt",
+            Map::class.java,
+            List::class.java,
+            String::class.java,
+            AiAnalysisService.IntentResult::class.java,
+            PromptVersion::class.java
+        ).apply { isAccessible = true }
+
+        val spearShotMatches = (0 until 20).map { idx ->
+            mapOf(
+                "matchId" to "EUW1_${9000 + idx}",
+                "patch" to "26.1",
+                "role" to "TOP",
+                "side" to if (idx % 2 == 0) "Blue" else "Red",
+                "champion" to "Pantheon",
+                "win" to (idx < 11),
+                "kda" to "6/4/7 (3.25)",
+                "csPerMin" to 7.1
+            )
+        }
+
+        val spearShotContext = mapOf<String, Any>(
+            "summonerName" to "Spear Shot#EUW",
+            "rank" to "CHALLENGER I (1120 LP)",
+            "rankedRecord" to mapOf("wins" to 1020, "losses" to 884, "games" to 1904, "winRate" to "53.6"),
+            "savedHistory" to mapOf("wins" to 462, "losses" to 421, "games" to 883, "winRate" to "52.3"),
+            "recentMatchSample" to mapOf("games" to 20, "wins" to 11, "losses" to 9, "winRate" to "55.0"),
+            "primaryRole" to "TOP",
+            "totalGamesAnalyzed" to 20,
+            "timelineStatus" to "NOT_ANALYZED",
+            "kda" to "2.21",
+            "avgCsPerMin" to "7.1",
+            "avgTurretPlates" to "2.1",
+            "topChampions" to listOf(
+                mapOf("name" to "Pantheon", "games" to 790, "wins" to 418, "losses" to 372, "winRate" to "53", "kda" to "2.21")
+            ),
+            "recentMatches" to spearShotMatches
+        )
+
+        When("building prompts for normal coaching, win-rate comparisons, missing timelines, suggested follow-ups, and invited roasts") {
+            Then("it enforces natural sample phrasing, preserves separate denominators/rates (#34), explains missing timelines in plain words, filters schema-leaking few-shot examples, and preserves causality and invited-roast rules") {
+                clearMocks(exampleRepository, patternRepository)
+                every {
+                    exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc(any(), any())
+                } returns listOf(
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "How has my Pantheon looked lately?",
+                        aiResponse = "In `recentMatchSample` you went 11W 9L, while `savedHistory` shows 52.3% WR (`timelineStatus` is `NOT_ANALYZED`).",
+                        qualityScore = BigDecimal("95.0")
+                    ),
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "What habit should I track next on Pantheon?",
+                        aiResponse = "Across your last 20 detailed matches (55.0% win rate), check whether early river deaths happen before your reset timer.",
+                        qualityScore = BigDecimal("91.0")
+                    )
+                )
+                every {
+                    patternRepository.findByTriggerCategoryAndIsActiveTrue(any())
+                } returns listOf(
+                    DiscoveredPattern(
+                        triggerCategory = "general",
+                        followUpCategory = "wave_management",
+                        occurrenceCount = 12,
+                        confidenceScore = 0.68
+                    )
+                )
+
+                val normalCoachingPrompt = constructPromptMethod.invoke(
+                    service,
+                    spearShotContext,
+                    emptyList<Map<String, String>>(),
+                    "Give me two practical Pantheon improvement habits for my next five games.",
+                    null,
+                    null
+                ) as String
+
+                val winRateComparisonPrompt = constructPromptMethod.invoke(
+                    service,
+                    spearShotContext,
+                    emptyList<Map<String, String>>(),
+                    "Why does my ranked win rate differ from my saved matches and my last 20 games?",
+                    null,
+                    null
+                ) as String
+
+                val missingTimelinePrompt = constructPromptMethod.invoke(
+                    service,
+                    spearShotContext,
+                    emptyList<Map<String, String>>(),
+                    "What were my exact 10-minute gold diff and first-item completion minute?",
+                    null,
+                    null
+                ) as String
+
+                val invitedRoastPrompt = constructPromptMethod.invoke(
+                    service,
+                    spearShotContext,
+                    emptyList<Map<String, String>>(),
+                    "Roast my Pantheon stats playfully, then give me one controllable habit to review next game.",
+                    null,
+                    null
+                ) as String
+
+                for (p in listOf(normalCoachingPrompt, winRateComparisonPrompt, missingTimelinePrompt, invitedRoastPrompt)) {
+                    // 1. Old #34 literal-key citation instruction is removed; natural 3-sample mapping is present
+                    p shouldNotContain "Always cite the exact sample name and denominator"
+                    p shouldContain "Natural Player Language (No Internal Keys or Backticks)"
+                    p shouldContain "(1) `rankedRecord` (\"your ranked record\": Solo/Duo W/L, games, and win rate)"
+                    p shouldContain "(2) `savedHistory` (\"your saved matches\", with the saved-match count when relevant and always paired with saved-match W/L or win rate"
+                    p shouldContain "(3) `recentMatchSample` (\"your last 20 detailed matches\" / \"your last N detailed matches\", with its own games and win rate"
+
+                    // 2. Separate denominators & win rates from #34 remain completely intact
+                    p shouldContain "rankedRecord (Solo/Duo Queue Counter): 1020W 884L across 1904 games (53.6% WR)"
+                    p shouldContain "savedHistory (Saved Match History): 462W 421L across 883 games (52.3% WR)"
+                    p shouldContain "recentMatchSample (Detailed Match List): 11W 9L across 20 games (55.0% WR)"
+                    p shouldContain "NEVER combine samples, remove counts from win-rate/record claims, or pair one sample's win rate with another sample's game count"
+
+                    // 3. Missing timeline & follow-up suggestions forbid internal keys, schema markers, NOT_ANALYZED, and backticks
+                    p shouldContain "Timeline (timeline not analyzed yet)"
+                    p shouldNotContain "Timeline Status (NOT_ANALYZED)"
+                    p shouldContain "in plain language (never `timelineStatus` or `NOT_ANALYZED`)"
+                    p shouldContain "plain player language—no raw keys, `[sample: ...]`, `NOT_ANALYZED`, or backticks; never mention Mythic items/paths or unsupported build-effect claims in suggestions"
+
+                    // 4. Evidence/causality rules & invited-roast openness remain intact (no roast-suppression added)
+                    p shouldContain "Observed Facts vs. Hypotheses & Conditional Recommendations"
+                    p shouldContain "Deaths & Assist Attribution"
+                    p shouldNotContain "never roast"
+                    p shouldNotContain "refuse to roast"
+
+                    // 5. Hard prompt budget invariant preserved
+                    (AiAnalysisService.utf8ByteSize(p) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+                }
+
+                // 6. Pre-#38 few-shot example exposing `recentMatchSample` / `savedHistory` / `NOT_ANALYZED` is filtered out,
+                // while the clean player-language example and natural suggestion pattern guidance remain included
+                normalCoachingPrompt shouldNotContain "In `recentMatchSample` you went 11W 9L"
+                normalCoachingPrompt shouldContain "Across your last 20 detailed matches (55.0% win rate), check whether early river deaths happen before your reset timer."
+                normalCoachingPrompt shouldContain "do not echo raw category keys"
+
+                // 7. Zero-match fallback uses natural plural phrasing rather than "your last 0 detailed matches"
+                val zeroMatchesPrompt = constructPromptMethod.invoke(
+                    service,
+                    mapOf(
+                        "summonerName" to "NewPlayer#EUW",
+                        "rank" to "Unranked",
+                        "recentMatchSample" to mapOf("games" to 0, "wins" to 0, "losses" to 0)
+                    ),
+                    emptyList<Map<String, String>>(),
+                    "Analyze my profile",
+                    null,
+                    null
+                ) as String
+                zeroMatchesPrompt shouldContain "\"your recent detailed matches\""
+                zeroMatchesPrompt shouldNotContain "your last 0 detailed matches"
+
+                clearMocks(exampleRepository, patternRepository)
+            }
+        }
+
+        When("checking player-facing coaching prose and follow-up suggestions with containsInternalSchemaLeak") {
+            Then("it flags internal sample keys, schema markers, header labels, and NOT_ANALYZED while passing natural player-facing coaching and suggestions") {
+                val leakyOutputs = listOf(
+                    "Across your `recentMatchSample` of 20 games you have a 55.0% win rate.",
+                    "Your savedHistory sits at 52.3% across 883 matches, while rankedRecord is 53.6%.",
+                    "Your Pantheon averages 2.21 KDA [sample: savedHistory (883g)].",
+                    "Because timelineStatus is NOT_ANALYZED, item spike minutes are unavailable.",
+                    "---SUGGESTIONS--- [\"Compare recentMatchSample to savedHistory\", \"Check `topChampions`\", \"Why is timeline NOT_ANALYZED?\"]"
+                )
+                leakyOutputs.forEach { sample ->
+                    AiAnalysisService.containsInternalSchemaLeak(sample) shouldBe true
+                }
+
+                val cleanOutputs = listOf(
+                    "In **your ranked record**, you sit at **53.6% win rate** across **1,904 games** (1,020W–884L), compared with **52.3%** across **883 saved matches** and **55.0%** across **your last 20 detailed matches** (11W–9L).\n---SUGGESTIONS--- [\"How do my Blue and Red side win rates compare?\", \"What two Pantheon habits should I track next?\", \"How should I play early river skirmishes?\"]",
+                    "Match timeline data hasn't been analyzed yet, so only end-of-game summary and challenge stats are available—exact 10-minute gold diffs and item completion minutes aren't loaded."
+                )
+                cleanOutputs.forEach { sample ->
+                    AiAnalysisService.containsInternalSchemaLeak(sample) shouldBe false
+                }
+            }
+        }
+    }
 })
 
 
