@@ -337,12 +337,14 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "WARD_PLACED"
                 prompt shouldContain "never claim ward placement in specific bushes"
                 prompt shouldContain "assisted deaths are not necessarily jungle ganks"
-                prompt shouldContain "cs10.target"
-                prompt shouldContain "114 for Top/Bot, 120 for Mid on verified patch 26.1+ games only"
-                prompt shouldContain "NEVER subtract `actual` from `target` to claim exact \"missed CS\""
+                prompt shouldContain "cs10.theoreticalMax"
+                prompt shouldContain "`114` for `TOP`/`BOTTOM`, `120` for `MIDDLE` on verified Patch 26.1+"
+                prompt shouldContain "NEVER subtract `actual` from `114`/`120` to claim \"missed CS\""
                 prompt shouldContain "laneCs@10=81"
-                prompt shouldContain "cs10.target=120"
-                prompt shouldContain "avgLaneCsAt10: {avgActual=81.0 (matchCount=1), avgTarget=120.0 (targetMatchCount=1, avgSupportedActual=81.0)"
+                prompt shouldContain "cs10.theoreticalMax=120"
+                prompt shouldContain "avgLaneCsAt10: {avgActual=81.0 (matchCount=1), avgTheoreticalMax=120.0 (theoreticalMaxMatchCount=1, avgSupportedActual=81.0)"
+                prompt shouldNotContain "cs10.target="
+                prompt shouldNotContain "avgTarget="
                 prompt shouldContain "missingLaneCsAt10Matches: 0"
                 prompt shouldNotContain "cs10.spawnedSupply"
                 prompt shouldNotContain "cs10.supplyLabel"
@@ -782,10 +784,12 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "Game 20 (Most Recent Match):"
                 prompt shouldContain "opponentDetails={champion=Viktor"
 
-                // 4. Redundant earlyDeaths fields stripped & targetLabel emitted at most once
+                // 4. Redundant earlyDeaths fields stripped & theoreticalMaxLabel emitted at most once
                 prompt shouldNotContain "participants="
                 prompt shouldNotContain "assistantsCount="
-                Regex("cs10\\.targetLabel=").findAll(prompt).count() shouldBe 1
+                Regex("cs10\\.theoreticalMaxLabel=").findAll(prompt).count() shouldBe 1
+                prompt shouldNotContain "cs10.target="
+                prompt shouldNotContain "cs10.targetLabel="
                 prompt shouldNotContain "cs10.spawnedSupply"
                 prompt shouldNotContain "cs10.supplyLabel"
 
@@ -993,13 +997,15 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     null
                 ) as String
 
-                // Reconciled laneCsAt10 contract
-                prompt shouldContain "avgLaneCsAt10: {avgActual=80.5 (matchCount=6), avgTarget=118.0 (targetMatchCount=4, avgSupportedActual=82.0)"
-                prompt shouldContain "roleBreakdown=[MIDDLE(actual=82.0 in 4g, target=120.0 in 3g, supportedActual=83.5); TOP(actual=77.5 in 2g, target=114.0 in 1g, supportedActual=79.0)]"
+                // Reconciled laneCsAt10 theoreticalMax contract (mixed-patch matchCount=6 > theoreticalMaxMatchCount=4 suppresses top-level avgTheoreticalMax to null)
+                prompt shouldContain "avgLaneCsAt10: {avgActual=80.5 (matchCount=6), avgTheoreticalMax=null (theoreticalMaxMatchCount=4, avgSupportedActual=82.0)"
+                prompt shouldContain "roleBreakdown=[MIDDLE(actual=82.0 in 4g, theoreticalMax=120.0 in 3g, supportedActual=83.5); TOP(actual=77.5 in 2g, theoreticalMax=114.0 in 1g, supportedActual=79.0)]"
                 prompt shouldContain "missingLaneCsAt10Matches: 2"
-                prompt shouldContain "cs10.target=120"
-                prompt shouldContain "cs10.target=null"
-                prompt shouldContain "cs10.targetLabel=Patch 26.1+ passive wave spawn total by 10:00"
+                prompt shouldContain "cs10.theoreticalMax=120"
+                prompt shouldContain "cs10.theoreticalMax=null"
+                prompt shouldContain "cs10.theoreticalMaxLabel=\"${AiAnalysisService.DEFAULT_CS10_THEORETICAL_MAX_LABEL}\""
+                prompt shouldNotContain "cs10.target="
+                prompt shouldNotContain "avgTarget="
                 prompt shouldNotContain "cs10.spawnedSupply"
 
                 // All 5 improvementStats groups + denominators + missingness
@@ -1243,6 +1249,249 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 @Suppress("UNCHECKED_CAST")
                 val genConfig = buildConfigMethod.invoke(service, 0.7) as Map<String, Any>
                 genConfig["maxOutputTokens"] shouldBe 4096
+            }
+        }
+    }
+
+    Given("Early Lane CS@10 theoretical maximum framing, PR #41 unsupported-number rejection, and preserved Frontend payload compatibility (#39)") {
+        val service = createService()
+        val constructPromptMethod = AiAnalysisService::class.java.getDeclaredMethod(
+            "constructPrompt",
+            Map::class.java,
+            List::class.java,
+            String::class.java,
+            AiAnalysisService.IntentResult::class.java,
+            PromptVersion::class.java
+        ).apply { isAccessible = true }
+
+        When("building a coaching prompt for Spear Shot's observed 72.9 CS@10 across 14 Top games from the preserved Frontend payload") {
+            Then("it preserves 72.9 across 14 games and 114 Top / 120 Mid strictly as theoretical maximums, strips 'Top lane target', forbids missed-CS / #1 focus grading, and filters poisoned few-shot examples") {
+                clearMocks(exampleRepository, patternRepository)
+
+                val poisonedTargetExample = AiLearnedExample(
+                    id = UUID.randomUUID(),
+                    questionCategory = "full_analysis",
+                    userQuestion = "Give me an executive summary of my recent performance.",
+                    aiResponse = "Your 72.9 CS at 10 across 14 games is well below the Top lane target of 114 (benchmark role-specific target), meaning you missed 41.1 CS before 10:00.",
+                    qualityScore = BigDecimal("95.0"),
+                    isActive = true
+                )
+                val poisonedPr41Example = AiLearnedExample(
+                    id = UUID.randomUUID(),
+                    questionCategory = "full_analysis",
+                    userQuestion = "How is my early farming?",
+                    aiResponse = "Only 107 lane minions spawn by 10:00 (~101-107 reachable), and 70-85 CS @ 10m is strong Challenger pacing.",
+                    qualityScore = BigDecimal("93.0"),
+                    isActive = true
+                )
+                val cleanTheoreticalMaxExample = AiLearnedExample(
+                    id = UUID.randomUUID(),
+                    questionCategory = "full_analysis",
+                    userQuestion = "How should I read my 72.9 lane CS at 10?",
+                    aiResponse = "You averaged **72.9** lane CS at 10 across **14** Top games; **114** is the Patch 26.1+ theoretical maximum passive wave spawn ceiling, not a target or benchmark. Compare against your Master Top cohort median of **74.0** (180 games) when evaluating early pace.",
+                    qualityScore = BigDecimal("90.0"),
+                    isActive = true
+                )
+
+                AiAnalysisService.containsCs10TheoreticalMaxMislabeling(poisonedTargetExample.aiResponse) shouldBe true
+                AiAnalysisService.containsCs10TheoreticalMaxMislabeling(poisonedPr41Example.aiResponse) shouldBe true
+                AiAnalysisService.containsCs10TheoreticalMaxMislabeling(cleanTheoreticalMaxExample.aiResponse) shouldBe false
+
+                every {
+                    exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc(any(), any())
+                } returns listOf(poisonedTargetExample, poisonedPr41Example, cleanTheoreticalMaxExample)
+                every { patternRepository.findByTriggerCategoryAndIsActiveTrue(any()) } returns emptyList()
+
+                // Exact shape emitted by preserved Frontend statsCalculator.ts + aiContextBuilder.ts + SummonerInfo.tsx SUMMARY_PROMPT
+                val spearShotFrontendContext = mapOf<String, Any>(
+                    "summonerName" to "Spear Shot#EUW",
+                    "rank" to "CHALLENGER I (1120 LP)",
+                    "primaryRole" to "TOP",
+                    "totalGamesAnalyzed" to 14,
+                    "timelineStatus" to "NOT_ANALYZED",
+                    "avgLaneCsAt10" to mapOf(
+                        "avgActual" to 72.9,
+                        "matchCount" to 14,
+                        "avgTarget" to 114,
+                        "targetMatchCount" to 14,
+                        "avgSupportedActual" to 72.9,
+                        "targetLabel" to "14 Top",
+                        "roleBreakdown" to mapOf("TOP" to 14, "MIDDLE" to 0, "BOTTOM" to 0)
+                    ),
+                    "missingLaneCsAt10Matches" to 0,
+                    "recentMatches" to listOf(
+                        mapOf(
+                            "matchId" to "EUW1_7001",
+                            "patch" to "16.4",
+                            "role" to "TOP",
+                            "gameDuration" to "27.4",
+                            "champion" to "Pantheon",
+                            "win" to true,
+                            "kda" to "9/3/7 (5.33)",
+                            "csPerMin" to 7.5,
+                            "laneMinionsFirst10Minutes" to 73,
+                            "laneCsAt10" to mapOf(
+                                "actual" to 73,
+                                "target" to 114,
+                                "targetLabel" to "Top lane target"
+                            )
+                        ),
+                        mapOf(
+                            "matchId" to "EUW1_7002",
+                            "patch" to "26.4",
+                            "role" to "MIDDLE",
+                            "gameDuration" to "24.1",
+                            "champion" to "Pantheon",
+                            "win" to true,
+                            "kda" to "8/2/6 (7.00)",
+                            "csPerMin" to 8.1,
+                            "laneMinionsFirst10Minutes" to 81,
+                            "laneCsAt10" to mapOf(
+                                "actual" to 81,
+                                "target" to 120,
+                                "targetLabel" to "Mid lane target"
+                            )
+                        ),
+                        mapOf(
+                            "matchId" to "EUW1_7003",
+                            "patch" to "26.4",
+                            "role" to "BOTTOM",
+                            "gameDuration" to "29.0",
+                            "champion" to "Pantheon",
+                            "win" to false,
+                            "kda" to "5/5/8 (2.60)",
+                            "csPerMin" to 7.8,
+                            "laneMinionsFirst10Minutes" to 78,
+                            "laneCsAt10" to mapOf(
+                                "actual" to 78,
+                                "target" to 114,
+                                "targetLabel" to "Bot lane target"
+                            )
+                        )
+                    )
+                )
+
+                val summaryPromptQuestion =
+                    "Give me a concise 2-3 sentence executive summary of my recent performance, key strength, and #1 focus area."
+                val prompt = constructPromptMethod.invoke(
+                    service,
+                    spearShotFrontendContext,
+                    emptyList<Map<String, String>>(),
+                    summaryPromptQuestion,
+                    null,
+                    null
+                ) as String
+
+                // Observed sample values & Patch 26.1+ 114 Top/Bot, 120 Mid theoretical maximums preserved accurately
+                prompt shouldContain "avgLaneCsAt10: {avgActual=72.9 (matchCount=14), avgTheoreticalMax=114 (theoreticalMaxMatchCount=14, avgSupportedActual=72.9)"
+                prompt shouldContain "roleBreakdown=[TOP(14g, theoreticalMax=114)]"
+                prompt shouldContain "laneCs@10=73, cs10.theoreticalMax=114"
+                prompt shouldContain "laneCs@10=81, cs10.theoreticalMax=120"
+                prompt shouldContain "laneCs@10=78, cs10.theoreticalMax=114"
+                Regex("cs10\\.theoreticalMaxLabel=").findAll(prompt).count() shouldBe 1
+
+                // Legacy Frontend target labels & keys are stripped so Gemini never sees "Top lane target" or "cs10.target"
+                prompt shouldNotContain "Top lane target"
+                prompt shouldNotContain "Mid lane target"
+                prompt shouldNotContain "Bot lane target"
+                prompt shouldNotContain "cs10.target="
+                prompt shouldNotContain "cs10.targetLabel="
+                prompt shouldNotContain "avgTarget="
+                prompt shouldNotContain "targetMatchCount="
+
+                // Strict guardrails against benchmark/target framing, missed-CS subtraction, #1 focus area grading, and PR #41 substitutions
+                prompt shouldContain "strictly the **theoretical maximum** passive single-lane wave spawn ceiling by 10:00"
+                prompt shouldContain "**never** an empirical rank/role benchmark, realistic performance target/expected CS, farmable supply, or missed-CS baseline"
+                prompt shouldContain "NEVER subtract `actual` from `114`/`120` to claim \"missed CS\" or \"missed last-hits\""
+                prompt shouldContain "NEVER treat a gap below `114`/`120` by itself as proof of poor farming or a `#1 focus area`"
+                prompt shouldContain "NEVER invent substitute wave/pacing numbers (such as `107`, `101-107`, `100`, or `70-85`)"
+
+                // Poisoned few-shot examples filtered out; valid theoretical-maximum + cohort example kept
+                prompt shouldNotContain "missed 41.1 CS"
+                prompt shouldNotContain "107 lane minions"
+                prompt shouldContain "Master Top cohort median of **74.0** (180 games)"
+                (AiAnalysisService.utf8ByteSize(prompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+            }
+        }
+
+        When("matches include JUNGLE, UTILITY/SUPPORT, pre-26.1 patches, short <600s games, or mixed-patch Frontend Map breakdowns") {
+            Then("theoreticalMax resolves to null for non-laners, pre-26.1 patches, short games, and mixed-patch top-level summaries") {
+                val gatedContext = mapOf<String, Any>(
+                    "summonerName" to "RolePatchGate#NA1",
+                    "rank" to "MASTER I (140 LP)",
+                    "totalGamesAnalyzed" to 5,
+                    "avgLaneCsAt10" to mapOf(
+                        "avgActual" to 74.2,
+                        "matchCount" to 14,
+                        "avgTheoreticalMax" to 114,
+                        "theoreticalMaxMatchCount" to 10,
+                        "avgSupportedActual" to 75.8,
+                        "roleBreakdown" to mapOf("TOP" to 14, "MIDDLE" to 0, "BOTTOM" to 0)
+                    ),
+                    "missingLaneCsAt10Matches" to 1,
+                    "recentMatches" to listOf(
+                        mapOf(
+                            "matchId" to "NA1_8001",
+                            "patch" to "16.3",
+                            "role" to "JUNGLE",
+                            "gameDurationSeconds" to 1680,
+                            "champion" to "LeeSin",
+                            "win" to true,
+                            "kda" to "6/2/9",
+                            "csPerMin" to 6.8,
+                            "laneCsAt10" to mapOf("actual" to 8, "theoreticalMax" to 114)
+                        ),
+                        mapOf(
+                            "matchId" to "NA1_8002",
+                            "patch" to "16.3",
+                            "role" to "UTILITY",
+                            "gameDurationSeconds" to 1720,
+                            "champion" to "Thresh",
+                            "win" to true,
+                            "kda" to "1/3/18",
+                            "csPerMin" to 1.1,
+                            "laneCsAt10" to mapOf("actual" to 12, "theoreticalMax" to 114)
+                        ),
+                        mapOf(
+                            "matchId" to "NA1_8003",
+                            "patch" to "15.24",
+                            "role" to "MIDDLE",
+                            "gameDurationSeconds" to 1800,
+                            "champion" to "Ahri",
+                            "win" to false,
+                            "kda" to "4/4/6",
+                            "csPerMin" to 7.9,
+                            "laneCsAt10" to mapOf("actual" to 80, "theoreticalMax" to 120)
+                        ),
+                        mapOf(
+                            "matchId" to "NA1_8004",
+                            "patch" to "16.3",
+                            "role" to "TOP",
+                            "gameDurationSeconds" to 540,
+                            "champion" to "Jax",
+                            "win" to false,
+                            "kda" to "0/1/0",
+                            "csPerMin" to 6.2,
+                            "laneCsAt10" to mapOf("actual" to 55, "theoreticalMax" to 114)
+                        )
+                    )
+                )
+
+                val gatedPrompt = constructPromptMethod.invoke(
+                    service,
+                    gatedContext,
+                    emptyList<Map<String, String>>(),
+                    "Check my early CS across roles and patches",
+                    null,
+                    null
+                ) as String
+
+                gatedPrompt shouldContain "avgLaneCsAt10: {avgActual=74.2 (matchCount=14), avgTheoreticalMax=null (theoreticalMaxMatchCount=10, avgSupportedActual=75.8)"
+                gatedPrompt shouldContain "roleBreakdown=[TOP(14g)]"
+                gatedPrompt shouldContain "missingLaneCsAt10Matches: 1"
+                Regex("cs10\\.theoreticalMax=null").findAll(gatedPrompt).count() shouldBe 4
+                gatedPrompt shouldNotContain "cs10.theoreticalMax=114"
+                gatedPrompt shouldNotContain "cs10.theoreticalMax=120"
             }
         }
     }
