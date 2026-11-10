@@ -328,10 +328,10 @@ class AiAnalysisService(
         } else {
             "your recent detailed matches"
         }
-        val naturalTimelineState = if (timelineStatus.equals("ANALYZED", ignoreCase = true)) {
-            "timeline analyzed"
-        } else {
-            "timeline not analyzed yet"
+        val naturalTimelineState = when {
+            timelineStatus.equals("ANALYZED", ignoreCase = true) -> "timeline analyzed"
+            timelineStatus.equals("PARTIAL", ignoreCase = true) -> "partial timeline analyzed"
+            else -> "timeline not analyzed yet"
         }
         
         var historyString = formatBoundedHistory(messages, MAX_HISTORY_MESSAGES, MAX_HISTORY_BYTES)
@@ -1271,6 +1271,14 @@ class AiAnalysisService(
             val inferredStatus = if (context["timelineInsights"] != null) "ANALYZED" else "NOT_ANALYZED"
             headerLines.add("  timelineStatus: $inferredStatus")
         }
+        (context["timelineCoverage"] as? Map<*, *>)?.let { cov ->
+            val covStatus = (cov["status"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: "UNKNOWN").take(24)
+            val covCount = cov["covered"] ?: cov["coveredCount"] ?: cov["coveredMatches"] ?: 0
+            val reqCount = cov["requested"] ?: cov["requestedCount"] ?: cov["requestedMatches"] ?: 0
+            val stopReason = cov["stopReason"]?.toString()?.trim()?.takeIf { it.isNotBlank() }?.take(48)
+            val stopSuffix = if (stopReason != null) ", stopReason=$stopReason" else ""
+            headerLines.add("  timelineCoverage: {status=$covStatus, covered=${covCount}/${reqCount} games$stopSuffix}")
+        }
 
         // 3. Saved-history per-game averages & side splits (explicitly scoped to savedHistory; omitted if structured savedHistory is invalid/null)
         val allowSavedHistoryDerivedMetrics = !hasStructuredSaved || savedSample != null
@@ -1985,36 +1993,47 @@ class AiAnalysisService(
      */
     @Suppress("UNCHECKED_CAST")
     private fun buildTimelineInsightsSection(context: Map<String, Any>): String {
-        val timeline = context["timelineInsights"] as? Map<String, Any?> ?: return ""
+        val timeline = context["timelineInsights"] as? Map<String, Any?>
+        val coverage = context["timelineCoverage"] as? Map<*, *>
+        val rawStatus = (context["timelineStatus"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: "").uppercase()
         val lines = mutableListOf<String>()
 
-        lines.add("\n**📊 TIMELINE ANALYSIS (last ${timeline["gamesAnalyzed"] ?: "?"} ranked games):**")
-        timeline["avgGoldLeadAt10"]?.let { lines.add("  - Avg gold lead vs opponent @10min: $it") }
-        timeline["avgGoldLeadAt15"]?.let { lines.add("  - Avg gold lead vs opponent @15min: $it") }
-        timeline["avgFirstDeathMinute"]?.let { lines.add("  - Avg minute of first death: $it") }
-        timeline["mostDangerousZone"]?.let { lines.add("  - Most frequent death zone: $it") }
-        timeline["wardsPlacedTotal"]?.let { lines.add("  - Total wards placed (across all games): $it") }
-        if (timeline.containsKey("wardsByTimeBucket")) {
-            val buckets = timeline["wardsByTimeBucket"]
-            lines.add("  - Wards placed by time bucket (no coordinates): ${buckets ?: "incomplete (legacy cache)"}")
-        }
-        timeline["killsTotal"]?.let { lines.add("  - Total kills across timeline games: $it") }
-        timeline["deathsTotal"]?.let { lines.add("  - Total deaths across timeline games: $it") }
-        timeline["assistsTotal"]?.let { lines.add("  - Total assists across timeline games: $it") }
-        if (timeline.containsKey("deathsBefore10")) {
-            lines.add("  - Deaths before 10min: ${timeline["deathsBefore10"] ?: "incomplete (legacy cache)"}")
-        }
-        if (timeline.containsKey("assistedDeaths")) {
-            lines.add("  - Assisted deaths (multi-enemy involvement, not necessarily ganks): ${timeline["assistedDeaths"] ?: "incomplete (legacy cache)"}")
-        }
-        if (timeline.containsKey("unassistedDeaths")) {
-            lines.add("  - Unassisted deaths (single-enemy kill credit, no assist credit): ${timeline["unassistedDeaths"] ?: "incomplete (legacy cache)"}")
-        }
-        if (timeline.containsKey("deathsNearObjectiveWindows")) {
-            lines.add("  - Deaths near objective windows: ${timeline["deathsNearObjectiveWindows"] ?: "incomplete (legacy cache)"}")
+        if (timeline != null) {
+            lines.add("\n**📊 TIMELINE ANALYSIS (last ${timeline["gamesAnalyzed"] ?: "?"} ranked games):**")
+            timeline["avgGoldLeadAt10"]?.let { lines.add("  - Avg gold lead vs opponent @10min: $it") }
+            timeline["avgGoldLeadAt15"]?.let { lines.add("  - Avg gold lead vs opponent @15min: $it") }
+            timeline["avgFirstDeathMinute"]?.let { lines.add("  - Avg minute of first death: $it") }
+            timeline["mostDangerousZone"]?.let { lines.add("  - Most frequent death zone: $it") }
+            timeline["wardsPlacedTotal"]?.let { lines.add("  - Total wards placed (across all games): $it") }
+            if (timeline.containsKey("wardsByTimeBucket")) {
+                val buckets = timeline["wardsByTimeBucket"]
+                lines.add("  - Wards placed by time bucket (no coordinates): ${buckets ?: "incomplete (legacy cache)"}")
+            }
+            timeline["killsTotal"]?.let { lines.add("  - Total kills across timeline games: $it") }
+            timeline["deathsTotal"]?.let { lines.add("  - Total deaths across timeline games: $it") }
+            timeline["assistsTotal"]?.let { lines.add("  - Total assists across timeline games: $it") }
+            if (timeline.containsKey("deathsBefore10")) {
+                lines.add("  - Deaths before 10min: ${timeline["deathsBefore10"] ?: "incomplete (legacy cache)"}")
+            }
+            if (timeline.containsKey("assistedDeaths")) {
+                lines.add("  - Assisted deaths (multi-enemy involvement, not necessarily ganks): ${timeline["assistedDeaths"] ?: "incomplete (legacy cache)"}")
+            }
+            if (timeline.containsKey("unassistedDeaths")) {
+                lines.add("  - Unassisted deaths (single-enemy kill credit, no assist credit): ${timeline["unassistedDeaths"] ?: "incomplete (legacy cache)"}")
+            }
+            if (timeline.containsKey("deathsNearObjectiveWindows")) {
+                lines.add("  - Deaths near objective windows: ${timeline["deathsNearObjectiveWindows"] ?: "incomplete (legacy cache)"}")
+            }
         }
 
-        return if (lines.size > 1) lines.joinToString("\n") else ""
+        if (coverage != null || rawStatus == "PARTIAL" || rawStatus == "BLOCKED") {
+            lines.add(
+                "\n**⏱️ TIMELINE COVERAGE BOUNDARY:** " +
+                    "When `timelineStatus` is `PARTIAL`, cite the exact `covered`/`requested` timeline denominator from `timelineCoverage` in plain player language (for example, \"minute-by-minute timeline data is available for X of your last Y games\"), anchor minute-by-minute claims strictly to those covered games without extrapolating to missing games, and when `timelineStatus` is `BLOCKED` or `covered` is 0, state plainly that minute-by-minute timeline data is temporarily unavailable and rely only on match summary stats. Never echo internal schema keys or status codes (`timelineCoverage`, `timelineStatus`, `stopReason`, `PARTIAL`, `BLOCKED`, `NOT_ANALYZED`)."
+            )
+        }
+
+        return if (lines.isNotEmpty()) lines.joinToString("\n") else ""
     }
 
     /**
