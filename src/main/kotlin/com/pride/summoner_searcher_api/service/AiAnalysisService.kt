@@ -270,12 +270,12 @@ class AiAnalysisService(
         val resolvedIntent = intent ?: detectIntent(userMessage, messages)
         val questionCategory = resolvedIntent.category
 
-        // 🎯 DYNAMIC FEW-SHOT LEARNING (bounded to at most 2 examples & MAX_FEW_SHOT_BYTES; skip stale schema-leaking examples)
+        // 🎯 DYNAMIC FEW-SHOT LEARNING (bounded to at most 2 concise, schema-, CS@10-, & boundary-clean examples)
         val fewShotExamples = try {
             exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc(
                 questionCategory,
-                PageRequest.of(0, 4)
-            ).filterNot { containsInternalSchemaLeak(it.aiResponse) || containsInternalSchemaLeak(it.userQuestion) }
+                PageRequest.of(0, 6)
+            ).filter { isEligibleCuratedExample(it.userQuestion, it.aiResponse) }
                 .take(2)
         } catch (e: Exception) {
             emptyList() // If repository not initialized yet
@@ -283,7 +283,7 @@ class AiAnalysisService(
         
         var fewShotSection = if (fewShotExamples.isNotEmpty()) {
             val formattedExamples = fewShotExamples.joinToString("\n\n") { example ->
-                val trimmedAnswer = example.aiResponse.take(450)
+                val trimmedAnswer = stripSuggestionsBlock(example.aiResponse).take(450)
                 """
                 Example:
                 User: "${example.userQuestion.take(160)}"
@@ -357,26 +357,22 @@ class AiAnalysisService(
         } ?: ""
 
         fun assemblePrompt(gt: String, fs: String, ph: String, hist: String, pv: String, tl: String, imp: String): String = """
-            You are an experienced, evidence-driven League of Legends coach analyzing ranked performance data. Calibrate your coaching depth and terminology to the player's actual rank ($playerRank) while using a constructive, natural, and analytical coaching methodology.
+            You are an experienced, evidence-driven League of Legends coach analyzing ranked performance data. Calibrate your coaching depth and terminology to the player's actual rank ($playerRank).
             
             **ANALYSIS FRAMEWORK (INTERNAL CHECKLIST):**
-            1. **Identify Context**: Rank ($playerRank), Role, Game Count ($recentSampleGameCount), Timeline ($naturalTimelineState), and the user's exact question.
-            2. **Answer the Question First**: Directly address what the user asked before anything else.
-            3. **Formulate Response**: Offer actionable, evidence-tied insight calibrated to the player's rank.
+            1. **Identify Context**: Rank ($playerRank), Role, Game Count ($recentSampleGameCount), Timeline ($naturalTimelineState).
+            2. **Answer First**: Lead with key scoped evidence, natural sample names, exact denominators, and missing-data limits.
+            3. **Two Practical Actions**: Give at most two controllable next-game actions (expand only when asked).
             
             $rankOptimization
             $pv
             
             **COACHING STYLE & TONE:**
-            - NEVER start a response with the player's name. NEVER address the player by their rank (e.g., do not say "Master I..."). Do not use the player's name ($playerName) more than once per response, and only when it's genuinely natural to do so mid-sentence. Most responses should use no name at all.
-            - Converse naturally. Avoid sounding like a rigid, automated report. Use natural paragraphs or short bullet points only when explaining complex concepts like wave management or ability combos.
-            - **Natural Player Language (No Internal Keys or Backticks):** In prose and `---SUGGESTIONS---`, speak naturally—never output internal field keys, `[sample: ...]` markers, `NOT_ANALYZED`, or backticks around stat/sample names.
-            - **Direct Answer Priority (#1 Rule):** ALWAYS directly and thoroughly answer the user's specific question first. Do NOT pivot to unrelated stat weaknesses (such as vision score or CS) when the user asks a focused question about a different topic (such as an item description, build path, champion mechanic, or matchup). Only bring up broader stat weaknesses when the user asks for an overall/general performance review or when it directly relates to their question.
-            - **Socratic Method:** When reviewing player mistakes, you may ask a brief guiding question to help them recognize the pattern, after answering their direct question.
-            - Be professional and honest about weaknesses. Do not use overly fluffy praise unless a stat is truly exceptional.
-            - **Concise & Natural Depth:** Keep responses concise, natural, and free of filler for straightforward questions, but allow longer, fuller explanations when the question needs depth (such as multi-game reviews, matchup breakdowns, build trade-offs, or macro walkthroughs). Tie every claim to specific evidence from the stats.
-            - **IMPORTANT: You MUST ALWAYS output the suggestions block at the very end of your response, absolutely nothing else should follow it. FORMAT:** `---SUGGESTIONS--- ["Option 1", "Option 2", "Option 3"]`
-            - **Formatting Highlight:** Use **bold text** strategically to emphasize key points, concepts, or statistics, making your answer easy to scan and read.
+            - NEVER start with the player's name or address them by rank (e.g., "Master I..."). Use $playerName at most once mid-sentence when natural (usually not at all). Converse naturally, not like an automated report, and use **bold text** for key points.
+            - **Natural Player Language (No Internal Keys or Backticks):** Speak naturally in prose and `---SUGGESTIONS---`—never output internal field keys, `[sample: ...]`, `NOT_ANALYZED`, or backticks around stat/sample names.
+            - **Direct Answer Priority (#1 Rule):** ALWAYS directly answer the user's specific question first; do NOT pivot to unrelated weaknesses unless asked for an overall review.
+            - **Default Short Answer & Two Practical Actions (Expand When Asked):** Default to a short, scannable answer with **no filler** and **no invented character or word limit**: cite key scoped evidence (natural sample names, exact denominators/win rates, and necessary uncertainty) and **at most two practical, controllable actions** without invented baseline targets. Expand into fuller detail only when the user explicitly asks.
+            - **Invited Bluntness & Playful Roasting:** Skip fluffy praise. When a roast or bluntness is invited, keep a sharp, playful edge on **verified personal, sample-scoped stats** only (never team-only objective rates such as first-secure rate on Voidgrubs/towers or unverified fight causes), plus two controllable actions.
             
             $fs
             
@@ -390,26 +386,19 @@ class AiAnalysisService(
             $imp
             
             **DATA-DRIVEN COACHING & DATA-BOUNDARY RULES:**
-            - For player-specific claims (win rates, KDA, CS/min, match history, or matchups played), rely strictly on the provided GROUND TRUTH STATS and recent-match summary/rows. Do not invent game events, player stats, or match results that are not listed in the data.
-            - **Strict Sample Scope & Denominator Separation (`rankedRecord` vs. `savedHistory` vs. `recentMatchSample`):** Ground-truth stats come from three distinct samples with different game counts: (1) `rankedRecord` ("your ranked record": Solo/Duo W/L, games, and win rate), (2) `savedHistory` ("your saved matches", with the saved-match count when relevant and always paired with saved-match W/L or win rate: `savedHistoryAverages`, `savedHistorySideSplits`, `topChampions`, `opponentStats`), and (3) `recentMatchSample` ("$naturalRecentMatchesPhrase" / "your last N detailed matches", with its own games and win rate: `recentMatchSummary`, `Game 1..N`, `championMatchups`, `topStrengths`, `topWeaknesses`). NEVER combine samples, remove counts from win-rate/record claims, or pair one sample's win rate with another sample's game count (e.g., `savedHistory` win rate with `rankedRecord` or `recentMatchSample` games). Cite each sample in plain player language with its own denominator (never raw keys or header tags), and treat `unavailable` samples as unavailable without substituting another denominator.
-            - For general League of Legends domain questions (such as item descriptions, build paths, rune interactions, ability mechanics, or macro concepts), answer directly using functional League of Legends concepts connected to the player's champions or stats when relevant, without asserting stale patch numbers or unsupported item-effect specifics.
-            - If the user asks for specific player data that is missing from the stats block, state clearly what data is unavailable.
-            - **Timeline Status (`timelineStatus` = $timelineStatus):** When `timelineStatus` is `NOT_ANALYZED`, state clearly that only end-of-game summary and challenge stats are available in plain language (never `timelineStatus` or `NOT_ANALYZED`); never make claims about exact item completion minutes, early gold/XP diffs at 10/15 minutes, or death locations.
-            - **Vision Boundary:** Discuss ward counts, ward types, and timing buckets only; never claim ward placement in specific bushes, river entrances, or map areas (`WARD_PLACED` events carry no coordinates).
-            - **Deaths & Assist Attribution:** Treat "assisted" deaths as multi-enemy kill participation only—assisted deaths are not necessarily jungle ganks (lane 2v2s, support roams, and skirmishes/teamfights produce assists too). Treat "unassisted" deaths as single-enemy kill credit with zero recorded assists—never equate unassisted deaths with 1v1 duels (solo picks, roam catches, or delayed finishes after assist timers expire also record zero assists). Describe recorded enemy involvement rather than inferring how the fight started.
-            - **Observed Facts vs. Hypotheses & Conditional Recommendations:** Death events do **not** prove bad trades, overextension, greed, or mechanical misplays. Always separate **observed facts** (timestamps, approximate zones, killers, recorded assistants, gold/XP/CS diffs, items built) from **hypotheses** about why they happened, and frame all coaching recommendations **conditionally** (e.g., *"If this death happened while pushing without river vision, consider...; if it happened rotating to a skirmish, instead..."*).
-            - **No Stale Mythic-Era or Unsupported Build-Effect Claims (Including `---SUGGESTIONS---`):** The Mythic item system was removed in Season 14. NEVER propose or mention "Mythic items", "Mythic passives", "Mythic paths/rushes", or removed Mythic-era items (e.g., Divine Sunderer, Everfrost, Galeforce, Goredrinker, Duskblade, Prowler's Claw, Crown of the Shattered Queen, Night Harvester, Radiant Virtue). Do not claim specific patch-dependent item stats, gold costs, or build-effect numbers unless the supplied patch/context data explicitly supports them; anchor build discussion to the items present in context (`items`, `opponentDetails.items`, `itemSpikes`) and their functional purpose. Apply this same rule to the 3 `---SUGGESTIONS---` follow-up questions.
-            - **Early Lane CS Target (`cs10.target`, `cs10.targetLabel`, `avgLaneCsAt10`, `missingLaneCsAt10Matches`):** `cs10.target` (114 for Top/Bot, 120 for Mid on verified patch 26.1+ games only; `null` for `JUNGLE`, `UTILITY`/`SUPPORT`, short `<600s` games, or pre-26.1 patches) is a role-specific 10:00 lane benchmark definition, **not** farmable supply or a missed-CS counter. NEVER subtract `actual` from `target` to claim exact "missed CS" or "missed last-hits", and never resurrect obsolete `spawnedSupply` claims. Keep `actual` (`laneCs@10`), benchmark definition (`cs10.target` / `cs10.targetLabel`), `patch`, `role`, denominator (`matchCount` vs `targetMatchCount`), and missingness (`missingLaneCsAt10Matches`, `null`) distinct (`avgTarget` is `null` on mixed-patch samples where `targetMatchCount < matchCount`).
-            - **5-Stat Improvement Evidence (`phaseFarming`, `leadRetention`, `deathCost`, `unspentGold`, `teamObjectives`):** Cite exact denominators (`eligibleGames`, `eligibleGamesAt10` vs `eligibleGamesAt20`, `eligibleTimeDeadGames`, `eligibleTimelineGames`, `eligibleTeamObjectiveGames`) and exclusions (`shortGames`, `excludedMissingTimeline`, `missingOpponentGames`) in plain words. Never claim missed CS in `phaseFarming`; treat `10-20m` objective/tower events in `leadRetention` as temporal association only (never proof of a throw or solo credit); never infer lost farm or death avoidability from `deathCost`; treat `>=1600g` 1-minute `currentGold` snapshots in `unspentGold` as descriptive balance checkpoints (never a mistake score or recall event); and keep team objective outcomes (`firstRate`, `teamAvg` vs `enemyAvg`) strictly separate from personal `personalLastHits`/`personalTakedowns`/`timelineInvolved`.
-            - **Incomplete Legacy Cache Fields:** When any stat or timeline breakdown (such as `assistedDeaths`, `unassistedDeaths`, `wardsByTimeBucket`, or `cs10.target`) is `null` or marked `incomplete`, treat it as unavailable/incomplete data—never treat `null` or `incomplete` fields as `0`.
-            
-            **MATCHUP GURU EXPERTISE:**
-            When discussing champion matchups, utilize the provided data. Go beyond basic win rates: explain *why* a matchup is favored or difficult by discussing specific ability interactions, cooldown windows, tethering, or power spikes.
-            
-            **ADVANCED LOL CONCEPTS TO CONSIDER:**
-            - **Fundamentals:** CS optimization, vision control, wave manipulation (freeze/slow push/crash), trading patterns.
-            - **Macro:** Rotation timing, objective priority, jungle pathing, roaming windows, tempo alignment.
-            - **Advanced Tactics:** Dive execution, tethering micro, cooldown tracking, cursor precision, FOW manipulation.
+            - Rely strictly on GROUND TRUTH STATS for player claims; state clearly when requested player data is unavailable.
+            - **Strict Sample Scope & Denominator Separation (`rankedRecord` vs. `savedHistory` vs. `recentMatchSample`):** Keep the three samples separate: (1) `rankedRecord` ("your ranked record": Solo/Duo W/L, games, and win rate), (2) `savedHistory` ("your saved matches", with the saved-match count when relevant and always paired with saved-match W/L or win rate: `savedHistoryAverages`, `savedHistorySideSplits`, `topChampions`, `opponentStats`), and (3) `recentMatchSample` ("$naturalRecentMatchesPhrase" / "your last N detailed matches", with its own games and win rate: `recentMatchSummary`, `Game 1..N`, `championMatchups`, `topStrengths`, `topWeaknesses`). NEVER combine samples, remove counts from win-rate/record claims, or pair one sample's win rate with another sample's game count. `rankedRecord` is Riot's **current ranked season/split** counter—NEVER call it a "lifetime", "all-time", or "career" ranked record. Riot does **not** expose hidden MMR ("matchmaking rating")—NEVER claim MMR has stabilized, converged, or shifted. Frame cross-sample win-rate differences via sample size / normal short-window variance and observed stats—NEVER invent unmeasured causes such as "better synergy" or "tighter macro". Treat `unavailable` samples as unavailable.
+            - For general League of Legends domain questions (such as item descriptions, build paths, rune interactions, ability mechanics, or macro concepts), use functional LoL concepts without stale patch numbers.
+            - **Verified Champion Ability Names Only:** Use official ability names only when certain; otherwise use ability keys (`Passive`, `Q`, `W`, `E`, `R`)—NEVER invent, guess, or blend ability names (such as "Aegis of Zealous").
+            - **Timeline Status (`timelineStatus` = $timelineStatus):** When `timelineStatus` is `NOT_ANALYZED`, state clearly that only end-of-game summary and challenge stats are available in plain language (never `timelineStatus` or `NOT_ANALYZED`); never claim item completion minutes, 10/15m gold/XP diffs, death locations, "low-percentage fights", bad engages, overextending, or wave-sequencing errors.
+            - **Vision Boundary:** Use ward counts, types, and timing buckets only; never claim ward placement in specific bushes, river entrances, or map areas (`WARD_PLACED` has no coordinates).
+            - **Deaths & Assist Attribution:** Assisted deaths mean multi-enemy participation—assisted deaths are not necessarily jungle ganks. Unassisted deaths mean single-enemy kill credit—never equate unassisted deaths with 1v1 duels.
+            - **Observed Facts vs. Hypotheses & Conditional Recommendations:** Death events do **not** prove bad trades, overextension, greed, mechanical misplays, "low-percentage fights", bad engages, or wave errors (nor do aggregate stats or grey-screen time). `topStrengths` and `topWeaknesses` percentages only count how often you beat or trailed your matched role opponent on a raw challenge stat in recent main-role games—NEVER turn challenge trail frequencies into confident skill diagnoses. Separate **observed facts** from **hypotheses**, and frame all coaching recommendations **conditionally**.
+            - **No Stale Mythic-Era or Unsupported Build-Effect Claims (Including `---SUGGESTIONS---`):** The Mythic item system was removed in Season 14. NEVER propose or mention "Mythic items", "Mythic passives", "Mythic paths/rushes", or removed Mythic items (Divine Sunderer, Everfrost, Galeforce, Goredrinker, Duskblade, Prowler's Claw, Crown of the Shattered Queen, Night Harvester, Radiant Virtue). Do not claim specific patch-dependent item stats, gold costs, or build-effect numbers unless the supplied patch/context data explicitly supports them; anchor builds to context items (`items`, `opponentDetails.items`, `itemSpikes`).
+            - **Early Lane CS Theoretical Maximum (`cs10.theoreticalMax`, `avgLaneCsAt10`, `missingLaneCsAt10Matches`):** `cs10.theoreticalMax` (`114` for `TOP`/`BOTTOM`, `120` for `MIDDLE` on verified Patch 26.1+ `>=600s` games; `null` for non-laners, `<600s`, or pre-26.1/unknown patches) is strictly the **theoretical maximum** passive lane wave spawn by 10:00—**never** an empirical benchmark, target/expected CS, farmable supply, or missed-CS baseline (including `---SUGGESTIONS---`). NEVER call `114`/`120` a "target" or "benchmark", NEVER invent substitute wave/pacing numbers (such as `107`, `101-107`, `100`, or `70-85`), NEVER subtract `actual` from `114`/`120` to claim "missed CS" or "missed last-hits", and NEVER treat a gap below `114`/`120` by itself as proof of poor farming or a `#1 focus area`. Keep `actual`, supported subset (`null` max when mixed), `patch`, `role`, missingness, and empirical cohort/opponent benchmarks distinct.
+            - **5-Stat Improvement Evidence (`phaseFarming`, `leadRetention`, `deathCost`, `unspentGold`, `teamObjectives`):** Cite exact denominators/exclusions in plain words. Never claim missed CS in `phaseFarming`; treat `10-20m` events in `leadRetention` as temporal association only; in `deathCost`, personal grey-screen time and game-time share remain valid personal stats even without timeline analysis when scoped to `eligibleTimeDeadGames`, but never infer lost farm, death avoidability, or "low-percentage fights" from `deathCost`; treat `unspentGold` `currentGold` checkpoints descriptively (not recall mistakes); and in `teamObjectives`, `first`/`firstRate` and `teamKills`/`teamAvg` are **5-player team outcomes**—NEVER frame low team `firstRate` (such as first-secure rate on Voidgrubs or first tower rate) as a personal weakness, personal fault, or player roast even when bluntness is invited, keeping them separate from personal `personalLastHits`/`personalTakedowns`/`timelineInvolved`.
+            - **Incomplete Legacy Cache Fields:** Treat `null` or `incomplete` fields (such as `assistedDeaths`, `unassistedDeaths`, `wardsByTimeBucket`, or `cs10.theoreticalMax`) as unavailable/incomplete—never as `0`.
+            - **Matchups:** Cite scoped matchup records with game counts and explain `Q`/`W`/`E`/`R` cooldown/spacing windows as hypotheses when unrecorded.
             
             **DATA QUALITY NOTES:**
             $sampleSizeWarning
@@ -417,10 +406,8 @@ class AiAnalysisService(
             **TONE ADJUSTMENT:**
             $streakToneAdjustment
             
-            IMPORTANT: At the very end of your response, you MUST provide exactly 3 short, relevant follow-up questions that the user might want to ask next based on your analysis (plain player language—no raw keys, `[sample: ...]`, `NOT_ANALYZED`, or backticks; never mention Mythic items/paths or unsupported build-effect claims in suggestions).
-            Format these questions exactly as a JSON array of strings, prefixed with "---SUGGESTIONS---".
-            Example:
-            ---SUGGESTIONS--- ["How do I improve my CS?", "Best warding spots?", "Review my champion pool"]
+            IMPORTANT: At the very end of your response, provide exactly 3 short follow-up questions (plain player language—no raw keys, `[sample: ...]`, `NOT_ANALYZED`, or backticks; never mention Mythic items/paths or unsupported build-effect claims in suggestions; never frame `114`/`120` as CS@10 targets, benchmarks, or missed CS) as a JSON array prefixed with "---SUGGESTIONS---".
+            Example: ---SUGGESTIONS--- ["How do I improve my CS?", "Best warding habits?", "Review my champion pool"]
             
             Previous:
             $hist
@@ -563,7 +550,7 @@ class AiAnalysisService(
         fun estimateTokens(text: String): Int = heuristicTokenEstimate(text)
 
         private val INTERNAL_SCHEMA_LEAK_REGEX = Regex(
-            """\b(?:rankedRecord|savedHistory|recentMatchSample|savedHistoryAverages|savedHistorySideSplits|recentMatchSummary|omittedMatchesRollup|timelineStatus|timelineInsights|improvementStats|visionDataPrecision|avgLaneCsAt10|missingLaneCsAt10Matches|NOT_ANALYZED)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`(?:topChampions|opponentStats|championMatchups|topStrengths|topWeaknesses|phaseFarming|leadRetention|deathCost|unspentGold|teamObjectives|ANALYZED)`"""
+            """\b(?:rankedRecord|savedHistory|recentMatchSample|savedHistoryAverages|savedHistorySideSplits|recentMatchSummary|omittedMatchesRollup|timelineStatus|timelineInsights|improvementStats|visionDataPrecision|avgLaneCsAt10|missingLaneCsAt10Matches|firstRate|NOT_ANALYZED)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`(?:topChampions|opponentStats|championMatchups|topStrengths|topWeaknesses|phaseFarming|leadRetention|deathCost|unspentGold|teamObjectives|ANALYZED)`"""
         )
 
         /**
@@ -572,6 +559,332 @@ class AiAnalysisService(
          */
         fun containsInternalSchemaLeak(text: String): Boolean =
             INTERNAL_SCHEMA_LEAK_REGEX.containsMatchIn(text)
+
+        private val SUGGESTIONS_BLOCK_REGEX = Regex("""\s*---SUGGESTIONS---[\s\S]*$""")
+
+        private val EXPANDED_ANSWER_REQUEST_REGEX = Regex(
+            """(?i)\b(?:in[- ]detail|in[- ]depth|detailed\s+breakdown|deep\s+dive|elaborate|expand(?:\s+on)?|walk\s+me\s+through|walkthrough|step[- ]by[- ]step|thorough(?:ly)?|comprehensive(?:ly)?|full\s+breakdown|game[- ]by[- ]game|explain\s+(?:more|further)|tell\s+me\s+more|go\s+deeper|break\s+down\s+each)\b"""
+        )
+
+        // Splits sentences and ellipses without breaking decimal numbers such as 147.05, 7.84%, 30.0%, or 26.1
+        private val SENTENCE_SPLIT_REGEX = Regex("""(?:\.(?!\d)|[!?\n])+""")
+
+        private val LOCAL_NEGATED_LIFETIME_RANKED_REGEX = Regex(
+            """(?i)\b(?:not|never|neither|nor|isn't|is\s+not|aren't|are\s+not|rather\s+than|instead\s+of)\s+(?:a\s+|an\s+|the\s+|your\s+)?(?:lifetime|all[- ]time|career)\s+(?:ranked|solo/?duo)\s+record\b"""
+        )
+
+        private val LIFETIME_RANKED_CLAIM_REGEX = Regex(
+            """(?i)\b(?:lifetime|all[- ]time|career)\s+(?:ranked|solo/?duo)\s+record\b"""
+        )
+
+        private val LOCAL_NEGATED_MMR_CLAIM_REGEX = Regex(
+            """(?i)\b(?:(?:does\s+not|doesn't|do\s+not|don't|cannot|can't|unable\s+to|never)\s+(?:prove|show|tell|mean|indicate|confirm|suggest|know|reveal)|no\s+(?:way|data|evidence)\s+to\s+(?:tell|know|verify|show|confirm))\s+(?:if\s+|whether\s+|that\s+)?(?:your\s+)?(?:overall\s+|hidden\s+)?(?:matchmaking\s+rating|\bmmr\b)(?:\s+(?:has\s+|have\s+|is\s+)?(?:stabilized|converged|leveled\s+off|plateaued|peaked|tanked|climbed|dropped|inflated|normali[sz]ed))?"""
+        )
+
+        private val MMR_CLAIM_REGEX = Regex(
+            """(?i)(?:\bsuggests\s+(?:that\s+)?your\s+(?:overall\s+)?(?:matchmaking\s+rating|\bmmr\b)|(?:matchmaking\s+rating|\bmmr\b)[^,;:.!?\n]{0,55}\b(?:has\s+|have\s+|is\s+)?(?:stabilized|converged|leveled\s+off|plateaued|peaked|tanked|climbed|dropped|inflated|normali[sz]ed)\b)"""
+        )
+
+        private val LOCAL_NEGATED_SYNERGY_MACRO_REGEX = Regex(
+            """(?i)\b(?:(?:does\s+not|doesn't|do\s+not|don't|cannot|can't|never)\s+(?:prove|show|confirm|mean|indicate|establish|suggest)|not\s+(?:proof|evidence)\s+of|rather\s+than|instead\s+of|neither)\s+(?:that\s+|any\s+)?(?:better\s+(?:team\s+|jungle\s+)?synergy|tighter\s+macro)(?:\s+(?:or|nor)\s+(?:better\s+(?:team\s+|jungle\s+)?synergy|tighter\s+macro))?"""
+        )
+
+        private val UNSUPPORTED_SYNERGY_MACRO_CAUSE_REGEX = Regex(
+            """(?i)\b(?:better\s+(?:team\s+|jungle\s+)?synergy|tighter\s+macro)\b"""
+        )
+
+        private val LOCAL_NEGATED_PERSONAL_OBJECTIVE_REGEX = Regex(
+            """(?i)\b(?:not|never|neither|nor|rather\s+than|instead\s+of)\s+(?:a\s+|an\s+|your\s+)?personal\s+(?:weakness|weaknesses|fault|failing|problem|issue|liability|stat|stats|metric)\b"""
+        )
+
+        private val TEAM_OBJECTIVE_TOPIC_REGEX = Regex(
+            """(?i)\b(?:first[- ](?:secure\s+rate|voidgrubs?|grubs?|horde|towers?|turrets?|dragons?|heralds?|barons?)|(?:voidgrubs?|grubs?|horde|towers?|turrets?)\s+first[- ](?:secure\s+)?rate|6\s+of\s+20|8\s+of\s+20)\b"""
+        )
+
+        private val PERSONAL_BLAME_ON_TEAM_STAT_REGEX = Regex(
+            """(?i)\b(?:personal\s+(?:weakness|weaknesses|fault|failing|problem|issue|liability)|your\s+personal\s+first[- ](?:secure|tower|turret|grub|voidgrub|dragon|herald|baron)|you\s+(?:personally\s+)?(?:only\s+)?secured\s+first\s+(?:voidgrubs?|grubs?|towers?|turrets?))\b"""
+        )
+
+        private val PEJORATIVE_TEAM_FIRST_RATE_REGEX = Regex(
+            """(?i)\b(?:poor|weak|abysmal|awful|terrible|pathetic|sloppy|dismal|embarrassing|mediocre|rough|lacking)\s+(?:\d+(?:\.\d+)?%\s+)?(?:first[- ]secure\s+rate(?:\s+on\s+(?:voidgrubs?|grubs?|horde|towers?|turrets?|dragons?|heralds?|barons?))?|first[- ](?:voidgrubs?|grubs?|horde|towers?|turrets?|dragons?|heralds?|barons?)\s+rate|(?:voidgrubs?|grubs?|horde|towers?|turrets?)\s+first[- ](?:secure\s+)?rate)\b"""
+        )
+
+        private val LOCAL_NEGATED_LOW_PCT_FIGHTS_REGEX = Regex(
+            """(?i)\b(?:(?:does\s+not|doesn't|do\s+not|don't|cannot|can't|unable\s+to|never)\s+(?:prove|show|confirm|mean|indicate|tell|know|verify|see|establish)|no\s+(?:way|data|evidence|timeline)\s+to\s+(?:tell|know|verify|prove|show|confirm)|not\s+(?:proof|evidence)\s+of)\s+(?:if\s+|whether\s+|that\s+)?(?:you(?:'re|\s+are)?\s+)?(?:(?:take|takes|taking|took|force|forces|forcing|pick|picking)\s+)?low[- ]percentage\s+fights\b"""
+        )
+
+        private val LOW_PERCENTAGE_FIGHTS_CLAIM_REGEX = Regex(
+            """(?i)\blow[- ]percentage\s+fights\b"""
+        )
+
+        private val LOCAL_NEGATED_ABILITY_MYTHIC_REGEX = Regex(
+            """(?i)\b(?:(?:no|never\s+(?:mention|build|buy|recommend|propose|cite)|removed|obsolete)\s+(?:removed\s+)?(?:mythic\s+(?:items?|passives?|paths?|rushes?)|divine\s+sunderer|everfrost|galeforce|goredrinker|duskblade(?:\s+of\s+draktharr)?|prowler'?s\s+claw|crown\s+of\s+the\s+shattered\s+queen|night\s+harvester|radiant\s+virtue)|mythic\s+(?:item\s+system|items?)\s+(?:was|were)\s+removed|(?:no|not\s+an?)\s+ability\s+(?:called|named)\s+aegis\s+of\s+zealous)\b"""
+        )
+
+        private val INVENTED_ABILITY_OR_MYTHIC_REGEX = Regex(
+            """(?i)\b(?:aegis\s+of\s+zealous|mythic\s+(?:items?|passives?|paths?|rushes?)|divine\s+sunderer|everfrost|galeforce|goredrinker|duskblade(?:\s+of\s+draktharr)?|prowler'?s\s+claw|crown\s+of\s+the\s+shattered\s+queen|night\s+harvester|radiant\s+virtue)\b"""
+        )
+
+        private val LOCAL_NEGATED_CHALLENGE_DIAGNOSIS_REGEX = Regex(
+            """(?i)\b(?:(?:does\s+not|doesn't|do\s+not|don't|cannot|can't|never)\s+(?:prove|confirm|diagnose|mean)|not\s+(?:proof|evidence|a\s+diagnosis)\s+of)\s+(?:(?:that\s+you\s+have\s+)?(?:poor|weak|bad|broken)\s+\w+(?:\s+\w+)?)?"""
+        )
+
+        private val CHALLENGE_DIAGNOSIS_CLAIM_REGEX = Regex(
+            """(?i)(?:\b(?:trail(?:ed|ing)?|behind\s+your\s+(?:role|lane)\s+opponent|weakness\s+(?:rate|consistency|frequency))[^.!?\n]{0,90}\b(?:proves?|confirms?|diagnoses|means\s+you\s+have\s+(?:poor|weak|bad|broken))\b|\b\d+(?:\.\d+)?%\s+of\s+(?:your\s+)?(?:main[- ]role\s+)?(?:games|matches)[^.!?\n]{0,70}\b(?:proves?|confirms?)\s+(?:poor|weak|bad|broken)\b)"""
+        )
+
+        const val MAX_DEFAULT_CURATED_EXAMPLE_WORDS: Int = 220
+
+        /**
+         * Strips the trailing `---SUGGESTIONS--- [...]` block so coaching prose length and content
+         * can be evaluated or injected cleanly without follow-up JSON noise.
+         */
+        fun stripSuggestionsBlock(text: String): String =
+            text.replace(SUGGESTIONS_BLOCK_REGEX, "").trim()
+
+        /**
+         * Returns true when the player explicitly asks for a fuller, expanded, or game-by-game breakdown
+         * rather than the default short coaching answer.
+         */
+        fun requestsExpandedAnswer(question: String): Boolean =
+            EXPANDED_ANSWER_REQUEST_REGEX.containsMatchIn(question)
+
+        /**
+         * Deterministically detects known evidence-boundary violations in coaching prose or candidate
+         * few-shot examples (such as mislabeling `rankedRecord` as a "lifetime ranked record", claiming
+         * hidden MMR stabilized, asserting unsupported "better synergy"/"tighter macro" cross-window causes,
+         * roasting or blaming 5-player team `firstRate` objectives as a personal weakness/fault, asserting
+         * "low-percentage fights" without timeline proof—including presuppositions such as "Your teammates
+         * aren't forcing you to take low-percentage fights"—inventing ability names like "Aegis of Zealous",
+         * turning challenge trail frequencies into confident skill diagnoses, or citing removed Mythic-era
+         * items). Uses strict per-rule local negated-clause scrubbing so unrelated negations elsewhere in a
+         * sentence never exempt an unsupported claim.
+         */
+        fun containsEvidenceBoundaryViolation(text: String): Boolean {
+            val body = stripSuggestionsBlock(text)
+            if (body.isBlank()) {
+                val tailOnly = text.substringAfter("---SUGGESTIONS---", "")
+                if (tailOnly.isBlank()) return false
+                val scrubbedTailOnly = LOCAL_NEGATED_ABILITY_MYTHIC_REGEX.replace(tailOnly, " ")
+                return INVENTED_ABILITY_OR_MYTHIC_REGEX.containsMatchIn(scrubbedTailOnly)
+            }
+
+            val sentences = body.split(SENTENCE_SPLIT_REGEX).map { it.trim() }.filter { it.isNotEmpty() }
+            for (sentence in sentences) {
+                if (LIFETIME_RANKED_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_LIFETIME_RANKED_REGEX.replace(sentence, " "))) {
+                    return true
+                }
+                if (MMR_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_MMR_CLAIM_REGEX.replace(sentence, " "))) {
+                    return true
+                }
+                if (UNSUPPORTED_SYNERGY_MACRO_CAUSE_REGEX.containsMatchIn(LOCAL_NEGATED_SYNERGY_MACRO_REGEX.replace(sentence, " "))) {
+                    return true
+                }
+                val scrubbedObj = LOCAL_NEGATED_PERSONAL_OBJECTIVE_REGEX.replace(sentence, " ")
+                if (
+                    PEJORATIVE_TEAM_FIRST_RATE_REGEX.containsMatchIn(scrubbedObj) ||
+                    (TEAM_OBJECTIVE_TOPIC_REGEX.containsMatchIn(scrubbedObj) &&
+                        PERSONAL_BLAME_ON_TEAM_STAT_REGEX.containsMatchIn(scrubbedObj))
+                ) {
+                    return true
+                }
+                if (LOW_PERCENTAGE_FIGHTS_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_LOW_PCT_FIGHTS_REGEX.replace(sentence, " "))) {
+                    return true
+                }
+                if (INVENTED_ABILITY_OR_MYTHIC_REGEX.containsMatchIn(LOCAL_NEGATED_ABILITY_MYTHIC_REGEX.replace(sentence, " "))) {
+                    return true
+                }
+                if (CHALLENGE_DIAGNOSIS_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_CHALLENGE_DIAGNOSIS_REGEX.replace(sentence, " "))) {
+                    return true
+                }
+            }
+            val suggestionsTail = text.substringAfter("---SUGGESTIONS---", "")
+            if (suggestionsTail.isNotBlank()) {
+                val scrubbedTail = LOCAL_NEGATED_ABILITY_MYTHIC_REGEX.replace(suggestionsTail, " ")
+                if (INVENTED_ABILITY_OR_MYTHIC_REGEX.containsMatchIn(scrubbedTail)) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        /**
+         * Validates whether a candidate or stored `AiLearnedExample` passes all three few-shot safety gates
+         * (#38 schema/natural-language filter, #39 CS@10 theoretical-maximum filter, and #36/Nov 10 evidence
+         * boundary + default-brevity filter) before entering or being injected from `PROVEN EXAMPLES`.
+         */
+        fun isEligibleCuratedExample(userQuestion: String, aiResponse: String): Boolean {
+            if (userQuestion.isBlank() || aiResponse.isBlank()) return false
+            if (containsInternalSchemaLeak(userQuestion) || containsInternalSchemaLeak(aiResponse)) return false
+            if (containsCs10TheoreticalMaxMislabeling(userQuestion) || containsCs10TheoreticalMaxMislabeling(aiResponse)) {
+                return false
+            }
+            if (containsEvidenceBoundaryViolation(aiResponse)) return false
+            val bodyWords = stripSuggestionsBlock(aiResponse)
+                .split(Regex("""\s+"""))
+                .count { it.isNotBlank() }
+            if (bodyWords == 0) return false
+            if (!requestsExpandedAnswer(userQuestion) && bodyWords > MAX_DEFAULT_CURATED_EXAMPLE_WORDS) {
+                return false
+            }
+            return true
+        }
+
+        const val DEFAULT_CS10_THEORETICAL_MAX_LABEL: String =
+            "Patch 26.1+ theoretical maximum wave spawn by 10:00 (114 Top/Bot, 120 Mid; not a target or benchmark)"
+
+        private val NEGATED_CS10_CLAUSE_REGEX = Regex(
+            """(?i)\b(?:not|never|neither|nor|rather\s+than|instead\s+of|without\s+(?:treating|framing|calling|using)\s+[^.;,\n]{0,40}?as)\s+(?:a\s+|an\s+|the\s+)?(?:realistic\s+|empirical\s+|performance\s+|expected\s+|practical\s+|role\s+|rank\s+|missed[- ]cs\s+)*(?:target|benchmark|baseline|goal|standard|farmable\s+supply)(?:\s+(?:or|nor)\s+(?:a\s+|an\s+|the\s+)?(?:realistic\s+|empirical\s+|performance\s+|missed[- ]cs\s+)*(?:target|benchmark|baseline|goal|standard|farmable\s+supply))*|\b(?:not|never|no|without|avoid)\s+(?:a\s+)?(?:claim(?:ing)?\s+|infer(?:ring)?\s+|count(?:ing)?\s+)?(?:exact\s+|measured\s+)?missed[- ]cs(?:\s+baseline)?"""
+        )
+
+        private val CS10_RAW_LEGACY_KEY_OR_UNSUPPORTED_SUB_REGEX = Regex(
+            """(?i)\b(?:cs10\.target(?:Label)?|avgTarget|targetMatchCount|cs10\.(?:spawnedSupply|supplyLabel))\b|\b(?:101\s*[-–—]\s*107|107\s+(?:lane\s+)?(?:minions?|cs)|70\s*[-–—]\s*85\s*(?:lane\s+)?cs|100\s+cs\s*(?:@|at)\s*10)\b"""
+        )
+
+        private val CS10_MISLABELED_PROSE_REGEX = Regex(
+            """(?i)\b(?:top|mid|middle|bot|bottom)\s+lane\s+target\b|\b(?:114|120|118)(?:\.0)?\b[^,;.\n]{0,45}?\b(?:target|benchmark|expected\s+cs|farmable\s+supply)\b|\b(?:target|benchmark|expected\s+cs|farmable\s+supply)\b[^,;.\n]{0,45}?\b(?:114|120|118)(?:\.0)?\b|\b(?:cs\s*(?:@|at)\s*10|10[- ]minute\s+(?:lane\s+)?cs)\s+(?:target|benchmark)\b|\b(?:missed|missing|lost|dropped)\s+~?\d+(?:\.\d+)?\s*(?:lane\s+)?(?:cs|minions?|last[- ]hits?)\b"""
+        )
+
+        /**
+         * Detects legacy/mislabeled CS@10 framing that treats the 114/120 theoretical wave-spawn ceiling
+         * as a target, benchmark, farmable supply, or missed-CS baseline, or substitutes ungrounded
+         * 107 / 101-107 / 70-85 / 100 CS@10 heuristics. Allows explicit negations ("not a target or benchmark").
+         */
+        fun containsCs10TheoreticalMaxMislabeling(text: String): Boolean {
+            if (text.isBlank()) return false
+            if (CS10_RAW_LEGACY_KEY_OR_UNSUPPORTED_SUB_REGEX.containsMatchIn(text)) return true
+            val scrubbed = NEGATED_CS10_CLAUSE_REGEX.replace(text, " ")
+            return CS10_MISLABELED_PROSE_REGEX.containsMatchIn(scrubbed)
+        }
+
+        /**
+         * Fail-closed Patch 26.1+ (Riot `gameVersion` `16.1+` or display `26.1+`) verifier.
+         * Requires at least `major.minor` where EVERY dot-separated segment is non-empty ASCII digits (`0-9`),
+         * `major >= 16`, and `minor >= 1`. Rejects malformed strings such as `"16.x"`, `"16"`, `"16."`, `"16.0"`.
+         */
+        fun isVerifiedPost26_1Patch(patchVersion: String?): Boolean {
+            val cleaned = patchVersion?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+            val parts = cleaned.split('.')
+            if (parts.size < 2) return false
+            if (parts.any { segment -> segment.isEmpty() || segment.any { ch -> ch !in '0'..'9' } }) {
+                return false
+            }
+            val major = parts[0].toIntOrNull() ?: return false
+            val minor = parts[1].toIntOrNull() ?: return false
+            return major >= 16 && minor >= 1
+        }
+
+        /**
+         * Canonical Patch 26.1+ passive single-lane wave spawn theoretical maximum by 10:00:
+         * `114` for `TOP` / `BOTTOM`, `120` for `MIDDLE`, `null` for `JUNGLE`, `UTILITY`/`SUPPORT`, or unknown.
+         */
+        fun post26_1RoleTheoreticalMaxCsAt10(role: String?): Int? =
+            when (role?.trim()?.uppercase()) {
+                "TOP", "BOTTOM" -> 114
+                "MIDDLE" -> 120
+                else -> null
+            }
+
+        fun normalizeCs10TheoreticalMaxLabel(rawLabel: Any?): String {
+            val candidate = rawLabel?.toString()?.trim()?.takeIf { it.isNotEmpty() && it != "null" }
+                ?: return DEFAULT_CS10_THEORETICAL_MAX_LABEL
+            if (
+                containsCs10TheoreticalMaxMislabeling(candidate) ||
+                !candidate.contains("theoretical maximum", ignoreCase = true)
+            ) {
+                return DEFAULT_CS10_THEORETICAL_MAX_LABEL
+            }
+            return candidate.replace("\"", "'").take(160)
+        }
+
+        internal fun parseStrictFiniteDouble(value: Any?): Double? =
+            when (value) {
+                is Number -> value.toDouble().takeIf { it.isFinite() }
+                is String -> {
+                    val trimmed = value.trim()
+                    if (trimmed.isEmpty() || trimmed.equals("null", ignoreCase = true)) null
+                    else trimmed.toDoubleOrNull()?.takeIf { it.isFinite() }
+                }
+                else -> null
+            }
+
+        internal fun parseStrictNonNegativeInt(value: Any?): Int? =
+            when (value) {
+                is Int -> value.takeIf { it >= 0 }
+                is Long -> value.takeIf { it in 0L..Int.MAX_VALUE.toLong() }?.toInt()
+                is Short -> value.toInt().takeIf { it >= 0 }
+                is Byte -> value.toInt().takeIf { it >= 0 }
+                is Double -> if (value.isFinite() && value >= 0.0 && value <= Int.MAX_VALUE.toDouble() && value % 1.0 == 0.0) value.toInt() else null
+                is Float -> if (value.isFinite() && value >= 0f && value <= Int.MAX_VALUE.toFloat() && value % 1.0f == 0.0f) value.toInt() else null
+                is java.math.BigDecimal -> runCatching { value.intValueExact() }.getOrNull()?.takeIf { it >= 0 }
+                is String -> {
+                    val trimmed = value.trim()
+                    if (trimmed.isNotEmpty() && trimmed.all { it in '0'..'9' }) trimmed.toIntOrNull() else null
+                }
+                else -> null
+            }
+
+        /**
+         * Fail-closed per-match CS@10 theoretical maximum resolver.
+         * Returns the canonical role ceiling (`114` Top/Bot, `120` Mid) ONLY when:
+         * 1. Match is not an early surrender (`gameEndedInEarlySurrender != true`),
+         * 2. Explicit valid duration is present and `>= 600s` (`gameDurationSeconds >= 600`) / `>= 10.0m` (`gameDuration >= 10.0`),
+         * 3. Explicit role (`role` / `teamPosition`) is `TOP`, `MIDDLE`, or `BOTTOM`,
+         * 4. Explicit patch (`patch` / `gameVersion`) passes [isVerifiedPost26_1Patch], AND
+         * 5. Provided `theoreticalMax` (or legacy `target`) is explicitly present and equals the canonical ceiling.
+         * Any absent, malformed, unsupported, or mismatched input fails closed to `null`.
+         */
+        fun resolveMatchCs10TheoreticalMax(
+            match: Map<String, Any?>,
+            cs10Map: Map<String, Any?>
+        ): Int? {
+            val earlySurrender = match["gameEndedInEarlySurrender"]
+            if (earlySurrender == true || earlySurrender?.toString()?.equals("true", ignoreCase = true) == true) {
+                return null
+            }
+
+            val rawDurationSeconds = match["gameDurationSeconds"]
+            val rawDurationMinutes = match["gameDuration"]
+            if (rawDurationSeconds == null && rawDurationMinutes == null) {
+                return null
+            }
+            if (rawDurationSeconds != null) {
+                val seconds = parseStrictFiniteDouble(rawDurationSeconds) ?: return null
+                if (seconds < 600.0) return null
+            }
+            if (rawDurationMinutes != null) {
+                if (rawDurationMinutes is String && rawDurationMinutes.contains(':')) {
+                    val mmSs = rawDurationMinutes.trim().split(':')
+                    if (mmSs.size != 2 || mmSs[0].isEmpty() || mmSs[1].length != 2) return null
+                    if (mmSs[0].any { it !in '0'..'9' } || mmSs[1].any { it !in '0'..'9' }) return null
+                    val mm = mmSs[0].toIntOrNull() ?: return null
+                    val ss = mmSs[1].toIntOrNull() ?: return null
+                    if (ss !in 0..59 || mm * 60 + ss < 600) return null
+                } else {
+                    val cleanedMinutes = if (rawDurationMinutes is String) {
+                        rawDurationMinutes.trim().removeSuffix("m").trim()
+                    } else {
+                        rawDurationMinutes
+                    }
+                    val minutes = parseStrictFiniteDouble(cleanedMinutes) ?: return null
+                    if (minutes < 10.0) return null
+                }
+            }
+
+            val roleRaw = (match["role"] ?: match["teamPosition"])?.toString()
+            val canonicalRoleMax = post26_1RoleTheoreticalMaxCsAt10(roleRaw) ?: return null
+
+            val patchRaw = (match["patch"] ?: match["gameVersion"])?.toString()
+            if (!isVerifiedPost26_1Patch(patchRaw)) return null
+
+            val rawProvided = if (cs10Map.containsKey("theoreticalMax")) {
+                cs10Map["theoreticalMax"]
+            } else {
+                cs10Map["target"]
+            }
+            val providedInt = parseStrictNonNegativeInt(rawProvided) ?: return null
+            return canonicalRoleMax.takeIf { providedInt == canonicalRoleMax }
+        }
 
         val VALID_CATEGORIES: Set<String> = setOf(
             "cs_farming", "vision_warding", "wave_management", "trading_laning",
@@ -968,28 +1281,153 @@ class AiAnalysisService(
             }
         }
 
-        // Aggregate Early Lane CS@10 summary (actual, benchmark definition, role breakdown, denominators, missingness)
+        // Aggregate Early Lane CS@10 summary (actual, theoretical maximum ceiling, role breakdown, denominators, missingness)
         val avgLaneCsAt10 = context["avgLaneCsAt10"] as? Map<*, *>
         if (avgLaneCsAt10 != null) {
             val avgActual = avgLaneCsAt10["avgActual"] ?: "null"
-            val matchCount = avgLaneCsAt10["matchCount"] ?: 0
-            val avgTarget = avgLaneCsAt10["avgTarget"] ?: "null"
-            val targetMatchCount = avgLaneCsAt10["targetMatchCount"] ?: 0
+            val matchCountInt = parseStrictNonNegativeInt(avgLaneCsAt10["matchCount"])
+            val rawAvgMax = if (avgLaneCsAt10.containsKey("avgTheoreticalMax")) {
+                avgLaneCsAt10["avgTheoreticalMax"]
+            } else {
+                avgLaneCsAt10["avgTarget"]
+            }
+            val avgMaxDouble = parseStrictFiniteDouble(rawAvgMax)
+            val rawSupportedCount = if (avgLaneCsAt10.containsKey("theoreticalMaxMatchCount")) {
+                avgLaneCsAt10["theoreticalMaxMatchCount"]
+            } else {
+                avgLaneCsAt10["targetMatchCount"]
+            }
+            val supportedCountInt = parseStrictNonNegativeInt(rawSupportedCount)
             val avgSupportedActual = avgLaneCsAt10["avgSupportedActual"] ?: "null"
-            val targetLabel = avgLaneCsAt10["targetLabel"] ?: "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
-            val roleBreakdownList = (avgLaneCsAt10["roleBreakdown"] as? List<*>)?.mapNotNull { entry ->
-                val rm = entry as? Map<*, *> ?: return@mapNotNull null
-                val r = rm["role"] ?: return@mapNotNull null
-                val mc = rm["matchCount"] ?: 0
-                val aa = rm["avgActual"] ?: "null"
-                val at = rm["avgTarget"] ?: "null"
-                val tmc = rm["targetMatchCount"] ?: 0
-                val asa = rm["avgSupportedActual"] ?: "null"
-                "$r(actual=$aa in ${mc}g, target=$at in ${tmc}g, supportedActual=$asa)"
-            } ?: emptyList()
-            val roleBreakdownStr = if (roleBreakdownList.isNotEmpty()) ", roleBreakdown=[${roleBreakdownList.joinToString("; ")}]" else ""
+            val rawLabel = if (avgLaneCsAt10.containsKey("theoreticalMaxLabel")) {
+                avgLaneCsAt10["theoreticalMaxLabel"]
+            } else {
+                avgLaneCsAt10["targetLabel"]
+            }
+            val normalizedLabel = normalizeCs10TheoreticalMaxLabel(rawLabel)
+
+            var roleBreakdownAllowsTopMax = true
+            val rawRoleBreakdown = avgLaneCsAt10["roleBreakdown"]
+            val roleBreakdownItems: List<String> = when (rawRoleBreakdown) {
+                is List<*> -> {
+                    if (rawRoleBreakdown.isEmpty()) {
+                        emptyList()
+                    } else {
+                        val items = mutableListOf<String>()
+                        for (entry in rawRoleBreakdown) {
+                            val rm = entry as? Map<*, *> ?: {
+                                roleBreakdownAllowsTopMax = false
+                                null
+                            }()
+                            if (rm == null) continue
+                            val rRaw = rm["role"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+                            if (rRaw == null) {
+                                roleBreakdownAllowsTopMax = false
+                                continue
+                            }
+                            val canonicalRoleMax = post26_1RoleTheoreticalMaxCsAt10(rRaw)
+                            val mcInt = parseStrictNonNegativeInt(rm["matchCount"])
+                            val rawRoleSupported = when {
+                                rm.containsKey("theoreticalMaxMatchCount") -> rm["theoreticalMaxMatchCount"]
+                                rm.containsKey("supportedMatchCount") -> rm["supportedMatchCount"]
+                                else -> rm["targetMatchCount"]
+                            }
+                            val tmcInt = parseStrictNonNegativeInt(rawRoleSupported)
+                            val rawRoleMax = when {
+                                rm.containsKey("theoreticalMax") -> rm["theoreticalMax"]
+                                rm.containsKey("avgTheoreticalMax") -> rm["avgTheoreticalMax"]
+                                else -> rm["avgTarget"]
+                            }
+                            val roleMaxDouble = parseStrictFiniteDouble(rawRoleMax)
+                            val aa = rm["avgActual"] ?: "null"
+                            val asaRaw = rm["avgSupportedActual"] ?: "null"
+
+                            val roleAllSupported = canonicalRoleMax != null &&
+                                mcInt != null &&
+                                mcInt > 0 &&
+                                tmcInt != null &&
+                                tmcInt == mcInt &&
+                                roleMaxDouble != null &&
+                                kotlin.math.abs(roleMaxDouble - canonicalRoleMax.toDouble()) < 1e-6
+
+                            if (mcInt == null || (mcInt > 0 && !roleAllSupported)) {
+                                roleBreakdownAllowsTopMax = false
+                            }
+                            val roleMaxStr = if (roleAllSupported) canonicalRoleMax!!.toDouble().toString() else "null"
+                            val mcVal = mcInt ?: 0
+                            val tmcVal = if (tmcInt != null && (mcInt == null || tmcInt <= mcInt)) tmcInt else 0
+                            val asaVal = if (tmcVal > 0) asaRaw else "null"
+                            items.add(
+                                "$rRaw(actual=$aa in ${mcVal}g, theoreticalMax=$roleMaxStr, supported=${tmcVal}g, supportedActual=$asaVal)"
+                            )
+                        }
+                        items
+                    }
+                }
+                is Map<*, *> -> {
+                    if (rawRoleBreakdown.isEmpty()) {
+                        emptyList()
+                    } else {
+                        val parsedEntries = mutableListOf<Pair<String, Int>>()
+                        var malformedEntry = false
+                        for ((k, v) in rawRoleBreakdown) {
+                            val roleStr = k?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+                            val gamesInt = parseStrictNonNegativeInt(v)
+                            if (roleStr == null || gamesInt == null) {
+                                malformedEntry = true
+                                continue
+                            }
+                            if (gamesInt > 0) {
+                                parsedEntries.add(roleStr to gamesInt)
+                            }
+                        }
+                        val mapAllSupported = !malformedEntry &&
+                            matchCountInt != null &&
+                            matchCountInt > 0 &&
+                            supportedCountInt != null &&
+                            supportedCountInt == matchCountInt &&
+                            parsedEntries.isNotEmpty() &&
+                            parsedEntries.sumOf { it.second } == matchCountInt &&
+                            parsedEntries.all { post26_1RoleTheoreticalMaxCsAt10(it.first) != null }
+                        if (!mapAllSupported) {
+                            roleBreakdownAllowsTopMax = false
+                        }
+                        parsedEntries.map { (roleStr, gamesInt) ->
+                            val roleMaxStr = if (mapAllSupported) {
+                                post26_1RoleTheoreticalMaxCsAt10(roleStr).toString()
+                            } else {
+                                "null"
+                            }
+                            "$roleStr(${gamesInt}g, theoreticalMax=$roleMaxStr)"
+                        }
+                    }
+                }
+                else -> emptyList()
+            }
+
+            val exposeTopAvgMax = matchCountInt != null &&
+                matchCountInt > 0 &&
+                supportedCountInt != null &&
+                supportedCountInt == matchCountInt &&
+                avgMaxDouble != null &&
+                avgMaxDouble in 114.0..120.0 &&
+                roleBreakdownAllowsTopMax
+
+            val formattedMatchCount = matchCountInt ?: 0
+            val formattedSupportedCount = if (supportedCountInt != null && (matchCountInt == null || supportedCountInt <= matchCountInt)) {
+                supportedCountInt
+            } else {
+                0
+            }
+            val formattedAvgMax = if (exposeTopAvgMax) rawAvgMax.toString().trim() else "null"
+            val formattedSupportedActual = if (formattedSupportedCount > 0) avgSupportedActual else "null"
+            val roleBreakdownStr = if (roleBreakdownItems.isNotEmpty()) {
+                ", roleBreakdown=[${roleBreakdownItems.joinToString("; ")}]"
+            } else {
+                ""
+            }
             headerLines.add(
-                "  avgLaneCsAt10: {avgActual=$avgActual (matchCount=$matchCount), avgTarget=$avgTarget (targetMatchCount=$targetMatchCount, avgSupportedActual=$avgSupportedActual), targetLabel=\"$targetLabel\"$roleBreakdownStr}"
+                "  avgLaneCsAt10: {avgActual=$avgActual (matchCount=$formattedMatchCount), avgTheoreticalMax=$formattedAvgMax (theoreticalMaxMatchCount=$formattedSupportedCount, avgSupportedActual=$formattedSupportedActual), theoreticalMaxLabel=\"$normalizedLabel\"$roleBreakdownStr}"
             )
         }
         if (context.containsKey("missingLaneCsAt10Matches")) {
@@ -1035,13 +1473,13 @@ class AiAnalysisService(
             }
         }
 
-        // Top strengths / weaknesses (cap at 4 each; scoped to recentMatchSample)
+        // Top strengths / weaknesses (cap at 4 each; scoped to recentMatchSample; challenge comparison frequency vs matched role opponent)
         val strengths = context["topStrengths"] as? List<*>
         if (!strengths.isNullOrEmpty()) {
             val formatted = strengths.take(4).joinToString(", ") { item ->
                 if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString().take(48)
             }
-            headerLines.add("  topStrengths: $formatted [sample: recentMatchSample]")
+            headerLines.add("  topStrengths (beat-opp freq): $formatted [sample: recentMatchSample]")
         }
 
         val weaknesses = context["topWeaknesses"] as? List<*>
@@ -1049,7 +1487,7 @@ class AiAnalysisService(
             val formatted = weaknesses.take(4).joinToString(", ") { item ->
                 if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString().take(48)
             }
-            headerLines.add("  topWeaknesses: $formatted [sample: recentMatchSample]")
+            headerLines.add("  topWeaknesses (trail-opp freq): $formatted [sample: recentMatchSample]")
         }
 
         // Champion Matchups (prioritize any champion mentioned in userMessage, up to 5; scoped to recentMatchSample)
@@ -1272,20 +1710,20 @@ class AiAnalysisService(
             lines.add("  omittedMatchesRollup: ${omitted.size} games not expanded (${omittedWins}W/${omittedLosses}L, champs=[$champCounts])")
         }
 
-        var emittedTargetLabel = false
+        var emittedTheoreticalMaxLabel = false
         for (sm in selectedChronological) {
             val isFullDetail = sm.chronologicalIndex in fullDetailIndices || totalMatches <= MAX_FULL_DETAIL_MATCHES
-            val includeTargetLabel = !emittedTargetLabel
-            val (line, usedTargetLabel) = formatMatchLine(
+            val includeTheoreticalMaxLabel = !emittedTheoreticalMaxLabel
+            val (line, usedTheoreticalMaxLabel) = formatMatchLine(
                 i = sm.chronologicalIndex,
                 totalMatches = totalMatches,
                 m = sm.match,
                 fullDetail = isFullDetail,
-                includeTargetLabel = includeTargetLabel,
+                includeTheoreticalMaxLabel = includeTheoreticalMaxLabel,
                 questionCategory = questionCategory,
                 userMessage = userMessage
             )
-            if (usedTargetLabel) emittedTargetLabel = true
+            if (usedTheoreticalMaxLabel) emittedTheoreticalMaxLabel = true
             lines.add(line)
         }
 
@@ -1298,7 +1736,7 @@ class AiAnalysisService(
         totalMatches: Int,
         m: Map<String, Any?>,
         fullDetail: Boolean,
-        includeTargetLabel: Boolean,
+        includeTheoreticalMaxLabel: Boolean,
         questionCategory: String,
         userMessage: String
     ): Pair<String, Boolean> {
@@ -1388,19 +1826,23 @@ class AiAnalysisService(
         (m["goldPerMinute"] ?: m["goldPerMin"])?.let { advStats.add("gold/min=$it") }
         m["soloKills"]?.let { advStats.add("soloKills=$it") }
         m["laneMinionsFirst10Minutes"]?.let { advStats.add("laneCs@10=$it") }
-        var usedTargetLabel = false
+        var usedTheoreticalMaxLabel = false
         val cs10Map = (m["laneCsAt10"] ?: m["cs10"]) as? Map<String, Any?>
         if (cs10Map != null) {
             val actual = cs10Map["actual"]
-            val target = cs10Map["target"]
-            val targetLabel = cs10Map["targetLabel"]
+            val resolvedTheoreticalMax = resolveMatchCs10TheoreticalMax(m, cs10Map)
+            val rawLabel = if (cs10Map.containsKey("theoreticalMaxLabel")) {
+                cs10Map["theoreticalMaxLabel"]
+            } else {
+                cs10Map["targetLabel"]
+            }
             if (m["laneMinionsFirst10Minutes"] == null && actual != null) {
                 advStats.add("laneCs@10=$actual")
             }
-            advStats.add("cs10.target=${target ?: "null"}")
-            if (targetLabel != null && includeTargetLabel) {
-                advStats.add("cs10.targetLabel=$targetLabel")
-                usedTargetLabel = true
+            advStats.add("cs10.theoreticalMax=${resolvedTheoreticalMax ?: "null"}")
+            if (resolvedTheoreticalMax != null && includeTheoreticalMaxLabel) {
+                advStats.add("cs10.theoreticalMaxLabel=\"${normalizeCs10TheoreticalMaxLabel(rawLabel)}\"")
+                usedTheoreticalMaxLabel = true
             }
         }
         m["jungleCsBefore10Minutes"]?.let { advStats.add("jungleCs@10=$it") }
@@ -1434,7 +1876,7 @@ class AiAnalysisService(
             else -> ""
         }
         val line = "    Game ${i + 1}$recencyLabel: $win on $champion vs $oppName ($oppChamp), kda=$kda, cs/min=$cs$advStr"
-        return line to usedTargetLabel
+        return line to usedTheoreticalMaxLabel
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -1698,7 +2140,7 @@ class AiAnalysisService(
         
         return when {
             wins >= 4 -> "Player is on a win streak. Be encouraging about current performance and momentum."
-            wins <= 1 -> "Player is struggling. Use extra supportive tone and focus on small, achievable improvements. Build confidence."
+            wins <= 1 -> "Player had a rough last-5 stretch. Keep constructive focus on two controllable next-game habits (unless playful bluntness/roasting was explicitly invited)."
             else -> "Standard coaching tone."
         }
     }

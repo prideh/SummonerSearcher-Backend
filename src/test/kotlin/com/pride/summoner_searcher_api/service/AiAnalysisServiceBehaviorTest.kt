@@ -296,6 +296,8 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     "missingLaneCsAt10Matches" to 0,
                     "recentMatches" to listOf(
                         mapOf(
+                            "patch" to "16.2",
+                            "gameDuration" to 28.5,
                             "champion" to "Ahri",
                             "role" to "MIDDLE",
                             "win" to true,
@@ -320,11 +322,12 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     null
                 ) as String
 
-                // 1. Softened 150-word rule -> concise-but-natural depth guidance
+                // 1. Softened 150-word rule -> default short answer + 2 actions (expand when asked, no invented word/char cap)
                 prompt shouldNotContain "MUST be under 150 words"
                 prompt shouldNotContain "brutally efficient elevator pitch"
-                prompt shouldContain "Concise & Natural Depth"
-                prompt shouldContain "allow longer, fuller explanations when the question needs depth"
+                prompt shouldContain "Default Short Answer & Two Practical Actions (Expand When Asked)"
+                prompt shouldContain "no invented character or word limit"
+                prompt shouldContain "Expand into fuller detail only when the user explicitly asks"
 
                 // 2. Rank-appropriate persona instead of hardcoded Challenger persona
                 prompt shouldNotContain "Treat the player as a Challenger tier player"
@@ -337,13 +340,16 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "WARD_PLACED"
                 prompt shouldContain "never claim ward placement in specific bushes"
                 prompt shouldContain "assisted deaths are not necessarily jungle ganks"
-                prompt shouldContain "cs10.target"
-                prompt shouldContain "114 for Top/Bot, 120 for Mid on verified patch 26.1+ games only"
-                prompt shouldContain "NEVER subtract `actual` from `target` to claim exact \"missed CS\""
+                prompt shouldContain "cs10.theoreticalMax"
+                prompt shouldContain "`114` for `TOP`/`BOTTOM`, `120` for `MIDDLE` on verified Patch 26.1+ `>=600s` games"
+                prompt shouldContain "NEVER subtract `actual` from `114`/`120` to claim \"missed CS\""
                 prompt shouldContain "laneCs@10=81"
-                prompt shouldContain "cs10.target=120"
-                prompt shouldContain "avgLaneCsAt10: {avgActual=81.0 (matchCount=1), avgTarget=120.0 (targetMatchCount=1, avgSupportedActual=81.0)"
+                prompt shouldContain "cs10.theoreticalMax=120"
+                prompt shouldContain "avgLaneCsAt10: {avgActual=81.0 (matchCount=1), avgTheoreticalMax=120.0 (theoreticalMaxMatchCount=1, avgSupportedActual=81.0)"
+                prompt shouldContain "roleBreakdown=[MIDDLE(actual=81.0 in 1g, theoreticalMax=120.0, supported=1g, supportedActual=81.0)]"
                 prompt shouldContain "missingLaneCsAt10Matches: 0"
+                prompt shouldNotContain "cs10.target"
+                prompt shouldNotContain "avgTarget="
                 prompt shouldNotContain "cs10.spawnedSupply"
                 prompt shouldNotContain "cs10.supplyLabel"
 
@@ -782,10 +788,11 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "Game 20 (Most Recent Match):"
                 prompt shouldContain "opponentDetails={champion=Viktor"
 
-                // 4. Redundant earlyDeaths fields stripped & targetLabel emitted at most once
+                // 4. Redundant earlyDeaths fields stripped & theoreticalMaxLabel emitted at most once
                 prompt shouldNotContain "participants="
                 prompt shouldNotContain "assistantsCount="
-                Regex("cs10\\.targetLabel=").findAll(prompt).count() shouldBe 1
+                Regex("cs10\\.theoreticalMaxLabel=").findAll(prompt).count() shouldBe 1
+                prompt shouldNotContain "cs10.targetLabel"
                 prompt shouldNotContain "cs10.spawnedSupply"
                 prompt shouldNotContain "cs10.supplyLabel"
 
@@ -855,6 +862,7 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                         mapOf(
                             "matchId" to "NA1_5001",
                             "patch" to "16.2",
+                            "gameDuration" to 29.4,
                             "role" to "MIDDLE",
                             "champion" to "Orianna",
                             "win" to true,
@@ -869,6 +877,7 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                         mapOf(
                             "matchId" to "NA1_5002",
                             "patch" to "15.24",
+                            "gameDuration" to 26.1,
                             "role" to "TOP",
                             "champion" to "Gnar",
                             "win" to false,
@@ -993,13 +1002,15 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     null
                 ) as String
 
-                // Reconciled laneCsAt10 contract
-                prompt shouldContain "avgLaneCsAt10: {avgActual=80.5 (matchCount=6), avgTarget=118.0 (targetMatchCount=4, avgSupportedActual=82.0)"
-                prompt shouldContain "roleBreakdown=[MIDDLE(actual=82.0 in 4g, target=120.0 in 3g, supportedActual=83.5); TOP(actual=77.5 in 2g, target=114.0 in 1g, supportedActual=79.0)]"
+                // Reconciled laneCsAt10 contract (fail-closed mixed-patch suppression on both top-level and List roleBreakdown)
+                prompt shouldContain "avgLaneCsAt10: {avgActual=80.5 (matchCount=6), avgTheoreticalMax=null (theoreticalMaxMatchCount=4, avgSupportedActual=82.0)"
+                prompt shouldContain "roleBreakdown=[MIDDLE(actual=82.0 in 4g, theoreticalMax=null, supported=3g, supportedActual=83.5); TOP(actual=77.5 in 2g, theoreticalMax=null, supported=1g, supportedActual=79.0)]"
                 prompt shouldContain "missingLaneCsAt10Matches: 2"
-                prompt shouldContain "cs10.target=120"
-                prompt shouldContain "cs10.target=null"
-                prompt shouldContain "cs10.targetLabel=Patch 26.1+ passive wave spawn total by 10:00"
+                prompt shouldContain "cs10.theoreticalMax=120"
+                prompt shouldContain "cs10.theoreticalMax=null"
+                prompt shouldContain "cs10.theoreticalMaxLabel=\"Patch 26.1+ theoretical maximum wave spawn by 10:00 (114 Top/Bot, 120 Mid; not a target or benchmark)\""
+                prompt shouldNotContain "cs10.target"
+                prompt shouldNotContain "avgTarget="
                 prompt shouldNotContain "cs10.spawnedSupply"
 
                 // All 5 improvementStats groups + denominators + missingness
@@ -1434,6 +1445,669 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
             }
         }
     }
+
+    Given("Issue #39 fail-closed CS@10 theoretical maximum framing (114 Top/Bot, 120 Mid) without target/benchmark/missed-CS mislabeling or unsupported 107/70-85 substitutions") {
+        val service = createService()
+        val constructPromptMethod = AiAnalysisService::class.java.getDeclaredMethod(
+            "constructPrompt",
+            Map::class.java,
+            List::class.java,
+            String::class.java,
+            AiAnalysisService.IntentResult::class.java,
+            PromptVersion::class.java
+        ).apply { isAccessible = true }
+
+        val frontendSummaryPrompt =
+            "Analyze my profile. Give me a clear picture of how I'm performing overall — what I'm doing well, the single biggest thing holding me back, and 2 concrete habits to focus on in my next few games."
+
+        When("building a coaching prompt for Spear Shot's 72.9 lane CS@10 across 14 Top games when Frontend sends legacy target/targetLabel keys and RLHF contains both #38 and #39 polluted examples") {
+            Then("it strips 'Top lane target', preserves 114 Top/Bot and 120 Mid strictly as theoretical maximums, rejects 107/70-85 substitutions, and filters both #38 and #39 polluted few-shot examples within the bounded PageRequest.of(0, 6) query") {
+                clearMocks(exampleRepository, patternRepository)
+                every {
+                    exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc(
+                        any(),
+                        org.springframework.data.domain.PageRequest.of(0, 6)
+                    )
+                } returns listOf(
+                    AiLearnedExample(
+                        questionCategory = "full_analysis",
+                        userQuestion = "Analyze my profile",
+                        aiResponse = "In `recentMatchSample` you went 11W 9L while `timelineStatus` is `NOT_ANALYZED`.",
+                        qualityScore = BigDecimal("97.0")
+                    ),
+                    AiLearnedExample(
+                        questionCategory = "full_analysis",
+                        userQuestion = "Analyze my profile",
+                        aiResponse = "Your 72.9 CS@10 is well below the 114 Top lane target, meaning you missed 41.1 CS by 10 minutes.",
+                        qualityScore = BigDecimal("96.0")
+                    ),
+                    AiLearnedExample(
+                        questionCategory = "full_analysis",
+                        userQuestion = "How is my early lane CS?",
+                        aiResponse = "Only 107 lane minions are farmable by 10:00, and a realistic target is 70-85 CS @ 10m.",
+                        qualityScore = BigDecimal("95.0")
+                    ),
+                    AiLearnedExample(
+                        questionCategory = "full_analysis",
+                        userQuestion = "Analyze my Pantheon profile",
+                        aiResponse = "Across **your last 14 detailed matches**, you averaged **72.9 lane CS at 10:00**; **114** is only the theoretical maximum passive wave spawn by 10:00 (not a target or benchmark), so judge early farm alongside Pantheon roam timers.",
+                        qualityScore = BigDecimal("92.0")
+                    )
+                )
+                every { patternRepository.findByTriggerCategoryAndIsActiveTrue(any()) } returns emptyList()
+
+                val spearShotCs10Context = mapOf<String, Any>(
+                    "summonerName" to "Spear Shot#EUW",
+                    "rank" to "CHALLENGER I (1120 LP)",
+                    "rankedRecord" to mapOf("wins" to 1020, "losses" to 884, "games" to 1904, "winRate" to "53.6"),
+                    "savedHistory" to mapOf("wins" to 462, "losses" to 421, "games" to 883, "winRate" to "52.3"),
+                    "recentMatchSample" to mapOf("games" to 14, "wins" to 8, "losses" to 6, "winRate" to "57.1"),
+                    "primaryRole" to "TOP",
+                    "totalGamesAnalyzed" to 14,
+                    "timelineStatus" to "NOT_ANALYZED",
+                    "avgLaneCsAt10" to mapOf(
+                        "avgActual" to 72.9,
+                        "matchCount" to 14,
+                        "avgTarget" to 114.0,
+                        "targetMatchCount" to 14,
+                        "avgSupportedActual" to 72.9,
+                        "targetLabel" to "Top lane target",
+                        "roleBreakdown" to mapOf("TOP" to 14)
+                    ),
+                    "missingLaneCsAt10Matches" to 0,
+                    "recentMatches" to (0 until 14).map { idx ->
+                        mapOf(
+                            "matchId" to "EUW1_${9500 + idx}",
+                            "patch" to "26.1",
+                            "gameDuration" to 27.5,
+                            "role" to "TOP",
+                            "champion" to "Pantheon",
+                            "win" to (idx < 8),
+                            "kda" to "6/4/7 (3.25)",
+                            "csPerMin" to 7.1,
+                            "laneCsAt10" to mapOf(
+                                "actual" to 73,
+                                "target" to 114,
+                                "targetLabel" to "Top lane target"
+                            )
+                        )
+                    }
+                )
+
+                val prompt = constructPromptMethod.invoke(
+                    service,
+                    spearShotCs10Context,
+                    emptyList<Map<String, String>>(),
+                    frontendSummaryPrompt,
+                    null,
+                    null
+                ) as String
+
+                prompt shouldNotContain "Top lane target"
+                prompt shouldNotContain "cs10.target"
+                prompt shouldNotContain "avgTarget="
+                prompt shouldNotContain "targetMatchCount="
+                prompt shouldContain "avgLaneCsAt10: {avgActual=72.9 (matchCount=14), avgTheoreticalMax=114.0 (theoreticalMaxMatchCount=14, avgSupportedActual=72.9), theoreticalMaxLabel=\"Patch 26.1+ theoretical maximum wave spawn by 10:00 (114 Top/Bot, 120 Mid; not a target or benchmark)\", roleBreakdown=[TOP(14g, theoreticalMax=114)]}"
+                prompt shouldContain "cs10.theoreticalMax=114"
+                Regex("cs10\\.theoreticalMaxLabel=").findAll(prompt).count() shouldBe 1
+                prompt shouldContain "NEVER call `114`/`120` a \"target\" or \"benchmark\""
+                prompt shouldContain "NEVER invent substitute wave/pacing numbers (such as `107`, `101-107`, `100`, or `70-85`)"
+                prompt shouldContain "NEVER subtract `actual` from `114`/`120` to claim \"missed CS\" or \"missed last-hits\""
+                prompt shouldContain "NEVER treat a gap below `114`/`120` by itself as proof of poor farming or a `#1 focus area`"
+                prompt shouldContain "never frame `114`/`120` as CS@10 targets, benchmarks, or missed CS"
+
+                // Combined #38 + #39 bounded few-shot filter assertions
+                prompt shouldNotContain "In `recentMatchSample` you went 11W 9L"
+                prompt shouldNotContain "missed 41.1 CS by 10 minutes"
+                prompt shouldNotContain "Only 107 lane minions are farmable"
+                prompt shouldContain "Across **your last 14 detailed matches**, you averaged **72.9 lane CS at 10:00**"
+                (AiAnalysisService.utf8ByteSize(prompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+
+                clearMocks(exampleRepository, patternRepository)
+            }
+        }
+
+        When("validating Patch 26.1+ version strings with fail-closed isVerifiedPost26_1Patch") {
+            Then("it rejects malformed '16.x', single-segment '16', '16.0', pre-26.1 patches, and non-digit segments while accepting valid 16.1+ and 26.1+ patches") {
+                val invalidPatches = listOf(
+                    null,
+                    "",
+                    "   ",
+                    "16",
+                    "26",
+                    "16.x",
+                    "26.x",
+                    "16.",
+                    ".1",
+                    "16..1",
+                    "16.1.",
+                    "16.0",
+                    "26.0",
+                    "15.24",
+                    "15.99.1",
+                    "16.1a",
+                    "16.1.x",
+                    "v16.1",
+                    "-16.1",
+                    "16.+1",
+                    "999999999999.1"
+                )
+                invalidPatches.forEach { patch ->
+                    AiAnalysisService.isVerifiedPost26_1Patch(patch) shouldBe false
+                }
+
+                val validPatches = listOf(
+                    "16.1",
+                    "16.2",
+                    "16.4.612.3456",
+                    "26.1",
+                    "26.4",
+                    " 26.2 ",
+                    "17.1"
+                )
+                validPatches.forEach { patch ->
+                    AiAnalysisService.isVerifiedPost26_1Patch(patch) shouldBe true
+                }
+            }
+        }
+
+        When("resolving per-match CS@10 theoretical maximums with absent, malformed, short, non-laner, or mismatched inputs") {
+            Then("resolveMatchCs10TheoreticalMax fails closed to null unless role, verified patch, valid >=600s duration, and canonical ceiling are all explicitly present") {
+                val validMidCs10 = mapOf<String, Any?>("actual" to 85, "target" to 120)
+                val validTopCs10 = mapOf<String, Any?>("actual" to 74, "target" to 114)
+
+                // Review gap #1: absent role, absent patch, or absent duration MUST fail closed to null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("patch" to "16.2", "gameDuration" to 28.0),
+                    validMidCs10
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "MIDDLE", "gameDuration" to 28.0),
+                    validMidCs10
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "MIDDLE", "patch" to "16.2"),
+                    validMidCs10
+                ) shouldBe null
+
+                // Short, malformed, or early-surrender matches fail closed to null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "MIDDLE", "patch" to "16.2", "gameDurationSeconds" to 599),
+                    validMidCs10
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "MIDDLE", "patch" to "16.2", "gameDuration" to 9.9),
+                    validMidCs10
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "MIDDLE", "patch" to "16.2", "gameDuration" to "09:59"),
+                    validMidCs10
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "MIDDLE", "patch" to "16.2", "gameDuration" to "abc"),
+                    validMidCs10
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "MIDDLE", "patch" to "16.2", "gameDuration" to "30:99"),
+                    validMidCs10
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "MIDDLE", "patch" to "16.2", "gameDuration" to 25.0, "gameEndedInEarlySurrender" to true),
+                    validMidCs10
+                ) shouldBe null
+
+                // Malformed patch, pre-26.1 patch, non-laners, and PR #41 / wrong ceilings fail closed to null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "MIDDLE", "patch" to "16.x", "gameDuration" to 28.0),
+                    validMidCs10
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "TOP", "patch" to "15.24", "gameDuration" to 28.0),
+                    validTopCs10
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "JUNGLE", "patch" to "16.2", "gameDuration" to 28.0),
+                    mapOf("actual" to 12, "target" to 114)
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "UTILITY", "patch" to "16.2", "gameDuration" to 28.0),
+                    mapOf("actual" to 8, "target" to 114)
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "TOP", "patch" to "16.2", "gameDuration" to 28.0),
+                    mapOf("actual" to 74, "target" to 107)
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "TOP", "patch" to "16.2", "gameDuration" to 28.0),
+                    mapOf("actual" to 74, "target" to 120)
+                ) shouldBe null
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "TOP", "patch" to "16.2", "gameDuration" to 28.0),
+                    mapOf("actual" to 74)
+                ) shouldBe null
+
+                // Explicit verified TOP/BOTTOM -> 114 and MIDDLE -> 120 succeed
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "TOP", "patch" to "26.1", "gameDurationSeconds" to 600),
+                    validTopCs10
+                ) shouldBe 114
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("teamPosition" to "BOTTOM", "gameVersion" to "16.3.610.1111", "gameDuration" to "10:00"),
+                    mapOf("actual" to 82, "theoreticalMax" to 114)
+                ) shouldBe 114
+                AiAnalysisService.resolveMatchCs10TheoreticalMax(
+                    mapOf("role" to "MIDDLE", "patch" to "16.2", "gameDuration" to "28.5m"),
+                    validMidCs10
+                ) shouldBe 120
+            }
+        }
+
+        When("rendering List and Map roleBreakdown when supportedCount < matchCount vs supportedCount == matchCount") {
+            Then("it suppresses per-role theoreticalMax=null whenever supportedCount < matchCount while exposing theoreticalMax only on fully supported laner buckets") {
+                val mixedListBreakdownContext = mapOf<String, Any>(
+                    "summonerName" to "MixedPatchTester#NA1",
+                    "rank" to "EMERALD II (40 LP)",
+                    "primaryRole" to "MIDDLE",
+                    "totalGamesAnalyzed" to 7,
+                    "avgLaneCsAt10" to mapOf(
+                        "avgActual" to 71.4,
+                        "matchCount" to 7,
+                        "avgTarget" to 118.0,
+                        "targetMatchCount" to 5,
+                        "avgSupportedActual" to 81.9,
+                        "roleBreakdown" to listOf(
+                            mapOf("role" to "MIDDLE", "matchCount" to 4, "avgActual" to 82.0, "avgTarget" to 120.0, "targetMatchCount" to 3, "avgSupportedActual" to 83.5),
+                            mapOf("role" to "BOTTOM", "matchCount" to 2, "avgActual" to 79.5, "avgTarget" to 114.0, "targetMatchCount" to 2, "avgSupportedActual" to 79.5),
+                            mapOf("role" to "JUNGLE", "matchCount" to 1, "avgActual" to 12.0, "avgTarget" to null, "targetMatchCount" to 0, "avgSupportedActual" to null)
+                        )
+                    ),
+                    "recentMatches" to listOf(
+                        mapOf(
+                            "matchId" to "NA1_7001",
+                            "champion" to "Orianna",
+                            "role" to "MIDDLE",
+                            "win" to true,
+                            "kda" to "5/2/8",
+                            "csPerMin" to 8.1,
+                            // Absent patch & duration -> must fail closed to cs10.theoreticalMax=null in prompt!
+                            "laneCsAt10" to mapOf("actual" to 84, "target" to 120, "targetLabel" to "Mid lane target")
+                        )
+                    )
+                )
+
+                val listPrompt = constructPromptMethod.invoke(
+                    service,
+                    mixedListBreakdownContext,
+                    emptyList<Map<String, String>>(),
+                    "Review my early CS across roles",
+                    null,
+                    null
+                ) as String
+
+                listPrompt shouldContain "avgLaneCsAt10: {avgActual=71.4 (matchCount=7), avgTheoreticalMax=null (theoreticalMaxMatchCount=5, avgSupportedActual=81.9)"
+                listPrompt shouldContain "roleBreakdown=[MIDDLE(actual=82.0 in 4g, theoreticalMax=null, supported=3g, supportedActual=83.5); BOTTOM(actual=79.5 in 2g, theoreticalMax=114.0, supported=2g, supportedActual=79.5); JUNGLE(actual=12.0 in 1g, theoreticalMax=null, supported=0g, supportedActual=null)]"
+                listPrompt shouldContain "cs10.theoreticalMax=null"
+                listPrompt shouldNotContain "Mid lane target"
+                listPrompt shouldNotContain "cs10.theoreticalMaxLabel="
+
+                val mixedMapBreakdownContext = mapOf<String, Any>(
+                    "summonerName" to "MixedMapTester#EUW",
+                    "rank" to "DIAMOND I (60 LP)",
+                    "primaryRole" to "TOP",
+                    "totalGamesAnalyzed" to 14,
+                    "avgLaneCsAt10" to mapOf(
+                        "avgActual" to 74.0,
+                        "matchCount" to 14,
+                        "avgTarget" to 114.0,
+                        "targetMatchCount" to 10,
+                        "avgSupportedActual" to 75.2,
+                        "roleBreakdown" to mapOf("TOP" to 14)
+                    )
+                )
+
+                val mapPrompt = constructPromptMethod.invoke(
+                    service,
+                    mixedMapBreakdownContext,
+                    emptyList<Map<String, String>>(),
+                    "Review my early CS",
+                    null,
+                    null
+                ) as String
+
+                mapPrompt shouldContain "avgLaneCsAt10: {avgActual=74.0 (matchCount=14), avgTheoreticalMax=null (theoreticalMaxMatchCount=10, avgSupportedActual=75.2)"
+                mapPrompt shouldContain "roleBreakdown=[TOP(14g, theoreticalMax=null)]"
+            }
+        }
+
+        When("checking coaching responses with containsCs10TheoreticalMaxMislabeling") {
+            Then("it flags target/benchmark mislabeling, missed-CS subtraction claims, raw target keys, and 107/70-85 substitutions while allowing proper theoretical-maximum framing") {
+                val mislabeledSamples = listOf(
+                    "Your 72.9 CS@10 is well below the 114 Top lane target, making early farming your #1 focus area.",
+                    "Aim for the 120 CS at 10 benchmark in Mid lane.",
+                    "Averaging 72.9 out of 114 means you missed 41.1 CS by 10 minutes.",
+                    "Only 107 lane minions are farmable by 10:00, and a realistic target is 70-85 CS @ 10m.",
+                    "Check `cs10.target` and `avgTarget` in your recent games.",
+                    "---SUGGESTIONS--- [\"How do I reach the 114 CS@10 target?\", \"Review wave crashes\", \"Check matchups\"]"
+                )
+                mislabeledSamples.forEach { sample ->
+                    AiAnalysisService.containsCs10TheoreticalMaxMislabeling(sample) shouldBe true
+                }
+
+                val validSamples = listOf(
+                    "Across **14 Top games** on Patch 26.1, you averaged **72.9 lane CS at 10:00**; **114** is strictly the theoretical maximum passive wave spawn by 10:00 (not a target or benchmark).",
+                    "In Mid lane on Patch 26.2, **120** is the theoretical maximum minions spawned by 10:00 rather than an empirical performance benchmark or missed-CS baseline.",
+                    "Compared against the Challenger Top cohort benchmark of 76.5 across 240 games, your 72.9 lane CS at 10:00 is slightly lower, while 114 is only the theoretical maximum wave spawn ceiling."
+                )
+                validSamples.forEach { sample ->
+                    AiAnalysisService.containsCs10TheoreticalMaxMislabeling(sample) shouldBe false
+                }
+            }
+        }
+    }
+
+    Given("Issue #36 & Nov 10 production regressions + combined #38/#39 qualification: evidence boundaries, invited bluntness, exact recorded roast, and strict local-negation filter scope") {
+        val service = createService()
+        val constructPromptMethod = AiAnalysisService::class.java.getDeclaredMethod(
+            "constructPrompt",
+            Map::class.java,
+            List::class.java,
+            String::class.java,
+            AiAnalysisService.IntentResult::class.java,
+            PromptVersion::class.java
+        ).apply { isAccessible = true }
+
+        val buildConfigMethod = AiAnalysisService::class.java.getDeclaredMethod(
+            "buildGenerationConfig",
+            Double::class.javaPrimitiveType
+        ).apply { isAccessible = true }
+
+        // Exact Nov 10 denominators: 384 ranked (49.0%), 100 saved (48.0%), 20 detailed (55.0%, with rough last-5 stretch so streak tone is exercised too)
+        val nov10DetailedMatches = (0 until 20).map { idx ->
+            val win = idx == 4 || idx >= 10
+            mapOf(
+                "matchId" to "EUW1_${9500 + idx}",
+                "patch" to "16.1.1",
+                "gameDurationSeconds" to 1875,
+                "role" to "TOP",
+                "side" to if (idx % 2 == 0) "Blue" else "Red",
+                "champion" to "Pantheon",
+                "win" to win,
+                "kda" to if (win) "7/4/8 (3.75)" else "3/7/4 (1.00)",
+                "csPerMin" to 6.8,
+                "cs10" to mapOf("actual" to 72, "theoreticalMax" to 114)
+            )
+        }
+
+        val nov10ProductionContext = mapOf<String, Any>(
+            "summonerName" to "Nov10Player#EUW",
+            "rank" to "EMERALD III (41 LP)",
+            "rankedRecord" to mapOf("wins" to 188, "losses" to 196, "games" to 384, "winRate" to "49.0"),
+            "savedHistory" to mapOf("wins" to 48, "losses" to 52, "games" to 100, "winRate" to "48.0"),
+            "recentMatchSample" to mapOf("games" to 20, "wins" to 11, "losses" to 9, "winRate" to "55.0"),
+            "primaryRole" to "TOP",
+            "totalGamesAnalyzed" to 20,
+            "timelineStatus" to "NOT_ANALYZED",
+            "kda" to "2.35",
+            "avgCsPerMin" to "6.8",
+            "topChampions" to listOf(
+                mapOf("name" to "Pantheon", "games" to 72, "wins" to 36, "losses" to 36, "winRate" to "50.0", "kda" to "2.35")
+            ),
+            "topStrengths" to listOf(
+                mapOf("name" to "Solo Kills", "consistency" to "65%")
+            ),
+            "topWeaknesses" to listOf(
+                mapOf("name" to "Early Laning Advantage", "consistency" to "75%"),
+                mapOf("name" to "Turret Plates", "consistency" to "70%")
+            ),
+            "recentMatches" to nov10DetailedMatches,
+            "improvementStats" to mapOf(
+                "totalGamesConsidered" to 20,
+                "excludedInvalidDurationGames" to 0,
+                "excludedMissingTimelineGames" to 20,
+                "hasTimelineAnalysis" to false,
+                "deathCost" to mapOf(
+                    "eligibleTimeDeadGames" to 20,
+                    "missingTimeDeadGames" to 0,
+                    "totalTimeSpentDeadSeconds" to 2941,
+                    "avgTimeSpentDeadSeconds" to 147.05,
+                    "avgDeadTimeGameSharePct" to 7.84,
+                    "overallDeadTimeGameSharePct" to 7.84
+                ),
+                "teamObjectives" to mapOf(
+                    "eligibleTeamObjectiveGames" to 20,
+                    "missingTeamsGames" to 0,
+                    "timelineEligibleGames" to 0,
+                    "tower" to mapOf(
+                        "eligibleGames" to 20, "missingGames" to 0,
+                        "firstCount" to 8, "firstRate" to 0.4,
+                        "teamKills" to 96, "teamAvg" to 4.8, "enemyAvg" to 5.4,
+                        "personalLh" to 14, "personalTd" to 29, "timelineInvolved" to null
+                    ),
+                    "horde" to mapOf(
+                        "eligibleGames" to 20, "missingGames" to 0,
+                        "firstCount" to 6, "firstRate" to 0.3,
+                        "teamKills" to 34, "teamAvg" to 1.7, "enemyAvg" to 2.9,
+                        "personalLh" to null, "personalTd" to null, "timelineInvolved" to null
+                    )
+                )
+            )
+        )
+
+        When("constructing prompts across Nov 10 comparison, invited roast, ordinary habits, and Pantheon mechanics with all 3 few-shot filters active") {
+            Then("it enforces season/MMR/synergy boundaries, preserves #38 natural rules & #39 CS10 theoreticalMax, keeps personal deathCost (147.05s / 7.84%) while forbidding team firstRate blame or low-percentage fights, and filters #38/#39/#36 bad curated examples") {
+                clearMocks(exampleRepository, patternRepository)
+                val unrequestedWallOfText = (1..245).joinToString(" ") { "word$it" }
+                every {
+                    exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc(any(), any())
+                } returns listOf(
+                    // Filter 1 (#38): internal schema leak
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "How am I playing lately?",
+                        aiResponse = "In `recentMatchSample` across 20 games (55.0% WR), check your `timelineStatus` before roaming.",
+                        qualityScore = BigDecimal("99.0")
+                    ),
+                    // Filter 2 (#39): CS@10 theoretical-max mislabeling
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "How is my Pantheon early game?",
+                        aiResponse = "Your 72.0 CS@10 is well below the 114 Top lane target, making early farming your #1 focus area.",
+                        qualityScore = BigDecimal("98.0")
+                    ),
+                    // Filter 3a (#36 Nov 10): exact recorded Nov 10 roast string
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "Roast my recent games.",
+                        aiResponse = "Your kill participation is languishing ... a poor 30% first-secure rate on Voidgrubs ... Your teammates aren't forcing you to take low-percentage fights.",
+                        qualityScore = BigDecimal("97.0")
+                    ),
+                    // Filter 3b (#36 filter-scope): unrelated negation + bad MMR stabilization claim
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "Compare my ranked and recent win rates.",
+                        aiResponse = "Even though MMR is hidden and timelines are not analyzed, your 49% ranked record across 384 games suggests your overall matchmaking rating has stabilized.",
+                        qualityScore = BigDecimal("96.0")
+                    ),
+                    // Filter 3c (#36 default brevity): unrequested 245-word essay
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "Quick tip?",
+                        aiResponse = unrequestedWallOfText,
+                        qualityScore = BigDecimal("95.0")
+                    ),
+                    // Clean concise #36 + #38 + #39 example (6th row in PageRequest.of(0, 6))
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "What should I focus on over my next few Pantheon games?",
+                        aiResponse = "Across your last 20 detailed matches (11W–9L, 55.0% win rate), you averaged 147.05s of grey-screen time (7.84% of game time) and 72.0 lane CS at 10:00 (where 114 is the theoretical maximum passive wave spawn by 10:00, not a target or benchmark). Next game: (1) check wave state before using W forward, and (2) reset on completed components.\n---SUGGESTIONS--- [\"Compare my three win-rate windows\", \"Break down my Pantheon matchups in detail\", \"How do I trim mid-game deaths?\"]",
+                        qualityScore = BigDecimal("90.0")
+                    )
+                )
+
+                val comparisonPrompt = constructPromptMethod.invoke(
+                    service,
+                    nov10ProductionContext,
+                    emptyList<Map<String, String>>(),
+                    "Compare my ranked record, saved matches, and last 20 games.",
+                    null,
+                    null
+                ) as String
+
+                val roastPrompt = constructPromptMethod.invoke(
+                    service,
+                    nov10ProductionContext,
+                    emptyList<Map<String, String>>(),
+                    "Roast my profile brutally and tell me what to fix.",
+                    null,
+                    null
+                ) as String
+
+                val habitsPrompt = constructPromptMethod.invoke(
+                    service,
+                    nov10ProductionContext,
+                    emptyList<Map<String, String>>(),
+                    "What are my biggest Pantheon habits and ability mistakes to fix?",
+                    null,
+                    null
+                ) as String
+
+                // 1. Nov 10 comparison regression: 384/49%, 100/48%, 20/55% separated; no "lifetime ranked record", no MMR stabilization, no "better synergy"/"tighter macro"
+                comparisonPrompt shouldContain "rankedRecord (Solo/Duo Queue Counter): 188W 196L across 384 games (49.0% WR)"
+                comparisonPrompt shouldContain "savedHistory (Saved Match History): 48W 52L across 100 games (48.0% WR)"
+                comparisonPrompt shouldContain "recentMatchSample (Detailed Match List): 11W 9L across 20 games (55.0% WR)"
+                comparisonPrompt shouldContain "current ranked season/split"
+                comparisonPrompt shouldContain "NEVER call it a \"lifetime\", \"all-time\", or \"career\" ranked record"
+                comparisonPrompt shouldContain "Riot does **not** expose hidden MMR (\"matchmaking rating\")—NEVER claim MMR has stabilized"
+                comparisonPrompt shouldContain "NEVER invent unmeasured causes such as \"better synergy\" or \"tighter macro\""
+
+                // 2. Nov 10 invited roast regression: personal deathCost 147.05s / 7.84% across 20g preserved; team firstRate 0.3 (6/20) & 0.4 (8/20) guarded; no "low-percentage fights" when timeline NOT_ANALYZED; invited bluntness kept
+                roastPrompt shouldContain "Death Cost (Time Dead & Direct Kill Bounty Only): eligibleTimeDead=20g (missingTimeDead=0g), totalDead=2941s, avgDeadPerGame=147.05s, avgGameShare=7.84%, overallShare=7.84%"
+                roastPrompt shouldContain "tower(elig=20g, miss=0g, first=8/20 [0.4]"
+                roastPrompt shouldContain "voidgrubs(elig=20g, miss=0g, first=6/20 [0.3]"
+                roastPrompt shouldContain "remain valid personal stats even without timeline analysis when scoped to `eligibleTimeDeadGames`, but never infer lost farm, death avoidability, or \"low-percentage fights\" from `deathCost`"
+                roastPrompt shouldContain "`first`/`firstRate` and `teamKills`/`teamAvg` are **5-player team outcomes**—NEVER frame low team `firstRate` (such as first-secure rate on Voidgrubs or first tower rate) as a personal weakness, personal fault, or player roast"
+                roastPrompt shouldContain "Invited Bluntness & Playful Roasting"
+                roastPrompt shouldContain "unless playful bluntness/roasting was explicitly invited"
+                roastPrompt shouldNotContain "never roast"
+                roastPrompt shouldNotContain "refuse to roast"
+
+                // 3. Nov 10 ordinary habits + #36 Pantheon ability names + #39 CS10 theoreticalMax preserved
+                habitsPrompt shouldContain "topStrengths (beat-opp freq): Solo Kills (65%) [sample: recentMatchSample]"
+                habitsPrompt shouldContain "topWeaknesses (trail-opp freq): Early Laning Advantage (75%), Turret Plates (70%) [sample: recentMatchSample]"
+                habitsPrompt shouldContain "`topStrengths` and `topWeaknesses` percentages only count how often you beat or trailed your matched role opponent on a raw challenge stat in recent main-role games—NEVER turn challenge trail frequencies into confident skill diagnoses"
+                habitsPrompt shouldContain "Verified Champion Ability Names Only"
+                habitsPrompt shouldContain "NEVER invent, guess, or blend ability names (such as \"Aegis of Zealous\")"
+                habitsPrompt shouldContain "cs10.theoreticalMax=114"
+                habitsPrompt shouldNotContain "cs10.target"
+
+                // 4. Default brevity + 2 practical actions + expand when asked + no invented character limit + all 3 few-shot filters + untouched budgets/model
+                for (p in listOf(comparisonPrompt, roastPrompt, habitsPrompt)) {
+                    p shouldContain "Default Short Answer & Two Practical Actions (Expand When Asked)"
+                    p shouldContain "at most two practical, controllable actions"
+                    p shouldContain "no invented character or word limit"
+                    p shouldContain "Expand into fuller detail only when the user explicitly asks"
+                    p shouldNotContain "character limit"
+                    p shouldNotContain "MUST be under"
+                    // PROVEN EXAMPLES rejected all 5 bad rows (#38 leak, #39 target, Nov 10 recorded roast, unrelated-negation MMR, 245w essay) and kept only row 6 with ---SUGGESTIONS--- stripped
+                    p shouldNotContain "check your `timelineStatus` before roaming"
+                    p shouldNotContain "114 Top lane target"
+                    p shouldNotContain "poor 30% first-secure rate on Voidgrubs"
+                    p shouldNotContain "aren't forcing you to take low-percentage fights"
+                    p shouldNotContain "overall matchmaking rating has stabilized"
+                    p shouldNotContain "word200"
+                    p shouldContain "you averaged 147.05s of grey-screen time (7.84% of game time)"
+                    p shouldNotContain "Break down my Pantheon matchups in detail"
+                    (AiAnalysisService.utf8ByteSize(p) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+                }
+
+                AiAnalysisService.MAX_PROMPT_BYTES shouldBe 16_000
+                AiAnalysisService.MAX_GROUND_TRUTH_BYTES shouldBe 8_500
+                @Suppress("UNCHECKED_CAST")
+                val genConfig = buildConfigMethod.invoke(service, 0.7) as Map<String, Any>
+                genConfig["maxOutputTokens"] shouldBe 4096
+                genConfig["thinkingConfig"] shouldBe mapOf("thinkingLevel" to "low")
+
+                clearMocks(exampleRepository, patternRepository)
+            }
+        }
+
+        When("evaluating containsEvidenceBoundaryViolation against the exact recorded Nov 10 roast string, unrelated-negation variants, and genuine local negations") {
+            Then("it catches the exact recorded Nov 10 roast string (and each clause independently), rejects unrelated-negation variants across every rule family, and allows genuine local negations") {
+                // 1. Exact recorded Nov 10 roast string + each recorded clause tested independently
+                val exactRecordedNov10Roast =
+                    "kill participation is languishing ... a poor 30% first-secure rate on Voidgrubs ... Your teammates aren't forcing you to take low-percentage fights"
+                val recordedVoidgrubClauseAlone =
+                    "Your kill participation is languishing at 38%, paired with a poor 30% first-secure rate on Voidgrubs and 40% on first towers."
+                val recordedTeammatesLowPctClauseAlone =
+                    "Your teammates aren't forcing you to take low-percentage fights—you are choosing them."
+
+                AiAnalysisService.containsEvidenceBoundaryViolation(exactRecordedNov10Roast) shouldBe true
+                AiAnalysisService.containsEvidenceBoundaryViolation(recordedVoidgrubClauseAlone) shouldBe true
+                AiAnalysisService.containsEvidenceBoundaryViolation(recordedTeammatesLowPctClauseAlone) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample("Roast my profile.", exactRecordedNov10Roast) shouldBe false
+
+                // 2. Unrelated-negation variants: 'hidden', 'not', 'aren't', 'don't', 'without', 'unavailable' elsewhere in the same sentence MUST NOT exempt bad claims
+                val unrelatedNegationViolations = listOf(
+                    // Unrelated 'hidden' / 'not' / 'unavailable' + bad MMR claim
+                    "Even though MMR is hidden, this 49% record across 384 games suggests your overall matchmaking rating has stabilized.",
+                    "Match timelines are not analyzed yet, and your 49% ranked record suggests your overall matchmaking rating has stabilized.",
+                    "Replay files are unavailable, yet your overall matchmaking rating has stabilized around Emerald.",
+                    "Riot does not expose MMR, yet your 49% record suggests your overall matchmaking rating has stabilized.",
+                    // Unrelated 'without' / 'not' + lifetime ranked record claim
+                    "Without timeline data, your 49% lifetime ranked record across 384 games shows steady volume.",
+                    "You aren't duo queuing, and your 49% all-time ranked record across 384 games is near even.",
+                    // Unrelated 'don't' / 'without' + unsupported synergy/macro cross-window claim
+                    "You don't duo queue, so climbing to 55% in 20 games reflects tighter macro and better synergy.",
+                    "Without changing champions, your 55% recent win rate comes from better team synergy.",
+                    // Unrelated 'aren't' / 'not' + team firstRate blamed/roasted personally
+                    "Even though Voidgrubs aren't soloable, a poor 30.0% first-secure rate on Voidgrubs exposes weak map presence.",
+                    "Timelines are not loaded, but securing first Voidgrubs in 6 of 20 games is a glaring personal weakness.",
+                    // Unrelated 'aren't' / 'without' / 'don't' + unverified low-percentage fights
+                    "Even without match timelines, spending 147.05 seconds dead shows a player who takes low-percentage fights.",
+                    "You don't buy Control Wards and keep taking low-percentage fights in river.",
+                    // Unrelated 'don't' / 'aren't' + invented ability name or removed Mythic item
+                    "Don't waste Flash before casting Pantheon's Aegis of Zealous stun.",
+                    "If you aren't ahead at 10 minutes, rush Divine Sunderer first.",
+                    // Unrelated 'without' / 'doesn't' + challenge trail frequency turned into confident skill diagnosis
+                    "Without jungle help, trailing your lane opponent in Early Laning Advantage across 75% of your games proves poor wave mechanics.",
+                    "Trailing your lane opponent in 75% of games proves poor wave mechanics when your jungler doesn't gank.",
+                    // Suggestions tail Mythic / invented ability leak
+                    "Short grounded body.\n---SUGGESTIONS--- [\"Should I build Mythic items first?\", \"When do I cast Aegis of Zealous?\", \"Review my CS\"]"
+                )
+                unrelatedNegationViolations.forEach { bad ->
+                    AiAnalysisService.containsEvidenceBoundaryViolation(bad) shouldBe true
+                    AiAnalysisService.isEligibleCuratedExample("How am I playing lately?", bad) shouldBe false
+                }
+
+                // Raw internal metric keys from the roast note (`horde.firstRate`, `tower.firstRate`) are caught by containsInternalSchemaLeak
+                AiAnalysisService.containsInternalSchemaLeak("Your horde.firstRate is 0.3 and tower.firstRate is 0.4.") shouldBe true
+
+                // 3. Genuine local negations & grounded coaching answers MUST pass
+                val genuineLocalNegationsAndGroundedAnswers = listOf(
+                    "Your **ranked record** this season sits at **49.0% across 384 games** (188W–196L)—a current-season Solo/Duo counter, not a lifetime ranked record—alongside **48.0% across 100 saved matches** (48W–52L) and **55.0% across your last 20 detailed matches** (11W–9L). Riot does not expose hidden matchmaking rating, summary stats cannot tell whether your MMR has stabilized, and win-rate swings alone do not prove tighter macro or better synergy. Next game: (1) track whether losses cluster on Red side, and (2) review deaths before 10 minutes.",
+                    "You spent an average of **147.05 seconds on a grey screen per game** (**7.84% of total game time** across your last 20 detailed matches)—nearly two and a half minutes watching teammates play without you. Your team's **30% first-Voidgrub rate (6 of 20)** and **40% first-tower rate (8 of 20)** are 5-player team outcomes rather than a personal weakness, and since match timelines aren't analyzed yet we can't tell whether you're taking low-percentage fights. Next game: (1) check enemy wave position before committing Pantheon's W stun, and (2) spend gold immediately after respawning.",
+                    "In your last 20 detailed matches (55.0% win rate), you trailed your matched top-lane opponent on the Early Laning Advantage challenge in **75%** of main-role games and Turret Plates in **70%**—that's a head-to-head comparison frequency, not proof of bad wave mechanics (trailing in 75% of games does not prove poor wave control). Next game: (1) save **Shield Vault (W)** or **E** cooldowns when enemy jungle location is unknown, and (2) crash the cannon wave before resetting."
+                )
+                genuineLocalNegationsAndGroundedAnswers.forEach { good ->
+                    AiAnalysisService.containsInternalSchemaLeak(good) shouldBe false
+                    AiAnalysisService.containsCs10TheoreticalMaxMislabeling(good) shouldBe false
+                    AiAnalysisService.containsEvidenceBoundaryViolation(good) shouldBe false
+                    AiAnalysisService.isEligibleCuratedExample("How am I playing lately?", good) shouldBe true
+                }
+
+                // Expansion detection & default length gate
+                AiAnalysisService.requestsExpandedAnswer("How am I playing lately?") shouldBe false
+                AiAnalysisService.requestsExpandedAnswer("Compare my last 20 detailed matches to my ranked record.") shouldBe false
+                AiAnalysisService.requestsExpandedAnswer("Give me a detailed breakdown of my Pantheon games step by step.") shouldBe true
+                AiAnalysisService.requestsExpandedAnswer("Can you elaborate and go deeper on those matchups?") shouldBe true
+
+                val twoHundredSixtyWordDeepDive = (1..260).joinToString(" ") { "groundedWord$it" } + " 55.0% next game"
+                AiAnalysisService.isEligibleCuratedExample("How am I playing?", twoHundredSixtyWordDeepDive) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample("Explain my matchups in detail.", twoHundredSixtyWordDeepDive) shouldBe true
+            }
+        }
+    }
 })
+
 
 
