@@ -2,7 +2,7 @@ name: Backend CI
 
 on:
   push:
-    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates, feat/collector-session-memory-series, feat/scalar-patch-metadata-queries, feat/cached-player-exact-ingestion ]
+    branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates, feat/collector-session-memory-series, feat/scalar-patch-metadata-queries, feat/cached-player-exact-ingestion, test/pr42-timeline-prep-512m-proof-e5a3ccd ]
   pull_request:
     branches: [ main, master, mem/candidate-512m, fix/collector-session-hard-cap, feat/durable-cohort-cell-aggregates ]
 
@@ -11,24 +11,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
     - name: Set up JDK 21
       uses: actions/setup-java@v4
       with:
         java-version: '21'
         distribution: 'temurin'
         cache: 'gradle'
-    - name: Grant execute permission for gradlew and preflight script
-      run: chmod +x gradlew scripts/preflight.sh
-    - name: Run shared preflight (compileKotlin compileTestKotlin + full test)
-      run: ./scripts/preflight.sh
-    - name: Run Real 512 MB Container Proof on Exact Repo Dockerfile (--memory=512m --memory-swap=512m) [Strict <78% Gate]
-      if: github.ref == 'refs/heads/feat/collector-session-memory-series' || github.ref == 'refs/heads/feat/durable-cohort-cell-aggregates' || github.ref == 'refs/heads/fix/collector-session-hard-cap' || github.ref == 'refs/heads/mem/candidate-512m'
+    - name: Detach exact candidate e5a3ccd worktree and verify diff is ci.yml-only
       run: |
+        CAND_SHA="e5a3ccd25b5fbcaa3d560c1ef5dbe4a3023e6daa"
+        test "$(git diff --name-only "$CAND_SHA" HEAD)" = ".github/workflows/ci.yml"
+        git worktree add --detach /tmp/wt-e5a3ccd "$CAND_SHA"
+        test "$(git -C /tmp/wt-e5a3ccd rev-parse HEAD)" = "$CAND_SHA"
+        chmod +x /tmp/wt-e5a3ccd/gradlew /tmp/wt-e5a3ccd/scripts/preflight.sh
+    - name: Run shared preflight on exact candidate e5a3ccd (compileKotlin compileTestKotlin + full test)
+      working-directory: /tmp/wt-e5a3ccd
+      run: ./scripts/preflight.sh
+    - name: Run Real 512 MB Container Proof on Exact Candidate e5a3ccd Dockerfile (--memory=512m --memory-swap=512m) [Strict <78% Gate]
+      if: github.ref == 'refs/heads/test/pr42-timeline-prep-512m-proof-e5a3ccd' || github.ref == 'refs/heads/mem/candidate-512m'
+      run: |
+        CAND_SHA="e5a3ccd25b5fbcaa3d560c1ef5dbe4a3023e6daa"
+        test "$(git -C /tmp/wt-e5a3ccd rev-parse HEAD)" = "$CAND_SHA"
         PG_FIXTURE_PASSWORD="$(python3 -c 'import secrets; print(secrets.token_hex(24))')"
         test "${#PG_FIXTURE_PASSWORD}" -eq 48
         POSTGRES_PASSWORD="$PG_FIXTURE_PASSWORD" docker run -d --name ss-postgres -p 5432:5432 -e POSTGRES_PASSWORD -e POSTGRES_DB=summoner_searcher postgres:16-alpine
         docker run -d --name ss-redis -p 6379:6379 redis:7-alpine
-        docker build -f Dockerfile -t ss-backend:512m-proof .
+        docker build -f /tmp/wt-e5a3ccd/Dockerfile -t ss-backend:512m-proof /tmp/wt-e5a3ccd
         openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/mockriot.key -out /tmp/mockriot.crt -days 1 \
           -subj "/CN=api.riotgames.com" \
           -addext "subjectAltName=DNS:euw1.api.riotgames.com,DNS:na1.api.riotgames.com,DNS:kr.api.riotgames.com,DNS:europe.api.riotgames.com,DNS:americas.api.riotgames.com,DNS:asia.api.riotgames.com,DNS:ddragon.leagueoflegends.com"
@@ -37,4 +47,368 @@ jobs:
         docker rm "$cid"
         keytool -importcert -noprompt -trustcacerts -alias mockriot -file /tmp/mockriot.crt -keystore /tmp/cacerts -storepass changeit
         chmod 644 /tmp/cacerts
-        PROOF_MODE=10_CYCLE ENABLE_NMT=0 DB_PASS="$PG_FIXTURE_PASSWORD" sudo --preserve-env=PROOF_MODE,ENABLE_NMT,DB_PASS python3 ./scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
+        PROOF_MODE=10_CYCLE ENABLE_NMT=0 DB_PASS="$PG_FIXTURE_PASSWORD" sudo --preserve-env=PROOF_MODE,ENABLE_NMT,DB_PASS python3 /tmp/wt-e5a3ccd/scripts/verify_512m_container.py /tmp/mockriot.crt /tmp/mockriot.key
+    - name: Run Timeline Prep & Legacy Route Burst Proof Inside Same 512 MB Container [Strict <78% Gate]
+      if: github.ref == 'refs/heads/test/pr42-timeline-prep-512m-proof-e5a3ccd'
+      run: |
+        sudo python3 - /tmp/mockriot.crt /tmp/mockriot.key <<'PY'
+        import concurrent.futures
+        import gzip
+        import http.server
+        import json
+        import socketserver
+        import ssl
+        import subprocess
+        import sys
+        import threading
+        import time
+        import urllib.error
+        import urllib.request
+
+        cert_file, key_file = sys.argv[1], sys.argv[2]
+
+        def build_match(mid: str, idx: int) -> bytes:
+            roles = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
+            participants = []
+            for p in range(10):
+                puuid = f"puuid-player-{(idx + p) % 45 + 1}" if p > 0 else "puuid-main-450"
+                if p == 1:
+                    puuid = "seed-puuid-1"
+                participants.append({
+                    "participantId": p + 1,
+                    "puuid": puuid,
+                    "summonerName": f"Player{p}",
+                    "riotIdGameName": f"Player{p}",
+                    "riotIdTagline": "EUW",
+                    "championId": 1 + ((idx + p) % 50),
+                    "championName": "Orianna" if p > 0 else "Pantheon",
+                    "teamId": 100 if p < 5 else 200,
+                    "teamPosition": roles[p % 5],
+                    "individualPosition": roles[p % 5],
+                    "win": (p < 5) if (idx % 2 == 0) else (p >= 5),
+                    "kills": 6 + (p % 5),
+                    "deaths": 3 + (p % 4),
+                    "assists": 8 + (p % 6),
+                    "totalMinionsKilled": 195 + (idx % 35),
+                    "neutralMinionsKilled": 12 + (idx % 10),
+                    "goldEarned": 12800 + (idx % 1500),
+                    "totalDamageDealtToChampions": 24500 + (idx % 4000),
+                    "totalDamageTaken": 18200 + (idx % 3000),
+                    "visionScore": 28 + (idx % 15),
+                    "wardsPlaced": 11,
+                    "wardsKilled": 4,
+                    "detectorWardsPlaced": 3,
+                    "champLevel": 16,
+                    "item0": 3089, "item1": 3157, "item2": 3020, "item3": 3135, "item4": 3165, "item5": 3116, "item6": 3363,
+                    "summoner1Id": 4, "summoner2Id": 12,
+                    "challenges": {
+                        "laneMinionsFirst10Minutes": 82 + (idx % 12),
+                        "turretPlatesTaken": 3,
+                        "dragonTakedowns": 2,
+                        "voidMonsterKill": 3
+                    }
+                })
+            now_ms = int(time.time() * 1000)
+            return json.dumps({
+                "metadata": {"matchId": mid, "participants": [pt["puuid"] for pt in participants]},
+                "info": {
+                    "gameCreation": now_ms - idx * 120000,
+                    "gameDuration": 1800,
+                    "gameId": 7000000 + idx,
+                    "queueId": 420,
+                    "gameMode": "CLASSIC",
+                    "gameType": "MATCHED_GAME",
+                    "gameVersion": "16.7.600.1234",
+                    "platformId": "EUW1",
+                    "participants": participants,
+                    "teams": [
+                        {"teamId": 100, "win": idx % 2 == 0, "objectives": {"baron": {"first": True, "kills": 1}, "dragon": {"first": True, "kills": 3}, "tower": {"first": True, "kills": 8}}},
+                        {"teamId": 200, "win": idx % 2 != 0, "objectives": {"baron": {"first": False, "kills": 0}, "dragon": {"first": False, "kills": 1}, "tower": {"first": False, "kills": 3}}}
+                    ]
+                }
+            }).encode("utf-8")
+
+        def build_timeline(mid: str, idx: int) -> tuple[bytes, bytes]:
+            participants_puuids = [
+                "puuid-main-450" if p == 0 else ("seed-puuid-1" if p == 1 else f"puuid-player-{(idx + p) % 45 + 1}")
+                for p in range(10)
+            ]
+            t_participants = [{"participantId": p + 1, "puuid": participants_puuids[p]} for p in range(10)]
+            frames = []
+            for minute in range(31):
+                p_frames = {}
+                for pid in range(1, 11):
+                    p_frames[str(pid)] = {
+                        "participantId": pid,
+                        "totalGold": 500 + minute * (390 + pid * 4),
+                        "level": min(18, 1 + minute // 2),
+                        "xp": minute * (450 + pid * 6),
+                        "currentGold": 1850 if (minute == 11 and pid == 1) else 420,
+                        "minionsKilled": minute * 7 + (idx % 5 if pid == 1 else 0),
+                        "jungleMinionsKilled": max(0, (minute - 10) * 2),
+                        "position": {"x": 2200 + minute * 240 + pid * 25, "y": 11800 - minute * 190}
+                    }
+                events = []
+                for pid in range(1, 11):
+                    events.append({
+                        "type": "ITEM_PURCHASED",
+                        "timestamp": minute * 60000 + pid * 400,
+                        "participantId": pid,
+                        "itemId": 1001 + (pid % 6)
+                    })
+                    events.append({
+                        "type": "WARD_PLACED",
+                        "timestamp": minute * 60000 + 15000 + pid * 300,
+                        "creatorId": pid,
+                        "wardType": "YELLOW_TRINKET"
+                    })
+                if minute in (4, 8, 13, 19, 24):
+                    events.append({
+                        "type": "CHAMPION_KILL",
+                        "timestamp": minute * 60000 + 25000,
+                        "killerId": 1 if minute != 8 else 6,
+                        "victimId": 6 if minute != 8 else 1,
+                        "assistingParticipantIds": [2] if minute != 8 else [7],
+                        "position": {"x": 3100, "y": 11200},
+                        "bounty": 300,
+                        "shutdownBounty": 150 if minute == 19 else 0
+                    })
+                if minute in (7, 11):
+                    events.append({
+                        "type": "TURRET_PLATE_DESTROYED",
+                        "timestamp": minute * 60000 + 30000,
+                        "killerId": 1,
+                        "teamId": 200,
+                        "laneType": "TOP_LANE",
+                        "position": {"x": 1500, "y": 13000}
+                    })
+                if minute in (10, 16, 22):
+                    events.append({
+                        "type": "ELITE_MONSTER_KILL",
+                        "timestamp": minute * 60000 + 40000,
+                        "killerId": 2,
+                        "killerTeamId": 100,
+                        "monsterType": "DRAGON",
+                        "monsterSubType": "FIRE_DRAGON",
+                        "position": {"x": 9800, "y": 4400}
+                    })
+                frames.append({
+                    "timestamp": minute * 60000,
+                    "participantFrames": p_frames,
+                    "events": events
+                })
+            raw = json.dumps({
+                "metadata": {"matchId": mid, "participants": participants_puuids},
+                "info": {"frameInterval": 60000, "participants": t_participants, "frames": frames}
+            }).encode("utf-8")
+            return raw, gzip.compress(raw)
+
+        MATCH_IDS = [f"EUW1_{i}" for i in range(1, 451)]
+        MATCH_JSON = {f"EUW1_{i}": build_match(f"EUW1_{i}", i) for i in range(1, 451)}
+        TIMELINES = {f"EUW1_{i}": build_timeline(f"EUW1_{i}", i) for i in range(1, 31)}
+        timeline_hits = 0
+        hits_lock = threading.Lock()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                pass
+
+            def _send(self, body: bytes, gzipped: bool = False):
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                if gzipped:
+                    self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("X-App-Rate-Limit", "500:10,30000:600")
+                self.send_header("X-App-Rate-Limit-Count", "2:10,20:600")
+                self.send_header("X-Method-Rate-Limit", "2000:10,120000:600")
+                self.send_header("X-Method-Rate-Limit-Count", "1:10,10:600")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                global timeline_hits
+                path = self.path.split("?")[0]
+                if path == "/api/versions.json":
+                    b = json.dumps(["16.7.1", "16.6.1"]).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(b)))
+                    self.end_headers()
+                    self.wfile.write(b)
+                elif "/riot/account/v1/accounts/by-riot-id/" in path:
+                    self._send(json.dumps({"puuid": "puuid-main-450", "gameName": "TestPlayer", "tagLine": "EUW"}).encode("utf-8"))
+                elif "/riot/account/v1/accounts/by-puuid/" in path:
+                    puuid = path.rsplit("/", 1)[-1]
+                    self._send(json.dumps({"puuid": puuid, "gameName": f"Name_{puuid[-4:]}", "tagLine": "EUW"}).encode("utf-8"))
+                elif "/lol/summoner/v4/summoners/by-puuid/" in path:
+                    puuid = path.rsplit("/", 1)[-1]
+                    self._send(json.dumps({"id": f"sum-{puuid}", "accountId": f"acc-{puuid}", "puuid": puuid, "profileIconId": 4568, "revisionDate": int(time.time() * 1000), "summonerLevel": 412}).encode("utf-8"))
+                elif "/lol/league/v4/entries/by-puuid/" in path:
+                    puuid = path.rsplit("/", 1)[-1]
+                    self._send(json.dumps([{"leagueId": "league-emerald", "queueType": "RANKED_SOLO_5x5", "tier": "EMERALD", "rank": "II", "summonerName": "TestPlayer", "puuid": puuid, "leaguePoints": 64, "wins": 240, "losses": 210, "veteran": False, "inactive": False, "freshBlood": False, "hotStreak": True}]).encode("utf-8"))
+                elif "/lol/match/v5/matches/by-puuid/" in path and path.endswith("/ids"):
+                    qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+                    params = dict(kv.split("=", 1) for kv in qs.split("&") if "=" in kv)
+                    start = int(params.get("start", "0"))
+                    count = int(params.get("count", "100"))
+                    self._send(json.dumps(MATCH_IDS[start:start + count]).encode("utf-8"))
+                elif path.endswith("/timeline") and "/lol/match/v5/matches/" in path:
+                    mid = path.split("/")[-2]
+                    with hits_lock:
+                        timeline_hits += 1
+                    raw, gz = TIMELINES.get(mid, TIMELINES["EUW1_1"])
+                    accept_enc = (self.headers.get("Accept-Encoding") or "").lower()
+                    if "gzip" in accept_enc:
+                        self._send(gz, gzipped=True)
+                    else:
+                        self._send(raw, gzipped=False)
+                elif "/lol/match/v5/matches/" in path:
+                    mid = path.rsplit("/", 1)[-1]
+                    self._send(MATCH_JSON.get(mid, MATCH_JSON["EUW1_1"]))
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+        socketserver.TCPServer.allow_reuse_address = True
+        httpd = socketserver.ThreadingTCPServer(("0.0.0.0", 443), Handler)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+        base_url = "http://localhost:10000"
+        op_headers = {"X-Cohort-Operator-Token": "test-op-token"}
+        host_pid = int(subprocess.check_output(["docker", "inspect", "-f", "{{.State.Pid}}", "ss-backend-512m"]).decode("utf-8").strip())
+
+        def http_req(url: str, method: str = "GET", body: dict = None, headers: dict = None, timeout: int = 120):
+            h = {"Accept": "application/json"}
+            if headers:
+                h.update(headers)
+            data = None
+            if body is not None:
+                data = json.dumps(body).encode("utf-8")
+                h["Content-Type"] = "application/json"
+            req = urllib.request.Request(url, data=data, headers=h, method=method)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return r.status, json.loads(r.read().decode("utf-8"))
+            except urllib.error.HTTPError as e:
+                raw_err = e.read().decode("utf-8", errors="replace")
+                try:
+                    return e.code, json.loads(raw_err)
+                except Exception:
+                    return e.code, {"raw": raw_err}
+
+        def read_cgroup():
+            limit = int(open(f"/proc/{host_pid}/root/sys/fs/cgroup/memory.max").read().strip())
+            cur = int(open(f"/proc/{host_pid}/root/sys/fs/cgroup/memory.current").read().strip())
+            peak = int(open(f"/proc/{host_pid}/root/sys/fs/cgroup/memory.peak").read().strip())
+            ev = {}
+            for line in open(f"/proc/{host_pid}/root/sys/fs/cgroup/memory.events"):
+                parts = line.strip().split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    ev[parts[0]] = int(parts[1])
+            oom_killed = subprocess.check_output(["docker", "inspect", "-f", "{{.State.OOMKilled}}", "ss-backend-512m"]).decode("utf-8").strip() == "true"
+            restarts = int(subprocess.check_output(["docker", "inspect", "-f", "{{.RestartCount}}", "ss-backend-512m"]).decode("utf-8").strip())
+            return {
+                "limitBytes": limit,
+                "currentBytes": cur,
+                "currentMiB": round(cur / (1024 * 1024), 2),
+                "currentRatioPct": round((cur / limit) * 100.0, 2),
+                "peakBytes": peak,
+                "peakMiB": round(peak / (1024 * 1024), 2),
+                "peakRatioPct": round((peak / limit) * 100.0, 2),
+                "events": ev,
+                "oomKilled": oom_killed,
+                "restartCount": restarts
+            }
+
+        raw_sample_bytes = len(TIMELINES["EUW1_1"][0])
+        gz_sample_bytes = len(TIMELINES["EUW1_1"][1])
+        print(f"=== TIMELINE PAYLOAD SIZE: raw={raw_sample_bytes}B gzip={gz_sample_bytes}B ===", flush=True)
+
+        # 1. Warm 450-match profile in Redis
+        st_prof, prof = http_req(f"{base_url}/api/riot/summoner/euw1/TestPlayer/EUW?refresh=true")
+        assert st_prof == 200 and len(prof.get("recentMatches") or []) >= 20, f"Profile load failed: {st_prof}"
+
+        # 2. Verify GET /prepare-coach is rejected (POST-only safety)
+        st_get, _ = http_req(f"{base_url}/api/riot/timeline/prepare-coach/euw1/puuid-main-450", method="GET")
+        assert st_get in (404, 405), f"Expected GET /prepare-coach to be rejected (404/405), got {st_get}"
+
+        # 3. 12-way concurrent cold POST /prepare-coach burst (singleflight + 20 rich 10-player timelines)
+        match_slice_20 = [f"EUW1_{i}" for i in range(1, 21)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as pool:
+            futs = [
+                pool.submit(
+                    http_req,
+                    f"{base_url}/api/riot/timeline/prepare-coach/euw1/puuid-main-450",
+                    "POST",
+                    {"matchIds": match_slice_20}
+                )
+                for _ in range(12)
+            ]
+            burst_results = [f.result() for f in futs]
+
+        statuses = [code for code, _ in burst_results]
+        assert all(code == 200 for code in statuses), f"12-way burst statuses: {statuses}"
+        assert all(body.get("status") == "COMPLETE" and body.get("preparedMatchesCount") == 20 for _, body in burst_results), f"Unexpected burst bodies: {burst_results[0]}"
+        assert timeline_hits == 20, f"Expected singleflight to coalesce 12 callers into 20 timeline hits, got {timeline_hits}"
+        cg_after_12way = read_cgroup()
+
+        # 4. Warm reopen POST /prepare-coach hits GZIP preparedCache with 0 network calls
+        st_warm, warm_body = http_req(
+            f"{base_url}/api/riot/timeline/prepare-coach/euw1/puuid-main-450",
+            method="POST",
+            body={"matchIds": match_slice_20}
+        )
+        assert st_warm == 200 and warm_body.get("status") == "COMPLETE" and warm_body.get("timelineFetchNetworkCalls") == 0, f"Warm reopen failed: {st_warm} {warm_body}"
+        assert timeline_hits == 20, f"Expected 0 new timeline hits on warm reopen, got {timeline_hits}"
+
+        # 5. Multi-slice 6-way concurrent burst + legacy /analyze + single /{matchId} route
+        slices = [[f"EUW1_{i}" for i in range( offset, offset + 20 )] for offset in range(1, 7)]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            multi_futs = [
+                pool.submit(
+                    http_req,
+                    f"{base_url}/api/riot/timeline/prepare-coach/euw1/puuid-main-450",
+                    "POST",
+                    {"matchIds": sl}
+                )
+                for sl in slices
+            ]
+            legacy_analyze_fut = pool.submit(http_req, f"{base_url}/api/riot/timeline/analyze/euw1/puuid-main-450", "GET")
+            legacy_single_fut = pool.submit(http_req, f"{base_url}/api/riot/timeline/euw1/EUW1_1", "GET")
+            multi_res = [f.result() for f in multi_futs]
+            st_an, body_an = legacy_analyze_fut.result()
+            st_sg, body_sg = legacy_single_fut.result()
+
+        assert st_an == 200 and body_an.get("gamesAnalyzed") == 20, f"Legacy /analyze failed: {st_an} {body_an}"
+        assert st_sg == 200 and body_sg.get("metadata", {}).get("matchId") == "EUW1_1", f"Legacy single timeline failed: {st_sg}"
+        _, status_snap = http_req(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers)
+        cg_final = read_cgroup()
+        httpd.shutdown()
+
+        summary = {
+            "rawTimelineBytesEach": raw_sample_bytes,
+            "gzipTimelineBytesEach": gz_sample_bytes,
+            "unsafeGetPrepareCoachStatus": st_get,
+            "cold12WayBurstAll200Complete": True,
+            "warmReopenNetworkCalls": warm_body.get("timelineFetchNetworkCalls"),
+            "multiSliceStatuses": [c for c, _ in multi_res],
+            "legacyAnalyzeGames": body_an.get("gamesAnalyzed"),
+            "totalTimelineUpstreamHits": timeline_hits,
+            "cgroupAfter12WayBurst": cg_after_12way,
+            "cgroupFinal": cg_final,
+            "jvmMemoryHeadroom": status_snap.get("memoryHeadroom")
+        }
+        print("=== TIMELINE PREP & LEGACY ROUTE 512 MB CONTAINER PROOF SUMMARY ===", flush=True)
+        print(json.dumps(summary, indent=2), flush=True)
+
+        assert not cg_final["oomKilled"], "Container was OOMKilled!"
+        assert cg_final["restartCount"] == 0, "Container restarted!"
+        assert cg_final["events"].get("oom", 0) == 0 and cg_final["events"].get("oom_kill", 0) == 0, f"OOM events: {cg_final['events']}"
+        assert cg_final["currentRatioPct"] < 78.0, f"currentRatioPct {cg_final['currentRatioPct']}% >= 78.0%!"
+        assert cg_final["peakRatioPct"] < 78.0, f"peakRatioPct {cg_final['peakRatioPct']}% >= 78.0%!"
+        print("=== TIMELINE PREP 512 MB CONTAINER PROOF PASSED (< 78.0% GATE, OOM=0) ===", flush=True)
+        PY
