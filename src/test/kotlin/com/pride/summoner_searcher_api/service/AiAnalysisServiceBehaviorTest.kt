@@ -320,11 +320,12 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     null
                 ) as String
 
-                // 1. Softened 150-word rule -> concise-but-natural depth guidance
+                // 1. Default short answer with key evidence & two practical actions (expand when asked; no invented character/word limit)
                 prompt shouldNotContain "MUST be under 150 words"
                 prompt shouldNotContain "brutally efficient elevator pitch"
-                prompt shouldContain "Concise & Natural Depth"
-                prompt shouldContain "allow longer, fuller explanations when the question needs depth"
+                prompt shouldContain "Default Short Answer & Two Practical Actions (Expand When Asked)"
+                prompt shouldContain "no invented character or word limit"
+                prompt shouldContain "Expand into fuller detail only when the user explicitly asks"
 
                 // 2. Rank-appropriate persona instead of hardcoded Challenger persona
                 prompt shouldNotContain "Treat the player as a Challenger tier player"
@@ -1434,6 +1435,262 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
             }
         }
     }
+
+    Given("Issue #36 & Nov 10 production regressions: evidence boundaries, invited bluntness, and default short answers") {
+        val service = createService()
+        val constructPromptMethod = AiAnalysisService::class.java.getDeclaredMethod(
+            "constructPrompt",
+            Map::class.java,
+            List::class.java,
+            String::class.java,
+            AiAnalysisService.IntentResult::class.java,
+            PromptVersion::class.java
+        ).apply { isAccessible = true }
+
+        val buildConfigMethod = AiAnalysisService::class.java.getDeclaredMethod(
+            "buildGenerationConfig",
+            Double::class.javaPrimitiveType
+        ).apply { isAccessible = true }
+
+        // Exact Nov 10 denominators: 384 ranked (49.0%), 100 saved (48.0%), 20 detailed (55.0%, with rough recent losses so streak tone is exercised too)
+        val nov10DetailedMatches = (0 until 20).map { idx ->
+            // Make indices 0..3 losses and idx 4 win (1W 4L in last 5) while keeping 11W 9L across all 20
+            val win = idx == 4 || idx >= 10
+            mapOf(
+                "matchId" to "EUW1_${9500 + idx}",
+                "patch" to "26.1",
+                "role" to "TOP",
+                "side" to if (idx % 2 == 0) "Blue" else "Red",
+                "champion" to "Pantheon",
+                "win" to win,
+                "kda" to if (win) "7/4/8 (3.75)" else "3/7/4 (1.00)",
+                "csPerMin" to 6.8
+            )
+        }
+
+        val nov10ProductionContext = mapOf<String, Any>(
+            "summonerName" to "Nov10Player#EUW",
+            "rank" to "EMERALD III (41 LP)",
+            "rankedRecord" to mapOf("wins" to 188, "losses" to 196, "games" to 384, "winRate" to "49.0"),
+            "savedHistory" to mapOf("wins" to 48, "losses" to 52, "games" to 100, "winRate" to "48.0"),
+            "recentMatchSample" to mapOf("games" to 20, "wins" to 11, "losses" to 9, "winRate" to "55.0"),
+            "primaryRole" to "TOP",
+            "totalGamesAnalyzed" to 20,
+            "timelineStatus" to "NOT_ANALYZED",
+            "kda" to "2.35",
+            "avgCsPerMin" to "6.8",
+            "topChampions" to listOf(
+                mapOf("name" to "Pantheon", "games" to 72, "wins" to 36, "losses" to 36, "winRate" to "50.0", "kda" to "2.35")
+            ),
+            "topStrengths" to listOf(
+                mapOf("name" to "Solo Kills", "consistency" to "65%")
+            ),
+            "topWeaknesses" to listOf(
+                mapOf("name" to "Early Laning Advantage", "consistency" to "75%"),
+                mapOf("name" to "Turret Plates", "consistency" to "70%")
+            ),
+            "recentMatches" to nov10DetailedMatches,
+            "improvementStats" to mapOf(
+                "totalGamesConsidered" to 20,
+                "excludedInvalidDurationGames" to 0,
+                "excludedMissingTimelineGames" to 20,
+                "hasTimelineAnalysis" to false,
+                "deathCost" to mapOf(
+                    "eligibleTimeDeadGames" to 20,
+                    "missingTimeDeadGames" to 0,
+                    "totalTimeSpentDeadSeconds" to 2941,
+                    "avgTimeSpentDeadSeconds" to 147.05,
+                    "avgDeadTimeGameSharePct" to 7.84,
+                    "overallDeadTimeGameSharePct" to 7.84
+                ),
+                "teamObjectives" to mapOf(
+                    "eligibleTeamObjectiveGames" to 20,
+                    "missingTeamsGames" to 0,
+                    "timelineEligibleGames" to 0,
+                    "tower" to mapOf(
+                        "eligibleGames" to 20, "missingGames" to 0,
+                        "firstCount" to 8, "firstRate" to 0.4,
+                        "teamKills" to 96, "teamAvg" to 4.8, "enemyAvg" to 5.4,
+                        "personalLh" to 14, "personalTd" to 29, "timelineInvolved" to null
+                    ),
+                    "horde" to mapOf(
+                        "eligibleGames" to 20, "missingGames" to 0,
+                        "firstCount" to 6, "firstRate" to 0.3,
+                        "teamKills" to 34, "teamAvg" to 1.7, "enemyAvg" to 2.9,
+                        "personalLh" to null, "personalTd" to null, "timelineInvolved" to null
+                    )
+                )
+            )
+        )
+
+        When("constructing prompts for Nov 10 sample comparison, invited roast, ordinary habits, and Pantheon mechanics") {
+            Then("it enforces season/MMR/synergy boundaries, keeps personal deathCost (147.05s / 7.84%) while forbidding personal blame for team firstRate or unverified low-percentage fights, frames topWeaknesses as trail frequency, bans invented ability names, defaults to short + 2 actions without a character cap, and filters bad curated examples") {
+                clearMocks(exampleRepository, patternRepository)
+                val unrequestedWallOfText = (1..245).joinToString(" ") { "word$it" }
+                every {
+                    exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc(any(), any())
+                } returns listOf(
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "Compare my ranked and recent win rates.",
+                        aiResponse = "Your 49% lifetime ranked record across 384 games suggests your overall matchmaking rating has stabilized, while 55% in your last 20 games comes from tighter macro and better synergy.",
+                        qualityScore = BigDecimal("96.0")
+                    ),
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "Roast my recent games.",
+                        aiResponse = "Securing first Voidgrubs in 6 of 20 games and first tower in 8 of 20 is a massive personal weakness because you keep taking low-percentage fights.",
+                        qualityScore = BigDecimal("95.0")
+                    ),
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "How do I play Pantheon trades?",
+                        aiResponse = "Lead with Pantheon's Aegis of Zealous stun before buffering E.",
+                        qualityScore = BigDecimal("94.0")
+                    ),
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "Quick tip?",
+                        aiResponse = unrequestedWallOfText,
+                        qualityScore = BigDecimal("93.0")
+                    ),
+                    AiLearnedExample(
+                        questionCategory = "general",
+                        userQuestion = "What should I focus on over my next few Pantheon games?",
+                        aiResponse = "Across your last 20 detailed matches (11W–9L, 55.0% win rate), you averaged 147.05s of grey-screen time (7.84% of game time). Track two habits next game: check wave state before using W forward, and reset on completed components.\n---SUGGESTIONS--- [\"Compare my three win-rate windows\", \"Break down my Pantheon matchups in detail\", \"How do I trim mid-game deaths?\"]",
+                        qualityScore = BigDecimal("90.0")
+                    )
+                )
+
+                val comparisonPrompt = constructPromptMethod.invoke(
+                    service,
+                    nov10ProductionContext,
+                    emptyList<Map<String, String>>(),
+                    "Compare my ranked record, saved matches, and last 20 games.",
+                    null,
+                    null
+                ) as String
+
+                val roastPrompt = constructPromptMethod.invoke(
+                    service,
+                    nov10ProductionContext,
+                    emptyList<Map<String, String>>(),
+                    "Roast my profile brutally and tell me what to fix.",
+                    null,
+                    null
+                ) as String
+
+                val habitsPrompt = constructPromptMethod.invoke(
+                    service,
+                    nov10ProductionContext,
+                    emptyList<Map<String, String>>(),
+                    "What are my biggest Pantheon habits and ability mistakes to fix?",
+                    null,
+                    null
+                ) as String
+
+                // 1. Nov 10 comparison regression: 384/49%, 100/48%, 20/55% separated; no "lifetime ranked record", no MMR stabilization, no "better synergy"/"tighter macro"
+                comparisonPrompt shouldContain "rankedRecord (Solo/Duo Queue Counter): 188W 196L across 384 games (49.0% WR)"
+                comparisonPrompt shouldContain "savedHistory (Saved Match History): 48W 52L across 100 games (48.0% WR)"
+                comparisonPrompt shouldContain "recentMatchSample (Detailed Match List): 11W 9L across 20 games (55.0% WR)"
+                comparisonPrompt shouldContain "current ranked season/split"
+                comparisonPrompt shouldContain "NEVER call it a \"lifetime\", \"all-time\", or \"career\" ranked record"
+                comparisonPrompt shouldContain "Riot does **not** expose hidden MMR (\"matchmaking rating\")—NEVER claim MMR has stabilized"
+                comparisonPrompt shouldContain "NEVER invent unmeasured causes such as \"better synergy\" or \"tighter macro\""
+
+                // 2. Nov 10 invited roast regression: personal deathCost 147.05s / 7.84% across 20g preserved; team firstRate 0.3 (6/20) & 0.4 (8/20) guarded; no "low-percentage fights" when timeline NOT_ANALYZED; invited bluntness kept
+                roastPrompt shouldContain "Death Cost (Time Dead & Direct Kill Bounty Only): eligibleTimeDead=20g (missingTimeDead=0g), totalDead=2941s, avgDeadPerGame=147.05s, avgGameShare=7.84%, overallShare=7.84%"
+                roastPrompt shouldContain "tower(elig=20g, miss=0g, first=8/20 [0.4]"
+                roastPrompt shouldContain "voidgrubs(elig=20g, miss=0g, first=6/20 [0.3]"
+                roastPrompt shouldContain "remain valid personal stats even without timeline analysis when scoped to `eligibleTimeDeadGames`, but never infer lost farm, death avoidability, or \"low-percentage fights\" from `deathCost`"
+                roastPrompt shouldContain "`first`/`firstRate` and `teamKills`/`teamAvg` are **5-player team outcomes**—NEVER call low team `firstRate` (such as Voidgrubs or first tower rate) a personal weakness or personal fault even in a roast"
+                roastPrompt shouldContain "Invited Bluntness & Playful Roasting"
+                roastPrompt shouldContain "unless playful bluntness/roasting was explicitly invited"
+                roastPrompt shouldNotContain "never roast"
+                roastPrompt shouldNotContain "refuse to roast"
+
+                // 3. Nov 10 ordinary habits + #36 Pantheon ability names: topWeaknesses rendered as trail-opp freq, never confident skill diagnosis; Q/W/E/R fallback vs "Aegis of Zealous"
+                habitsPrompt shouldContain "topStrengths (beat-opp freq): Solo Kills (65%) [sample: recentMatchSample]"
+                habitsPrompt shouldContain "topWeaknesses (trail-opp freq): Early Laning Advantage (75%), Turret Plates (70%) [sample: recentMatchSample]"
+                habitsPrompt shouldContain "`topStrengths` and `topWeaknesses` percentages only count how often you beat or trailed your matched role opponent on a raw challenge stat in recent main-role games—NEVER turn challenge trail frequencies into confident skill diagnoses"
+                habitsPrompt shouldContain "Verified Champion Ability Names Only"
+                habitsPrompt shouldContain "NEVER invent, guess, or blend ability names (such as \"Aegis of Zealous\")"
+
+                // 4. Default brevity + 2 practical actions + expand when asked + no invented character limit + untouched budgets/model/#39
+                for (p in listOf(comparisonPrompt, roastPrompt, habitsPrompt)) {
+                    p shouldContain "Default Short Answer & Two Practical Actions (Expand When Asked)"
+                    p shouldContain "at most two practical, controllable actions"
+                    p shouldContain "no invented character or word limit"
+                    p shouldContain "Expand into fuller detail only when the user explicitly asks"
+                    p shouldNotContain "character limit"
+                    p shouldNotContain "MUST be under"
+                    // PROVEN EXAMPLES filtered out all 4 invalid/verbose examples and stripped ---SUGGESTIONS--- from the 1 clean example
+                    p shouldNotContain "lifetime ranked record across 384 games"
+                    p shouldNotContain "massive personal weakness because you keep taking low-percentage fights"
+                    p shouldNotContain "Pantheon's Aegis of Zealous"
+                    p shouldNotContain "word200"
+                    p shouldContain "you averaged 147.05s of grey-screen time (7.84% of game time)"
+                    p shouldNotContain "Break down my Pantheon matchups in detail"
+                    (AiAnalysisService.utf8ByteSize(p) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+                }
+
+                AiAnalysisService.MAX_PROMPT_BYTES shouldBe 16_000
+                AiAnalysisService.MAX_GROUND_TRUTH_BYTES shouldBe 8_500
+                @Suppress("UNCHECKED_CAST")
+                val genConfig = buildConfigMethod.invoke(service, 0.7) as Map<String, Any>
+                genConfig["maxOutputTokens"] shouldBe 4096
+                genConfig["thinkingConfig"] shouldBe mapOf("thinkingLevel" to "low")
+
+                clearMocks(exampleRepository, patternRepository)
+            }
+        }
+
+        When("evaluating deterministic evidence-boundary, schema-leak, and brevity helpers against exact Nov 10 regressions vs grounded coaching") {
+            Then("it flags every Nov 10 / #36 violation and unrequested essay while passing grounded comparisons, sharp roasts, disclaimers, and requested deep dives") {
+                val violatingResponses = listOf(
+                    "Your **49% lifetime ranked record** across 384 games suggests your overall matchmaking rating has stabilized.",
+                    "Moving from 48% across 100 saved matches to 55% in your last 20 detailed matches reflects tighter macro and better synergy with your jungler.",
+                    "Securing first Voidgrubs in only 6 of 20 games (30%) and first tower in 8 of 20 (40%) is a glaring personal weakness.",
+                    "Even without match timelines, spending 147.05 seconds dead shows a player who takes low-percentage fights constantly.",
+                    "Trailing your lane opponent in Early Laning Advantage across 75% of your games proves poor wave mechanics.",
+                    "Hold Pantheon's Aegis of Zealous until the enemy dashes, then rush Divine Sunderer.",
+                    "Short grounded body.\n---SUGGESTIONS--- [\"Should I build Mythic items first?\", \"When do I cast Aegis of Zealous?\", \"Review my CS\"]"
+                )
+                violatingResponses.forEach { bad ->
+                    AiAnalysisService.containsEvidenceBoundaryViolation(bad) shouldBe true
+                    AiAnalysisService.isEligibleCuratedExample("How am I playing lately?", bad) shouldBe false
+                }
+
+                // Raw internal metric keys from the roast note (`horde.firstRate`, `tower.firstRate`) are caught by containsInternalSchemaLeak
+                AiAnalysisService.containsInternalSchemaLeak("Your horde.firstRate is 0.3 and tower.firstRate is 0.4.") shouldBe true
+
+                val groundedResponses = listOf(
+                    // Grounded comparison with explicit disclaimers
+                    "Your **ranked record** this season sits at **49.0% across 384 games** (188W–196L), alongside **48.0% across 100 saved matches** (48W–52L) and **55.0% across your last 20 detailed matches** (11W–9L). That 11W–9L uptick is a two-game swing within normal 20-game variance—Riot does not expose hidden matchmaking rating, and summary stats alone do not prove tighter macro or better synergy. Next game: (1) track whether losses cluster on Red side, and (2) review deaths before 10 minutes.",
+                    // Invited blunt roast using valid personal deathCost (147.05s / 7.84% in 20g) while respecting team objective & missing-timeline boundaries
+                    "You spent an average of **147.05 seconds on a grey screen per game** (**7.84% of total game time** across your last 20 detailed matches)—nearly two and a half minutes watching teammates play without you. Your team's **30% first-Voidgrub rate (6 of 20)** and **40% first-tower rate (8 of 20)** are 5-player team outcomes rather than a personal weakness, and since match timelines aren't analyzed yet we can't tell whether you're taking low-percentage fights. Next game: (1) check enemy wave position before committing Pantheon's W stun, and (2) spend gold immediately after respawning.",
+                    // Grounded ordinary habits + verified Pantheon ability name Shield Vault / W-E keys
+                    "In your last 20 detailed matches (55.0% win rate), you trailed your matched top-lane opponent on the Early Laning Advantage challenge in **75%** of main-role games and Turret Plates in **70%**—that's a head-to-head comparison frequency, not proof of bad wave mechanics. Next game: (1) save **Shield Vault (W)** or **E** cooldowns when enemy jungle location is unknown, and (2) crash the cannon wave before resetting."
+                )
+                groundedResponses.forEach { good ->
+                    AiAnalysisService.containsInternalSchemaLeak(good) shouldBe false
+                    AiAnalysisService.containsEvidenceBoundaryViolation(good) shouldBe false
+                    AiAnalysisService.isEligibleCuratedExample("How am I playing lately?", good) shouldBe true
+                }
+
+                // Expansion detection & default length gate
+                AiAnalysisService.requestsExpandedAnswer("How am I playing lately?") shouldBe false
+                AiAnalysisService.requestsExpandedAnswer("Compare my last 20 detailed matches to my ranked record.") shouldBe false
+                AiAnalysisService.requestsExpandedAnswer("Give me a detailed breakdown of my Pantheon games step by step.") shouldBe true
+                AiAnalysisService.requestsExpandedAnswer("Can you elaborate and go deeper on those matchups?") shouldBe true
+
+                val twoHundredSixtyWordDeepDive = (1..260).joinToString(" ") { "groundedWord$it" } + " 55.0% next game"
+                AiAnalysisService.isEligibleCuratedExample("How am I playing?", twoHundredSixtyWordDeepDive) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample("Explain my matchups in detail.", twoHundredSixtyWordDeepDive) shouldBe true
+            }
+        }
+    }
 })
+
 
 
