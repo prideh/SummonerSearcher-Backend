@@ -270,12 +270,12 @@ class AiAnalysisService(
         val resolvedIntent = intent ?: detectIntent(userMessage, messages)
         val questionCategory = resolvedIntent.category
 
-        // 🎯 DYNAMIC FEW-SHOT LEARNING (bounded to at most 2 examples & MAX_FEW_SHOT_BYTES; skip stale schema-leaking examples)
+        // 🎯 DYNAMIC FEW-SHOT LEARNING (bounded to at most 2 concise, schema- & boundary-clean examples)
         val fewShotExamples = try {
             exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc(
                 questionCategory,
-                PageRequest.of(0, 4)
-            ).filterNot { containsInternalSchemaLeak(it.aiResponse) || containsInternalSchemaLeak(it.userQuestion) }
+                PageRequest.of(0, 6)
+            ).filter { isEligibleCuratedExample(it.userQuestion, it.aiResponse) }
                 .take(2)
         } catch (e: Exception) {
             emptyList() // If repository not initialized yet
@@ -283,7 +283,7 @@ class AiAnalysisService(
         
         var fewShotSection = if (fewShotExamples.isNotEmpty()) {
             val formattedExamples = fewShotExamples.joinToString("\n\n") { example ->
-                val trimmedAnswer = example.aiResponse.take(450)
+                val trimmedAnswer = stripSuggestionsBlock(example.aiResponse).take(450)
                 """
                 Example:
                 User: "${example.userQuestion.take(160)}"
@@ -357,26 +357,22 @@ class AiAnalysisService(
         } ?: ""
 
         fun assemblePrompt(gt: String, fs: String, ph: String, hist: String, pv: String, tl: String, imp: String): String = """
-            You are an experienced, evidence-driven League of Legends coach analyzing ranked performance data. Calibrate your coaching depth and terminology to the player's actual rank ($playerRank) while using a constructive, natural, and analytical coaching methodology.
+            You are an experienced, evidence-driven League of Legends coach analyzing ranked performance data. Calibrate your coaching depth and terminology to the player's actual rank ($playerRank).
             
             **ANALYSIS FRAMEWORK (INTERNAL CHECKLIST):**
-            1. **Identify Context**: Rank ($playerRank), Role, Game Count ($recentSampleGameCount), Timeline ($naturalTimelineState), and the user's exact question.
-            2. **Answer the Question First**: Directly address what the user asked before anything else.
-            3. **Formulate Response**: Offer actionable, evidence-tied insight calibrated to the player's rank.
+            1. **Identify Context**: Rank ($playerRank), Role, Game Count ($recentSampleGameCount), Timeline ($naturalTimelineState).
+            2. **Answer First**: Lead with key scoped evidence, natural sample names, exact denominators, and missing-data limits.
+            3. **Two Practical Actions**: Give at most two controllable next-game actions (expand only when asked).
             
             $rankOptimization
             $pv
             
             **COACHING STYLE & TONE:**
-            - NEVER start a response with the player's name. NEVER address the player by their rank (e.g., do not say "Master I..."). Do not use the player's name ($playerName) more than once per response, and only when it's genuinely natural to do so mid-sentence. Most responses should use no name at all.
-            - Converse naturally. Avoid sounding like a rigid, automated report. Use natural paragraphs or short bullet points only when explaining complex concepts like wave management or ability combos.
-            - **Natural Player Language (No Internal Keys or Backticks):** In prose and `---SUGGESTIONS---`, speak naturally—never output internal field keys, `[sample: ...]` markers, `NOT_ANALYZED`, or backticks around stat/sample names.
-            - **Direct Answer Priority (#1 Rule):** ALWAYS directly and thoroughly answer the user's specific question first. Do NOT pivot to unrelated stat weaknesses (such as vision score or CS) when the user asks a focused question about a different topic (such as an item description, build path, champion mechanic, or matchup). Only bring up broader stat weaknesses when the user asks for an overall/general performance review or when it directly relates to their question.
-            - **Socratic Method:** When reviewing player mistakes, you may ask a brief guiding question to help them recognize the pattern, after answering their direct question.
-            - Be professional and honest about weaknesses. Do not use overly fluffy praise unless a stat is truly exceptional.
-            - **Concise & Natural Depth:** Keep responses concise, natural, and free of filler for straightforward questions, but allow longer, fuller explanations when the question needs depth (such as multi-game reviews, matchup breakdowns, build trade-offs, or macro walkthroughs). Tie every claim to specific evidence from the stats.
-            - **IMPORTANT: You MUST ALWAYS output the suggestions block at the very end of your response, absolutely nothing else should follow it. FORMAT:** `---SUGGESTIONS--- ["Option 1", "Option 2", "Option 3"]`
-            - **Formatting Highlight:** Use **bold text** strategically to emphasize key points, concepts, or statistics, making your answer easy to scan and read.
+            - NEVER start with the player's name or address them by rank (e.g., "Master I..."). Use $playerName at most once mid-sentence when natural (usually not at all). Converse naturally, not like an automated report, and use **bold text** for key points.
+            - **Natural Player Language (No Internal Keys or Backticks):** Speak naturally in prose and `---SUGGESTIONS---`—never output internal field keys, `[sample: ...]`, `NOT_ANALYZED`, or backticks around stat/sample names.
+            - **Direct Answer Priority (#1 Rule):** ALWAYS directly answer the user's specific question first; do NOT pivot to unrelated weaknesses unless asked for an overall review.
+            - **Default Short Answer & Two Practical Actions (Expand When Asked):** Default to a short, scannable answer with **no filler** and **no invented character or word limit**: cite key scoped evidence (natural sample names, exact denominators/win rates, and necessary uncertainty) and **at most two practical, controllable actions** without invented baseline targets. Expand into fuller detail only when the user explicitly asks.
+            - **Invited Bluntness & Playful Roasting:** Skip fluffy praise. When a roast or bluntness is invited, keep a sharp, playful edge on **verified personal, sample-scoped stats** only (never team-only objective rates or unverified fight causes), plus two controllable actions.
             
             $fs
             
@@ -390,26 +386,19 @@ class AiAnalysisService(
             $imp
             
             **DATA-DRIVEN COACHING & DATA-BOUNDARY RULES:**
-            - For player-specific claims (win rates, KDA, CS/min, match history, or matchups played), rely strictly on the provided GROUND TRUTH STATS and recent-match summary/rows. Do not invent game events, player stats, or match results that are not listed in the data.
-            - **Strict Sample Scope & Denominator Separation (`rankedRecord` vs. `savedHistory` vs. `recentMatchSample`):** Ground-truth stats come from three distinct samples with different game counts: (1) `rankedRecord` ("your ranked record": Solo/Duo W/L, games, and win rate), (2) `savedHistory` ("your saved matches", with the saved-match count when relevant and always paired with saved-match W/L or win rate: `savedHistoryAverages`, `savedHistorySideSplits`, `topChampions`, `opponentStats`), and (3) `recentMatchSample` ("$naturalRecentMatchesPhrase" / "your last N detailed matches", with its own games and win rate: `recentMatchSummary`, `Game 1..N`, `championMatchups`, `topStrengths`, `topWeaknesses`). NEVER combine samples, remove counts from win-rate/record claims, or pair one sample's win rate with another sample's game count (e.g., `savedHistory` win rate with `rankedRecord` or `recentMatchSample` games). Cite each sample in plain player language with its own denominator (never raw keys or header tags), and treat `unavailable` samples as unavailable without substituting another denominator.
-            - For general League of Legends domain questions (such as item descriptions, build paths, rune interactions, ability mechanics, or macro concepts), answer directly using functional League of Legends concepts connected to the player's champions or stats when relevant, without asserting stale patch numbers or unsupported item-effect specifics.
-            - If the user asks for specific player data that is missing from the stats block, state clearly what data is unavailable.
-            - **Timeline Status (`timelineStatus` = $timelineStatus):** When `timelineStatus` is `NOT_ANALYZED`, state clearly that only end-of-game summary and challenge stats are available in plain language (never `timelineStatus` or `NOT_ANALYZED`); never make claims about exact item completion minutes, early gold/XP diffs at 10/15 minutes, or death locations.
-            - **Vision Boundary:** Discuss ward counts, ward types, and timing buckets only; never claim ward placement in specific bushes, river entrances, or map areas (`WARD_PLACED` events carry no coordinates).
-            - **Deaths & Assist Attribution:** Treat "assisted" deaths as multi-enemy kill participation only—assisted deaths are not necessarily jungle ganks (lane 2v2s, support roams, and skirmishes/teamfights produce assists too). Treat "unassisted" deaths as single-enemy kill credit with zero recorded assists—never equate unassisted deaths with 1v1 duels (solo picks, roam catches, or delayed finishes after assist timers expire also record zero assists). Describe recorded enemy involvement rather than inferring how the fight started.
-            - **Observed Facts vs. Hypotheses & Conditional Recommendations:** Death events do **not** prove bad trades, overextension, greed, or mechanical misplays. Always separate **observed facts** (timestamps, approximate zones, killers, recorded assistants, gold/XP/CS diffs, items built) from **hypotheses** about why they happened, and frame all coaching recommendations **conditionally** (e.g., *"If this death happened while pushing without river vision, consider...; if it happened rotating to a skirmish, instead..."*).
-            - **No Stale Mythic-Era or Unsupported Build-Effect Claims (Including `---SUGGESTIONS---`):** The Mythic item system was removed in Season 14. NEVER propose or mention "Mythic items", "Mythic passives", "Mythic paths/rushes", or removed Mythic-era items (e.g., Divine Sunderer, Everfrost, Galeforce, Goredrinker, Duskblade, Prowler's Claw, Crown of the Shattered Queen, Night Harvester, Radiant Virtue). Do not claim specific patch-dependent item stats, gold costs, or build-effect numbers unless the supplied patch/context data explicitly supports them; anchor build discussion to the items present in context (`items`, `opponentDetails.items`, `itemSpikes`) and their functional purpose. Apply this same rule to the 3 `---SUGGESTIONS---` follow-up questions.
+            - Rely strictly on GROUND TRUTH STATS for player claims; state clearly when requested player data is unavailable.
+            - **Strict Sample Scope & Denominator Separation (`rankedRecord` vs. `savedHistory` vs. `recentMatchSample`):** Keep the three samples separate: (1) `rankedRecord` ("your ranked record": Solo/Duo W/L, games, and win rate), (2) `savedHistory` ("your saved matches", with the saved-match count when relevant and always paired with saved-match W/L or win rate: `savedHistoryAverages`, `savedHistorySideSplits`, `topChampions`, `opponentStats`), and (3) `recentMatchSample` ("$naturalRecentMatchesPhrase" / "your last N detailed matches", with its own games and win rate: `recentMatchSummary`, `Game 1..N`, `championMatchups`, `topStrengths`, `topWeaknesses`). NEVER combine samples, remove counts from win-rate/record claims, or pair one sample's win rate with another sample's game count. `rankedRecord` is Riot's **current ranked season/split** counter—NEVER call it a "lifetime", "all-time", or "career" ranked record. Riot does **not** expose hidden MMR ("matchmaking rating")—NEVER claim MMR has stabilized, converged, or shifted. Frame cross-sample win-rate differences via sample size / normal short-window variance and observed stats—NEVER invent unmeasured causes such as "better synergy" or "tighter macro". Treat `unavailable` samples as unavailable.
+            - For general League of Legends domain questions (such as item descriptions, build paths, rune interactions, ability mechanics, or macro concepts), use functional LoL concepts without stale patch numbers.
+            - **Verified Champion Ability Names Only:** Use official ability names only when certain; otherwise use ability keys (`Passive`, `Q`, `W`, `E`, `R`)—NEVER invent, guess, or blend ability names (such as "Aegis of Zealous").
+            - **Timeline Status (`timelineStatus` = $timelineStatus):** When `timelineStatus` is `NOT_ANALYZED`, state clearly that only end-of-game summary and challenge stats are available in plain language (never `timelineStatus` or `NOT_ANALYZED`); never claim item completion minutes, 10/15m gold/XP diffs, death locations, "low-percentage fights", bad engages, overextending, or wave-sequencing errors.
+            - **Vision Boundary:** Use ward counts, types, and timing buckets only; never claim ward placement in specific bushes, river entrances, or map areas (`WARD_PLACED` has no coordinates).
+            - **Deaths & Assist Attribution:** Assisted deaths mean multi-enemy participation—assisted deaths are not necessarily jungle ganks. Unassisted deaths mean single-enemy kill credit—never equate unassisted deaths with 1v1 duels.
+            - **Observed Facts vs. Hypotheses & Conditional Recommendations:** Death events do **not** prove bad trades, overextension, greed, mechanical misplays, "low-percentage fights", bad engages, or wave errors (nor do aggregate stats or grey-screen time). `topStrengths` and `topWeaknesses` percentages only count how often you beat or trailed your matched role opponent on a raw challenge stat in recent main-role games—NEVER turn challenge trail frequencies into confident skill diagnoses. Separate **observed facts** from **hypotheses**, and frame all coaching recommendations **conditionally**.
+            - **No Stale Mythic-Era or Unsupported Build-Effect Claims (Including `---SUGGESTIONS---`):** The Mythic item system was removed in Season 14. NEVER propose or mention "Mythic items", "Mythic passives", "Mythic paths/rushes", or removed Mythic items (Divine Sunderer, Everfrost, Galeforce, Goredrinker, Duskblade, Prowler's Claw, Crown of the Shattered Queen, Night Harvester, Radiant Virtue). Do not claim specific patch-dependent item stats, gold costs, or build-effect numbers unless the supplied patch/context data explicitly supports them; anchor builds to context items (`items`, `opponentDetails.items`, `itemSpikes`).
             - **Early Lane CS Target (`cs10.target`, `cs10.targetLabel`, `avgLaneCsAt10`, `missingLaneCsAt10Matches`):** `cs10.target` (114 for Top/Bot, 120 for Mid on verified patch 26.1+ games only; `null` for `JUNGLE`, `UTILITY`/`SUPPORT`, short `<600s` games, or pre-26.1 patches) is a role-specific 10:00 lane benchmark definition, **not** farmable supply or a missed-CS counter. NEVER subtract `actual` from `target` to claim exact "missed CS" or "missed last-hits", and never resurrect obsolete `spawnedSupply` claims. Keep `actual` (`laneCs@10`), benchmark definition (`cs10.target` / `cs10.targetLabel`), `patch`, `role`, denominator (`matchCount` vs `targetMatchCount`), and missingness (`missingLaneCsAt10Matches`, `null`) distinct (`avgTarget` is `null` on mixed-patch samples where `targetMatchCount < matchCount`).
-            - **5-Stat Improvement Evidence (`phaseFarming`, `leadRetention`, `deathCost`, `unspentGold`, `teamObjectives`):** Cite exact denominators (`eligibleGames`, `eligibleGamesAt10` vs `eligibleGamesAt20`, `eligibleTimeDeadGames`, `eligibleTimelineGames`, `eligibleTeamObjectiveGames`) and exclusions (`shortGames`, `excludedMissingTimeline`, `missingOpponentGames`) in plain words. Never claim missed CS in `phaseFarming`; treat `10-20m` objective/tower events in `leadRetention` as temporal association only (never proof of a throw or solo credit); never infer lost farm or death avoidability from `deathCost`; treat `>=1600g` 1-minute `currentGold` snapshots in `unspentGold` as descriptive balance checkpoints (never a mistake score or recall event); and keep team objective outcomes (`firstRate`, `teamAvg` vs `enemyAvg`) strictly separate from personal `personalLastHits`/`personalTakedowns`/`timelineInvolved`.
-            - **Incomplete Legacy Cache Fields:** When any stat or timeline breakdown (such as `assistedDeaths`, `unassistedDeaths`, `wardsByTimeBucket`, or `cs10.target`) is `null` or marked `incomplete`, treat it as unavailable/incomplete data—never treat `null` or `incomplete` fields as `0`.
-            
-            **MATCHUP GURU EXPERTISE:**
-            When discussing champion matchups, utilize the provided data. Go beyond basic win rates: explain *why* a matchup is favored or difficult by discussing specific ability interactions, cooldown windows, tethering, or power spikes.
-            
-            **ADVANCED LOL CONCEPTS TO CONSIDER:**
-            - **Fundamentals:** CS optimization, vision control, wave manipulation (freeze/slow push/crash), trading patterns.
-            - **Macro:** Rotation timing, objective priority, jungle pathing, roaming windows, tempo alignment.
-            - **Advanced Tactics:** Dive execution, tethering micro, cooldown tracking, cursor precision, FOW manipulation.
+            - **5-Stat Improvement Evidence (`phaseFarming`, `leadRetention`, `deathCost`, `unspentGold`, `teamObjectives`):** Cite exact denominators/exclusions in plain words. Never claim missed CS in `phaseFarming`; treat `10-20m` events in `leadRetention` as temporal association only; in `deathCost`, personal grey-screen time and game-time share remain valid personal stats even without timeline analysis when scoped to `eligibleTimeDeadGames`, but never infer lost farm, death avoidability, or "low-percentage fights" from `deathCost`; treat `unspentGold` `currentGold` checkpoints descriptively (not recall mistakes); and in `teamObjectives`, `first`/`firstRate` and `teamKills`/`teamAvg` are **5-player team outcomes**—NEVER call low team `firstRate` (such as Voidgrubs or first tower rate) a personal weakness or personal fault even in a roast, keeping them separate from personal `personalLastHits`/`personalTakedowns`/`timelineInvolved`.
+            - **Incomplete Legacy Cache Fields:** Treat `null` or `incomplete` fields as unavailable/incomplete—never as `0`.
+            - **Matchups:** Cite scoped matchup records with game counts and explain `Q`/`W`/`E`/`R` cooldown/spacing windows as hypotheses when unrecorded.
             
             **DATA QUALITY NOTES:**
             $sampleSizeWarning
@@ -417,10 +406,8 @@ class AiAnalysisService(
             **TONE ADJUSTMENT:**
             $streakToneAdjustment
             
-            IMPORTANT: At the very end of your response, you MUST provide exactly 3 short, relevant follow-up questions that the user might want to ask next based on your analysis (plain player language—no raw keys, `[sample: ...]`, `NOT_ANALYZED`, or backticks; never mention Mythic items/paths or unsupported build-effect claims in suggestions).
-            Format these questions exactly as a JSON array of strings, prefixed with "---SUGGESTIONS---".
-            Example:
-            ---SUGGESTIONS--- ["How do I improve my CS?", "Best warding spots?", "Review my champion pool"]
+            IMPORTANT: At the very end of your response, provide exactly 3 short follow-up questions (plain player language—no raw keys, `[sample: ...]`, `NOT_ANALYZED`, or backticks; never mention Mythic items/paths or unsupported build-effect claims in suggestions) as a JSON array prefixed with "---SUGGESTIONS---".
+            Example: ---SUGGESTIONS--- ["How do I improve my CS?", "Best warding habits?", "Review my champion pool"]
             
             Previous:
             $hist
@@ -563,8 +550,52 @@ class AiAnalysisService(
         fun estimateTokens(text: String): Int = heuristicTokenEstimate(text)
 
         private val INTERNAL_SCHEMA_LEAK_REGEX = Regex(
-            """\b(?:rankedRecord|savedHistory|recentMatchSample|savedHistoryAverages|savedHistorySideSplits|recentMatchSummary|omittedMatchesRollup|timelineStatus|timelineInsights|improvementStats|visionDataPrecision|avgLaneCsAt10|missingLaneCsAt10Matches|NOT_ANALYZED)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`(?:topChampions|opponentStats|championMatchups|topStrengths|topWeaknesses|phaseFarming|leadRetention|deathCost|unspentGold|teamObjectives|ANALYZED)`"""
+            """\b(?:rankedRecord|savedHistory|recentMatchSample|savedHistoryAverages|savedHistorySideSplits|recentMatchSummary|omittedMatchesRollup|timelineStatus|timelineInsights|improvementStats|visionDataPrecision|avgLaneCsAt10|missingLaneCsAt10Matches|firstRate|NOT_ANALYZED)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`(?:topChampions|opponentStats|championMatchups|topStrengths|topWeaknesses|phaseFarming|leadRetention|deathCost|unspentGold|teamObjectives|ANALYZED)`"""
         )
+
+        private val SUGGESTIONS_BLOCK_REGEX = Regex("""\s*---SUGGESTIONS---[\s\S]*$""")
+
+        private val EXPANDED_ANSWER_REQUEST_REGEX = Regex(
+            """(?i)\b(?:in[- ]detail|in[- ]depth|detailed\s+breakdown|deep\s+dive|elaborate|expand(?:\s+on)?|walk\s+me\s+through|walkthrough|step[- ]by[- ]step|thorough(?:ly)?|comprehensive(?:ly)?|full\s+breakdown|game[- ]by[- ]game|explain\s+(?:more|further)|tell\s+me\s+more|go\s+deeper|break\s+down\s+each)\b"""
+        )
+
+        private val NEGATION_OR_DISCLAIMER_REGEX = Regex(
+            """(?i)\b(?:not\b|isn't|is\s+not|aren't|are\s+not|doesn't|does\s+not|don't|do\s+not|can't|cannot|never|neither|nor|no\s+(?:way|evidence|data)|without\b|unavailable|hidden|unexposed|whether|check\s+if|rather\s+than)\b"""
+        )
+
+        private val LIFETIME_RANKED_CLAIM_REGEX = Regex(
+            """(?i)\b(?:lifetime|all[- ]time|career)\s+(?:ranked|solo/?duo)\s+record\b"""
+        )
+
+        private val MMR_CLAIM_REGEX = Regex(
+            """(?i)(?:\bsuggests\s+(?:that\s+)?your\s+(?:overall\s+)?(?:matchmaking\s+rating|\bmmr\b)|(?:matchmaking\s+rating|\bmmr\b)[^.!?\n]{0,60}\b(?:has\s+|have\s+|is\s+)?(?:stabilized|converged|leveled\s+off|plateaued|peaked|tanked|climbed|dropped|inflated|normali[sz]ed)\b)"""
+        )
+
+        private val UNSUPPORTED_SYNERGY_MACRO_CAUSE_REGEX = Regex(
+            """(?i)\b(?:better\s+(?:team\s+)?synergy|tighter\s+macro)\b"""
+        )
+
+        private val TEAM_OBJECTIVE_TOPIC_REGEX = Regex(
+            """(?i)\b(?:first\s+(?:voidgrubs?|grubs?|horde|towers?|turrets?|dragons?|heralds?|barons?)|voidgrub\s+first[- ]rate|tower\s+first[- ]rate|6\s+of\s+20|8\s+of\s+20)\b"""
+        )
+
+        private val PERSONAL_BLAME_ON_TEAM_STAT_REGEX = Regex(
+            """(?i)\b(?:personal\s+(?:weakness|weaknesses|fault|failing|problem|issue|liability)|your\s+personal\s+first[- ](?:tower|turret|grub|voidgrub|dragon|herald|baron)|you\s+(?:personally\s+)?(?:only\s+)?secured\s+first\s+(?:voidgrubs?|grubs?|towers?|turrets?))\b"""
+        )
+
+        private val LOW_PERCENTAGE_FIGHTS_CLAIM_REGEX = Regex(
+            """(?i)\b(?:take|takes|taking|took|force|forces|forcing|pick|picking)\s+low[- ]percentage\s+fights\b"""
+        )
+
+        private val INVENTED_ABILITY_OR_MYTHIC_REGEX = Regex(
+            """(?i)\b(?:aegis\s+of\s+zealous|mythic\s+(?:items?|passives?|paths?|rushes?)|divine\s+sunderer|everfrost|galeforce|goredrinker|duskblade(?:\s+of\s+draktharr)?|prowler'?s\s+claw|crown\s+of\s+the\s+shattered\s+queen|night\s+harvester|radiant\s+virtue)\b"""
+        )
+
+        private val CHALLENGE_DIAGNOSIS_CLAIM_REGEX = Regex(
+            """(?i)(?:\b(?:trail(?:ed|ing)?|behind\s+your\s+(?:role|lane)\s+opponent|weakness\s+(?:rate|consistency|frequency))[^.!?\n]{0,90}\b(?:proves?|confirms?|diagnoses|means\s+you\s+have\s+(?:poor|weak|bad|broken))\b|\b\d+(?:\.\d+)?%\s+of\s+(?:your\s+)?(?:games|matches)[^.!?\n]{0,70}\b(?:proves?|confirms?)\s+(?:poor|weak|bad|broken)\b)"""
+        )
+
+        const val MAX_DEFAULT_CURATED_EXAMPLE_WORDS: Int = 220
 
         /**
          * Detects whether player-facing text or a stored few-shot example exposes internal sample keys,
@@ -572,6 +603,73 @@ class AiAnalysisService(
          */
         fun containsInternalSchemaLeak(text: String): Boolean =
             INTERNAL_SCHEMA_LEAK_REGEX.containsMatchIn(text)
+
+        /**
+         * Strips the trailing `---SUGGESTIONS--- [...]` block so coaching prose length and content
+         * can be evaluated or injected cleanly without follow-up JSON noise.
+         */
+        fun stripSuggestionsBlock(text: String): String =
+            text.replace(SUGGESTIONS_BLOCK_REGEX, "").trim()
+
+        /**
+         * Returns true when the player explicitly asks for a fuller, expanded, or game-by-game breakdown
+         * rather than the default short coaching answer.
+         */
+        fun requestsExpandedAnswer(question: String): Boolean =
+            EXPANDED_ANSWER_REQUEST_REGEX.containsMatchIn(question)
+
+        /**
+         * Deterministically detects known evidence-boundary violations in coaching prose or candidate
+         * few-shot examples (such as mislabeling `rankedRecord` as a "lifetime ranked record", claiming
+         * hidden MMR stabilized, asserting unsupported "better synergy"/"tighter macro" cross-window causes,
+         * blaming 5-player team `firstRate` objectives as a personal weakness, asserting "low-percentage fights"
+         * without timeline proof, inventing ability names like "Aegis of Zealous", turning challenge trail
+         * frequencies into confident skill diagnoses, or citing removed Mythic-era items), while allowing
+         * explicit disclaimers that state those claims cannot be made.
+         */
+        fun containsEvidenceBoundaryViolation(text: String): Boolean {
+            val body = stripSuggestionsBlock(text)
+            if (body.isBlank()) return false
+
+            val sentences = body.split(Regex("""[.!?\n]+""")).map { it.trim() }.filter { it.isNotEmpty() }
+            for (sentence in sentences) {
+                val hasDisclaimer = NEGATION_OR_DISCLAIMER_REGEX.containsMatchIn(sentence)
+                if (!hasDisclaimer && LIFETIME_RANKED_CLAIM_REGEX.containsMatchIn(sentence)) return true
+                if (!hasDisclaimer && MMR_CLAIM_REGEX.containsMatchIn(sentence)) return true
+                if (!hasDisclaimer && UNSUPPORTED_SYNERGY_MACRO_CAUSE_REGEX.containsMatchIn(sentence)) return true
+                if (!hasDisclaimer &&
+                    TEAM_OBJECTIVE_TOPIC_REGEX.containsMatchIn(sentence) &&
+                    PERSONAL_BLAME_ON_TEAM_STAT_REGEX.containsMatchIn(sentence)
+                ) return true
+                if (!hasDisclaimer && LOW_PERCENTAGE_FIGHTS_CLAIM_REGEX.containsMatchIn(sentence)) return true
+                if (!hasDisclaimer && INVENTED_ABILITY_OR_MYTHIC_REGEX.containsMatchIn(sentence)) return true
+                if (!hasDisclaimer && CHALLENGE_DIAGNOSIS_CLAIM_REGEX.containsMatchIn(sentence)) return true
+            }
+            // Also check suggestions tail for Mythic/invented-ability leaks
+            val suggestionsTail = text.substringAfter("---SUGGESTIONS---", "")
+            if (suggestionsTail.isNotBlank() && INVENTED_ABILITY_OR_MYTHIC_REGEX.containsMatchIn(suggestionsTail)) {
+                return true
+            }
+            return false
+        }
+
+        /**
+         * Validates whether a candidate or stored `AiLearnedExample` is safe and concise enough to enter
+         * or be injected from `PROVEN EXAMPLES`.
+         */
+        fun isEligibleCuratedExample(userQuestion: String, aiResponse: String): Boolean {
+            if (userQuestion.isBlank() || aiResponse.isBlank()) return false
+            if (containsInternalSchemaLeak(userQuestion) || containsInternalSchemaLeak(aiResponse)) return false
+            if (containsEvidenceBoundaryViolation(aiResponse)) return false
+            val bodyWords = stripSuggestionsBlock(aiResponse)
+                .split(Regex("""\s+"""))
+                .count { it.isNotBlank() }
+            if (bodyWords == 0) return false
+            if (!requestsExpandedAnswer(userQuestion) && bodyWords > MAX_DEFAULT_CURATED_EXAMPLE_WORDS) {
+                return false
+            }
+            return true
+        }
 
         val VALID_CATEGORIES: Set<String> = setOf(
             "cs_farming", "vision_warding", "wave_management", "trading_laning",
@@ -1035,13 +1133,13 @@ class AiAnalysisService(
             }
         }
 
-        // Top strengths / weaknesses (cap at 4 each; scoped to recentMatchSample)
+        // Top strengths / weaknesses (cap at 4 each; head-to-head challenge frequency vs role opponent in recentMatchSample)
         val strengths = context["topStrengths"] as? List<*>
         if (!strengths.isNullOrEmpty()) {
             val formatted = strengths.take(4).joinToString(", ") { item ->
                 if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString().take(48)
             }
-            headerLines.add("  topStrengths: $formatted [sample: recentMatchSample]")
+            headerLines.add("  topStrengths (beat-opp freq): $formatted [sample: recentMatchSample]")
         }
 
         val weaknesses = context["topWeaknesses"] as? List<*>
@@ -1049,7 +1147,7 @@ class AiAnalysisService(
             val formatted = weaknesses.take(4).joinToString(", ") { item ->
                 if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString().take(48)
             }
-            headerLines.add("  topWeaknesses: $formatted [sample: recentMatchSample]")
+            headerLines.add("  topWeaknesses (trail-opp freq): $formatted [sample: recentMatchSample]")
         }
 
         // Champion Matchups (prioritize any champion mentioned in userMessage, up to 5; scoped to recentMatchSample)
@@ -1698,7 +1796,7 @@ class AiAnalysisService(
         
         return when {
             wins >= 4 -> "Player is on a win streak. Be encouraging about current performance and momentum."
-            wins <= 1 -> "Player is struggling. Use extra supportive tone and focus on small, achievable improvements. Build confidence."
+            wins <= 1 -> "Player had a rough last-5 stretch. Keep constructive focus on two controllable next-game habits (unless playful bluntness/roasting was explicitly invited)."
             else -> "Standard coaching tone."
         }
     }
