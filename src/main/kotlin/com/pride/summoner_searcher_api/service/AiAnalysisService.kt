@@ -594,7 +594,7 @@ class AiAnalysisService(
         )
 
         private val LOCAL_NEGATED_PERSONAL_OBJECTIVE_REGEX = Regex(
-            """(?i)\b(?:not|never|neither|nor|rather\s+than|instead\s+of)\s+(?:a\s+|an\s+|your\s+)?personal\s+(?:weakness|weaknesses|fault|failing|problem|issue|liability|stat|stats|metric)\b"""
+            """(?i)\b(?:not|never|neither|nor|rather\s+than|instead\s+of)\s+(?:a\s+|an\s+|your\s+)?(?:personal\s+)?(?:weakness|weaknesses|fault|failing|problem|issue|liability|stat|stats|metric)\b"""
         )
 
         private val TEAM_OBJECTIVE_TOPIC_REGEX = Regex(
@@ -602,7 +602,7 @@ class AiAnalysisService(
         )
 
         private val PERSONAL_BLAME_ON_TEAM_STAT_REGEX = Regex(
-            """(?i)\b(?:personal\s+(?:weakness|weaknesses|fault|failing|problem|issue|liability)|your\s+personal\s+first[- ](?:secure|tower|turret|grub|voidgrub|dragon|herald|baron)|you\s+(?:personally\s+)?(?:only\s+)?secured\s+first\s+(?:voidgrubs?|grubs?|towers?|turrets?))\b"""
+            """(?i)\b(?:personal\s+(?:weakness|weaknesses|fault|failing|problem|issue|liability)|your\s+(?:bottom\s+|top\s+|biggest\s+|main\s+|glaring\s+|key\s+)?weakness(?:es)?|your\s+personal\s+first[- ](?:secure|tower|turret|grub|voidgrub|dragon|herald|baron)|you\s+(?:personally\s+)?(?:only\s+)?secured\s+first\s+(?:voidgrubs?|grubs?|towers?|turrets?))\b"""
         )
 
         private val PEJORATIVE_TEAM_FIRST_RATE_REGEX = Regex(
@@ -884,6 +884,42 @@ class AiAnalysisService(
             }
             val providedInt = parseStrictNonNegativeInt(rawProvided) ?: return null
             return canonicalRoleMax.takeIf { providedInt == canonicalRoleMax }
+        }
+
+        /**
+         * Verifies that a candidate top-level `avgTheoreticalMax` equals the canonical role-weighted
+         * theoretical maximum (`sum(roleGames * canonicalRoleMax) / totalMatches`) within exact IEEE-754
+         * tolerance or standard 1-decimal / 2-decimal rounding (`HALF_UP` / JS `Math.round` / `HALF_EVEN`),
+         * rejecting impossible aggregates such as `TOP 14` paired with `avgTheoreticalMax = 118.0`.
+         */
+        internal fun matchesCanonicalWeightedCs10Max(
+            candidateAvgMax: Double,
+            weightedCanonicalMaxSum: Long,
+            totalMatches: Int
+        ): Boolean {
+            if (!candidateAvgMax.isFinite() || totalMatches <= 0 || weightedCanonicalMaxSum <= 0L) return false
+            val exact = weightedCanonicalMaxSum.toDouble() / totalMatches.toDouble()
+            val jsRound1dp = kotlin.math.floor(exact * 10.0 + 0.5) / 10.0
+            val jsRound2dp = kotlin.math.floor(exact * 100.0 + 0.5) / 100.0
+            val halfUp1dp = java.math.BigDecimal(weightedCanonicalMaxSum)
+                .divide(java.math.BigDecimal(totalMatches), 1, java.math.RoundingMode.HALF_UP)
+                .toDouble()
+            val halfUp2dp = java.math.BigDecimal(weightedCanonicalMaxSum)
+                .divide(java.math.BigDecimal(totalMatches), 2, java.math.RoundingMode.HALF_UP)
+                .toDouble()
+            val halfEven1dp = java.math.BigDecimal(weightedCanonicalMaxSum)
+                .divide(java.math.BigDecimal(totalMatches), 1, java.math.RoundingMode.HALF_EVEN)
+                .toDouble()
+            val halfEven2dp = java.math.BigDecimal(weightedCanonicalMaxSum)
+                .divide(java.math.BigDecimal(totalMatches), 2, java.math.RoundingMode.HALF_EVEN)
+                .toDouble()
+            return kotlin.math.abs(candidateAvgMax - exact) < 1e-6 ||
+                kotlin.math.abs(candidateAvgMax - jsRound1dp) < 1e-6 ||
+                kotlin.math.abs(candidateAvgMax - jsRound2dp) < 1e-6 ||
+                kotlin.math.abs(candidateAvgMax - halfUp1dp) < 1e-6 ||
+                kotlin.math.abs(candidateAvgMax - halfUp2dp) < 1e-6 ||
+                kotlin.math.abs(candidateAvgMax - halfEven1dp) < 1e-6 ||
+                kotlin.math.abs(candidateAvgMax - halfEven2dp) < 1e-6
         }
 
         val VALID_CATEGORIES: Set<String> = setOf(
@@ -1306,7 +1342,8 @@ class AiAnalysisService(
             }
             val normalizedLabel = normalizeCs10TheoreticalMaxLabel(rawLabel)
 
-            var roleBreakdownAllowsTopMax = true
+            var roleBreakdownAllowsTopMax = false
+            var canonicalWeightedMaxSum: Long? = null
             val rawRoleBreakdown = avgLaneCsAt10["roleBreakdown"]
             val roleBreakdownItems: List<String> = when (rawRoleBreakdown) {
                 is List<*> -> {
@@ -1314,16 +1351,21 @@ class AiAnalysisService(
                         emptyList()
                     } else {
                         val items = mutableListOf<String>()
+                        val seenRoles = mutableSetOf<String>()
+                        var listValidForTopMax = true
+                        var listMatchSum = 0L
+                        var listSupportedSum = 0L
+                        var listWeightedMaxSum = 0L
                         for (entry in rawRoleBreakdown) {
-                            val rm = entry as? Map<*, *> ?: {
-                                roleBreakdownAllowsTopMax = false
-                                null
-                            }()
-                            if (rm == null) continue
-                            val rRaw = rm["role"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
-                            if (rRaw == null) {
-                                roleBreakdownAllowsTopMax = false
+                            val rm = entry as? Map<*, *>
+                            if (rm == null) {
+                                listValidForTopMax = false
                                 continue
+                            }
+                            val rRaw = rm["role"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+                            if (rRaw == null || !seenRoles.add(rRaw.uppercase())) {
+                                listValidForTopMax = false
+                                if (rRaw == null) continue
                             }
                             val canonicalRoleMax = post26_1RoleTheoreticalMaxCsAt10(rRaw)
                             val mcInt = parseStrictNonNegativeInt(rm["matchCount"])
@@ -1350,16 +1392,37 @@ class AiAnalysisService(
                                 roleMaxDouble != null &&
                                 kotlin.math.abs(roleMaxDouble - canonicalRoleMax.toDouble()) < 1e-6
 
-                            if (mcInt == null || (mcInt > 0 && !roleAllSupported)) {
-                                roleBreakdownAllowsTopMax = false
+                            if (mcInt == null || tmcInt == null || tmcInt > mcInt) {
+                                listValidForTopMax = false
+                            } else if (mcInt == 0) {
+                                if (tmcInt != 0) listValidForTopMax = false
+                            } else if (!roleAllSupported) {
+                                listValidForTopMax = false
+                            } else {
+                                listMatchSum += mcInt.toLong()
+                                listSupportedSum += tmcInt.toLong()
+                                listWeightedMaxSum += mcInt.toLong() * canonicalRoleMax!!.toLong()
                             }
+
                             val roleMaxStr = if (roleAllSupported) canonicalRoleMax!!.toDouble().toString() else "null"
                             val mcVal = mcInt ?: 0
-                            val tmcVal = if (tmcInt != null && (mcInt == null || tmcInt <= mcInt)) tmcInt else 0
+                            val tmcVal = if (tmcInt != null && mcInt != null && tmcInt <= mcInt) tmcInt else 0
                             val asaVal = if (tmcVal > 0) asaRaw else "null"
                             items.add(
                                 "$rRaw(actual=$aa in ${mcVal}g, theoreticalMax=$roleMaxStr, supported=${tmcVal}g, supportedActual=$asaVal)"
                             )
+                        }
+                        if (
+                            listValidForTopMax &&
+                            matchCountInt != null &&
+                            matchCountInt > 0 &&
+                            supportedCountInt != null &&
+                            supportedCountInt == matchCountInt &&
+                            listMatchSum == matchCountInt.toLong() &&
+                            listSupportedSum == supportedCountInt.toLong()
+                        ) {
+                            roleBreakdownAllowsTopMax = true
+                            canonicalWeightedMaxSum = listWeightedMaxSum
                         }
                         items
                     }
@@ -1369,11 +1432,12 @@ class AiAnalysisService(
                         emptyList()
                     } else {
                         val parsedEntries = mutableListOf<Pair<String, Int>>()
+                        val seenRoles = mutableSetOf<String>()
                         var malformedEntry = false
                         for ((k, v) in rawRoleBreakdown) {
                             val roleStr = k?.toString()?.trim()?.takeIf { it.isNotEmpty() }
                             val gamesInt = parseStrictNonNegativeInt(v)
-                            if (roleStr == null || gamesInt == null) {
+                            if (roleStr == null || gamesInt == null || !seenRoles.add(roleStr.uppercase())) {
                                 malformedEntry = true
                                 continue
                             }
@@ -1381,16 +1445,28 @@ class AiAnalysisService(
                                 parsedEntries.add(roleStr to gamesInt)
                             }
                         }
+                        val mapMatchSum = parsedEntries.sumOf { it.second.toLong() }
+                        val allRolesSupported = parsedEntries.isNotEmpty() &&
+                            parsedEntries.all { post26_1RoleTheoreticalMaxCsAt10(it.first) != null }
+                        val mapWeightedMaxSum = if (allRolesSupported) {
+                            parsedEntries.sumOf { (r, g) ->
+                                g.toLong() * post26_1RoleTheoreticalMaxCsAt10(r)!!.toLong()
+                            }
+                        } else {
+                            0L
+                        }
                         val mapAllSupported = !malformedEntry &&
                             matchCountInt != null &&
                             matchCountInt > 0 &&
                             supportedCountInt != null &&
                             supportedCountInt == matchCountInt &&
-                            parsedEntries.isNotEmpty() &&
-                            parsedEntries.sumOf { it.second } == matchCountInt &&
-                            parsedEntries.all { post26_1RoleTheoreticalMaxCsAt10(it.first) != null }
-                        if (!mapAllSupported) {
-                            roleBreakdownAllowsTopMax = false
+                            allRolesSupported &&
+                            mapMatchSum == matchCountInt.toLong() &&
+                            avgMaxDouble != null &&
+                            matchesCanonicalWeightedCs10Max(avgMaxDouble, mapWeightedMaxSum, matchCountInt)
+                        if (mapAllSupported) {
+                            roleBreakdownAllowsTopMax = true
+                            canonicalWeightedMaxSum = mapWeightedMaxSum
                         }
                         parsedEntries.map { (roleStr, gamesInt) ->
                             val roleMaxStr = if (mapAllSupported) {
@@ -1410,11 +1486,12 @@ class AiAnalysisService(
                 supportedCountInt != null &&
                 supportedCountInt == matchCountInt &&
                 avgMaxDouble != null &&
-                avgMaxDouble in 114.0..120.0 &&
-                roleBreakdownAllowsTopMax
+                roleBreakdownAllowsTopMax &&
+                canonicalWeightedMaxSum != null &&
+                matchesCanonicalWeightedCs10Max(avgMaxDouble, canonicalWeightedMaxSum, matchCountInt)
 
             val formattedMatchCount = matchCountInt ?: 0
-            val formattedSupportedCount = if (supportedCountInt != null && (matchCountInt == null || supportedCountInt <= matchCountInt)) {
+            val formattedSupportedCount = if (supportedCountInt != null && matchCountInt != null && supportedCountInt <= matchCountInt) {
                 supportedCountInt
             } else {
                 0

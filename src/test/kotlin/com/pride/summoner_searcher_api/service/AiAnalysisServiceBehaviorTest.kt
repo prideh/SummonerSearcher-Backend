@@ -1779,6 +1779,127 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
             }
         }
 
+        When("validating aggregate avgLaneCsAt10 against absent/empty/malformed roleBreakdown, incomplete role coverage, and impossible vs canonical weighted maximums") {
+            Then("it fails closed to avgTheoreticalMax=null unless roleBreakdown is complete, valid, and matches the canonical role-weighted ceiling") {
+                fun renderAvgCs10Prompt(avgCs10: Map<String, Any?>): String {
+                    val ctx = mapOf<String, Any>(
+                        "summonerName" to "AggGateTester#EUW",
+                        "rank" to "CHALLENGER I (900 LP)",
+                        "primaryRole" to "TOP",
+                        "totalGamesAnalyzed" to 14,
+                        "avgLaneCsAt10" to avgCs10
+                    )
+                    return constructPromptMethod.invoke(
+                        service,
+                        ctx,
+                        emptyList<Map<String, String>>(),
+                        "Review my early CS",
+                        null,
+                        null
+                    ) as String
+                }
+
+                // 1. Absent, empty, all-zero, malformed, and duplicate-role breakdowns MUST fail closed to avgTheoreticalMax=null
+                val invalidBreakdownPayloads = listOf<Map<String, Any?>>(
+                    // Absent roleBreakdown
+                    mapOf("avgActual" to 72.9, "matchCount" to 14, "avgTheoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 14, "avgSupportedActual" to 72.9),
+                    // Empty List & empty Map & all-zero Map
+                    mapOf("avgActual" to 72.9, "matchCount" to 14, "avgTheoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 14, "avgSupportedActual" to 72.9, "roleBreakdown" to emptyList<Any>()),
+                    mapOf("avgActual" to 72.9, "matchCount" to 14, "avgTheoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 14, "avgSupportedActual" to 72.9, "roleBreakdown" to emptyMap<String, Int>()),
+                    mapOf("avgActual" to 72.9, "matchCount" to 14, "avgTheoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 14, "avgSupportedActual" to 72.9, "roleBreakdown" to mapOf("TOP" to 0, "MIDDLE" to 0, "BOTTOM" to 0)),
+                    // Malformed non-List/Map, malformed List element, malformed Map count, duplicate role keys
+                    mapOf("avgActual" to 72.9, "matchCount" to 14, "avgTheoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 14, "avgSupportedActual" to 72.9, "roleBreakdown" to "TOP:14"),
+                    mapOf("avgActual" to 72.9, "matchCount" to 14, "avgTheoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 14, "avgSupportedActual" to 72.9, "roleBreakdown" to listOf("not-a-map")),
+                    mapOf("avgActual" to 72.9, "matchCount" to 14, "avgTheoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 14, "avgSupportedActual" to 72.9, "roleBreakdown" to mapOf("TOP" to "14.5")),
+                    mapOf("avgActual" to 72.9, "matchCount" to 14, "avgTheoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 14, "avgSupportedActual" to 72.9, "roleBreakdown" to mapOf("TOP" to 7, "top" to 7)),
+                    // Incomplete role coverage (10 accounted for out of 14 matchCount) in both Map and List
+                    mapOf("avgActual" to 72.9, "matchCount" to 14, "avgTheoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 14, "avgSupportedActual" to 72.9, "roleBreakdown" to mapOf("TOP" to 10)),
+                    mapOf(
+                        "avgActual" to 72.9, "matchCount" to 14, "avgTheoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 14, "avgSupportedActual" to 72.9,
+                        "roleBreakdown" to listOf(mapOf("role" to "TOP", "matchCount" to 10, "avgActual" to 72.9, "theoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 10, "avgSupportedActual" to 72.9))
+                    )
+                )
+                invalidBreakdownPayloads.forEach { badPayload ->
+                    val rendered = renderAvgCs10Prompt(badPayload)
+                    rendered shouldContain "avgTheoreticalMax=null"
+                    rendered shouldNotContain "avgTheoreticalMax=114"
+                }
+
+                // 2. Impossible weighted aggregate (e.g., TOP 14 with avgTheoreticalMax=118.0, or TOP 10 + MIDDLE 4 with avgTheoreticalMax=118.0) MUST fail closed to null
+                val impossibleMapPrompt = renderAvgCs10Prompt(
+                    mapOf(
+                        "avgActual" to 72.9,
+                        "matchCount" to 14,
+                        "avgTheoreticalMax" to 118.0,
+                        "theoreticalMaxMatchCount" to 14,
+                        "avgSupportedActual" to 72.9,
+                        "roleBreakdown" to mapOf("TOP" to 14)
+                    )
+                )
+                impossibleMapPrompt shouldContain "avgLaneCsAt10: {avgActual=72.9 (matchCount=14), avgTheoreticalMax=null (theoreticalMaxMatchCount=14, avgSupportedActual=72.9)"
+                impossibleMapPrompt shouldContain "roleBreakdown=[TOP(14g, theoreticalMax=null)]"
+                impossibleMapPrompt shouldNotContain "118.0"
+
+                val impossibleListPrompt = renderAvgCs10Prompt(
+                    mapOf(
+                        "avgActual" to 72.9,
+                        "matchCount" to 14,
+                        "avgTheoreticalMax" to 118.0,
+                        "theoreticalMaxMatchCount" to 14,
+                        "avgSupportedActual" to 72.9,
+                        "roleBreakdown" to listOf(
+                            mapOf("role" to "TOP", "matchCount" to 14, "avgActual" to 72.9, "theoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 14, "avgSupportedActual" to 72.9)
+                        )
+                    )
+                )
+                impossibleListPrompt shouldContain "avgLaneCsAt10: {avgActual=72.9 (matchCount=14), avgTheoreticalMax=null (theoreticalMaxMatchCount=14, avgSupportedActual=72.9)"
+                impossibleListPrompt shouldNotContain "avgTheoreticalMax=118"
+
+                val impossibleMixedRoleWeightedPrompt = renderAvgCs10Prompt(
+                    mapOf(
+                        "avgActual" to 75.0,
+                        "matchCount" to 14,
+                        "avgTheoreticalMax" to 118.0, // canonical for 10 TOP + 4 MIDDLE is (10*114 + 4*120)/14 = 115.714... (~115.7)
+                        "theoreticalMaxMatchCount" to 14,
+                        "avgSupportedActual" to 75.0,
+                        "roleBreakdown" to mapOf("TOP" to 10, "MIDDLE" to 4)
+                    )
+                )
+                impossibleMixedRoleWeightedPrompt shouldContain "avgTheoreticalMax=null"
+                impossibleMixedRoleWeightedPrompt shouldContain "roleBreakdown=[TOP(10g, theoreticalMax=null); MIDDLE(4g, theoreticalMax=null)]"
+
+                // 3. Valid multi-role canonical weighted aggregate (10 TOP @ 114 + 4 MIDDLE @ 120 + 0 BOTTOM = 1620 / 14 = 115.7) exposes canonical weighted max
+                val validMixedMapPrompt = renderAvgCs10Prompt(
+                    mapOf(
+                        "avgActual" to 75.4,
+                        "matchCount" to 14,
+                        "avgTheoreticalMax" to 115.7,
+                        "theoreticalMaxMatchCount" to 14,
+                        "avgSupportedActual" to 75.4,
+                        "roleBreakdown" to mapOf("TOP" to 10, "MIDDLE" to 4, "BOTTOM" to 0)
+                    )
+                )
+                validMixedMapPrompt shouldContain "avgLaneCsAt10: {avgActual=75.4 (matchCount=14), avgTheoreticalMax=115.7 (theoreticalMaxMatchCount=14, avgSupportedActual=75.4)"
+                validMixedMapPrompt shouldContain "roleBreakdown=[TOP(10g, theoreticalMax=114); MIDDLE(4g, theoreticalMax=120)]"
+
+                val validMixedListPrompt = renderAvgCs10Prompt(
+                    mapOf(
+                        "avgActual" to 75.4,
+                        "matchCount" to 14,
+                        "avgTheoreticalMax" to 115.7,
+                        "theoreticalMaxMatchCount" to 14,
+                        "avgSupportedActual" to 75.4,
+                        "roleBreakdown" to listOf(
+                            mapOf("role" to "TOP", "matchCount" to 10, "avgActual" to 73.0, "theoreticalMax" to 114.0, "theoreticalMaxMatchCount" to 10, "avgSupportedActual" to 73.0),
+                            mapOf("role" to "MIDDLE", "matchCount" to 4, "avgActual" to 81.4, "theoreticalMax" to 120.0, "theoreticalMaxMatchCount" to 4, "avgSupportedActual" to 81.4)
+                        )
+                    )
+                )
+                validMixedListPrompt shouldContain "avgLaneCsAt10: {avgActual=75.4 (matchCount=14), avgTheoreticalMax=115.7 (theoreticalMaxMatchCount=14, avgSupportedActual=75.4)"
+                validMixedListPrompt shouldContain "roleBreakdown=[TOP(actual=73.0 in 10g, theoreticalMax=114.0, supported=10g, supportedActual=73.0); MIDDLE(actual=81.4 in 4g, theoreticalMax=120.0, supported=4g, supportedActual=81.4)]"
+            }
+        }
+
         When("checking coaching responses with containsCs10TheoreticalMaxMislabeling") {
             Then("it flags target/benchmark mislabeling, missed-CS subtraction claims, raw target keys, and 107/70-85 substitutions while allowing proper theoretical-maximum framing") {
                 val mislabeledSamples = listOf(
@@ -1914,11 +2035,11 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                         aiResponse = "Your 72.0 CS@10 is well below the 114 Top lane target, making early farming your #1 focus area.",
                         qualityScore = BigDecimal("98.0")
                     ),
-                    // Filter 3a (#36 Nov 10): exact recorded Nov 10 roast string
+                    // Filter 3a (#36 Nov 10): exact recovered Nov 10 roast fragments
                     AiLearnedExample(
                         questionCategory = "general",
                         userQuestion = "Roast my recent games.",
-                        aiResponse = "Your kill participation is languishing ... a poor 30% first-secure rate on Voidgrubs ... Your teammates aren't forcing you to take low-percentage fights.",
+                        aiResponse = "your kill participation is languishing in your bottom weaknesses, alongside your damage per minute and a poor 30% first-secure rate on Voidgrubs. Your teammates aren't forcing you to take low-percentage fights or drop map objectives.",
                         qualityScore = BigDecimal("97.0")
                     ),
                     // Filter 3b (#36 filter-scope): unrelated negation + bad MMR stabilization claim
@@ -2008,11 +2129,12 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     p shouldContain "Expand into fuller detail only when the user explicitly asks"
                     p shouldNotContain "character limit"
                     p shouldNotContain "MUST be under"
-                    // PROVEN EXAMPLES rejected all 5 bad rows (#38 leak, #39 target, Nov 10 recorded roast, unrelated-negation MMR, 245w essay) and kept only row 6 with ---SUGGESTIONS--- stripped
+                    // PROVEN EXAMPLES rejected all 5 bad rows (#38 leak, #39 target, Nov 10 exact recovered roast, unrelated-negation MMR, 245w essay) and kept only row 6 with ---SUGGESTIONS--- stripped
                     p shouldNotContain "check your `timelineStatus` before roaming"
                     p shouldNotContain "114 Top lane target"
+                    p shouldNotContain "languishing in your bottom weaknesses"
                     p shouldNotContain "poor 30% first-secure rate on Voidgrubs"
-                    p shouldNotContain "aren't forcing you to take low-percentage fights"
+                    p shouldNotContain "aren't forcing you to take low-percentage fights or drop map objectives"
                     p shouldNotContain "overall matchmaking rating has stabilized"
                     p shouldNotContain "word200"
                     p shouldContain "you averaged 147.05s of grey-screen time (7.84% of game time)"
@@ -2031,20 +2153,22 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
             }
         }
 
-        When("evaluating containsEvidenceBoundaryViolation against the exact recorded Nov 10 roast string, unrelated-negation variants, and genuine local negations") {
-            Then("it catches the exact recorded Nov 10 roast string (and each clause independently), rejects unrelated-negation variants across every rule family, and allows genuine local negations") {
-                // 1. Exact recorded Nov 10 roast string + each recorded clause tested independently
-                val exactRecordedNov10Roast =
-                    "kill participation is languishing ... a poor 30% first-secure rate on Voidgrubs ... Your teammates aren't forcing you to take low-percentage fights"
-                val recordedVoidgrubClauseAlone =
-                    "Your kill participation is languishing at 38%, paired with a poor 30% first-secure rate on Voidgrubs and 40% on first towers."
-                val recordedTeammatesLowPctClauseAlone =
-                    "Your teammates aren't forcing you to take low-percentage fights—you are choosing them."
+        When("evaluating containsEvidenceBoundaryViolation against the exact recovered Nov 10 bad roast fragments, unrelated-negation variants, and genuine local negations") {
+            Then("it catches both exact recovered Nov 10 roast fragments (individually and combined), rejects unrelated-negation variants across every rule family, and allows genuine local negations") {
+                // 1. Exact recovered Nov 10 bad roast fragments tested both individually and combined
+                val exactRecoveredNov10Fragment1 =
+                    "your kill participation is languishing in your bottom weaknesses, alongside your damage per minute and a poor 30% first-secure rate on Voidgrubs."
+                val exactRecoveredNov10Fragment2 =
+                    "Your teammates aren't forcing you to take low-percentage fights or drop map objectives."
+                val exactRecoveredNov10Combined =
+                    "$exactRecoveredNov10Fragment1 $exactRecoveredNov10Fragment2"
 
-                AiAnalysisService.containsEvidenceBoundaryViolation(exactRecordedNov10Roast) shouldBe true
-                AiAnalysisService.containsEvidenceBoundaryViolation(recordedVoidgrubClauseAlone) shouldBe true
-                AiAnalysisService.containsEvidenceBoundaryViolation(recordedTeammatesLowPctClauseAlone) shouldBe true
-                AiAnalysisService.isEligibleCuratedExample("Roast my profile.", exactRecordedNov10Roast) shouldBe false
+                AiAnalysisService.containsEvidenceBoundaryViolation(exactRecoveredNov10Fragment1) shouldBe true
+                AiAnalysisService.containsEvidenceBoundaryViolation(exactRecoveredNov10Fragment2) shouldBe true
+                AiAnalysisService.containsEvidenceBoundaryViolation(exactRecoveredNov10Combined) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample("Roast my profile.", exactRecoveredNov10Fragment1) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample("Roast my profile.", exactRecoveredNov10Fragment2) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample("Roast my profile.", exactRecoveredNov10Combined) shouldBe false
 
                 // 2. Unrelated-negation variants: 'hidden', 'not', 'aren't', 'don't', 'without', 'unavailable' elsewhere in the same sentence MUST NOT exempt bad claims
                 val unrelatedNegationViolations = listOf(

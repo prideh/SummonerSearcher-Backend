@@ -245,7 +245,7 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                 )
                 val badRecordedNov10Roast = makeCandidate(
                     "Roast me.",
-                    "Your kill participation is languishing at 38.5%, paired with a poor 30% first-secure rate on Voidgrubs. Your teammates aren't forcing you to take low-percentage fights. Next game try playing safer."
+                    "In recent games, your kill participation is languishing in your bottom weaknesses, alongside your damage per minute and a poor 30% first-secure rate on Voidgrubs. Your teammates aren't forcing you to take low-percentage fights or drop map objectives. Next game try playing safer."
                 )
                 val badSchemaLeak = makeCandidate(
                     "How is my recent form?",
