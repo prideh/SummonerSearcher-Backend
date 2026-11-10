@@ -270,12 +270,13 @@ class AiAnalysisService(
         val resolvedIntent = intent ?: detectIntent(userMessage, messages)
         val questionCategory = resolvedIntent.category
 
-        // 🎯 DYNAMIC FEW-SHOT LEARNING (bounded to at most 2 examples & MAX_FEW_SHOT_BYTES)
+        // 🎯 DYNAMIC FEW-SHOT LEARNING (bounded to at most 2 examples & MAX_FEW_SHOT_BYTES; skip stale schema-leaking examples)
         val fewShotExamples = try {
             exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc(
                 questionCategory,
-                PageRequest.of(0, 2)
-            )
+                PageRequest.of(0, 4)
+            ).filterNot { containsInternalSchemaLeak(it.aiResponse) || containsInternalSchemaLeak(it.userQuestion) }
+                .take(2)
         } catch (e: Exception) {
             emptyList() // If repository not initialized yet
         }
@@ -308,7 +309,7 @@ class AiAnalysisService(
                 """
                 **COACHING INSIGHT (from real user data):**
                 After answering $questionCategory questions, users commonly follow up about: $hints
-                Use these topics when generating your 3 `---SUGGESTIONS---` follow-up options at the end (do not derail your main answer away from the user's question).
+                Use these topics in natural player wording when generating your 3 `---SUGGESTIONS---` follow-up options at the end (do not echo raw category keys or derail your main answer away from the user's question).
                 """.trimIndent()
             } else ""
         } catch (e: Exception) { "" }
@@ -322,6 +323,16 @@ class AiAnalysisService(
         val playerName = (context["summonerName"]?.toString() ?: "the player").take(64)
         val timelineStatus = (context["timelineStatus"]?.toString()?.trim()?.takeIf { it.isNotBlank() }
             ?: if (context["timelineInsights"] != null) "ANALYZED" else "NOT_ANALYZED").take(32)
+        val naturalRecentMatchesPhrase = if (recentSampleGameCount > 0) {
+            "your last $recentSampleGameCount detailed matches"
+        } else {
+            "your recent detailed matches"
+        }
+        val naturalTimelineState = if (timelineStatus.equals("ANALYZED", ignoreCase = true)) {
+            "timeline analyzed"
+        } else {
+            "timeline not analyzed yet"
+        }
         
         var historyString = formatBoundedHistory(messages, MAX_HISTORY_MESSAGES, MAX_HISTORY_BYTES)
         var groundTruth = buildGroundTruthSection(
@@ -349,7 +360,7 @@ class AiAnalysisService(
             You are an experienced, evidence-driven League of Legends coach analyzing ranked performance data. Calibrate your coaching depth and terminology to the player's actual rank ($playerRank) while using a constructive, natural, and analytical coaching methodology.
             
             **ANALYSIS FRAMEWORK (INTERNAL CHECKLIST):**
-            1. **Identify Context**: Rank ($playerRank), Role, Game Count, Timeline Status ($timelineStatus), and the user's exact question.
+            1. **Identify Context**: Rank ($playerRank), Role, Game Count ($recentSampleGameCount), Timeline ($naturalTimelineState), and the user's exact question.
             2. **Answer the Question First**: Directly address what the user asked before anything else.
             3. **Formulate Response**: Offer actionable, evidence-tied insight calibrated to the player's rank.
             
@@ -359,6 +370,7 @@ class AiAnalysisService(
             **COACHING STYLE & TONE:**
             - NEVER start a response with the player's name. NEVER address the player by their rank (e.g., do not say "Master I..."). Do not use the player's name ($playerName) more than once per response, and only when it's genuinely natural to do so mid-sentence. Most responses should use no name at all.
             - Converse naturally. Avoid sounding like a rigid, automated report. Use natural paragraphs or short bullet points only when explaining complex concepts like wave management or ability combos.
+            - **Natural Player Language (No Internal Keys or Backticks):** In prose and `---SUGGESTIONS---`, speak naturally—never output internal field keys, `[sample: ...]` markers, `NOT_ANALYZED`, or backticks around stat/sample names.
             - **Direct Answer Priority (#1 Rule):** ALWAYS directly and thoroughly answer the user's specific question first. Do NOT pivot to unrelated stat weaknesses (such as vision score or CS) when the user asks a focused question about a different topic (such as an item description, build path, champion mechanic, or matchup). Only bring up broader stat weaknesses when the user asks for an overall/general performance review or when it directly relates to their question.
             - **Socratic Method:** When reviewing player mistakes, you may ask a brief guiding question to help them recognize the pattern, after answering their direct question.
             - Be professional and honest about weaknesses. Do not use overly fluffy praise unless a stat is truly exceptional.
@@ -378,17 +390,17 @@ class AiAnalysisService(
             $imp
             
             **DATA-DRIVEN COACHING & DATA-BOUNDARY RULES:**
-            - For player-specific claims (win rates, KDA, CS/min, match history, or matchups played), rely strictly on the provided GROUND TRUTH STATS and recentMatchSummary. Do not invent game events, player stats, or match results that are not listed in the data.
-            - **Strict Sample Scope & Denominator Separation (`rankedRecord` vs. `savedHistory` vs. `recentMatchSample`):** Ground-truth stats come from three distinct samples with different game counts: (1) `rankedRecord` (Solo/Duo Queue Riot League counter: ranked wins, losses, total games, and ranked win rate), (2) `savedHistory` (saved match-history aggregate: saved-history wins, losses, total games, saved-history win rate, plus `savedHistoryAverages`, `savedHistorySideSplits`, `topChampions`, and `opponentStats`), and (3) `recentMatchSample` (detailed recent matches loaded in context: `recentMatchSummary`, per-match `Game 1..N` rows, `championMatchups`, `topStrengths`, and `topWeaknesses`). NEVER combine a win rate from one sample with a game count from another sample (e.g., NEVER pair `savedHistory` win rate with `rankedRecord` total games or `recentMatchSample` games). Always cite the exact sample name and denominator alongside any win rate or record, and treat `unavailable` samples as unavailable without substituting another sample's denominator.
+            - For player-specific claims (win rates, KDA, CS/min, match history, or matchups played), rely strictly on the provided GROUND TRUTH STATS and recent-match summary/rows. Do not invent game events, player stats, or match results that are not listed in the data.
+            - **Strict Sample Scope & Denominator Separation (`rankedRecord` vs. `savedHistory` vs. `recentMatchSample`):** Ground-truth stats come from three distinct samples with different game counts: (1) `rankedRecord` ("your ranked record": Solo/Duo W/L, games, and win rate), (2) `savedHistory` ("your saved matches", with the saved-match count when relevant and always paired with saved-match W/L or win rate: `savedHistoryAverages`, `savedHistorySideSplits`, `topChampions`, `opponentStats`), and (3) `recentMatchSample` ("$naturalRecentMatchesPhrase" / "your last N detailed matches", with its own games and win rate: `recentMatchSummary`, `Game 1..N`, `championMatchups`, `topStrengths`, `topWeaknesses`). NEVER combine samples, remove counts from win-rate/record claims, or pair one sample's win rate with another sample's game count (e.g., `savedHistory` win rate with `rankedRecord` or `recentMatchSample` games). Cite each sample in plain player language with its own denominator (never raw keys or header tags), and treat `unavailable` samples as unavailable without substituting another denominator.
             - For general League of Legends domain questions (such as item descriptions, build paths, rune interactions, ability mechanics, or macro concepts), answer directly using functional League of Legends concepts connected to the player's champions or stats when relevant, without asserting stale patch numbers or unsupported item-effect specifics.
             - If the user asks for specific player data that is missing from the stats block, state clearly what data is unavailable.
-            - **Timeline Status (`timelineStatus` = $timelineStatus):** When `timelineStatus` is `NOT_ANALYZED`, state clearly that only end-of-game summary and challenge stats are available; never make claims about exact item completion minutes, early gold/XP diffs at 10/15 minutes, or death locations.
+            - **Timeline Status (`timelineStatus` = $timelineStatus):** When `timelineStatus` is `NOT_ANALYZED`, state clearly that only end-of-game summary and challenge stats are available in plain language (never `timelineStatus` or `NOT_ANALYZED`); never make claims about exact item completion minutes, early gold/XP diffs at 10/15 minutes, or death locations.
             - **Vision Boundary:** Discuss ward counts, ward types, and timing buckets only; never claim ward placement in specific bushes, river entrances, or map areas (`WARD_PLACED` events carry no coordinates).
             - **Deaths & Assist Attribution:** Treat "assisted" deaths as multi-enemy kill participation only—assisted deaths are not necessarily jungle ganks (lane 2v2s, support roams, and skirmishes/teamfights produce assists too). Treat "unassisted" deaths as single-enemy kill credit with zero recorded assists—never equate unassisted deaths with 1v1 duels (solo picks, roam catches, or delayed finishes after assist timers expire also record zero assists). Describe recorded enemy involvement rather than inferring how the fight started.
             - **Observed Facts vs. Hypotheses & Conditional Recommendations:** Death events do **not** prove bad trades, overextension, greed, or mechanical misplays. Always separate **observed facts** (timestamps, approximate zones, killers, recorded assistants, gold/XP/CS diffs, items built) from **hypotheses** about why they happened, and frame all coaching recommendations **conditionally** (e.g., *"If this death happened while pushing without river vision, consider...; if it happened rotating to a skirmish, instead..."*).
             - **No Stale Mythic-Era or Unsupported Build-Effect Claims (Including `---SUGGESTIONS---`):** The Mythic item system was removed in Season 14. NEVER propose or mention "Mythic items", "Mythic passives", "Mythic paths/rushes", or removed Mythic-era items (e.g., Divine Sunderer, Everfrost, Galeforce, Goredrinker, Duskblade, Prowler's Claw, Crown of the Shattered Queen, Night Harvester, Radiant Virtue). Do not claim specific patch-dependent item stats, gold costs, or build-effect numbers unless the supplied patch/context data explicitly supports them; anchor build discussion to the items present in context (`items`, `opponentDetails.items`, `itemSpikes`) and their functional purpose. Apply this same rule to the 3 `---SUGGESTIONS---` follow-up questions.
             - **Early Lane CS Target (`cs10.target`, `cs10.targetLabel`, `avgLaneCsAt10`, `missingLaneCsAt10Matches`):** `cs10.target` (114 for Top/Bot, 120 for Mid on verified patch 26.1+ games only; `null` for `JUNGLE`, `UTILITY`/`SUPPORT`, short `<600s` games, or pre-26.1 patches) is a role-specific 10:00 lane benchmark definition, **not** farmable supply or a missed-CS counter. NEVER subtract `actual` from `target` to claim exact "missed CS" or "missed last-hits", and never resurrect obsolete `spawnedSupply` claims. Keep `actual` (`laneCs@10`), benchmark definition (`cs10.target` / `cs10.targetLabel`), `patch`, `role`, denominator (`matchCount` vs `targetMatchCount`), and missingness (`missingLaneCsAt10Matches`, `null`) distinct (`avgTarget` is `null` on mixed-patch samples where `targetMatchCount < matchCount`).
-            - **5-Stat Improvement Evidence (`phaseFarming`, `leadRetention`, `deathCost`, `unspentGold`, `teamObjectives`):** Cite exact denominators (`eligibleGames`, `eligibleGamesAt10` vs `eligibleGamesAt20`, `eligibleTimeDeadGames`, `eligibleTimelineGames`, `eligibleTeamObjectiveGames`) and exclusions (`shortGames`, `excludedMissingTimeline`, `missingOpponentGames`). Never claim missed CS in `phaseFarming`; treat `10-20m` objective/tower events in `leadRetention` as temporal association only (never proof of a throw or solo credit); never infer lost farm or death avoidability from `deathCost`; treat `>=1600g` 1-minute `currentGold` snapshots in `unspentGold` as descriptive balance checkpoints (never a mistake score or recall event); and keep team objective outcomes (`firstRate`, `teamAvg` vs `enemyAvg`) strictly separate from personal `personalLastHits`/`personalTakedowns`/`timelineInvolved`.
+            - **5-Stat Improvement Evidence (`phaseFarming`, `leadRetention`, `deathCost`, `unspentGold`, `teamObjectives`):** Cite exact denominators (`eligibleGames`, `eligibleGamesAt10` vs `eligibleGamesAt20`, `eligibleTimeDeadGames`, `eligibleTimelineGames`, `eligibleTeamObjectiveGames`) and exclusions (`shortGames`, `excludedMissingTimeline`, `missingOpponentGames`) in plain words. Never claim missed CS in `phaseFarming`; treat `10-20m` objective/tower events in `leadRetention` as temporal association only (never proof of a throw or solo credit); never infer lost farm or death avoidability from `deathCost`; treat `>=1600g` 1-minute `currentGold` snapshots in `unspentGold` as descriptive balance checkpoints (never a mistake score or recall event); and keep team objective outcomes (`firstRate`, `teamAvg` vs `enemyAvg`) strictly separate from personal `personalLastHits`/`personalTakedowns`/`timelineInvolved`.
             - **Incomplete Legacy Cache Fields:** When any stat or timeline breakdown (such as `assistedDeaths`, `unassistedDeaths`, `wardsByTimeBucket`, or `cs10.target`) is `null` or marked `incomplete`, treat it as unavailable/incomplete data—never treat `null` or `incomplete` fields as `0`.
             
             **MATCHUP GURU EXPERTISE:**
@@ -405,7 +417,7 @@ class AiAnalysisService(
             **TONE ADJUSTMENT:**
             $streakToneAdjustment
             
-            IMPORTANT: At the very end of your response, you MUST provide exactly 3 short, relevant follow-up questions that the user might want to ask next based on your analysis (never mention Mythic items/paths or unsupported build-effect claims in suggestions).
+            IMPORTANT: At the very end of your response, you MUST provide exactly 3 short, relevant follow-up questions that the user might want to ask next based on your analysis (plain player language—no raw keys, `[sample: ...]`, `NOT_ANALYZED`, or backticks; never mention Mythic items/paths or unsupported build-effect claims in suggestions).
             Format these questions exactly as a JSON array of strings, prefixed with "---SUGGESTIONS---".
             Example:
             ---SUGGESTIONS--- ["How do I improve my CS?", "Best warding spots?", "Review my champion pool"]
@@ -549,6 +561,17 @@ class AiAnalysisService(
          */
         fun heuristicTokenEstimate(text: String): Int = (utf8ByteSize(text) + 3) / 4
         fun estimateTokens(text: String): Int = heuristicTokenEstimate(text)
+
+        private val INTERNAL_SCHEMA_LEAK_REGEX = Regex(
+            """\b(?:rankedRecord|savedHistory|recentMatchSample|savedHistoryAverages|savedHistorySideSplits|recentMatchSummary|omittedMatchesRollup|timelineStatus|timelineInsights|improvementStats|visionDataPrecision|avgLaneCsAt10|missingLaneCsAt10Matches|NOT_ANALYZED)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`(?:topChampions|opponentStats|championMatchups|topStrengths|topWeaknesses|phaseFarming|leadRetention|deathCost|unspentGold|teamObjectives|ANALYZED)`"""
+        )
+
+        /**
+         * Detects whether player-facing text or a stored few-shot example exposes internal sample keys,
+         * bracketed `[sample: ...]` schema markers, prompt header tags, or status codes such as `NOT_ANALYZED`.
+         */
+        fun containsInternalSchemaLeak(text: String): Boolean =
+            INTERNAL_SCHEMA_LEAK_REGEX.containsMatchIn(text)
 
         val VALID_CATEGORIES: Set<String> = setOf(
             "cs_farming", "vision_warding", "wave_management", "trading_laning",
