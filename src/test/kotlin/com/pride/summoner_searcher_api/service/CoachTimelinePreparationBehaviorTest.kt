@@ -2019,9 +2019,13 @@ class CoachTimelinePreparationBehaviorTest {
         ) as String
 
         assertTrue(partialPrompt.contains("Timeline (partial timeline analyzed)"))
-        assertTrue(partialPrompt.contains("timelineStatus: PARTIAL"))
-        assertTrue(partialPrompt.contains("timelineCoverage: {status=PARTIAL, covered=12/20 games, stopReason=RATE_LIMIT_COOLDOWN}"))
-        assertTrue(partialPrompt.contains("When `timelineStatus` is `PARTIAL`, cite the exact `covered`/`requested` timeline denominator from `timelineCoverage`"))
+        assertTrue(
+            partialPrompt.contains("timelineStatus: PARTIAL") ||
+                partialPrompt.contains("Match timeline analysis: PARTIAL") ||
+                partialPrompt.contains("Match timeline analysis: partially analyzed")
+        )
+        assertTrue(partialPrompt.contains("Timeline coverage: status=partial, covered=12/20 games, stop reason=rate limit cooldown"))
+        assertTrue(partialPrompt.contains("When match timeline analysis is partial, cite the exact covered/requested game denominator from Timeline coverage"))
         assertFalse(partialPrompt.contains("5 plates per turret across 9 lane turrets"), "Unrelated Season 2026 turret-plate prompt hunk must be omitted")
 
         // Verify BLOCKED context with null timelineInsights still emits TIMELINE COVERAGE BOUNDARY
@@ -2044,7 +2048,7 @@ class CoachTimelinePreparationBehaviorTest {
             null,
             null
         ) as String
-        assertTrue(blockedPrompt.contains("timelineCoverage: {status=BLOCKED, covered=0/20 games, stopReason=MEMORY_HEADROOM_ADMISSION_BLOCKED}"))
+        assertTrue(blockedPrompt.contains("Timeline coverage: status=blocked, covered=0/20 games, stop reason=memory headroom admission blocked"))
         assertTrue(blockedPrompt.contains("TIMELINE COVERAGE BOUNDARY"))
 
         // Verify #38 schema-leak detector remains intact

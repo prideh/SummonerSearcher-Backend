@@ -923,12 +923,12 @@ class AiAnalysisService(
             headerLines.add("  timelineStatus: $inferredStatus")
         }
         (context["timelineCoverage"] as? Map<*, *>)?.let { cov ->
-            val covStatus = (cov["status"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: "UNKNOWN").take(24)
+            val covStatus = (cov["status"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: "unknown").lowercase().take(24)
             val covCount = cov["covered"] ?: cov["coveredCount"] ?: cov["coveredMatches"] ?: 0
             val reqCount = cov["requested"] ?: cov["requestedCount"] ?: cov["requestedMatches"] ?: 0
-            val stopReason = cov["stopReason"]?.toString()?.trim()?.takeIf { it.isNotBlank() }?.take(48)
-            val stopSuffix = if (stopReason != null) ", stopReason=$stopReason" else ""
-            headerLines.add("  timelineCoverage: {status=$covStatus, covered=${covCount}/${reqCount} games$stopSuffix}")
+            val stopReason = cov["stopReason"]?.toString()?.trim()?.takeIf { it.isNotBlank() }?.lowercase()?.replace('_', ' ')?.take(48)
+            val stopSuffix = if (stopReason != null) ", stop reason=$stopReason" else ""
+            headerLines.add("  Timeline coverage: status=$covStatus, covered=${covCount}/${reqCount} games$stopSuffix")
         }
 
         // 3. Saved-history per-game averages & side splits (explicitly scoped to savedHistory; omitted if structured savedHistory is invalid/null)
@@ -1510,7 +1510,7 @@ class AiAnalysisService(
         if (coverage != null || rawStatus == "PARTIAL" || rawStatus == "BLOCKED") {
             lines.add(
                 "\n**⏱️ TIMELINE COVERAGE BOUNDARY:** " +
-                    "When `timelineStatus` is `PARTIAL`, cite the exact `covered`/`requested` timeline denominator from `timelineCoverage` in plain player language (for example, \"minute-by-minute timeline data is available for X of your last Y games\"), anchor minute-by-minute claims strictly to those covered games without extrapolating to missing games, and when `timelineStatus` is `BLOCKED` or `covered` is 0, state plainly that minute-by-minute timeline data is temporarily unavailable and rely only on match summary stats. Never echo internal schema keys or status codes (`timelineCoverage`, `timelineStatus`, `stopReason`, `PARTIAL`, `BLOCKED`, `NOT_ANALYZED`)."
+                    "When match timeline analysis is partial, cite the exact covered/requested game denominator from Timeline coverage in plain player words (for example, \"minute-by-minute timeline data is available for X of your last Y games\"), anchor minute-by-minute claims strictly to those covered games without extrapolating to missing games, and when match timeline analysis is blocked or covered games is 0, state plainly that minute-by-minute timeline data is temporarily unavailable and rely only on match summary stats. Never echo internal schema keys, status codes, or backticks."
             )
         }
 
