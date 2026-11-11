@@ -56,8 +56,10 @@ class PlayerCacheService(
     private val logger = LoggerFactory.getLogger(javaClass)
     private val timelineAnalysisService = TimelineAnalysisService()
     private val inFlightMutex = Mutex()
-    private val inFlightRefreshes = ConcurrentHashMap<String, CompletableDeferred<SummonerProfileDto?>>()
+    private val inFlightRefreshes = ConcurrentHashMap<String, InFlightRefreshEntry>()
     private val lastBackgroundRefreshAtMs = ConcurrentHashMap<String, Long>()
+    private val riotIdToPuuidIndex = ConcurrentHashMap<String, RiotIdMappingEntry>()
+    private val verifiedCompleteRedisOnlySeasons = ConcurrentHashMap<String, VerifiedRedisSeasonLedger>()
     private val backgroundRefreshScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val indexedPlayersUpsertedCounter = java.util.concurrent.atomic.AtomicLong(0L)
@@ -67,9 +69,37 @@ class PlayerCacheService(
     private val lastRefreshPeakRetainedMatchDtos = java.util.concurrent.atomic.AtomicInteger(0)
     private val lastRefreshPeakCrossChunkRetainedMatchDtos = java.util.concurrent.atomic.AtomicInteger(0)
 
+    private data class InFlightRefreshEntry(
+        val deferred: CompletableDeferred<SummonerProfileDto?>,
+        val priorityRef: java.util.concurrent.atomic.AtomicReference<ApiPriority>,
+        val promotionSignal: CompletableDeferred<Unit>,
+        val activeWaiters: java.util.concurrent.atomic.AtomicInteger,
+        val workerJobRef: java.util.concurrent.atomic.AtomicReference<kotlinx.coroutines.Job?>
+    )
+
+    private data class RiotIdMappingEntry(
+        val puuid: String,
+        val updatedAtMs: Long
+    )
+
+    private data class VerifiedRedisSeasonLedger(
+        val seasonYear: Int,
+        val orderedMatchIds: List<String>,
+        val excludedMatchIds: Set<String>,
+        val historyCapped: Boolean,
+        val updatedAtMs: Long
+    )
+
+    data class ImmediateProfileLookupResult(
+        val served: Boolean = false,
+        val profile: SummonerProfileDto? = null
+    )
+
     companion object {
         private const val RECENT_MATCHES_LIMIT = 20
         private const val CHUNK_SIZE = 50
+        private const val MAX_CONCURRENT_MATCH_FETCHES_PER_REFRESH = 20
+        private const val MAX_RIOT_ID_INDEX_ENTRIES = 512
         private const val MAX_MATCHES_FOR_PARTICIPANT_INDEXING = 20
         private const val MAX_INDEXED_PLAYERS_PER_BATCH = 200
         private const val MAX_OPTIMISTIC_LOCK_RETRIES = 2
@@ -560,6 +590,121 @@ class PlayerCacheService(
         return !refreshedAt.isBefore(now.minus(window))
     }
 
+    private fun normalizeRiotIdKey(region: String, summonerName: String, tagLine: String): String {
+        return "${region.lowercase().trim()}|${summonerName.trim().lowercase()}|${tagLine.trim().lowercase()}"
+    }
+
+    private fun recordRiotIdMapping(region: String, summonerName: String?, tagLine: String?, puuid: String?) {
+        val cleanName = summonerName?.trim()?.takeIf { it.isNotBlank() } ?: return
+        val cleanTag = tagLine?.trim()?.takeIf { it.isNotBlank() } ?: return
+        val cleanPuuid = puuid?.trim()?.takeIf { it.isNotBlank() } ?: return
+        val normalizedRegionPrefix = "${region.lowercase().trim()}|"
+        val key = normalizeRiotIdKey(region, cleanName, cleanTag)
+        val nowMs = timeProvider.now()
+        // Evict any prior Riot-ID alias on the same regional shard pointing to this PUUID (handles renames cleanly).
+        riotIdToPuuidIndex.entries.removeIf { (existingKey, existingEntry) ->
+            existingKey != key && existingKey.startsWith(normalizedRegionPrefix) && existingEntry.puuid == cleanPuuid
+        }
+        if (!riotIdToPuuidIndex.containsKey(key)) {
+            while (riotIdToPuuidIndex.size >= MAX_RIOT_ID_INDEX_ENTRIES) {
+                val oldestKey = riotIdToPuuidIndex.entries.minByOrNull { it.value.updatedAtMs }?.key ?: break
+                riotIdToPuuidIndex.remove(oldestKey)
+            }
+        }
+        riotIdToPuuidIndex[key] = RiotIdMappingEntry(puuid = cleanPuuid, updatedAtMs = nowMs)
+    }
+
+    internal fun reconcileVerifiedRiotIdOwner(region: String, summonerName: String, tagLine: String, verifiedPuuid: String) {
+        val key = normalizeRiotIdKey(region, summonerName, tagLine)
+        riotIdToPuuidIndex.computeIfPresent(key) { _, entry ->
+            if (entry.puuid != verifiedPuuid) null else entry
+        }
+    }
+
+    internal fun evictRiotIdMapping(region: String, summonerName: String, tagLine: String, expectedPuuid: String? = null) {
+        val key = normalizeRiotIdKey(region, summonerName, tagLine)
+        if (expectedPuuid == null) {
+            riotIdToPuuidIndex.remove(key)
+        } else {
+            riotIdToPuuidIndex.computeIfPresent(key) { _, entry ->
+                if (entry.puuid == expectedPuuid) null else entry
+            }
+        }
+    }
+
+    private fun cacheMatchesBatch(entries: Map<String, MatchDto>, expiration: Duration) {
+        if (entries.isEmpty()) return
+        if (redisCacheService.canPipelineBatchWrites()) {
+            redisCacheService.setAll(entries, expiration)
+        } else {
+            for ((key, match) in entries) {
+                redisCacheService.set(key, match, expiration)
+            }
+        }
+    }
+
+    /**
+     * Resolves an immediately-servable cached profile by normalized `(region, summonerName, tagLine)` without
+     * blocking on `account-v1-by-riot-id`:
+     * - Fresh (`<5m`, `explicitRefresh = false`): served immediately with **0** Riot API calls.
+     * - Stale (`>=5m`, `explicitRefresh = false`): served immediately with **0** foreground Riot API calls while
+     *   triggering a cooldown-guarded `LOW`-priority background refresh that also reconciles Riot ID ownership.
+     * - Explicit refresh within `60s` cooldown (`explicitRefresh = true`): served immediately with **0** Riot API calls.
+     * - Cold miss, un-enriched legacy cache entry, or explicit refresh past `60s`: returns `served = false` so the
+     *   caller performs live `getAccountByRiotId` verification before synchronous refresh.
+     */
+    fun resolveImmediateCachedProfileByRiotId(
+        region: String,
+        summonerName: String,
+        tagLine: String,
+        explicitRefresh: Boolean = false
+    ): ImmediateProfileLookupResult {
+        val trimmedName = summonerName.trim()
+        val trimmedTag = tagLine.trim()
+        if (trimmedName.isEmpty() || trimmedTag.isEmpty()) {
+            return ImmediateProfileLookupResult(served = false)
+        }
+        val key = normalizeRiotIdKey(region, trimmedName, trimmedTag)
+        val entry = riotIdToPuuidIndex[key] ?: return ImmediateProfileLookupResult(served = false)
+        val cacheKey = getProfileCacheKey(entry.puuid, region)
+        val cachedProfile = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
+        if (cachedProfile == null ||
+            cachedProfile.puuid != entry.puuid ||
+            !cachedProfile.gameName.orEmpty().trim().equals(trimmedName, ignoreCase = true) ||
+            !cachedProfile.tagLine.orEmpty().trim().equals(trimmedTag, ignoreCase = true) ||
+            !isProfileReadyForImmediateServe(cachedProfile)
+        ) {
+            evictRiotIdMapping(region, trimmedName, trimmedTag, entry.puuid)
+            return ImmediateProfileLookupResult(served = false)
+        }
+
+        val now = Instant.ofEpochMilli(timeProvider.now())
+        if (explicitRefresh) {
+            if (isProfileWithinFreshnessWindow(cachedProfile, now, EXPLICIT_REFRESH_MIN_COOLDOWN)) {
+                recordRiotIdMapping(region, cachedProfile.gameName ?: trimmedName, cachedProfile.tagLine ?: trimmedTag, entry.puuid)
+                logger.info("Explicit refresh requested within 60s cooldown for $summonerName#$tagLine ($region); serving fresh cached profile with zero Riot calls.")
+                return ImmediateProfileLookupResult(served = true, profile = cachedProfile)
+            }
+            return ImmediateProfileLookupResult(served = false)
+        }
+
+        recordRiotIdMapping(region, cachedProfile.gameName ?: trimmedName, cachedProfile.tagLine ?: trimmedTag, entry.puuid)
+        if (isProfileWithinFreshnessWindow(cachedProfile, now, PROFILE_FRESHNESS_WINDOW)) {
+            logger.info("Fresh Riot-ID cache hit for $summonerName#$tagLine ($region); serving cached profile with zero Riot calls.")
+            return ImmediateProfileLookupResult(served = true, profile = cachedProfile)
+        }
+
+        logger.info("Stale Riot-ID cache hit for $summonerName#$tagLine ($region); serving cached profile with zero foreground Riot calls and scheduling LOW-priority refresh.")
+        triggerBackgroundRefreshIfCooldownAllows(
+            puuid = entry.puuid,
+            region = region,
+            summonerName = cachedProfile.gameName ?: summonerName,
+            tagLine = cachedProfile.tagLine ?: tagLine,
+            verifyRiotIdOwnership = true
+        )
+        return ImmediateProfileLookupResult(served = true, profile = cachedProfile)
+    }
+
     /**
      * Retrieves a player's profile with bounded freshness and explicit-refresh semantics:
      * - If a ready cached profile exists and [explicitRefresh] is `false`:
@@ -584,13 +729,22 @@ class PlayerCacheService(
         val now = Instant.ofEpochMilli(timeProvider.now())
 
         if (isProfileReadyForImmediateServe(cachedProfile)) {
+            recordRiotIdMapping(region, summonerName, tagLine, puuid)
+            recordRiotIdMapping(region, cachedProfile?.gameName, cachedProfile?.tagLine, puuid)
             if (explicitRefresh) {
                 if (isProfileWithinFreshnessWindow(cachedProfile, now, EXPLICIT_REFRESH_MIN_COOLDOWN)) {
                     logger.info("Explicit refresh requested within 60s cooldown for $summonerName#$tagLine ($region); serving fresh cached profile.")
                     return cachedProfile
                 }
                 logger.info("Explicit refresh requested for $summonerName#$tagLine ($region); refreshing synchronously.")
-                return refreshPlayerProfile(puuid, region, summonerName, tagLine)
+                return refreshPlayerProfileInternal(
+                    puuid = puuid,
+                    region = region,
+                    summonerName = summonerName,
+                    tagLine = tagLine,
+                    requestedPriority = ApiPriority.HIGH,
+                    preloadedCacheSnapshot = true to cachedProfile
+                )
             }
 
             if (isProfileWithinFreshnessWindow(cachedProfile, now, PROFILE_FRESHNESS_WINDOW)) {
@@ -603,7 +757,14 @@ class PlayerCacheService(
             return cachedProfile
         }
 
-        return refreshPlayerProfile(puuid, region, summonerName, tagLine)
+        return refreshPlayerProfileInternal(
+            puuid = puuid,
+            region = region,
+            summonerName = summonerName,
+            tagLine = tagLine,
+            requestedPriority = ApiPriority.HIGH,
+            preloadedCacheSnapshot = true to cachedProfile
+        )
     }
 
     /**
@@ -616,11 +777,12 @@ class PlayerCacheService(
         puuid: String,
         region: String,
         summonerName: String,
-        tagLine: String
+        tagLine: String,
+        verifyRiotIdOwnership: Boolean = false
     ): Boolean {
         val flightKey = getFlightKey(puuid, region)
         val existing = inFlightRefreshes[flightKey]
-        if (existing != null && existing.isActive) {
+        if (existing != null && existing.deferred.isActive) {
             return false
         }
 
@@ -646,7 +808,29 @@ class PlayerCacheService(
         lastBackgroundRefreshAtMs[flightKey] = nowMs
         backgroundRefreshScope.launch {
             try {
-                refreshPlayerProfile(puuid, region, summonerName, tagLine)
+                if (verifyRiotIdOwnership) {
+                    val accountCheck = kotlinx.coroutines.withContext(
+                        RiotApiService.RiotCallPriorityElement(priorityProvider = { ApiPriority.LOW })
+                    ) {
+                        riotApiService.getAccountByRiotId(summonerName, tagLine, region)
+                    }
+                    val verifiedPuuid = accountCheck?.puuid?.trim()?.takeIf { it.isNotBlank() }
+                    if (verifiedPuuid == null || verifiedPuuid != puuid) {
+                        evictRiotIdMapping(region, summonerName, tagLine, puuid)
+                        logger.info(
+                            "Background Riot-ID ownership changed or missing for {}#{} ({}) (expectedPuuid={}, actualPuuid={}); evicted Riot-ID mapping.",
+                            summonerName, tagLine, region, puuid, verifiedPuuid
+                        )
+                        return@launch
+                    }
+                }
+                refreshPlayerProfileInternal(
+                    puuid = puuid,
+                    region = region,
+                    summonerName = summonerName,
+                    tagLine = tagLine,
+                    requestedPriority = ApiPriority.LOW
+                )
             } catch (e: Exception) {
                 logger.warn("Background profile refresh failed for $summonerName#$tagLine ($region): ${e.message}")
             }
@@ -665,35 +849,78 @@ class PlayerCacheService(
         summonerName: String,
         tagLine: String
     ): SummonerProfileDto? {
+        return refreshPlayerProfileInternal(
+            puuid = puuid,
+            region = region,
+            summonerName = summonerName,
+            tagLine = tagLine,
+            requestedPriority = ApiPriority.HIGH
+        )
+    }
+
+    private suspend fun refreshPlayerProfileInternal(
+        puuid: String,
+        region: String,
+        summonerName: String,
+        tagLine: String,
+        requestedPriority: ApiPriority = ApiPriority.HIGH,
+        preloadedCacheSnapshot: Pair<Boolean, SummonerProfileDto?>? = null
+    ): SummonerProfileDto? {
         val flightKey = getFlightKey(puuid, region)
-        val (deferred, isLeader) = inFlightMutex.withLock {
+        val (entry, isLeader) = inFlightMutex.withLock {
             val active = inFlightRefreshes[flightKey]
-            if (active != null && active.isActive) {
+            if (active != null && active.deferred.isActive) {
+                active.activeWaiters.incrementAndGet()
+                if (requestedPriority == ApiPriority.HIGH) {
+                    active.priorityRef.set(ApiPriority.HIGH)
+                    active.promotionSignal.complete(Unit)
+                }
                 active to false
             } else {
-                val created = CompletableDeferred<SummonerProfileDto?>()
+                val created = InFlightRefreshEntry(
+                    deferred = CompletableDeferred(),
+                    priorityRef = java.util.concurrent.atomic.AtomicReference(requestedPriority),
+                    promotionSignal = CompletableDeferred<Unit>().apply {
+                        if (requestedPriority == ApiPriority.HIGH) complete(Unit)
+                    },
+                    activeWaiters = java.util.concurrent.atomic.AtomicInteger(1),
+                    workerJobRef = java.util.concurrent.atomic.AtomicReference(null)
+                )
+                val workerJob = backgroundRefreshScope.launch(
+                    RiotApiService.RiotCallPriorityElement(
+                        priorityProvider = { created.priorityRef.get() },
+                        promotionSignal = created.promotionSignal
+                    )
+                ) {
+                    try {
+                        val result = executeLockedRefresh(puuid, region, summonerName, tagLine, preloadedCacheSnapshot)
+                        created.deferred.complete(result)
+                    } catch (t: Throwable) {
+                        created.deferred.completeExceptionally(t)
+                    } finally {
+                        inFlightMutex.withLock {
+                            if (inFlightRefreshes[flightKey] === created) {
+                                inFlightRefreshes.remove(flightKey)
+                            }
+                        }
+                    }
+                }
+                created.workerJobRef.set(workerJob)
                 inFlightRefreshes[flightKey] = created
                 created to true
             }
         }
 
         if (!isLeader) {
-            logger.info("Joining in-flight profile refresh for $summonerName#$tagLine ($region)")
-            return deferred.await()
+            logger.info("Joining in-flight profile refresh for $summonerName#$tagLine ($region) (priority={})", requestedPriority)
         }
 
-        try {
-            val result = executeLockedRefresh(puuid, region, summonerName, tagLine)
-            deferred.complete(result)
-            return result
-        } catch (t: Throwable) {
-            deferred.completeExceptionally(t)
-            throw t
+        return try {
+            entry.deferred.await()
         } finally {
-            inFlightMutex.withLock {
-                if (inFlightRefreshes[flightKey] === deferred) {
-                    inFlightRefreshes.remove(flightKey)
-                }
+            val remaining = entry.activeWaiters.decrementAndGet()
+            if (remaining <= 0 && !entry.deferred.isCompleted) {
+                entry.workerJobRef.get()?.cancel()
             }
         }
     }
@@ -702,15 +929,18 @@ class PlayerCacheService(
         puuid: String,
         region: String,
         summonerName: String,
-        tagLine: String
+        tagLine: String,
+        preloadedCacheSnapshot: Pair<Boolean, SummonerProfileDto?>? = null
     ): SummonerProfileDto? = coroutineScope {
         val cacheKey = getProfileCacheKey(puuid, region)
         val lockKey = getLockKey(puuid, region)
         val waitStart = Instant.ofEpochMilli(timeProvider.now())
 
         var ownsLock = redisCacheService.setIfAbsent(lockKey, "LOCKED", PROFILE_LOCK_TTL)
+        var waitedForExternalLock = false
 
         if (!ownsLock) {
+            waitedForExternalLock = true
             logger.info("Profile refresh lock held externally for $summonerName#$tagLine ($region). Waiting up to ${lockMaxPollAttempts * lockPollIntervalMs}ms.")
             val immediateCached = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
             if (isProfileReadyForImmediateServe(immediateCached)) {
@@ -755,7 +985,11 @@ class PlayerCacheService(
         try {
             val refreshStartMs = timeProvider.now()
             val normalizedRegion = region.lowercase().trim()
-            val cachedProfile = redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
+            val cachedProfile = if (!waitedForExternalLock && preloadedCacheSnapshot?.first == true) {
+                preloadedCacheSnapshot.second
+            } else {
+                redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
+            }
 
             if (cachedProfile != null) {
                 logger.info("Refreshing cached profile for $summonerName#$tagLine ($region)")
@@ -768,26 +1002,96 @@ class PlayerCacheService(
             val startOfYear = java.time.Year.of(currentYear).atDay(1).atStartOfDay(java.time.ZoneOffset.UTC).toEpochSecond()
             val startOfYearMs = startOfYear * 1000L
 
-            // 1. Verify summoner exists on this regional shard and fetch fresh level & icon
-            val metaStartMs = timeProvider.now()
-            val freshSummoner = riotApiService.getSummonerByPuuid(puuid, region)
-            if (freshSummoner == null) {
-                logger.info("No summoner found on shard $region for $summonerName#$tagLine (puuid=$puuid). Returning null.")
-                if (cachedProfile != null) {
-                    redisCacheService.delete(cacheKey)
+            val loadedDurable = loadValidDurableSeasonState(normalizedRegion, puuid, currentYear)
+            val durableState = loadedDurable?.state
+            val recentMatchesComplete = cachedProfile?.recentMatches?.none { needsMatchBackfill(it) } ?: true
+            val redisSeasonKey = "$normalizedRegion|$puuid|$currentYear"
+
+            // Build incremental match-ID pagination anchor ONLY when prior seasonal history is proven complete
+            // (or cleanly at the 2,100-match cap) with zero unresolved pending gaps — never from a partial ledger.
+            val matchIdsAnchor = when {
+                playerSeasonStatsRepository != null -> {
+                    if (durableState != null &&
+                        durableState.pendingMatchIds.isEmpty() &&
+                        durableState.processedMatchIds.isNotEmpty() &&
+                        (durableState.historyComplete ||
+                            (durableState.historyCapped &&
+                                durableState.processedMatchIds.size >= DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS))
+                    ) {
+                        RiotApiService.MatchIdsIncrementalAnchor(
+                            knownOrderedSeasonalIds = durableState.processedMatchIds,
+                            knownExcludedIds = durableState.excludedMatchIds.toHashSet(),
+                            priorHistoryCapped = durableState.historyCapped
+                        )
+                    } else {
+                        null
+                    }
                 }
-                return@coroutineScope null
+                else -> {
+                    val verifiedLedger = verifiedCompleteRedisOnlySeasons[redisSeasonKey]
+                    if (verifiedLedger != null &&
+                        verifiedLedger.seasonYear == currentYear &&
+                        cachedProfile != null &&
+                        cachedProfile.allMatchIds.isNotEmpty() &&
+                        cachedProfile.allMatchIds == verifiedLedger.orderedMatchIds &&
+                        cachedProfile.overallStats != null &&
+                        cachedProfile.totalMatches == cachedProfile.allMatchIds.size &&
+                        recentMatchesComplete
+                    ) {
+                        RiotApiService.MatchIdsIncrementalAnchor(
+                            knownOrderedSeasonalIds = verifiedLedger.orderedMatchIds,
+                            knownExcludedIds = verifiedLedger.excludedMatchIds,
+                            priorHistoryCapped = verifiedLedger.historyCapped
+                        )
+                    } else {
+                        null
+                    }
+                }
+            }
+
+            suspend fun fetchSeasonalMatchIdsOutcome(): RiotApiService.MatchIdsPaginationOutcome {
+                return if (matchIdsAnchor != null) {
+                    kotlinx.coroutines.withContext(RiotApiService.MatchIdsIncrementalAnchorElement(matchIdsAnchor)) {
+                        riotApiService.fetchMatchIdsWithOutcomeSince(puuid, region, startOfYear)
+                    }
+                } else {
+                    riotApiService.fetchMatchIdsWithOutcomeSince(puuid, region, startOfYear)
+                }
+            }
+
+            // 1. Verify summoner exists on this regional shard and fetch fresh level, icon, rank, and match IDs.
+            // For summoners already verified on this regional shard (cachedProfile or durableState present),
+            // overlap Summoner-V4, League-V4, and Match-V5 IDs concurrently to save a full sequential RTT.
+            val metaStartMs = timeProvider.now()
+            val (freshSummoner, freshRank, paginationOutcome) = if (cachedProfile != null || durableState != null) {
+                val summonerDeferred = async { riotApiService.getSummonerByPuuid(puuid, region) }
+                val rankDeferred = async { riotApiService.fetchLeagueRank(puuid, region) }
+                val matchIdsOutcomeDeferred = async { fetchSeasonalMatchIdsOutcome() }
+                val summoner = summonerDeferred.await()
+                if (summoner == null) {
+                    rankDeferred.cancel()
+                    matchIdsOutcomeDeferred.cancel()
+                    logger.info("No summoner found on shard $region for $summonerName#$tagLine (puuid=$puuid). Returning null.")
+                    if (cachedProfile != null) {
+                        redisCacheService.delete(cacheKey)
+                    }
+                    evictRiotIdMapping(region, summonerName, tagLine, puuid)
+                    return@coroutineScope null
+                }
+                Triple(summoner, rankDeferred.await(), matchIdsOutcomeDeferred.await())
+            } else {
+                val summoner = riotApiService.getSummonerByPuuid(puuid, region)
+                if (summoner == null) {
+                    logger.info("No summoner found on shard $region for $summonerName#$tagLine (puuid=$puuid). Returning null.")
+                    evictRiotIdMapping(region, summonerName, tagLine, puuid)
+                    return@coroutineScope null
+                }
+                val rankDeferred = async { riotApiService.fetchLeagueRank(puuid, region) }
+                val matchIdsOutcomeDeferred = async { fetchSeasonalMatchIdsOutcome() }
+                Triple(summoner, rankDeferred.await(), matchIdsOutcomeDeferred.await())
             }
             val refreshedLevel = freshSummoner.summonerLevel ?: cachedProfile?.summonerLevel
             val refreshedIconId = freshSummoner.profileIconId ?: cachedProfile?.profileIconId
-
-            // Fetch rank and season match ID list (with explicit pagination outcome) concurrently
-            val rankDeferred = async { riotApiService.fetchLeagueRank(puuid, region) }
-            val matchIdsOutcomeDeferred = async {
-                riotApiService.fetchMatchIdsWithOutcomeSince(puuid, region, startOfYear)
-            }
-            val freshRank = rankDeferred.await()
-            val paginationOutcome = matchIdsOutcomeDeferred.await()
             val rawAllMatchIds = paginationOutcome.matchIds
             val rawNonBlankIds = rawAllMatchIds
                 .asSequence()
@@ -807,9 +1111,6 @@ class PlayerCacheService(
                 !rawFetchTruncatedByLedgerCap
             val distinctAllMatchIds = rawDistinctMatchIds.take(DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS)
             val metadataAndIdsMs = timeProvider.now() - metaStartMs
-
-            val loadedDurable = loadValidDurableSeasonState(normalizedRegion, puuid, currentYear)
-            val durableState = loadedDurable?.state
 
             // Never conflate a page-0 match-ID pagination failure (`matchIds == null` at start=0) with an empty season:
             if (paginationStoppedOnFailure && paginationOutcome.pagesFetched == 0 && distinctAllMatchIds.isEmpty()) {
@@ -833,13 +1134,13 @@ class PlayerCacheService(
             }
 
             // Check whether durable state (if repo is wired) is already complete with zero unfolded or pending match IDs
+            val excludedLookupForFastPath = durableState?.excludedMatchIds?.toHashSet() ?: emptySet()
             val durableCompleteAndUpToDate = if (playerSeasonStatsRepository != null) {
                 if (durableState == null || !durableState.historyComplete || durableState.pendingMatchIds.isNotEmpty()) {
                     false
                 } else {
                     val foldedLookup = durableState.processedMatchIds.toHashSet()
-                    val excludedLookup = durableState.excludedMatchIds.toHashSet()
-                    candidateWindowIds.all { it in foldedLookup || it in excludedLookup } &&
+                    candidateWindowIds.all { it in foldedLookup || it in excludedLookupForFastPath } &&
                         cachedProfile?.totalMatches == durableState.overallCounters.totalGames &&
                         cachedProfile.allMatchIds == durableState.processedMatchIds
                 }
@@ -850,12 +1151,16 @@ class PlayerCacheService(
             // Fast-path: if we already have a cached profile, no new or out-of-order/pending matches exist,
             // durable state (when wired) is complete, and all served recentMatches have gameVersion + teams populated,
             // skip re-streaming and re-accumulating all matches from Redis while updating rank, level, and icon.
-            val recentMatchesComplete = cachedProfile?.recentMatches?.none { needsMatchBackfill(it) } ?: true
+            val unexcludedCandidateIds = if (excludedLookupForFastPath.isNotEmpty()) {
+                candidateWindowIds.filter { it !in excludedLookupForFastPath }
+            } else {
+                candidateWindowIds
+            }
             if (cachedProfile != null && recentMatchesComplete && durableCompleteAndUpToDate && (
-                (distinctAllMatchIds.isEmpty() && cachedProfile.allMatchIds.isEmpty()) ||
+                (unexcludedCandidateIds.isEmpty() && cachedProfile.allMatchIds.isEmpty()) ||
                 (cachedProfile.allMatchIds.isNotEmpty() &&
-                    distinctAllMatchIds.firstOrNull() == cachedProfile.allMatchIds.first() &&
-                    distinctAllMatchIds.size == cachedProfile.allMatchIds.size &&
+                    unexcludedCandidateIds.firstOrNull() == cachedProfile.allMatchIds.first() &&
+                    unexcludedCandidateIds.size == cachedProfile.allMatchIds.size &&
                     cachedProfile.overallStats != null)
             )) {
                 val fastImprovementStats = cachedProfile.improvementStats
@@ -870,6 +1175,7 @@ class PlayerCacheService(
                     lastRefreshed = Instant.ofEpochMilli(timeProvider.now())
                 )
                 redisCacheService.set(cacheKey, fastUpdatedProfile, PROFILE_CACHE_TTL)
+                recordRiotIdMapping(region, summonerName, tagLine, puuid)
                 val totalFastMs = timeProvider.now() - refreshStartMs
                 logger.info(
                     "Fast-path refresh for {}#{} ({}): totalMs={}, metadataAndIdsMs={}, totalMatches={} (no new matches since {}).",
@@ -880,6 +1186,7 @@ class PlayerCacheService(
             }
 
             val matchProcessingStartMs = timeProvider.now()
+            val matchFetchSemaphore = kotlinx.coroutines.sync.Semaphore(MAX_CONCURRENT_MATCH_FETCHES_PER_REFRESH)
             val accumulator = MatchStatsAccumulator(puuid)
             val foldedSet = LinkedHashSet<String>()
             val excludedSet = LinkedHashSet<String>()
@@ -1001,21 +1308,26 @@ class PlayerCacheService(
 
                 val fetchedMatches = missingIds.map { matchId ->
                     async {
+                        matchFetchSemaphore.acquire()
                         try {
                             riotApiService.getMatchById(matchId, region)
                         } catch (e: Exception) {
                             null
+                        } finally {
+                            matchFetchSemaphore.release()
                         }
                     }
                 }.awaitAll().filterNotNull()
 
+                val seasonalMatchesToCache = LinkedHashMap<String, MatchDto>(fetchedMatches.size)
                 for (match in fetchedMatches) {
                     val creation = match.info?.gameCreation ?: 0
                     val matchId = match.metadata?.matchId
                     if (matchId != null && creation >= startOfYearMs) {
-                        redisCacheService.set(getMatchCacheKey(matchId, region), match, MATCH_CACHE_TTL)
+                        seasonalMatchesToCache[getMatchCacheKey(matchId, region)] = match
                     }
                 }
+                cacheMatchesBatch(seasonalMatchesToCache, MATCH_CACHE_TTL)
 
                 val fetchedById = fetchedMatches.associateBy { it.metadata?.matchId }
                 var chunkHitPreSeason = false
@@ -1367,12 +1679,14 @@ class PlayerCacheService(
                     }
                 }.awaitAll().filterNotNull()
                 val topUpById = topUpFetched.associateBy { it.metadata?.matchId }
-                topUpFetched.forEach { match ->
+                val topUpToCache = LinkedHashMap<String, MatchDto>(topUpFetched.size)
+                for (match in topUpFetched) {
                     val matchId = match.metadata?.matchId
                     if (matchId != null) {
-                        redisCacheService.set(getMatchCacheKey(matchId, region), match, MATCH_CACHE_TTL)
+                        topUpToCache[getMatchCacheKey(matchId, region)] = match
                     }
                 }
+                cacheMatchesBatch(topUpToCache, MATCH_CACHE_TTL)
                 for (i in recentMatches.indices) {
                     val mid = recentMatches[i].metadata?.matchId
                     val replacement = if (mid != null) topUpById[mid] else null
@@ -1407,6 +1721,33 @@ class PlayerCacheService(
             )
             
             redisCacheService.set(cacheKey, updatedProfile, PROFILE_CACHE_TTL)
+            recordRiotIdMapping(region, summonerName, tagLine, puuid)
+            if (playerSeasonStatsRepository == null) {
+                val canRecordVerifiedRedisLedger = orderedPendingIds.isEmpty() &&
+                    !stoppedForMemoryHeadroom &&
+                    finalValidMatchIds.isNotEmpty() &&
+                    (isHistoryComplete ||
+                        (isHistoryCapped &&
+                            finalValidMatchIds.size >= DurablePlayerSeasonStatsDto.MAX_TRACKED_SEASON_MATCH_IDS &&
+                            !paginationStoppedOnFailure))
+                if (canRecordVerifiedRedisLedger) {
+                    if (!verifiedCompleteRedisOnlySeasons.containsKey(redisSeasonKey)) {
+                        while (verifiedCompleteRedisOnlySeasons.size >= MAX_RIOT_ID_INDEX_ENTRIES) {
+                            val oldestKey = verifiedCompleteRedisOnlySeasons.entries.minByOrNull { it.value.updatedAtMs }?.key ?: break
+                            verifiedCompleteRedisOnlySeasons.remove(oldestKey)
+                        }
+                    }
+                    verifiedCompleteRedisOnlySeasons[redisSeasonKey] = VerifiedRedisSeasonLedger(
+                        seasonYear = currentYear,
+                        orderedMatchIds = finalValidMatchIds,
+                        excludedMatchIds = excludedSet.take(DurablePlayerSeasonStatsDto.MAX_EXCLUDED_MATCH_IDS).toHashSet(),
+                        historyCapped = isHistoryCapped,
+                        updatedAtMs = timeProvider.now()
+                    )
+                } else {
+                    verifiedCompleteRedisOnlySeasons.remove(redisSeasonKey)
+                }
+            }
             timelineService?.invalidatePlayerPreparedCache(normalizedRegion, puuid)
             val matchProcessingMs = timeProvider.now() - matchProcessingStartMs
             val totalRefreshMs = timeProvider.now() - refreshStartMs
@@ -1446,24 +1787,29 @@ class PlayerCacheService(
             val cached = cachedMatchesMap[getMatchCacheKey(id, region)]
             needsMatchBackfill(cached)
         }
-        
+        val fetchSemaphore = kotlinx.coroutines.sync.Semaphore(MAX_CONCURRENT_MATCH_FETCHES_PER_REFRESH)
         val fetchedMatches = missingIds.map { matchId ->
             async {
+                fetchSemaphore.acquire()
                 try {
                     riotApiService.getMatchById(matchId, region)
                 } catch (e: Exception) {
                     null
+                } finally {
+                    fetchSemaphore.release()
                 }
             }
         }.awaitAll().filterNotNull()
         
         val fetchedById = fetchedMatches.associateBy { it.metadata?.matchId }
-        fetchedMatches.forEach { match ->
-             val mid = match.metadata?.matchId
-             if (mid != null) {
-                 redisCacheService.set(getMatchCacheKey(mid, region), match, Duration.ofDays(60))
-             }
+        val fetchedToCache = LinkedHashMap<String, MatchDto>(fetchedMatches.size)
+        for (match in fetchedMatches) {
+            val mid = match.metadata?.matchId
+            if (mid != null) {
+                fetchedToCache[getMatchCacheKey(mid, region)] = match
+            }
         }
+        cacheMatchesBatch(fetchedToCache, MATCH_CACHE_TTL)
         
         // Index players found in these new matches for autocomplete search
         if (fetchedMatches.isNotEmpty()) {

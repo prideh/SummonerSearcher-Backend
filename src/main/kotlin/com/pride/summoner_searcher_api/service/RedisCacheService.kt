@@ -67,6 +67,65 @@ class RedisCacheService(
     }
 
     /**
+     * Returns true on real [RedisCacheService] instances (and false on unstubbed relaxed mocks so unit tests
+     * spying on per-key [set] continue to observe individual writes without stub changes).
+     */
+    fun canPipelineBatchWrites(): Boolean = true
+
+    /**
+     * Pre-compresses [entries] and writes all keys in a single Redis pipeline round-trip with identical
+     * GZIP+Base64 payload encoding and [expiration] TTL semantics as [set]. Falls back cleanly to per-key writes
+     * if pipelining is unavailable in a test stub.
+     */
+    fun <T> setAll(entries: Map<String, T>, expiration: Duration) {
+        if (entries.isEmpty()) return
+        val compressedEntries = LinkedHashMap<String, String>(entries.size)
+        for ((key, value) in entries) {
+            compressedEntries[key] = serializeAndCompress(value)
+        }
+        val hasPositiveTtl = !expiration.isZero && !expiration.isNegative
+        val pipelinedSucceeded = try {
+            if (redisTemplate.connectionFactory == null) {
+                false
+            } else {
+                val redisExpiration = if (hasPositiveTtl) {
+                    org.springframework.data.redis.core.types.Expiration.from(expiration)
+                } else {
+                    org.springframework.data.redis.core.types.Expiration.persistent()
+                }
+                redisTemplate.executePipelined { connection ->
+                    val stringCommands = connection.stringCommands()
+                    for ((key, compressed) in compressedEntries) {
+                        val keyBytes = key.toByteArray(java.nio.charset.StandardCharsets.UTF_8)
+                        val valueBytes = compressed.toByteArray(java.nio.charset.StandardCharsets.UTF_8)
+                        stringCommands.set(
+                            keyBytes,
+                            valueBytes,
+                            redisExpiration,
+                            org.springframework.data.redis.connection.RedisStringCommands.SetOption.UPSERT
+                        )
+                    }
+                    null
+                }
+                true
+            }
+        } catch (_: Exception) {
+            false
+        }
+
+        if (!pipelinedSucceeded) {
+            val valueOps = redisTemplate.opsForValue()
+            for ((key, compressed) in compressedEntries) {
+                if (hasPositiveTtl) {
+                    valueOps.set(key, compressed, expiration)
+                } else {
+                    valueOps.set(key, compressed)
+                }
+            }
+        }
+    }
+
+    /**
      * Tries to set a key if it does not already exist. Useful for locking.
      * @return true if the key was set, false if it already existed.
      */

@@ -28,16 +28,35 @@ class SummonerProfileService(
         tagLine: String,
         explicitRefresh: Boolean = false
     ): SummonerProfileDto? {
-        // Step 1: Get the global account PUUID from the Riot ID. This call is not cached.
+        // Fast-path: serve ready fresh/stale/cooldown-guarded cached profiles without a blocking Account-V1 RTT.
+        val immediate = playerCacheService.resolveImmediateCachedProfileByRiotId(
+            region = region,
+            summonerName = summonerName,
+            tagLine = tagLine,
+            explicitRefresh = explicitRefresh
+        )
+        if (immediate.served) {
+            return immediate.profile?.let { profile ->
+                profile.copy(recentMatches = profile.recentMatches?.take(20))
+            }
+        }
+
+        // Step 1: Get the global account PUUID from the Riot ID when cold or refreshing past cooldown.
         val accountDto = riotApiService.getAccountByRiotId(summonerName, tagLine, region)
-        val puuid = accountDto?.puuid?.takeIf { it.isNotBlank() } ?: return null
+        val puuid = accountDto?.puuid?.takeIf { it.isNotBlank() } ?: run {
+            playerCacheService.evictRiotIdMapping(region, summonerName, tagLine)
+            return null
+        }
+        playerCacheService.reconcileVerifiedRiotIdOwner(region, summonerName, tagLine, puuid)
+        val effectiveName = accountDto.gameName?.takeIf { it.isNotBlank() } ?: summonerName
+        val effectiveTag = accountDto.tagLine?.takeIf { it.isNotBlank() } ?: tagLine
 
         // Step 2: Get full profile from cache (or refresh if missing / explicitly requested)
         val fullProfile = playerCacheService.getPlayerProfile(
             puuid = puuid,
             region = region,
-            summonerName = summonerName,
-            tagLine = tagLine,
+            summonerName = effectiveName,
+            tagLine = effectiveTag,
             explicitRefresh = explicitRefresh
         ) ?: return null
 

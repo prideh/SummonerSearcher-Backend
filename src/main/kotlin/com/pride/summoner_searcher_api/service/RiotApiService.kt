@@ -326,11 +326,31 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
         companion object Key : kotlin.coroutines.CoroutineContext.Key<LingeringWorkerHookElement>
     }
 
+    internal class RiotCallPriorityElement(
+        val priorityProvider: () -> ApiPriority,
+        val promotionSignal: kotlinx.coroutines.CompletableDeferred<Unit>? = null
+    ) : kotlin.coroutines.AbstractCoroutineContextElement(RiotCallPriorityElement) {
+        companion object Key : kotlin.coroutines.CoroutineContext.Key<RiotCallPriorityElement>
+    }
+
+    internal data class MatchIdsIncrementalAnchor(
+        val knownOrderedSeasonalIds: List<String>,
+        val knownExcludedIds: Set<String> = emptySet(),
+        val priorHistoryCapped: Boolean = false
+    )
+
+    internal class MatchIdsIncrementalAnchorElement(
+        val anchor: MatchIdsIncrementalAnchor
+    ) : kotlin.coroutines.AbstractCoroutineContextElement(MatchIdsIncrementalAnchorElement) {
+        companion object Key : kotlin.coroutines.CoroutineContext.Key<MatchIdsIncrementalAnchorElement>
+    }
+
     companion object {
         const val MAX_CHALLENGER_LEAGUE_RESPONSE_BYTES = 524_288 // 512 KiB strict bound
         const val MAX_CHALLENGER_LEAGUE_ENTRIES = 300
         const val MAX_TIMELINE_RESPONSE_BYTES = 4 * 1024 * 1024 // 4 MiB strict raw timeline bound
         const val DEFAULT_SINGLE_TIMELINE_DEADLINE_MS = 10_000L
+        const val ANCHOR_MIN_CONTIGUOUS_KNOWN_TAIL = 20
 
         internal suspend fun <R> withLingeringWorkerHook(
             hook: (LingeringWorkerHandle) -> Unit,
@@ -359,21 +379,57 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
     ): T? {
         var attempts = 0
         val effectiveMaxRetries = maxRetries.coerceAtLeast(0)
-        if (priority == ApiPriority.HIGH) {
+        val priorityContext = kotlin.coroutines.coroutineContext[RiotCallPriorityElement]
+        fun resolveEffectivePriority(): ApiPriority {
+            if (priority == ApiPriority.LOW) return ApiPriority.LOW
+            return priorityContext?.priorityProvider?.invoke() ?: priority
+        }
+
+        var registeredHighUserRequest = false
+        if (resolveEffectivePriority() == ApiPriority.HIGH) {
             rateLimiter.beginUserRequest(region)
+            registeredHighUserRequest = true
         }
         try {
             while (true) {
-                val waitStartMs = System.currentTimeMillis()
-                if (priority == ApiPriority.LOW) {
-                    rateLimiter.awaitLowPriorityClearance(region)
+                var attemptPriority = resolveEffectivePriority()
+                if (attemptPriority == ApiPriority.HIGH && !registeredHighUserRequest) {
+                    rateLimiter.beginUserRequest(region)
+                    registeredHighUserRequest = true
                 }
-                rateLimiter.acquirePermit(region, priority, endpointKey)
+                val waitStartMs = System.currentTimeMillis()
+                if (attemptPriority == ApiPriority.LOW) {
+                    val promoSignal = if (priority == ApiPriority.LOW) null else priorityContext?.promotionSignal
+                    if (promoSignal != null) {
+                        coroutineScope {
+                            val clearanceJob = async { rateLimiter.awaitLowPriorityClearance(region) }
+                            val promoWatcher = async {
+                                promoSignal.await()
+                                clearanceJob.cancel()
+                            }
+                            try {
+                                clearanceJob.await()
+                            } catch (_: kotlin.coroutines.cancellation.CancellationException) {
+                                if (!promoSignal.isCompleted) throw kotlin.coroutines.cancellation.CancellationException()
+                            } finally {
+                                promoWatcher.cancel()
+                            }
+                        }
+                        attemptPriority = resolveEffectivePriority()
+                        if (attemptPriority == ApiPriority.HIGH && !registeredHighUserRequest) {
+                            rateLimiter.beginUserRequest(region)
+                            registeredHighUserRequest = true
+                        }
+                    } else {
+                        rateLimiter.awaitLowPriorityClearance(region)
+                    }
+                }
+                rateLimiter.acquirePermit(region, attemptPriority, endpointKey)
                 val limiterWaitMs = System.currentTimeMillis() - waitStartMs
                 if (limiterWaitMs > 25L) {
                     logger.info(
                         "Riot rate limiter wait: region={}, endpoint={}, priority={}, limiterWaitMs={}",
-                        region, endpointKey ?: "unspecified", priority, limiterWaitMs
+                        region, endpointKey ?: "unspecified", attemptPriority, limiterWaitMs
                     )
                 }
                 try {
@@ -400,7 +456,7 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
                         )
                         logger.debug(
                             "Riot API call complete: region={}, endpoint={}, priority={}, limiterWaitMs={}, httpMs={}, appLimit={} ({}), methodLimit={} ({})",
-                            region, endpointKey ?: "unspecified", priority, limiterWaitMs, httpMs,
+                            region, endpointKey ?: "unspecified", attemptPriority, limiterWaitMs, httpMs,
                             appLimit ?: "n/a", appCount ?: "n/a", methodLimit ?: "n/a", methodCount ?: "n/a"
                         )
                         return response.body
@@ -465,7 +521,7 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
                 }
             }
         } finally {
-            if (priority == ApiPriority.HIGH) {
+            if (registeredHighUserRequest) {
                 rateLimiter.endUserRequest(region)
             }
         }
@@ -1048,6 +1104,18 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
         var exhaustedCleanly = false
         var hitSafetyCap = false
         var stoppedOnPageFailure = false
+        val anchor = kotlin.coroutines.coroutineContext[MatchIdsIncrementalAnchorElement]?.anchor
+            ?.takeIf { it.knownOrderedSeasonalIds.isNotEmpty() }
+        val knownIndexById = if (anchor != null) {
+            HashMap<String, Int>(anchor.knownOrderedSeasonalIds.size * 2).apply {
+                anchor.knownOrderedSeasonalIds.forEachIndexed { idx, id ->
+                    putIfAbsent(id.trim(), idx)
+                }
+            }
+        } else {
+            null
+        }
+        val knownExcludedSet = anchor?.knownExcludedIds
 
         while (true) {
             logger.info("Fetching match IDs for $puuid: start=$start, count=$count")
@@ -1079,6 +1147,63 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
             if (matchIds.size < count) {
                 exhaustedCleanly = true
                 break
+            }
+
+            if (anchor != null && knownIndexById != null && knownExcludedSet != null &&
+                matchIds.size >= ANCHOR_MIN_CONTIGUOUS_KNOWN_TAIL
+            ) {
+                val tailStartIdx = matchIds.size - ANCHOR_MIN_CONTIGUOUS_KNOWN_TAIL
+                var tailAllKnown = true
+                val tailSeasonalIndices = ArrayList<Int>(ANCHOR_MIN_CONTIGUOUS_KNOWN_TAIL)
+                for (i in tailStartIdx until matchIds.size) {
+                    val trimmed = matchIds[i].trim()
+                    val seasonalIdx = knownIndexById[trimmed]
+                    if (seasonalIdx != null) {
+                        tailSeasonalIndices.add(seasonalIdx)
+                    } else if (trimmed !in knownExcludedSet) {
+                        tailAllKnown = false
+                        break
+                    }
+                }
+                var tailStrictlyConsecutive = tailSeasonalIndices.isNotEmpty()
+                if (tailAllKnown && tailStrictlyConsecutive) {
+                    for (k in 1 until tailSeasonalIndices.size) {
+                        if (tailSeasonalIndices[k] != tailSeasonalIndices[k - 1] + 1) {
+                            tailStrictlyConsecutive = false
+                            break
+                        }
+                    }
+                }
+                if (tailAllKnown && tailStrictlyConsecutive) {
+                    val bridgeEndIdx = tailSeasonalIndices.last()
+                    val fetchedLookup = HashSet<String>(allMatchIds.size * 2)
+                    for (id in allMatchIds) {
+                        fetchedLookup.add(id.trim())
+                    }
+                    // Verify zero upstream missing IDs across knownOrderedSeasonalIds[0..bridgeEndIdx] before splicing.
+                    var prefixComplete = true
+                    for (idx in 0..bridgeEndIdx) {
+                        if (anchor.knownOrderedSeasonalIds[idx] !in fetchedLookup) {
+                            prefixComplete = false
+                            break
+                        }
+                    }
+                    if (prefixComplete) {
+                        for (idx in (bridgeEndIdx + 1) until anchor.knownOrderedSeasonalIds.size) {
+                            val tailKnownId = anchor.knownOrderedSeasonalIds[idx]
+                            if (tailKnownId !in fetchedLookup) {
+                                allMatchIds.add(tailKnownId)
+                            }
+                        }
+                        hitSafetyCap = anchor.priorHistoryCapped || allMatchIds.size > 2000
+                        exhaustedCleanly = !hitSafetyCap
+                        logger.info(
+                            "Anchored match ID pagination bridged cleanly at index={} for {} ({}) after {} page(s); spliced total={} IDs.",
+                            bridgeEndIdx, puuid, region, pagesFetched, allMatchIds.size
+                        )
+                        break
+                    }
+                }
             }
 
             start += count
