@@ -61,6 +61,16 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
 
     val mapper: ObjectMapper = ObjectMapper().findAndRegisterModules()
 
+    val healthyContainerMemoryStats = object : MemoryStatsProvider {
+        override fun sample(): RawMemorySample = RawMemorySample(
+            jvmHeapUsedBytes = 96L * 1024L * 1024L,
+            jvmHeapCommittedBytes = 192L * 1024L * 1024L,
+            jvmHeapMaxBytes = 384L * 1024L * 1024L,
+            cgroupMemoryCurrentBytes = 256L * 1024L * 1024L,
+            cgroupMemoryMaxBytes = 512L * 1024L * 1024L
+        )
+    }
+
     class MutableClock(initialMs: Long) : TimeProvider {
         private val current = AtomicLong(initialMs)
         override fun now(): Long = current.get()
@@ -450,7 +460,7 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
             timeProvider = clock,
             playerSeasonStatsRepository = seasonRepo,
             transactionTemplate = txTemplate,
-            objectMapper = mapper
+            objectMapper = mapper, memoryStatsProvider = healthyContainerMemoryStats
         )
         if (helper.isProfileReadyForImmediateServe(cachedProfile)) {
             if (explicitRefresh) {
@@ -556,7 +566,7 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
                 timeProvider = clock,
                 playerSeasonStatsRepository = seasonRepo,
                 transactionTemplate = txTemplate,
-                objectMapper = mapper
+                objectMapper = mapper, memoryStatsProvider = healthyContainerMemoryStats
             )
             return seqHelper.refreshPlayerProfile(puuid, region, summonerName, tagLine)?.let {
                 it.copy(recentMatches = it.recentMatches?.take(20))
@@ -682,7 +692,7 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
             timeProvider = branchClock,
             playerSeasonStatsRepository = branchSeasonRepo,
             transactionTemplate = branchTx,
-            objectMapper = mapper
+            objectMapper = mapper, memoryStatsProvider = healthyContainerMemoryStats
         )
         val branchProfileService = SummonerProfileService(branchRiotService, branchCacheService)
 
@@ -714,14 +724,21 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
         val distinctPatchesInSeason = (1..450).map { branchRiotBackend.matchesById["EUW1_$it"]!!.info!!.gameVersion!! }.toSet()
         distinctPatchesInSeason.size shouldBe 22
 
+        val coldPipelineTelemetry = branchRedis.service.getPipelineWriteTelemetry()
         coldAfterRiotCalls shouldBe 458
         coldBeforeRiotCalls shouldBe 458
         coldAfterPeakConcurrency shouldBeLessThanOrEqualTo 20
-        coldAfterPipelineBatches shouldBe 9 // 9 chunks of 50 matches pipelined instead of 450 single SETs
+        coldAfterPipelineBatches shouldBe 18 // 9 chunks of 50 matches split into 18 bounded <=25-entry / <=256KiB pipeline sub-batches (vs 450 single SETs)
         coldAfterSingleSets shouldBe 1 // Only 1 single SET for player:profile
         coldBeforeSingleSets shouldBe 451
         telemetryAfterCold["lastRefreshPeakLiveMatchDtos"]!! shouldBeLessThanOrEqualTo 70L
         telemetryAfterCold["lastRefreshPeakCrossChunkRetainedMatchDtos"]!! shouldBeLessThanOrEqualTo 20L
+        telemetryAfterCold["lastRefreshPeakLiveMatchJsonBytes"]!! shouldBeLessThanOrEqualTo (1024L * 1024L)
+        (telemetryAfterCold["lastRefreshPeakLiveMatchJsonBytes"]!! > 0L) shouldBe true
+        telemetryAfterCold["verifiedRedisSeasonsEntries"] shouldBe 0L
+        telemetryAfterCold["verifiedRedisSeasonsEstimatedRetainedBytes"]!! shouldBeLessThanOrEqualTo 128L
+        coldPipelineTelemetry.maxObservedSubBatchBytes shouldBeLessThanOrEqualTo (256L * 1024L)
+        (coldPipelineTelemetry.maxObservedSubBatchBytes > 0L) shouldBe true
         coldAfterMs shouldBeLessThan coldBeforeMs
 
         // Warm fresh (<5m) branch
@@ -932,7 +949,7 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
                 timeProvider = rClock,
                 playerSeasonStatsRepository = aRepo,
                 transactionTemplate = noOpTransactionTemplate(),
-                objectMapper = mapper
+                objectMapper = mapper, memoryStatsProvider = healthyContainerMemoryStats
             )
             val aSvc = SummonerProfileService(aRiot, aCache)
             val aStart = System.nanoTime()
@@ -973,7 +990,7 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
         println(
             """
             [SPEED_BENCHMARK_SUMMARY] (Synthetic 12ms Riot HTTP RTT, 1ms Redis RTT; full 2026 YTD across 22 patches preserved)
-              Cold 450g (patches 16.1..16.22): before=${coldBeforeMs}ms (riotCalls=$coldBeforeRiotCalls, redisRtts=$coldBeforeRedisRtts, singleSets=$coldBeforeSingleSets) -> after=${coldAfterMs}ms (riotCalls=$coldAfterRiotCalls, redisRtts=$coldAfterRedisRtts, pipelineBatches=$coldAfterPipelineBatches, peakConcurrentMatchFetches=$coldAfterPeakConcurrency, peakLiveDtos=${telemetryAfterCold["lastRefreshPeakLiveMatchDtos"]})
+              Cold 450g (patches 16.1..16.22): before=${coldBeforeMs}ms (riotCalls=$coldBeforeRiotCalls, redisRtts=$coldBeforeRedisRtts, singleSets=$coldBeforeSingleSets) -> after=${coldAfterMs}ms (riotCalls=$coldAfterRiotCalls, redisRtts=$coldAfterRedisRtts, pipelineSubBatches=$coldAfterPipelineBatches, peakConcurrentMatchFetches=$coldAfterPeakConcurrency, peakLiveDtos=${telemetryAfterCold["lastRefreshPeakLiveMatchDtos"]}, peakLiveMatchJsonBytes=${telemetryAfterCold["lastRefreshPeakLiveMatchJsonBytes"]}, peakPipelineSubBatchBytes=${coldPipelineTelemetry.maxObservedSubBatchBytes})
               Warm Fresh (<5m, 450g):          before=${warmBeforeMs}ms (riotCalls=$warmBeforeRiotCalls, redisRtts=$warmBeforeRedisRtts) -> after=${warmAfterMs}ms (riotCalls=$warmAfterRiotCalls, redisRtts=$warmAfterRedisRtts)
               Explicit Cooldown (<60s, 450g):  after=${cooldownAfterMs}ms (riotCalls=0, redisRtts=1)
               Warm Stale (>=5m fg, 450g):      before=${staleBeforeMs}ms (fgRiotCalls=$staleBeforeFgRiotCalls) -> after=${staleAfterMs}ms (fgRiotCalls=$staleAfterFgRiotCalls, bgActiveHighUserReqs=0, bgIdPages=1)
@@ -999,7 +1016,7 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
             timeProvider = clock,
             playerSeasonStatsRepository = seasonRepo,
             transactionTemplate = noOpTransactionTemplate(),
-            objectMapper = mapper
+            objectMapper = mapper, memoryStatsProvider = healthyContainerMemoryStats
         )
         val profileService = SummonerProfileService(riotService, cacheService)
 
@@ -1091,7 +1108,7 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
             timeProvider = clock,
             playerSeasonStatsRepository = seasonRepo,
             transactionTemplate = noOpTransactionTemplate(),
-            objectMapper = mapper
+            objectMapper = mapper, memoryStatsProvider = healthyContainerMemoryStats
         )
 
         riotBackend.summonersByRegionPuuid["$region|$puuid"] = SummonerDto("s-p", puuid, 150L, 5)
@@ -1121,12 +1138,12 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
 
         // 2. Cancellation isolation: Leader Caller 1 cancels mid-flight while Joiner Caller 2 awaits -> Caller 2 still succeeds!
         val cancelPuuid = "cancel-iso-puuid"
-        val cancelMatchId = "EUW1_CANCEL_1"
+        val cancelMatchId = "CANCEL_1"
         val gateEntered = CompletableDeferred<Unit>()
         val releaseGate = CompletableDeferred<Unit>()
         riotBackend.summonersByRegionPuuid["$region|$cancelPuuid"] = SummonerDto("s-c", cancelPuuid, 220L, 6)
         riotBackend.ranksByRegionPuuid["$region|$cancelPuuid"] = emptyList()
-        riotBackend.matchesById[cancelMatchId] = buildSeasonalMatch(cancelPuuid, 1, baseNowMs)
+        riotBackend.matchesById[cancelMatchId] = buildSeasonalMatch(cancelPuuid, 1, baseNowMs, prefix = "CANCEL")
         riotBackend.matchIdsPagesGenerator[cancelPuuid] = { _, _ -> listOf(cancelMatchId) }
         riotBackend.onBeforeEndpoint = { tag, uri ->
             if (tag == "summoner-v4" && uri.path.endsWith(cancelPuuid)) {
@@ -1178,8 +1195,12 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
             soleEntered.await()
             soleCaller.cancel()
             soleHold.complete(Unit)
+            soleCaller.join()
             val deadline = System.currentTimeMillis() + 2_000L
-            while (System.currentTimeMillis() < deadline && redis.store.containsKey("lock:profile:euw1:$soleCancelPuuid")) {
+            while (System.currentTimeMillis() < deadline &&
+                (redis.store.containsKey("lock:profile:euw1:$soleCancelPuuid") ||
+                    limiter.getVerificationSnapshot(region).activeUserRequests > 0)
+            ) {
                 delay(20)
             }
         }
@@ -1203,7 +1224,7 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
             timeProvider = clock,
             playerSeasonStatsRepository = seasonRepo,
             transactionTemplate = noOpTransactionTemplate(),
-            objectMapper = mapper
+            objectMapper = mapper, memoryStatsProvider = healthyContainerMemoryStats
         )
 
         // Seed 250 matches in FakeRiotHttpBackend + Redis so match hydration is fast
@@ -1285,4 +1306,826 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
         missingUpstreamOutcome.pagesFetched shouldBe 3 // Did NOT stop on page 1; paginated all upstream pages!
         missingUpstreamOutcome.matchIds.contains("EUW1_250") shouldBe false // Did NOT falsely splice missing EUW1_250!
     }
+
+    test("Strict atomic 512 Riot-ID cap & 64 compact Redis-only season marker cap under concurrent admissions, retained-byte bounds, and 30m owner identity-age SWR contract") {
+        val baseNowMs = Instant.parse("2026-11-11T12:00:00Z").toEpochMilli()
+        val clock = MutableClock(baseNowMs)
+        val region = "euw1"
+        val riotBackend = FakeRiotHttpBackend(mapper)
+        val redis = InMemoryLatencyRedisHarness(mapper)
+        val limiter = RiotApiRateLimiter(clock)
+        val riotService = RiotApiService(riotBackend.buildRestClient(), limiter, RestClient.create(), clock)
+        val (seasonRepo, _) = inMemorySeasonRepo()
+        val cacheService = PlayerCacheService(
+            redisCacheService = redis.service,
+            riotApiService = riotService,
+            indexedPlayerRepository = mockk(relaxed = true),
+            timeProvider = clock,
+            playerSeasonStatsRepository = seasonRepo,
+            transactionTemplate = noOpTransactionTemplate(),
+            objectMapper = mapper, memoryStatsProvider = healthyContainerMemoryStats
+        )
+        val profileService = SummonerProfileService(riotService, cacheService)
+
+        // 1. Multi-thread concurrent Riot-ID admissions (64 coroutines x 32 = 2,048 admissions) MUST never exceed 512 at any instant
+        val maxObservedRiotEntries = AtomicLong(0L)
+        val stopSampling = AtomicBoolean(false)
+        withContext(Dispatchers.Default) {
+            val sampler = async {
+                while (!stopSampling.get()) {
+                    val cur = cacheService.getInMemoryIndexTelemetry()["riotIdIndexEntries"] ?: 0L
+                    maxObservedRiotEntries.accumulateAndGet(cur, ::maxOf)
+                    Thread.yield()
+                }
+            }
+            val workers = (1..64).map { workerIdx ->
+                async {
+                    for (itemIdx in 1..32) {
+                        val idNum = (workerIdx - 1) * 32 + itemIdx
+                        cacheService.recordVerifiedRiotIdOwner(
+                            region = region,
+                            queriedName = "ConcurrentUser$idNum",
+                            queriedTag = "EUW",
+                            canonicalName = "ConcurrentUser$idNum",
+                            canonicalTag = "EUW",
+                            verifiedPuuid = "concurrent-puuid-$idNum".padEnd(78, 'x')
+                        )
+                    }
+                }
+            }
+            workers.map { it.await() }
+            stopSampling.set(true)
+            sampler.await()
+        }
+        val finalIndexTelemetry = cacheService.getInMemoryIndexTelemetry()
+        maxObservedRiotEntries.get() shouldBeLessThanOrEqualTo 512L
+        finalIndexTelemetry["riotIdIndexEntries"] shouldBe 512L
+        finalIndexTelemetry["riotIdIndexEstimatedRetainedBytes"]!! shouldBeLessThanOrEqualTo (256L * 1024L) // <= 256 KiB at full 512 capacity
+        finalIndexTelemetry["verifiedRedisSeasonsEntries"] shouldBe 0L // Durable DB mode retains 0 Redis-only markers
+
+        // 2. Redis-only fallback mode (playerSeasonStatsRepository = null): concurrent 96-player refreshes + 2,100-ID capped season
+        //    with 80 excluded matches -> strict atomic <= 64 cap and <= 320 KiB total retained bytes (vs ~85 MiB if orderedMatchIds were retained)
+        val redisOnlyCache = PlayerCacheService(
+            redisCacheService = redis.service,
+            riotApiService = riotService,
+            indexedPlayerRepository = mockk(relaxed = true),
+            timeProvider = clock,
+            playerSeasonStatsRepository = null,
+            transactionTemplate = null,
+            objectMapper = mapper, memoryStatsProvider = healthyContainerMemoryStats
+        )
+        for (i in 1..96) {
+            val p = "ro-conc-puuid-$i".padEnd(78, 'p')
+            riotBackend.summonersByRegionPuuid["$region|$p"] = SummonerDto("s-ro-$i", p, 100L + i, 1)
+            riotBackend.ranksByRegionPuuid["$region|$p"] = emptyList()
+            val mId = "ROCONC_${i}_1"
+            val mDto = buildSeasonalMatch(p, 1, baseNowMs, prefix = "ROCONC_$i")
+            riotBackend.matchesById[mId] = mDto
+            redis.service.set("match:euw1:$mId", mDto, Duration.ofDays(60))
+            riotBackend.matchIdsPagesGenerator[p] = { start, _ -> if (start == 0) listOf(mId) else emptyList() }
+        }
+
+        val maxObservedSeasonMarkers = AtomicLong(0L)
+        val stopMarkerSampling = AtomicBoolean(false)
+        withContext(Dispatchers.Default) {
+            val markerSampler = async {
+                while (!stopMarkerSampling.get()) {
+                    val cur = redisOnlyCache.getInMemoryIndexTelemetry()["verifiedRedisSeasonsEntries"] ?: 0L
+                    maxObservedSeasonMarkers.accumulateAndGet(cur, ::maxOf)
+                    Thread.yield()
+                }
+            }
+            val refreshWorkers = (1..16).map { w ->
+                async {
+                    for (k in 1..6) {
+                        val idx = (w - 1) * 6 + k
+                        val p = "ro-conc-puuid-$idx".padEnd(78, 'p')
+                        redisOnlyCache.getPlayerProfile(p, region, "RoConc$idx", "EUW", explicitRefresh = true)
+                    }
+                }
+            }
+            refreshWorkers.map { it.await() }
+            stopMarkerSampling.set(true)
+            markerSampler.await()
+        }
+        maxObservedSeasonMarkers.get() shouldBeLessThanOrEqualTo 64L
+        redisOnlyCache.getInMemoryIndexTelemetry()["verifiedRedisSeasonsEntries"] shouldBe 64L
+
+        // Seed a 2,100-game capped Redis-only player + 80 Arena (queueId=1700) excluded matches to validate worst-case marker size & rolling-hash anchor
+        val ro2100Puuid = "ro-2100-capped-puuid".padEnd(78, 'z')
+        riotBackend.summonersByRegionPuuid["$region|$ro2100Puuid"] = SummonerDto("s-ro-2100", ro2100Puuid, 777L, 9)
+        riotBackend.ranksByRegionPuuid["$region|$ro2100Puuid"] = emptyList()
+        val ro2100Batch = LinkedHashMap<String, MatchDto>(60)
+        for (idx in 1..2_102) {
+            val m = buildSeasonalMatch(ro2100Puuid, idx, baseNowMs, prefix = "RO2100")
+            riotBackend.matchesById["RO2100_$idx"] = m
+            if (idx <= 2_100) {
+                ro2100Batch["match:euw1:RO2100_$idx"] = m
+                if (ro2100Batch.size == 50) {
+                    redis.service.setAll(ro2100Batch, Duration.ofDays(60))
+                    ro2100Batch.clear()
+                }
+            }
+        }
+        if (ro2100Batch.isNotEmpty()) {
+            redis.service.setAll(ro2100Batch, Duration.ofDays(60))
+            ro2100Batch.clear()
+        }
+        for (exIdx in 1..64) {
+            val baseExcluded = buildSeasonalMatch(ro2100Puuid, exIdx, baseNowMs, prefix = "ROEX")
+            val exDto = baseExcluded.copy(info = baseExcluded.info!!.copy(gameDuration = 0L))
+            riotBackend.matchesById["ROEX_$exIdx"] = exDto
+            redis.service.set("match:euw1:ROEX_$exIdx", exDto, Duration.ofDays(60))
+        }
+        var roMaxIdx = 1_900
+        riotBackend.matchIdsPagesGenerator[ro2100Puuid] = { start, count ->
+            val all = buildList {
+                addAll((roMaxIdx downTo 1_701).map { "RO2100_$it" }) // 200+ consecutive seasonal IDs on Pages 0..1
+                addAll((1..64).map { "ROEX_$it" })                   // 64 excluded remakes (exact MAX_REDIS_ONLY_EXCLUDED_IDS worst-case marker)
+                addAll((1_700 downTo 1).map { "RO2100_$it" })        // Remaining seasonal tail (1,964 total IDs)
+            }
+            if (start >= all.size) emptyList() else all.subList(start, minOf(start + count, all.size))
+        }
+        val roInitial = redisOnlyCache.getPlayerProfile(ro2100Puuid, region, "Ro2100", "EUW", explicitRefresh = true)
+        roInitial?.totalMatches shouldBe 1_900
+
+        val roTelemetry = redisOnlyCache.getInMemoryIndexTelemetry()
+        roTelemetry["verifiedRedisSeasonsEntries"] shouldBe 64L
+        roTelemetry["verifiedRedisSeasonsEstimatedRetainedBytes"]!! shouldBeLessThanOrEqualTo (320L * 1024L) // <= 320 KiB worst-case!
+
+        // Incremental +2 seasonal games on Redis-only player: compact marker + cachedProfile.allMatchIds bridges in 1 page!
+        clock.advanceBy(120_000L)
+        roMaxIdx = 1_902
+        riotBackend.resetCounters()
+        val roIncremental = redisOnlyCache.getPlayerProfile(ro2100Puuid, region, "Ro2100", "EUW", explicitRefresh = true)
+        roIncremental?.totalMatches shouldBe 1_902
+        riotBackend.matchIdsPageCalls.get() shouldBe 1
+
+        // Interior tamper of cachedProfile.allMatchIds (same count, head, tail, but swapped interior elements) MUST fail rolling-hash check!
+        val cachedRo = redis.service.get("player:profile:euw1:$ro2100Puuid", SummonerProfileDto::class.java)!!
+        val tamperedIds = cachedRo.allMatchIds.toMutableList().apply {
+            val tmp = this[500]
+            this[500] = this[501]
+            this[501] = tmp
+        }
+        redis.service.set("player:profile:euw1:$ro2100Puuid", cachedRo.copy(allMatchIds = tamperedIds), Duration.ofDays(14))
+        clock.advanceBy(120_000L)
+        riotBackend.resetCounters()
+        val roAfterTamper = redisOnlyCache.getPlayerProfile(ro2100Puuid, region, "Ro2100", "EUW", explicitRefresh = true)
+        roAfterTamper?.totalMatches shouldBe 1_902
+        (riotBackend.matchIdsPageCalls.get() >= 20) shouldBe true // Refused tampered cachedProfile.allMatchIds and re-paginated!
+
+        // 3. Identity age (`ownerVerifiedAtMs`) non-extension on hits/PUUID refreshes & 30m max unverified SWR cap
+        val ownerClock = MutableClock(baseNowMs)
+        val ownerLimiter = RiotApiRateLimiter(ownerClock)
+        val ownerRiot = RiotApiService(riotBackend.buildRestClient(), ownerLimiter, RestClient.create(), ownerClock)
+        val (ownerSeasonRepo, _) = inMemorySeasonRepo()
+        val ownerCache = PlayerCacheService(
+            redisCacheService = redis.service,
+            riotApiService = ownerRiot,
+            indexedPlayerRepository = mockk(relaxed = true),
+            timeProvider = ownerClock,
+            playerSeasonStatsRepository = ownerSeasonRepo,
+            transactionTemplate = noOpTransactionTemplate(),
+            objectMapper = mapper, memoryStatsProvider = healthyContainerMemoryStats
+        )
+        val ownerProfileSvc = SummonerProfileService(ownerRiot, ownerCache)
+
+        riotBackend.accountsByRiotId["europe|ownerswr|tag"] = AccountDto("puuid-owner-1", "OwnerSwr", "TAG")
+        riotBackend.summonersByRegionPuuid["euw1|puuid-owner-1"] = SummonerDto("s-o1", "puuid-owner-1", 400L, 4)
+        riotBackend.summonersByRegionPuuid["euw1|puuid-owner-2"] = SummonerDto("s-o2", "puuid-owner-2", 500L, 5)
+        riotBackend.matchIdsPagesGenerator["puuid-owner-1"] = { start, _ -> if (start == 0) listOf("OWN1_1") else emptyList() }
+        riotBackend.matchIdsPagesGenerator["puuid-owner-2"] = { start, _ -> if (start == 0) listOf("OWN2_1") else emptyList() }
+        riotBackend.matchesById["OWN1_1"] = buildSeasonalMatch("puuid-owner-1", 1, baseNowMs, prefix = "OWN1")
+        riotBackend.matchesById["OWN2_1"] = buildSeasonalMatch("puuid-owner-2", 1, baseNowMs, prefix = "OWN2")
+
+        // t = 0: initial cold lookup authenticates OwnerSwr#TAG -> puuid-owner-1 via Account-V1
+        val initialOwner = ownerProfileSvc.getSummonerProfile("euw1", "OwnerSwr", "TAG", explicitRefresh = false)
+        initialOwner?.puuid shouldBe "puuid-owner-1"
+
+        // Upstream re-assigns OwnerSwr#TAG -> puuid-owner-2 right after t = 0
+        riotBackend.accountsByRiotId["europe|ownerswr|tag"] = AccountDto("puuid-owner-2", "OwnerSwr", "TAG")
+
+        // Keep player:profile:euw1:puuid-owner-1 `lastRefreshed` fresh via PUUID-only refreshes (no Account-V1!)
+        // and serve repeated warm Riot-ID hits at +4m, +12m, +20m, +28m: hits MUST NOT extend `ownerVerifiedAtMs`!
+        for (step in 1..4) {
+            ownerClock.advanceBy(4 * 60_000L) // +4m, +11m, +18m, +25m
+            riotBackend.resetCounters()
+            val hit = ownerProfileSvc.getSummonerProfile("euw1", "OwnerSwr", "TAG", explicitRefresh = false)
+            hit?.puuid shouldBe "puuid-owner-1"
+            riotBackend.accountByRiotIdCalls.get() shouldBe 0
+            if (step < 4) {
+                ownerClock.advanceBy(3 * 60_000L) // +7m, +14m, +21m: PUUID-only refresh keeps profile <5m fresh without Account-V1
+                ownerCache.refreshPlayerProfile("puuid-owner-1", "euw1", "OwnerSwr", "TAG")
+            }
+        }
+        // Keep profile fresh one more time at t = +28m (`lastRefreshed` = +28m), then advance to t = +31m (`profile` is 3m fresh,
+        // NOT >5m stale, YET `ownerVerifiedAtMs` is 31m >= 30m old!): MUST force foreground Account-V1 re-authentication!
+        ownerClock.advanceBy(3 * 60_000L) // t = +28m total
+        ownerCache.refreshPlayerProfile("puuid-owner-1", "euw1", "OwnerSwr", "TAG")
+        ownerClock.advanceBy(3 * 60_000L) // t = +31m total (>= 30m MAX_UNVERIFIED_OWNER_SWR_AGE)
+        riotBackend.resetCounters()
+        val reauthedOwner = ownerProfileSvc.getSummonerProfile("euw1", "OwnerSwr", "TAG", explicitRefresh = false)
+        riotBackend.accountByRiotIdCalls.get() shouldBe 1 // Forced foreground Account-V1 re-authentication!
+        reauthedOwner?.puuid shouldBe "puuid-owner-2"
+
+        println(
+            """
+            [MEMORY_AND_IDENTITY_BOUND_SUMMARY]
+              Riot-ID Index (512 concurrent cap): maxObserved=${maxObservedRiotEntries.get()}, finalEntries=${finalIndexTelemetry["riotIdIndexEntries"]}, estRetainedBytes=${finalIndexTelemetry["riotIdIndexEstimatedRetainedBytes"]}
+              Redis-Only Season Markers (64 concurrent cap, 1900g+64ex): maxObserved=${maxObservedSeasonMarkers.get()}, finalEntries=${roTelemetry["verifiedRedisSeasonsEntries"]}, estRetainedBytes=${roTelemetry["verifiedRedisSeasonsEstimatedRetainedBytes"]} (0 bytes in DB mode)
+              Identity Age Contract: hits/PUUID-refreshes do not extend ownerVerifiedAtMs; forced Account-V1 re-auth verified at >=30m
+            """.trimIndent()
+        )
+    }
+
+    test("Real StringRedisTemplate pipeline/sub-batch/TTL/fallback contract and real loopback TCP HTTP RestClient profile contract") {
+        val baseNowMs = Instant.parse("2026-11-11T12:00:00Z").toEpochMilli()
+        val clock = MutableClock(baseNowMs)
+
+        // 1. Real StringRedisTemplate wired to a wire-level RedisConnectionFactory + RedisConnection recording raw bytes, TTLs, and pipelines
+        val rawRedisBytes = ConcurrentHashMap<String, ByteArray>()
+        val recordedTtlMs = ConcurrentHashMap<String, Long>()
+        val recordedSetOptions = ConcurrentHashMap<String, RedisStringCommands.SetOption>()
+        val openPipelineCalls = AtomicInteger(0)
+        val closePipelineCalls = AtomicInteger(0)
+        val directNonPipelinedSets = AtomicInteger(0)
+        val pipelineBatchSizes = java.util.concurrent.CopyOnWriteArrayList<Int>()
+        val failPipeline = AtomicBoolean(false)
+
+        val connectionFactory = object : RedisConnectionFactory {
+            override fun getConnection(): RedisConnection {
+                val inPipeline = AtomicBoolean(false)
+                val queuedInBatch = AtomicInteger(0)
+                lateinit var connProxy: Any
+                val handler = java.lang.reflect.InvocationHandler { _, method, args ->
+                    when (method.name) {
+                        "stringCommands", "keyCommands" -> connProxy
+                        "isPipelined" -> inPipeline.get()
+                        "isQueueing", "isClosed" -> false
+                        "close" -> null
+                        "openPipeline" -> {
+                            if (failPipeline.get()) {
+                                throw org.springframework.data.redis.RedisSystemException(
+                                    "ERR simulated pipeline failure",
+                                    RuntimeException("simulated")
+                                )
+                            }
+                            inPipeline.set(true)
+                            queuedInBatch.set(0)
+                            openPipelineCalls.incrementAndGet()
+                            null
+                        }
+                        "closePipeline" -> {
+                            inPipeline.set(false)
+                            closePipelineCalls.incrementAndGet()
+                            pipelineBatchSizes.add(queuedInBatch.get())
+                            emptyList<Any>()
+                        }
+                        "set" -> {
+                            val k = String(args[0] as ByteArray, StandardCharsets.UTF_8)
+                            val v = (args[1] as ByteArray).copyOf()
+                            val exp = args.getOrNull(2) as? Expiration
+                            val opt = args.getOrNull(3) as? RedisStringCommands.SetOption
+                            val ttl = if (exp == null || exp.isPersistent) -1L else exp.expirationTimeInMilliseconds
+                            if (opt == RedisStringCommands.SetOption.SET_IF_ABSENT) {
+                                val inserted = rawRedisBytes.putIfAbsent(k, v) == null
+                                if (inserted) recordedTtlMs[k] = ttl
+                                if (inPipeline.get()) null else inserted
+                            } else {
+                                rawRedisBytes[k] = v
+                                recordedTtlMs[k] = ttl
+                                if (opt != null) recordedSetOptions[k] = opt
+                                if (inPipeline.get()) {
+                                    queuedInBatch.incrementAndGet()
+                                    null
+                                } else {
+                                    directNonPipelinedSets.incrementAndGet()
+                                    true
+                                }
+                            }
+                        }
+                        "setEx" -> {
+                            val k = String(args[0] as ByteArray, StandardCharsets.UTF_8)
+                            val secs = args[1] as Long
+                            val v = (args[2] as ByteArray).copyOf()
+                            rawRedisBytes[k] = v
+                            recordedTtlMs[k] = secs * 1_000L
+                            directNonPipelinedSets.incrementAndGet()
+                            if (inPipeline.get()) null else true
+                        }
+                        "pSetEx" -> {
+                            val k = String(args[0] as ByteArray, StandardCharsets.UTF_8)
+                            val ms = args[1] as Long
+                            val v = (args[2] as ByteArray).copyOf()
+                            rawRedisBytes[k] = v
+                            recordedTtlMs[k] = ms
+                            directNonPipelinedSets.incrementAndGet()
+                            if (inPipeline.get()) null else true
+                        }
+                        "setNX" -> {
+                            val k = String(args[0] as ByteArray, StandardCharsets.UTF_8)
+                            val v = (args[1] as ByteArray).copyOf()
+                            val inserted = rawRedisBytes.putIfAbsent(k, v) == null
+                            if (inPipeline.get()) null else inserted
+                        }
+                        "get" -> {
+                            val k = String(args[0] as ByteArray, StandardCharsets.UTF_8)
+                            rawRedisBytes[k]?.copyOf()
+                        }
+                        "mGet" -> {
+                            @Suppress("UNCHECKED_CAST")
+                            val keysArr = args[0] as Array<ByteArray>
+                            keysArr.map { rawRedisBytes[String(it, StandardCharsets.UTF_8)]?.copyOf() }
+                        }
+                        "del" -> {
+                            @Suppress("UNCHECKED_CAST")
+                            val keysArr = args[0] as Array<ByteArray>
+                            keysArr.count { rawRedisBytes.remove(String(it, StandardCharsets.UTF_8)) != null }.toLong()
+                        }
+                        "toString" -> "RecordingRedisConnectionProxy"
+                        "hashCode" -> System.identityHashCode(connProxy)
+                        "equals" -> args?.getOrNull(0) === connProxy
+                        else -> throw UnsupportedOperationException("Unexpected RedisConnection method: ${method.name}")
+                    }
+                }
+                connProxy = java.lang.reflect.Proxy.newProxyInstance(
+                    RedisConnection::class.java.classLoader,
+                    arrayOf(
+                        RedisConnection::class.java,
+                        RedisStringCommands::class.java,
+                        org.springframework.data.redis.connection.RedisKeyCommands::class.java
+                    ),
+                    handler
+                )
+                return connProxy as RedisConnection
+            }
+
+            override fun getConvertPipelineAndTxResults(): Boolean = true
+            override fun getClusterConnection() = throw UnsupportedOperationException()
+            override fun getSentinelConnection() = throw UnsupportedOperationException()
+            override fun translateExceptionIfPossible(ex: RuntimeException) =
+                ex as? org.springframework.dao.DataAccessException
+                    ?: org.springframework.data.redis.RedisSystemException(ex.message ?: "redis error", ex)
+        }
+
+        val realTemplate = StringRedisTemplate(connectionFactory).apply { afterPropertiesSet() }
+        val realRedisService = RedisCacheService(realTemplate, mapper)
+
+        // A. 60-entry setAll contract: splits into 3 bounded pipeline flushes (25 + 25 + 10), GZIP+Base64 wire format, exact 60d TTL, UPSERT
+        val sixtyMatches = LinkedHashMap<String, MatchDto>()
+        for (idx in 1..60) {
+            sixtyMatches["match:euw1:WIRE_$idx"] = buildSeasonalMatch("wire-puuid", idx, baseNowMs, prefix = "WIRE")
+        }
+        realRedisService.setAll(sixtyMatches, Duration.ofDays(60))
+
+        openPipelineCalls.get() shouldBe 3
+        closePipelineCalls.get() shouldBe 3
+        pipelineBatchSizes.toList() shouldBe listOf(25, 25, 10)
+        directNonPipelinedSets.get() shouldBe 0
+        val wireTel = realRedisService.getPipelineWriteTelemetry()
+        wireTel.pipelineFlushes shouldBe 3L
+        wireTel.fallbackWrites shouldBe 0L
+        wireTel.maxObservedSubBatchBytes shouldBeLessThanOrEqualTo (256L * 1024L)
+        (wireTel.maxObservedSubBatchBytes > 0L) shouldBe true
+
+        // Verify raw wire payload is "GZIP_B64:" + valid Base64 + GZIP magic bytes (0x1f, 0x8b) + exact 60-day TTL (5,184,000,000 ms)
+        val rawSampleString = String(rawRedisBytes["match:euw1:WIRE_1"]!!, StandardCharsets.UTF_8)
+        rawSampleString.startsWith("GZIP_B64:") shouldBe true
+        val decodedCompressed = java.util.Base64.getDecoder().decode(rawSampleString.removePrefix("GZIP_B64:"))
+        (decodedCompressed[0].toInt() and 0xFF) shouldBe 0x1F
+        (decodedCompressed[1].toInt() and 0xFF) shouldBe 0x8B
+        val inflatedJson = java.util.zip.GZIPInputStream(ByteArrayInputStream(decodedCompressed)).use {
+            String(it.readBytes(), StandardCharsets.UTF_8)
+        }
+        inflatedJson.contains("\"matchId\":\"WIRE_1\"") shouldBe true
+        recordedTtlMs["match:euw1:WIRE_1"] shouldBe Duration.ofDays(60).toMillis()
+        recordedSetOptions["match:euw1:WIRE_1"] shouldBe RedisStringCommands.SetOption.UPSERT
+
+        // Round-trip all 60 entries via real multiGet and single get
+        val roundTripped = realRedisService.multiGet(sixtyMatches.keys.toList(), MatchDto::class.java)
+        roundTripped.size shouldBe 60
+        roundTripped["match:euw1:WIRE_60"]?.metadata?.matchId shouldBe "WIRE_60"
+        realRedisService.get("match:euw1:WIRE_30", MatchDto::class.java)?.metadata?.matchId shouldBe "WIRE_30"
+
+        // B. Byte-cap sub-batching contract: 8 incompressible ~50 KiB payloads (~400 KiB > 256 KiB cap) split into multiple flushes <= 256 KiB
+        val rng = java.util.Random(42L)
+        val incompressibleEntries = LinkedHashMap<String, Map<String, String>>()
+        for (i in 1..8) {
+            val randomBytes = ByteArray(38_000).also { rng.nextBytes(it) }
+            incompressibleEntries["blob:test:$i"] = mapOf("payload" to java.util.Base64.getEncoder().encodeToString(randomBytes))
+        }
+        pipelineBatchSizes.clear()
+        realRedisService.setAll(incompressibleEntries, Duration.ofMinutes(10))
+        (pipelineBatchSizes.size >= 2) shouldBe true // Split strictly by 256 KiB byte cap even though 8 < 25 entries!
+        realRedisService.getPipelineWriteTelemetry().lastCallPeakSubBatchBytes shouldBeLessThanOrEqualTo (256L * 1024L)
+
+        // C. Pipeline failure fallback contract: when executePipelined throws, setAll falls back cleanly to per-key ValueOperations.set with exact TTL
+        failPipeline.set(true)
+        directNonPipelinedSets.set(0)
+        val fallbackEntries = LinkedHashMap<String, MatchDto>()
+        for (idx in 1..6) {
+            fallbackEntries["match:euw1:FB_$idx"] = buildSeasonalMatch("wire-puuid", idx, baseNowMs, prefix = "FB")
+        }
+        realRedisService.setAll(fallbackEntries, Duration.ofDays(60))
+        failPipeline.set(false)
+
+        directNonPipelinedSets.get() shouldBe 6
+        realRedisService.getPipelineWriteTelemetry().fallbackWrites shouldBe 6L
+        recordedTtlMs["match:euw1:FB_6"] shouldBe Duration.ofDays(60).toMillis()
+        realRedisService.multiGet(fallbackEntries.keys.toList(), MatchDto::class.java)["match:euw1:FB_6"]?.metadata?.matchId shouldBe "FB_6"
+
+        // 2. Real loopback TCP HTTP server (`HttpServer` on 127.0.0.1:0) + real Spring `RestClient` + real `RedisCacheService` end-to-end profile flow
+        val tcpPuuid = "tcp-http-puuid-001"
+        val tcpHttpCalls = AtomicInteger(0)
+        val tcpMatchIdsPageCalls = AtomicInteger(0)
+        var tcpMaxIdx = 5
+        val tcpMatches = ConcurrentHashMap<String, MatchDto>()
+        for (idx in 1..7) {
+            tcpMatches["EUW1_TCP_$idx"] = buildSeasonalMatch(tcpPuuid, idx, baseNowMs, prefix = "EUW1_TCP")
+        }
+
+        val httpServer = com.sun.net.httpserver.HttpServer.create(java.net.InetSocketAddress("127.0.0.1", 0), 0)
+        httpServer.createContext("/") { exchange ->
+            tcpHttpCalls.incrementAndGet()
+            val path = exchange.requestURI.path
+            val query = exchange.requestURI.rawQuery ?: ""
+            val bodyBytes: ByteArray? = when {
+                path.startsWith("/riot/account/v1/accounts/by-riot-id/") ->
+                    mapper.writeValueAsBytes(AccountDto(tcpPuuid, "TcpPlayer", "EUW"))
+                path.startsWith("/lol/summoner/v4/summoners/by-puuid/") ->
+                    mapper.writeValueAsBytes(SummonerDto("s-tcp", tcpPuuid, 350L, 21))
+                path.startsWith("/lol/league/v4/entries/by-puuid/") ->
+                    """[{"leagueId":"lg-1","queueType":"RANKED_SOLO_5x5","tier":"MASTER","rank":"I","puuid":"$tcpPuuid","summonerName":"TcpPlayer","leaguePoints":120,"wins":40,"losses":30,"veteran":false,"inactive":false,"freshBlood":false,"hotStreak":true}]"""
+                        .toByteArray(StandardCharsets.UTF_8)
+                path.contains("/lol/match/v5/matches/by-puuid/") && path.endsWith("/ids") -> {
+                    tcpMatchIdsPageCalls.incrementAndGet()
+                    val params = query.split("&").filter { it.contains("=") }.associate {
+                        val (k, v) = it.split("=", limit = 2)
+                        k to v
+                    }
+                    val start = params["start"]?.toIntOrNull() ?: 0
+                    val count = params["count"]?.toIntOrNull() ?: 100
+                    val all = (tcpMaxIdx downTo 1).map { "EUW1_TCP_$it" }
+                    val slice = if (start >= all.size) emptyList() else all.subList(start, minOf(start + count, all.size))
+                    mapper.writeValueAsBytes(slice)
+                }
+                path.startsWith("/lol/match/v5/matches/") -> {
+                    val mId = path.substringAfterLast("/")
+                    tcpMatches[mId]?.let { mapper.writeValueAsBytes(it) }
+                }
+                else -> null
+            }
+            exchange.responseHeaders.add("Content-Type", "application/json")
+            exchange.responseHeaders.add("X-App-Rate-Limit", "500:1,6000:120")
+            exchange.responseHeaders.add("X-App-Rate-Limit-Count", "1:1,1:120")
+            if (bodyBytes != null) {
+                exchange.sendResponseHeaders(200, bodyBytes.size.toLong())
+                exchange.responseBody.use { it.write(bodyBytes) }
+            } else {
+                val err = """{"status":{"status_code":404}}""".toByteArray(StandardCharsets.UTF_8)
+                exchange.sendResponseHeaders(404, err.size.toLong())
+                exchange.responseBody.use { it.write(err) }
+            }
+        }
+        httpServer.start()
+        try {
+            val localPort = httpServer.address.port
+            val underlyingFactory = org.springframework.http.client.SimpleClientHttpRequestFactory().apply {
+                setProxy(java.net.Proxy.NO_PROXY)
+                setConnectTimeout(Duration.ofSeconds(5))
+                setReadTimeout(Duration.ofSeconds(5))
+            }
+            val loopbackRoutingFactory = ClientHttpRequestFactory { originalUri, httpMethod ->
+                val rewrittenUri = URI(
+                    "http",
+                    null,
+                    "127.0.0.1",
+                    localPort,
+                    originalUri.rawPath,
+                    originalUri.rawQuery,
+                    null
+                )
+                underlyingFactory.createRequest(rewrittenUri, httpMethod).apply {
+                    headers.set("X-Original-Host", originalUri.host ?: "localhost")
+                }
+            }
+            val realLoopbackRestClient = RestClient.builder().requestFactory(loopbackRoutingFactory).build()
+            val tcpLimiter = RiotApiRateLimiter(clock)
+            val tcpRiotService = RiotApiService(realLoopbackRestClient, tcpLimiter, RestClient.create(), clock)
+            val (tcpSeasonRepo, _) = inMemorySeasonRepo()
+            val tcpCacheService = PlayerCacheService(
+                redisCacheService = realRedisService,
+                riotApiService = tcpRiotService,
+                indexedPlayerRepository = mockk(relaxed = true),
+                timeProvider = clock,
+                playerSeasonStatsRepository = tcpSeasonRepo,
+                transactionTemplate = noOpTransactionTemplate(),
+                objectMapper = mapper, memoryStatsProvider = healthyContainerMemoryStats
+            )
+            val tcpProfileService = SummonerProfileService(tcpRiotService, tcpCacheService)
+
+            // Cold load over real loopback TCP HTTP + real StringRedisTemplate pipeline
+            openPipelineCalls.set(0)
+            val coldTcpProfile = tcpProfileService.getSummonerProfile("euw1", "TcpPlayer", "EUW", explicitRefresh = false)
+            coldTcpProfile?.totalMatches shouldBe 5
+            coldTcpProfile?.soloQueueRank?.tier shouldBe "MASTER"
+            tcpHttpCalls.get() shouldBe 9 // 1 account + 1 summoner + 1 league + 1 matchIds + 5 matches over real TCP HTTP
+            openPipelineCalls.get() shouldBe 1 // 5 matches written in 1 real Redis pipeline flush
+            recordedTtlMs["match:euw1:EUW1_TCP_1"] shouldBe Duration.ofDays(60).toMillis()
+            recordedTtlMs["player:profile:euw1:$tcpPuuid"] shouldBe Duration.ofDays(14).toMillis()
+
+            // Warm <5m load: 0 real TCP HTTP calls
+            clock.advanceBy(30_000L)
+            tcpHttpCalls.set(0)
+            val warmTcpProfile = tcpProfileService.getSummonerProfile("euw1", "TcpPlayer", "EUW", explicitRefresh = false)
+            warmTcpProfile?.totalMatches shouldBe 5
+            tcpHttpCalls.get() shouldBe 0
+
+            // Stale >=5m (<30m) SWR load + +2 new matches: 0 foreground TCP HTTP calls, LOW background refresh reconciles to 7 matches
+            clock.advanceBy(360_000L)
+            tcpMaxIdx = 7
+            tcpHttpCalls.set(0)
+            tcpMatchIdsPageCalls.set(0)
+            val staleTcpProfile = tcpProfileService.getSummonerProfile("euw1", "TcpPlayer", "EUW", explicitRefresh = false)
+            staleTcpProfile?.totalMatches shouldBe 5
+            withContext(Dispatchers.IO) {
+                val deadline = System.currentTimeMillis() + 3_000L
+                while (System.currentTimeMillis() < deadline &&
+                    (realRedisService.get("player:profile:euw1:$tcpPuuid", SummonerProfileDto::class.java)?.totalMatches ?: 0) < 7
+                ) {
+                    delay(20)
+                }
+            }
+            val refreshedAfterSwr = tcpProfileService.getSummonerProfile("euw1", "TcpPlayer", "EUW", explicitRefresh = false)
+            refreshedAfterSwr?.totalMatches shouldBe 7
+            tcpMatchIdsPageCalls.get() shouldBe 1 // Anchored incremental splice over real TCP HTTP!
+        } finally {
+            httpServer.stop(0)
+        }
+    }
+
+    test("Plain-League player error/status copy never leaks internal field/enum/schema/cache names and preserves unknown vs zero") {
+        val baseNowMs = Instant.parse("2026-08-18T12:00:00Z").toEpochMilli()
+        val clock = MutableClock(baseNowMs)
+        val handler = com.pride.summoner_searcher_api.handler.GlobalExceptionHandler()
+
+        // 1. Error handler contract: internal JSON keys unchanged (`timestamp`, `status`, `error`, `message`),
+        //    `failedUrl` and internal schema/variable/cache/upstream identifiers never leaked to players.
+        val toxicUrl = "https://euw1.api.riotgames.com/lol/match/v5/matches/by-puuid/secret-puuid-999/ids?queue=420&start=0&count=100"
+        val toxicReason = "DEADLINE_EXCEEDED: historyComplete=false pendingMatchIds=300 status_code=429 redisCacheService verifiedCompleteRedisOnlySeasons"
+        val expectedCopyByCode = mapOf(
+            404 to "Summoner Not Found",
+            429 to "Match History Busy",
+            503 to "League Servers Unavailable",
+            500 to "Profile Unavailable"
+        )
+        val forbiddenLeakTokens = listOf(
+            "failedUrl",
+            "secret-puuid-999",
+            "queue=420",
+            "api.riotgames.com",
+            "Riot API",
+            "DEADLINE_EXCEEDED",
+            "historyComplete",
+            "historyCapped",
+            "pendingMatchIds",
+            "excludedMatchIds",
+            "status_code",
+            "redisCacheService",
+            "verifiedCompleteRedisOnlySeasons",
+            "ownerVerifiedAtMs"
+        )
+
+        for ((code, expectedTitle) in expectedCopyByCode) {
+            val resp = handler.handleRiotApiStatusException(
+                com.pride.summoner_searcher_api.exception.RiotApiStatusException(
+                    statusCode = HttpStatus.valueOf(code),
+                    reason = toxicReason,
+                    url = toxicUrl
+                )
+            )
+            resp.statusCode.value() shouldBe code
+            val body = resp.body!!
+            body.keys shouldBe setOf("timestamp", "status", "error", "message")
+            body["status"] shouldBe code
+            body["error"] shouldBe expectedTitle
+            val json = mapper.writeValueAsString(body)
+            for (token in forbiddenLeakTokens) {
+                json.contains(token, ignoreCase = true) shouldBe false
+            }
+            (body["message"] as String).contains("_") shouldBe false
+        }
+
+        val timeoutResp = handler.handleResourceAccessException(
+            org.springframework.web.client.ResourceAccessException("I/O error on GET request for \"$toxicUrl\": Read timed out; redisCacheService")
+        )
+        timeoutResp.statusCode shouldBe HttpStatus.GATEWAY_TIMEOUT
+        val timeoutBody = timeoutResp.body!!
+        timeoutBody.keys shouldBe setOf("timestamp", "status", "error", "message")
+        timeoutBody["error"] shouldBe "Match History Timeout"
+        val timeoutJson = mapper.writeValueAsString(timeoutBody)
+        for (token in forbiddenLeakTokens) {
+            timeoutJson.contains(token, ignoreCase = true) shouldBe false
+        }
+
+        // 2. Status-V4 contract: raw snake_case enums (`in_progress`, `scheduled`, `warning`, `critical`)
+        //    map to plain League words while unknown `incident_severity` / `description` stay `null`.
+        val statusFactory = ClientHttpRequestFactory { uri, httpMethod ->
+            object : ClientHttpRequest {
+                private val reqHeaders = HttpHeaders()
+                private val reqBody = ByteArrayOutputStream()
+                override fun getMethod(): HttpMethod = httpMethod
+                override fun getURI(): URI = uri
+                override fun getAttributes(): MutableMap<String, Any> = HashMap()
+                override fun getHeaders(): HttpHeaders = reqHeaders
+                override fun getBody(): OutputStream = reqBody
+                override fun execute(): ClientHttpResponse {
+                    val payload = """
+                        {
+                          "name": "EU West",
+                          "locales": ["en_US"],
+                          "maintenances": [
+                            {
+                              "maintenance_status": "in_progress",
+                              "incident_severity": "warning",
+                              "titles": [{"locale": "en_US", "content": "Ranked Queue Maintenance"}],
+                              "updates": [{"id": 1, "author": "Riot", "translations": [{"locale": "en_US", "content": "Ranked Solo/Duo is temporarily offline for patch deploy."}]}],
+                              "platforms": ["windows", "macos"]
+                            },
+                            {
+                              "maintenance_status": "scheduled",
+                              "incident_severity": null,
+                              "titles": [],
+                              "updates": [],
+                              "platforms": ["windows"]
+                            }
+                          ],
+                          "incidents": [
+                            {
+                              "active": true,
+                              "incident_severity": "critical",
+                              "titles": [],
+                              "updates": [],
+                              "platforms": ["windows"]
+                            }
+                          ]
+                        }
+                    """.trimIndent().toByteArray(StandardCharsets.UTF_8)
+                    val respHeaders = HttpHeaders().apply {
+                        contentType = MediaType.APPLICATION_JSON
+                        set("X-App-Rate-Limit", "500:1,6000:120")
+                        set("X-App-Rate-Limit-Count", "1:1,1:120")
+                    }
+                    return object : ClientHttpResponse {
+                        override fun getStatusCode(): HttpStatus = HttpStatus.OK
+                        override fun getStatusText(): String = "OK"
+                        override fun close() {}
+                        override fun getBody(): InputStream = ByteArrayInputStream(payload)
+                        override fun getHeaders(): HttpHeaders = respHeaders
+                    }
+                }
+            }
+        }
+        val statusRiotService = RiotApiService(
+            RestClient.builder().requestFactory(statusFactory).build(),
+            RiotApiRateLimiter(clock),
+            RestClient.create(),
+            clock
+        )
+        val platformStatus = statusRiotService.getPlatformData("euw1")!!
+        platformStatus.maintenances.size shouldBe 2
+        platformStatus.maintenances[0].status shouldBe "In Progress"
+        platformStatus.maintenances[0].severity shouldBe "Warning"
+        platformStatus.maintenances[0].title shouldBe "Ranked Queue Maintenance"
+        platformStatus.maintenances[1].status shouldBe "Scheduled"
+        platformStatus.maintenances[1].severity shouldBe null // Unknown preserved as null, never "null" or "UNKNOWN"
+        platformStatus.maintenances[1].description shouldBe null // Unknown preserved as null
+        platformStatus.maintenances[1].title shouldBe "League Server Maintenance"
+        platformStatus.incidents[0].status shouldBe "Active"
+        platformStatus.incidents[0].severity shouldBe "Critical"
+        platformStatus.incidents[0].title shouldBe "League Server Notice"
+        platformStatus.incidents[0].description shouldBe null
+        val statusJson = mapper.writeValueAsString(platformStatus)
+        statusJson.contains("in_progress") shouldBe false
+        statusJson.contains("maintenance_status") shouldBe false
+        statusJson.contains("incident_severity") shouldBe false
+        statusJson.contains("No Title") shouldBe false
+
+        // 3. Unknown (`null`) vs Zero (`0`) preservation on profile loading:
+        //    3a. Cold Match-V5 page-0 failure with NO cache and either NO durable state OR an incomplete 0-game durable row
+        //        MUST return `null` (unknown) rather than fabricating `0` matches (`0W 0L`).
+        val unknownPuuid = "puuid-unknown-vs-zero-fail"
+        val failBackend = FakeRiotHttpBackend(mapper)
+        failBackend.accountsByRiotId["europe|unknownplayer|euw"] = AccountDto(unknownPuuid, "UnknownPlayer", "EUW")
+        failBackend.summonersByRegionPuuid["euw1|$unknownPuuid"] = SummonerDto("s-unk", unknownPuuid, 220L, 12)
+        failBackend.ranksByRegionPuuid["euw1|$unknownPuuid"] = emptyList()
+        failBackend.matchIdsPagesGenerator[unknownPuuid] = { _, _ -> null } // Upstream 500 on page 0 -> unknown match history!
+
+        val failRedis = InMemoryLatencyRedisHarness(mapper)
+        val (failRepo, failMap) = inMemorySeasonRepo()
+        val failRiot = RiotApiService(failBackend.buildRestClient(), RiotApiRateLimiter(clock), RestClient.create(), clock)
+        val failCache = PlayerCacheService(
+            redisCacheService = failRedis.service,
+            riotApiService = failRiot,
+            indexedPlayerRepository = mockk(relaxed = true),
+            timeProvider = clock,
+            playerSeasonStatsRepository = failRepo,
+            transactionTemplate = noOpTransactionTemplate(),
+            objectMapper = mapper,
+            memoryStatsProvider = healthyContainerMemoryStats
+        )
+        val failSvc = SummonerProfileService(failRiot, failCache)
+
+        // Case 3a-i: durableState == null -> returns null (unknown, NOT 0 matches)
+        val unknownResultNoDb = failSvc.getSummonerProfile("euw1", "UnknownPlayer", "EUW", explicitRefresh = false)
+        unknownResultNoDb shouldBe null
+
+        // Case 3a-ii: incomplete 0-game durable row (`historyComplete = false`, `processedMatchIds = emptyList()`) -> still returns null (unknown)
+        val emptyAcc = MatchStatsAccumulator(unknownPuuid)
+        val (emptySnapOverall, emptySnapChamp) = emptyAcc.toAdditiveSnapshots()
+        val incompleteZeroDurable = DurablePlayerSeasonStatsDto(
+            schemaVersion = DurablePlayerSeasonStatsDto.CURRENT_SCHEMA_VERSION,
+            region = "euw1",
+            puuid = unknownPuuid,
+            seasonYear = 2026,
+            queueId = 420,
+            processedMatchIds = emptyList(),
+            pendingMatchIds = listOf("EUW1_PENDING_1"),
+            excludedMatchIds = emptyList(),
+            hitPreSeasonBoundary = false,
+            firstPreSeasonMatchId = null,
+            historyCapped = false,
+            historyComplete = false,
+            overallCounters = emptySnapOverall,
+            championCounters = emptySnapChamp,
+            updatedAtEpochMilli = baseNowMs - 60_000L
+        )
+        failMap["euw1|$unknownPuuid|2026|420"] = PlayerSeasonStatsEntity(
+            id = UUID.randomUUID(),
+            region = "euw1",
+            puuid = unknownPuuid,
+            seasonYear = 2026,
+            queueId = 420,
+            schemaVersion = 1,
+            foldedGamesCount = 0,
+            pendingGamesCount = 1,
+            historyCapped = false,
+            historyComplete = false,
+            stateJson = mapper.writeValueAsString(incompleteZeroDurable),
+            updatedAt = Instant.ofEpochMilli(baseNowMs - 60_000L),
+            version = 1L
+        )
+        val unknownResultIncompleteZeroDb = failSvc.getSummonerProfile("euw1", "UnknownPlayer", "EUW", explicitRefresh = true)
+        unknownResultIncompleteZeroDb shouldBe null
+
+        //    3b. Clean empty season (`matchIds = emptyList()`) with unknown `summonerLevel = null`, `profileIconId = null`, unranked (`ranks = emptyList()`)
+        //        MUST return true `0` (`totalMatches == 0`, `wins == 0`, `losses == 0`) while preserving `null` for unknown fields.
+        val zeroPuuid = "puuid-true-zero-season"
+        val zeroBackend = FakeRiotHttpBackend(mapper)
+        zeroBackend.accountsByRiotId["europe|zeroplayer|euw"] = AccountDto(zeroPuuid, "ZeroPlayer", "EUW")
+        zeroBackend.summonersByRegionPuuid["euw1|$zeroPuuid"] = SummonerDto("s-zero", zeroPuuid, summonerLevel = null, profileIconId = null)
+        zeroBackend.ranksByRegionPuuid["euw1|$zeroPuuid"] = emptyList()
+        zeroBackend.matchIdsPagesGenerator[zeroPuuid] = { _, _ -> emptyList() }
+
+        val zeroRedis = InMemoryLatencyRedisHarness(mapper)
+        val (zeroRepo, _) = inMemorySeasonRepo()
+        val zeroRiot = RiotApiService(zeroBackend.buildRestClient(), RiotApiRateLimiter(clock), RestClient.create(), clock)
+        val zeroCache = PlayerCacheService(
+            redisCacheService = zeroRedis.service,
+            riotApiService = zeroRiot,
+            indexedPlayerRepository = mockk(relaxed = true),
+            timeProvider = clock,
+            playerSeasonStatsRepository = zeroRepo,
+            transactionTemplate = noOpTransactionTemplate(),
+            objectMapper = mapper,
+            memoryStatsProvider = healthyContainerMemoryStats
+        )
+        val zeroSvc = SummonerProfileService(zeroRiot, zeroCache)
+        val trueZeroProfile = zeroSvc.getSummonerProfile("euw1", "ZeroPlayer", "EUW", explicitRefresh = false)!!
+        trueZeroProfile.totalMatches shouldBe 0
+        trueZeroProfile.allMatchIds shouldBe emptyList()
+        trueZeroProfile.overallStats?.wins shouldBe 0
+        trueZeroProfile.overallStats?.losses shouldBe 0
+        trueZeroProfile.summonerLevel shouldBe null // Unknown preserved as null, never coerced to 0L
+        trueZeroProfile.profileIconId shouldBe null // Unknown preserved as null, never coerced to 0
+        trueZeroProfile.soloQueueRank shouldBe null // Unranked/unknown preserved as null
+
+        val profileWireJson = mapper.writeValueAsString(trueZeroProfile)
+        val internalLedgerIdentifiers = listOf(
+            "historyComplete",
+            "historyCapped",
+            "pendingMatchIds",
+            "excludedMatchIds",
+            "ownerVerifiedAtMs",
+            "verifiedRedisSeasons",
+            "verifiedCompleteRedisOnlySeasons",
+            "pipelineFlushes"
+        )
+        for (internalKey in internalLedgerIdentifiers) {
+            profileWireJson.contains(internalKey) shouldBe false
+        }
+    }
 })
+
+

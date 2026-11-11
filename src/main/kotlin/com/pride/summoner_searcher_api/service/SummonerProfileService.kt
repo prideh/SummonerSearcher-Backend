@@ -41,7 +41,7 @@ class SummonerProfileService(
             }
         }
 
-        // Step 1: Get the global account PUUID from the Riot ID when cold or refreshing past cooldown.
+        // Step 1: Get the global account PUUID from the Riot ID when cold, refreshing past cooldown, or past 30m owner-auth window.
         val accountDto = riotApiService.getAccountByRiotId(summonerName, tagLine, region)
         val puuid = accountDto?.puuid?.takeIf { it.isNotBlank() } ?: run {
             playerCacheService.evictRiotIdMapping(region, summonerName, tagLine)
@@ -59,6 +59,16 @@ class SummonerProfileService(
             tagLine = effectiveTag,
             explicitRefresh = explicitRefresh
         ) ?: return null
+
+        // Only Account-V1-authenticated lookups record/advance ownerVerifiedAtMs (never unauthenticated cache hits).
+        playerCacheService.recordVerifiedRiotIdOwner(
+            region = region,
+            queriedName = summonerName,
+            queriedTag = tagLine,
+            canonicalName = effectiveName,
+            canonicalTag = effectiveTag,
+            verifiedPuuid = puuid
+        )
 
         // Step 3: Return profile with only the first page of matches (e.g., 20)
         // We keep the stats as they are calculated from the full history.

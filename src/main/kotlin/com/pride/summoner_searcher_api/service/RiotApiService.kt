@@ -1684,6 +1684,34 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
             ?: translations.firstOrNull()?.content
     }
 
+    private fun formatPlainStatusLabel(raw: String?): String? {
+        val normalized = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return when (normalized.lowercase()) {
+            "scheduled" -> "Scheduled"
+            "in_progress" -> "In Progress"
+            "complete", "completed" -> "Completed"
+            "active" -> "Active"
+            "resolved" -> "Resolved"
+            else -> normalized
+                .split('_', '-')
+                .filter { it.isNotBlank() }
+                .joinToString(" ") { word ->
+                    word.lowercase().replaceFirstChar { ch -> ch.titlecase() }
+                }
+                .takeIf { it.isNotBlank() }
+        }
+    }
+
+    private fun formatPlainSeverityLabel(raw: String?): String? {
+        val normalized = raw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        return when (normalized.lowercase()) {
+            "info" -> "Info"
+            "warning" -> "Warning"
+            "critical" -> "Critical"
+            else -> formatPlainStatusLabel(normalized)
+        }
+    }
+
     suspend fun getPlatformData(region: String): PlatformStatusDto? {
         val baseUrl = "https://${region}.api.riotgames.com"
         val uri = "$baseUrl/lol/status/v4/platform-data"
@@ -1702,9 +1730,9 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
                 name = it.name,
                 maintenances = it.maintenances.map { maintenance ->
                     StatusItemDto(
-                        status = maintenance.maintenanceStatus,
-                        severity = maintenance.incidentSeverity,
-                        title = getPreferredContent(maintenance.titles) ?: "No Title",
+                        status = formatPlainStatusLabel(maintenance.maintenanceStatus),
+                        severity = formatPlainSeverityLabel(maintenance.incidentSeverity),
+                        title = getPreferredContent(maintenance.titles) ?: "League Server Maintenance",
                         description = maintenance.updates.firstOrNull()?.let { update -> getPreferredContent(update.translations) },
                         platforms = maintenance.platforms
                     )
@@ -1712,8 +1740,8 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
                 incidents = it.incidents.map { incident ->
                     StatusItemDto(
                         status = if (incident.active) "Active" else "Resolved",
-                        severity = incident.incidentSeverity,
-                        title = getPreferredContent(incident.titles) ?: "No Title",
+                        severity = formatPlainSeverityLabel(incident.incidentSeverity),
+                        title = getPreferredContent(incident.titles) ?: "League Server Notice",
                         description = incident.updates.firstOrNull()?.let { update -> getPreferredContent(update.translations) },
                         platforms = incident.platforms
                     )

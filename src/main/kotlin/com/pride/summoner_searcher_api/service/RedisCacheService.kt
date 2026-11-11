@@ -66,63 +66,120 @@ class RedisCacheService(
         }
     }
 
+    private val lastSetAllPeakSubBatchBytes = java.util.concurrent.atomic.AtomicLong(0L)
+    private val maxObservedSetAllSubBatchBytes = java.util.concurrent.atomic.AtomicLong(0L)
+    private val pipelineSubBatchFlushes = java.util.concurrent.atomic.AtomicLong(0L)
+    private val pipelineFallbackWrites = java.util.concurrent.atomic.AtomicLong(0L)
+
+    internal data class PipelineWriteTelemetry(
+        val lastCallPeakSubBatchBytes: Long,
+        val maxObservedSubBatchBytes: Long,
+        val pipelineFlushes: Long,
+        val fallbackWrites: Long
+    )
+
+    internal fun getPipelineWriteTelemetry(): PipelineWriteTelemetry = PipelineWriteTelemetry(
+        lastCallPeakSubBatchBytes = lastSetAllPeakSubBatchBytes.get(),
+        maxObservedSubBatchBytes = maxObservedSetAllSubBatchBytes.get(),
+        pipelineFlushes = pipelineSubBatchFlushes.get(),
+        fallbackWrites = pipelineFallbackWrites.get()
+    )
+
     /**
      * Returns true on real [RedisCacheService] instances (and false on unstubbed relaxed mocks so unit tests
      * spying on per-key [set] continue to observe individual writes without stub changes).
      */
     fun canPipelineBatchWrites(): Boolean = true
 
+    private class PreparedPipelineEntry(
+        val key: String,
+        val keyBytes: ByteArray,
+        val valueBytes: ByteArray
+    ) {
+        val totalBufferedBytes: Long
+            get() = keyBytes.size.toLong() + valueBytes.size.toLong()
+    }
+
     /**
-     * Pre-compresses [entries] and writes all keys in a single Redis pipeline round-trip with identical
-     * GZIP+Base64 payload encoding and [expiration] TTL semantics as [set]. Falls back cleanly to per-key writes
-     * if pipelining is unavailable in a test stub.
+     * Streams [entries] through bounded GZIP+Base64 sub-batches (`<= 25` entries and `<= 256 KiB` buffered bytes
+     * per pipeline flush) so whole-chunk pre-compression never spikes live heap on a 512 MiB container.
+     * Preserves identical payload encoding and [expiration] TTL semantics as [set], falling back cleanly to
+     * per-key [ValueOperations.set] if pipelining is unavailable or throws.
      */
     fun <T> setAll(entries: Map<String, T>, expiration: Duration) {
         if (entries.isEmpty()) return
-        val compressedEntries = LinkedHashMap<String, String>(entries.size)
-        for ((key, value) in entries) {
-            compressedEntries[key] = serializeAndCompress(value)
-        }
         val hasPositiveTtl = !expiration.isZero && !expiration.isNegative
-        val pipelinedSucceeded = try {
-            if (redisTemplate.connectionFactory == null) {
-                false
-            } else {
-                val redisExpiration = if (hasPositiveTtl) {
-                    org.springframework.data.redis.core.types.Expiration.from(expiration)
-                } else {
-                    org.springframework.data.redis.core.types.Expiration.persistent()
-                }
-                redisTemplate.executePipelined { connection ->
-                    val stringCommands = connection.stringCommands()
-                    for ((key, compressed) in compressedEntries) {
-                        val keyBytes = key.toByteArray(java.nio.charset.StandardCharsets.UTF_8)
-                        val valueBytes = compressed.toByteArray(java.nio.charset.StandardCharsets.UTF_8)
-                        stringCommands.set(
-                            keyBytes,
-                            valueBytes,
-                            redisExpiration,
-                            org.springframework.data.redis.connection.RedisStringCommands.SetOption.UPSERT
-                        )
-                    }
-                    null
-                }
-                true
-            }
-        } catch (_: Exception) {
-            false
+        val redisExpiration = if (hasPositiveTtl) {
+            org.springframework.data.redis.core.types.Expiration.from(expiration)
+        } else {
+            org.springframework.data.redis.core.types.Expiration.persistent()
         }
 
-        if (!pipelinedSucceeded) {
-            val valueOps = redisTemplate.opsForValue()
-            for ((key, compressed) in compressedEntries) {
-                if (hasPositiveTtl) {
-                    valueOps.set(key, compressed, expiration)
+        val subBatch = ArrayList<PreparedPipelineEntry>(minOf(entries.size, MAX_PIPELINE_SUBBATCH_ENTRIES))
+        var subBatchBytes = 0L
+        var callPeakBytes = 0L
+
+        fun flushSubBatch() {
+            if (subBatch.isEmpty()) return
+            if (subBatchBytes > callPeakBytes) {
+                callPeakBytes = subBatchBytes
+            }
+            maxObservedSetAllSubBatchBytes.accumulateAndGet(subBatchBytes, ::maxOf)
+            val pipelinedSucceeded = try {
+                if (redisTemplate.connectionFactory == null) {
+                    false
                 } else {
-                    valueOps.set(key, compressed)
+                    redisTemplate.executePipelined { connection ->
+                        val stringCommands = connection.stringCommands()
+                        for (item in subBatch) {
+                            stringCommands.set(
+                                item.keyBytes,
+                                item.valueBytes,
+                                redisExpiration,
+                                org.springframework.data.redis.connection.RedisStringCommands.SetOption.UPSERT
+                            )
+                        }
+                        null
+                    }
+                    pipelineSubBatchFlushes.incrementAndGet()
+                    true
+                }
+            } catch (_: Exception) {
+                false
+            }
+
+            if (!pipelinedSucceeded) {
+                val valueOps = redisTemplate.opsForValue()
+                for (item in subBatch) {
+                    val compressed = String(item.valueBytes, java.nio.charset.StandardCharsets.UTF_8)
+                    if (hasPositiveTtl) {
+                        valueOps.set(item.key, compressed, expiration)
+                    } else {
+                        valueOps.set(item.key, compressed)
+                    }
+                    pipelineFallbackWrites.incrementAndGet()
                 }
             }
+            subBatch.clear()
+            subBatchBytes = 0L
         }
+
+        for ((key, value) in entries) {
+            val keyBytes = key.toByteArray(java.nio.charset.StandardCharsets.UTF_8)
+            val valueBytes = serializeAndCompress(value).toByteArray(java.nio.charset.StandardCharsets.UTF_8)
+            val prepared = PreparedPipelineEntry(key, keyBytes, valueBytes)
+            val entryBytes = prepared.totalBufferedBytes
+            if (subBatch.isNotEmpty() &&
+                (subBatch.size >= MAX_PIPELINE_SUBBATCH_ENTRIES ||
+                    subBatchBytes + entryBytes > MAX_PIPELINE_SUBBATCH_UTF8_BYTES)
+            ) {
+                flushSubBatch()
+            }
+            subBatch.add(prepared)
+            subBatchBytes += entryBytes
+        }
+        flushSubBatch()
+        lastSetAllPeakSubBatchBytes.set(callPeakBytes)
     }
 
     /**
@@ -726,6 +783,8 @@ class RedisCacheService(
             this['/'.code] = 63
             this['='.code] = BASE64_PAD
         }
+        const val MAX_PIPELINE_SUBBATCH_ENTRIES = 25
+        const val MAX_PIPELINE_SUBBATCH_UTF8_BYTES = 256L * 1024L // 256 KiB strict pre-compressed sub-batch ceiling
         const val DEFAULT_MAX_SCAN_KEYS = 2_000
         const val HARD_MAX_SCAN_KEYS = 5_000
         const val DEFAULT_MAX_INFLATED_CACHE_BYTES = 16 * 1024 * 1024 // 16 MiB default bomb guard
