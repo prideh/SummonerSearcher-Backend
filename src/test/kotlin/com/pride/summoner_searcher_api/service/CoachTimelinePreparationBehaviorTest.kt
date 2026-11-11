@@ -2051,4 +2051,542 @@ class CoachTimelinePreparationBehaviorTest {
         assertTrue(AiAnalysisService.containsInternalSchemaLeak("Your timelineStatus is NOT_ANALYZED"))
         assertFalse(AiAnalysisService.containsInternalSchemaLeak("Minute-by-minute timeline data is available for 12 of your last 20 games."))
     }
+
+    private fun awaitLatchIgnoringInterrupts(latch: CountDownLatch, maxWaitMs: Long = 5_000L) {
+        val deadlineNs = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(maxWaitMs)
+        while (latch.count > 0L) {
+            val remainingNs = deadlineNs - System.nanoTime()
+            if (remainingNs <= 0L) break
+            try {
+                latch.await(remainingNs.coerceAtMost(TimeUnit.MILLISECONDS.toNanos(20L)), TimeUnit.NANOSECONDS)
+            } catch (_: InterruptedException) {
+                // Deliberately swallow interrupt to simulate non-interruptible Redis/decode/JNI I/O worker
+            }
+        }
+    }
+
+    @Test
+    fun `concurrent warm reopens coalesce same-player inflate, enforce 2-slot cap across distinct warm players without admission softening, and never block singleflightMutex`() = runBlocking {
+        val riotApiService = mockk<RiotApiService>()
+        val redisCacheService = mockk<RedisCacheService>(relaxed = true)
+        val playerCacheService = mockk<PlayerCacheService>()
+        val timeProvider = SystemTimeProvider()
+        val memoryProvider = MutableMemoryStatsProvider(cgroupUsedBytes = 315L * 1024L * 1024L)
+
+        val matchIds = listOf("EUW1_WARM_1", "EUW1_WARM_2")
+        val profileDecodeCount = AtomicInteger(0)
+        every { playerCacheService.getCachedProfile(any(), any()) } answers {
+            profileDecodeCount.incrementAndGet()
+            val target = firstArg<String>()
+            SummonerProfileDto(
+                puuid = target,
+                gameName = "WarmPlayer",
+                tagLine = "EUW",
+                summonerLevel = 400,
+                profileIconId = 1,
+                soloQueueRank = null,
+                recentMatches = matchIds.map { mid -> buildMatchDto(mid, targetPuuid = target) },
+                allMatchIds = matchIds
+            )
+        }
+        every { redisCacheService.get(any(), MatchTimelineDto::class.java) } returns null
+
+        val service = TimelineService(
+            riotApiService = riotApiService,
+            redisCacheService = redisCacheService,
+            timelineAnalysisService = TimelineAnalysisService(),
+            timeProvider = timeProvider,
+            memoryStatsProvider = memoryProvider,
+            maxConcurrentPreparations = 2,
+            preparedCacheMaxEntries = 16,
+            prepDeadlineMs = 4_000L
+        )
+        val controller = TimelineController(service, TimelineAnalysisService(), playerCacheService)
+
+        // Warm 8 distinct players (8 * 2 keys = 16 = preparedCacheMaxEntries) so each has a real GZIP-compressed entry in preparedCache
+        for (idx in 1..8) {
+            val targetPuuid = "puuid-warm-$idx"
+            val perPlayerDtos = matchIds.map { mid -> buildMatchDto(mid, targetPuuid = targetPuuid) }
+            coEvery {
+                riotApiService.getMatchTimelineBounded(any(), any(), any(), any(), any(), any(), any(), any())
+            } coAnswers {
+                buildRichRawTimeline(firstArg(), targetPuuid = targetPuuid)
+            }
+            val coldResp = controller.prepareCoachTimelinesPost(
+                "euw1",
+                targetPuuid,
+                CoachTimelinePreparationRequestDto(matchIds = matchIds)
+            )
+            assertEquals("COMPLETE", coldResp.body?.status)
+            assertFalse(coldResp.body!!.cacheHit)
+            assertEquals(matchIds.size, perPlayerDtos.size)
+        }
+        assertEquals(16, service.getPreparedCacheEntryCount())
+        profileDecodeCount.set(0)
+
+        // 1. 16 concurrent SAME-player warm reopens coalesce onto 1 warm inflate/decode and 0 profile decodes
+        val warmDecodeCount = AtomicInteger(0)
+        val firstWarmEntered = CountDownLatch(1)
+        val releaseSamePlayerWarm = CountDownLatch(1)
+        service.warmCacheDecodeHook = {
+            warmDecodeCount.incrementAndGet()
+            firstWarmEntered.countDown()
+            releaseSamePlayerWarm.await(3_000L, TimeUnit.MILLISECONDS)
+        }
+
+        val sixteenSameWarmJobs = (1..16).map {
+            async(Dispatchers.IO) {
+                controller.prepareCoachTimelinesPost(
+                    "euw1",
+                    "puuid-warm-1",
+                    CoachTimelinePreparationRequestDto(matchIds = matchIds)
+                )
+            }
+        }
+        assertTrue(firstWarmEntered.await(2_000L, TimeUnit.MILLISECONDS))
+        delay(50L) // Let all 15 remaining callers arrive and coalesce onto singleflight entry
+        assertEquals(1, service.getActiveGlobalPreparations(), "Same-player warm burst must occupy only 1 global slot")
+        releaseSamePlayerWarm.countDown()
+
+        val sixteenSameWarmResponses = sixteenSameWarmJobs.awaitAll()
+        assertTrue(sixteenSameWarmResponses.all { it.body?.status == "COMPLETE" && it.body?.cacheHit == true })
+        assertEquals(1, warmDecodeCount.get(), "16 concurrent same-player warm reopens must inflate/decode preparedCache ONCE")
+        assertEquals(0, profileDecodeCount.get(), "Warm reopen must perform zero SummonerProfileDto decodes")
+
+        // 2. 8 concurrent DISTINCT-player warm reopens strictly obey global 2-slot bound AND never hold singleflightMutex during decode
+        val activeWarmDecodes = AtomicInteger(0)
+        val peakWarmDecodes = AtomicInteger(0)
+        val peakCacheWorkers = AtomicInteger(0)
+        val twoWarmSlotsEntered = CountDownLatch(2)
+        val releaseDistinctWarm = CountDownLatch(1)
+
+        service.warmCacheDecodeHook = {
+            val cur = activeWarmDecodes.incrementAndGet()
+            peakWarmDecodes.accumulateAndGet(cur, ::maxOf)
+            peakCacheWorkers.accumulateAndGet(service.getActiveCacheReadWorkers(), ::maxOf)
+            twoWarmSlotsEntered.countDown()
+            releaseDistinctWarm.await(4_000L, TimeUnit.MILLISECONDS)
+            activeWarmDecodes.decrementAndGet()
+        }
+
+        val eightDistinctWarmJobs = (1..8).map { idx ->
+            async(Dispatchers.IO) {
+                controller.prepareCoachTimelinesPost(
+                    "euw1",
+                    "puuid-warm-$idx",
+                    CoachTimelinePreparationRequestDto(matchIds = matchIds)
+                )
+            }
+        }
+        assertTrue(twoWarmSlotsEntered.await(2_000L, TimeUnit.MILLISECONDS))
+        assertEquals(2, service.getActiveGlobalPreparations())
+
+        // While both global slots are actively paused inside warm GZIP inflate/decode, a brand-new player's
+        // singleflight registration MUST NOT block on singleflightMutex (completes immediately with CONCURRENCY_LIMIT_REACHED)
+        val probeStartMs = System.currentTimeMillis()
+        val mutexProbeResp = controller.prepareCoachTimelinesPost(
+            "euw1",
+            "puuid-unblocked-mutex-probe",
+            CoachTimelinePreparationRequestDto(matchIds = matchIds)
+        )
+        val probeElapsedMs = System.currentTimeMillis() - probeStartMs
+        assertEquals("BLOCKED", mutexProbeResp.body?.status)
+        assertEquals("CONCURRENCY_LIMIT_REACHED", mutexProbeResp.body?.stopReason)
+        assertTrue(probeElapsedMs < 500L, "singleflightMutex must never block on warm cache inflate/decode; took ${probeElapsedMs}ms")
+
+        releaseDistinctWarm.countDown()
+        val eightDistinctResponses = eightDistinctWarmJobs.awaitAll()
+        service.warmCacheDecodeHook = null
+
+        assertEquals(2, peakWarmDecodes.get(), "Concurrent warm inflates across distinct players must never exceed 2-slot cap")
+        assertTrue(peakCacheWorkers.get() <= 2, "Active cache-read workers must never exceed 2-slot cap")
+        val completedWarm = eightDistinctResponses.count { it.body?.status == "COMPLETE" && it.body?.cacheHit == true }
+        val concurrencyBlockedWarm = eightDistinctResponses.count {
+            it.body?.status == "BLOCKED" && it.body?.stopReason == "CONCURRENCY_LIMIT_REACHED"
+        }
+        assertTrue(completedWarm >= 2)
+        assertEquals(8, completedWarm + concurrencyBlockedWarm)
+
+        // 3. No admission guard softening: at 350 MiB cgroup usage, warm reopens fail closed before inflating preparedCache
+        val postGuardDecodeCount = AtomicInteger(0)
+        service.warmCacheDecodeHook = { postGuardDecodeCount.incrementAndGet() }
+        memoryProvider.cgroupUsedBytes = TimelineService.COACH_PREP_ADMISSION_MAX_BYTES // 350 MiB exact boundary
+        val guardedWarmResp = controller.prepareCoachTimelinesPost(
+            "euw1",
+            "puuid-warm-1",
+            CoachTimelinePreparationRequestDto(matchIds = matchIds)
+        )
+        assertEquals("BLOCKED", guardedWarmResp.body?.status)
+        assertEquals("MEMORY_HEADROOM_ADMISSION_BLOCKED", guardedWarmResp.body?.stopReason)
+        assertEquals(0, postGuardDecodeCount.get(), "350 MiB admission guard must block before warm preparedCache inflate")
+    }
+
+    @Test
+    fun `interrupt-ignoring profile and timeline cache workers retain global 2-slot across deadline and cancellation under saturated request bursts until actual worker exit`() = runBlocking {
+        val timeProvider = SystemTimeProvider()
+        val memoryProvider = MutableMemoryStatsProvider(cgroupUsedBytes = 315L * 1024L * 1024L)
+        val matchIds = listOf("EUW1_LINGER_1")
+
+        // 1. Interrupt-ignoring profile decode workers under deadline expiry + saturated 10-request burst
+        run {
+            val riotApiService = mockk<RiotApiService>()
+            val redisCacheService = mockk<RedisCacheService>(relaxed = true)
+            val playerCacheService = mockk<PlayerCacheService>()
+
+            val hangProfileDecode = java.util.concurrent.atomic.AtomicBoolean(true)
+            val twoProfileWorkersStarted = CountDownLatch(2)
+            val releaseProfileWorkers = CountDownLatch(1)
+            val peakProfileWorkers = AtomicInteger(0)
+            val activeProfileWorkers = AtomicInteger(0)
+
+            every { playerCacheService.getCachedProfile(any(), any()) } answers {
+                val target = firstArg<String>()
+                if (hangProfileDecode.get()) {
+                    val cur = activeProfileWorkers.incrementAndGet()
+                    peakProfileWorkers.accumulateAndGet(cur, ::maxOf)
+                    twoProfileWorkersStarted.countDown()
+                    try {
+                        awaitLatchIgnoringInterrupts(releaseProfileWorkers, 5_000L)
+                    } finally {
+                        activeProfileWorkers.decrementAndGet()
+                    }
+                }
+                SummonerProfileDto(
+                    puuid = target,
+                    gameName = "Player",
+                    tagLine = "EUW",
+                    summonerLevel = 300,
+                    profileIconId = 1,
+                    soloQueueRank = null,
+                    recentMatches = matchIds.map { buildMatchDto(it, targetPuuid = target) },
+                    allMatchIds = matchIds
+                )
+            }
+            every { redisCacheService.get(any(), MatchTimelineDto::class.java) } answers {
+                buildRichRawTimeline("EUW1_LINGER_1", targetPuuid = puuid)
+            }
+            coEvery {
+                riotApiService.getMatchTimelineBounded(any(), any(), any(), any(), any(), any(), any(), any())
+            } coAnswers {
+                buildRichRawTimeline(firstArg(), targetPuuid = "puuid-after-profile-exit")
+            }
+
+            val service = TimelineService(
+                riotApiService = riotApiService,
+                redisCacheService = redisCacheService,
+                timelineAnalysisService = TimelineAnalysisService(),
+                timeProvider = timeProvider,
+                memoryStatsProvider = memoryProvider,
+                prepDeadlineMs = 150L,
+                maxConcurrentPreparations = 2,
+                lingeringWorkerPollMs = 25L
+            )
+            val controller = TimelineController(service, TimelineAnalysisService(), playerCacheService)
+
+            try {
+                val initialTwo = (1..2).map { idx ->
+                    async(Dispatchers.IO) {
+                        controller.prepareCoachTimelinesPost(
+                            "euw1",
+                            "puuid-hang-prof-$idx",
+                            CoachTimelinePreparationRequestDto(matchIds = matchIds)
+                        )
+                    }
+                }
+                assertTrue(twoProfileWorkersStarted.await(2_000L, TimeUnit.MILLISECONDS))
+                val initialResponses = initialTwo.awaitAll()
+                assertTrue(initialResponses.all { it.body?.status == "BLOCKED" && it.body?.stopReason == "DEADLINE_EXCEEDED" })
+
+                // Both workers ignored Thread.interrupt() and are STILL running -> global 2-slot MUST stay pinned at 2!
+                assertEquals(2, service.getActiveCacheReadWorkers())
+                assertEquals(2, service.getActiveGlobalPreparations(), "Global 2-slot must remain pinned while profile decode workers are still alive")
+
+                // Saturated 10-request concurrent burst MUST fail closed with CONCURRENCY_LIMIT_REACHED and spawn 0 extra workers
+                val burstResponses = (1..10).map { idx ->
+                    async(Dispatchers.IO) {
+                        controller.prepareCoachTimelinesPost(
+                            "euw1",
+                            "puuid-burst-prof-$idx",
+                            CoachTimelinePreparationRequestDto(matchIds = matchIds)
+                        )
+                    }
+                }.awaitAll()
+                assertTrue(burstResponses.all { it.body?.status == "BLOCKED" && it.body?.stopReason == "CONCURRENCY_LIMIT_REACHED" })
+                assertEquals(2, peakProfileWorkers.get(), "Concurrent live profile decode workers must never exceed 2")
+                assertEquals(2, service.getActiveGlobalPreparations())
+
+                // Release lingering workers -> slots return to 0 promptly after actual worker exit
+                hangProfileDecode.set(false)
+                releaseProfileWorkers.countDown()
+                val waitDeadline = System.currentTimeMillis() + 2_000L
+                while (service.getActiveGlobalPreparations() > 0 && System.currentTimeMillis() < waitDeadline) {
+                    delay(15L)
+                }
+                assertEquals(0, service.getActiveCacheReadWorkers())
+                assertEquals(0, service.getActiveGlobalPreparations())
+
+                every { redisCacheService.get(any(), MatchTimelineDto::class.java) } returns null
+                val recovered = controller.prepareCoachTimelinesPost(
+                    "euw1",
+                    "puuid-after-profile-exit",
+                    CoachTimelinePreparationRequestDto(matchIds = matchIds)
+                )
+                assertEquals("COMPLETE", recovered.body?.status)
+            } finally {
+                releaseProfileWorkers.countDown()
+            }
+        }
+
+        // 2. Interrupt-ignoring timeline Redis cache workers under caller cancellation + deadline expiry + saturated burst
+        run {
+            val riotApiService = mockk<RiotApiService>(relaxed = true)
+            val redisCacheService = mockk<RedisCacheService>()
+            val hangTimelineCache = java.util.concurrent.atomic.AtomicBoolean(true)
+            val firstTimelineWorkerStarted = CountDownLatch(1)
+            val secondTimelineWorkerStarted = CountDownLatch(1)
+            val releaseTimelineWorkers = CountDownLatch(1)
+            val activeTimelineWorkers = AtomicInteger(0)
+            val peakTimelineWorkers = AtomicInteger(0)
+
+            every { redisCacheService.get(any(), MatchTimelineDto::class.java) } answers {
+                if (hangTimelineCache.get()) {
+                    val cur = activeTimelineWorkers.incrementAndGet()
+                    peakTimelineWorkers.accumulateAndGet(cur, ::maxOf)
+                    if (cur == 1) {
+                        firstTimelineWorkerStarted.countDown()
+                    } else {
+                        secondTimelineWorkerStarted.countDown()
+                    }
+                    try {
+                        awaitLatchIgnoringInterrupts(releaseTimelineWorkers, 5_000L)
+                    } finally {
+                        activeTimelineWorkers.decrementAndGet()
+                    }
+                }
+                buildRichRawTimeline("EUW1_LINGER_1", targetPuuid = puuid)
+            }
+
+            val service = TimelineService(
+                riotApiService = riotApiService,
+                redisCacheService = redisCacheService,
+                timelineAnalysisService = TimelineAnalysisService(),
+                timeProvider = timeProvider,
+                memoryStatsProvider = memoryProvider,
+                prepDeadlineMs = 2_500L,
+                maxConcurrentPreparations = 2,
+                lingeringWorkerPollMs = 25L
+            )
+            val matchDtos = matchIds.map { buildMatchDto(it, targetPuuid = puuid) }
+
+            try {
+                // Slot 1: Caller coroutine cancels mid-flight while timeline Redis worker ignores interrupt
+                val cancelStartMs = System.currentTimeMillis()
+                val cancelledCallerJob = launch(Dispatchers.IO) {
+                    service.prepareCoachTimelines("euw1", "puuid-cancel-tl-1", matchIds, matchDtos)
+                }
+                assertTrue(firstTimelineWorkerStarted.await(2_000L, TimeUnit.MILLISECONDS))
+                cancelledCallerJob.cancel()
+                cancelledCallerJob.join()
+                val cancelElapsedMs = System.currentTimeMillis() - cancelStartMs
+                assertTrue(cancelElapsedMs < 1_000L, "Caller cancellation must unblock promptly without waiting 2.5s deadline, took ${cancelElapsedMs}ms")
+
+                // Give singleflight workerJob cancellation + 25ms NonCancellable latch join a moment to settle
+                delay(60L)
+                assertEquals(1, service.getActiveCacheReadWorkers())
+                assertEquals(1, service.getActiveGlobalPreparations(), "Cancelled singleflight owner must retain slot while timeline cache worker is still running")
+
+                // Slot 2: Single-timeline route (`getTimelineForController`) hits caller cancellation while 2nd worker ignores interrupt
+                val secondCancelledJob = launch(Dispatchers.IO) {
+                    service.getTimelineForController("EUW1_LINGER_1", "euw1")
+                }
+                assertTrue(secondTimelineWorkerStarted.await(2_000L, TimeUnit.MILLISECONDS))
+                secondCancelledJob.cancel()
+                secondCancelledJob.join()
+                delay(60L)
+
+                assertEquals(2, service.getActiveCacheReadWorkers())
+                assertEquals(2, service.getActiveGlobalPreparations(), "Both global slots must stay pinned while 2 timeline cache workers remain alive")
+
+                // Saturated burst across both prepareCoachTimelines and getTimelineForController MUST fail closed
+                val burstCoach = (1..6).map { idx ->
+                    async(Dispatchers.IO) {
+                        service.prepareCoachTimelines("euw1", "puuid-tl-burst-$idx", matchIds, matchDtos)
+                    }
+                }.awaitAll()
+                val burstSingle = (1..4).map { idx ->
+                    async(Dispatchers.IO) {
+                        service.getTimelineForController("EUW1_BURST_SINGLE_$idx", "euw1")
+                    }
+                }.awaitAll()
+
+                assertTrue(burstCoach.all { it.status == "BLOCKED" && it.stopReason == "CONCURRENCY_LIMIT_REACHED" })
+                assertTrue(burstSingle.all { it == TimelineService.SingleTimelineOutcome.Blocked("CONCURRENCY_LIMIT_REACHED") })
+                assertEquals(2, peakTimelineWorkers.get(), "Concurrent live timeline cache workers must never exceed 2")
+
+                // Release workers -> slots recover cleanly to 0 and subsequent preparation succeeds
+                hangTimelineCache.set(false)
+                releaseTimelineWorkers.countDown()
+                val waitDeadline = System.currentTimeMillis() + 2_000L
+                while (service.getActiveGlobalPreparations() > 0 && System.currentTimeMillis() < waitDeadline) {
+                    delay(15L)
+                }
+                assertEquals(0, service.getActiveCacheReadWorkers())
+                assertEquals(0, service.getActiveGlobalPreparations())
+
+                val recovered = service.prepareCoachTimelines("euw1", puuid, matchIds, matchDtos)
+                assertEquals("COMPLETE", recovered.status)
+            } finally {
+                releaseTimelineWorkers.countDown()
+            }
+        }
+    }
+
+    @Test
+    fun `releaseGlobalSlotAfterWorkers never releases global slot across multi-poll timeouts while HTTP or cache worker thread remains alive`() = runBlocking {
+        val timeProvider = SystemTimeProvider()
+        val memoryProvider = MutableMemoryStatsProvider(cgroupUsedBytes = 315L * 1024L * 1024L)
+        val matchIds = listOf("EUW1_POLL_1")
+        val matchDtos = matchIds.map { buildMatchDto(it, targetPuuid = puuid) }
+
+        // 1. Lingering cache worker stays alive across > 6 poll intervals (lingeringWorkerPollMs = 25ms, alive for 180ms post-deadline)
+        run {
+            val riotApiService = mockk<RiotApiService>(relaxed = true)
+            val redisCacheService = mockk<RedisCacheService>()
+            val workerStarted = CountDownLatch(1)
+            val releaseWorker = CountDownLatch(1)
+            val hangWorker = java.util.concurrent.atomic.AtomicBoolean(true)
+
+            every { redisCacheService.get(any(), MatchTimelineDto::class.java) } answers {
+                if (hangWorker.get()) {
+                    workerStarted.countDown()
+                    awaitLatchIgnoringInterrupts(releaseWorker, 5_000L)
+                }
+                buildRichRawTimeline("EUW1_POLL_1", targetPuuid = puuid)
+            }
+
+            val service = TimelineService(
+                riotApiService = riotApiService,
+                redisCacheService = redisCacheService,
+                timelineAnalysisService = TimelineAnalysisService(),
+                timeProvider = timeProvider,
+                memoryStatsProvider = memoryProvider,
+                prepDeadlineMs = 110L,
+                maxConcurrentPreparations = 1,
+                lingeringWorkerPollMs = 25L
+            )
+
+            try {
+                val timedOut = service.prepareCoachTimelines("euw1", "puuid-poll-cache", matchIds, matchDtos)
+                assertTrue(workerStarted.await(1_000L, TimeUnit.MILLISECONDS))
+                assertEquals("BLOCKED", timedOut.status)
+                assertEquals("DEADLINE_EXCEEDED", timedOut.stopReason)
+
+                // Wait 180ms (> 7x lingeringWorkerPollMs = 25ms) while worker is STILL alive:
+                // under any single-shot await timeout without worker liveness loop, the slot would have released prematurely!
+                delay(180L)
+                assertEquals(1, service.getActiveCacheReadWorkers())
+                assertEquals(1, service.getActiveGlobalPreparations(), "Slot must NEVER release across poll timeouts while cache worker thread is alive")
+
+                val blockedWhileAlive = service.prepareCoachTimelines("euw1", puuid, matchIds, matchDtos)
+                assertEquals("BLOCKED", blockedWhileAlive.status)
+                assertEquals("CONCURRENCY_LIMIT_REACHED", blockedWhileAlive.stopReason)
+
+                hangWorker.set(false)
+                releaseWorker.countDown()
+                val waitDeadline = System.currentTimeMillis() + 2_000L
+                while (service.getActiveGlobalPreparations() > 0 && System.currentTimeMillis() < waitDeadline) {
+                    delay(10L)
+                }
+                assertEquals(0, service.getActiveGlobalPreparations())
+
+                val afterExit = service.prepareCoachTimelines("euw1", puuid, matchIds, matchDtos)
+                assertEquals("COMPLETE", afterExit.status)
+            } finally {
+                releaseWorker.countDown()
+            }
+        }
+
+        // 2. Lingering HTTP worker in real RiotApiService stays alive across > 6 poll intervals (lingeringWorkerPollMs = 25ms)
+        run {
+            val redisCacheService = mockk<RedisCacheService>(relaxed = true)
+            every { redisCacheService.get(any(), MatchTimelineDto::class.java) } returns null
+
+            val httpWorkerStarted = CountDownLatch(1)
+            val releaseHttpWorker = CountDownLatch(1)
+            val hangHttp = java.util.concurrent.atomic.AtomicBoolean(true)
+            val timelineJsonBytes = com.fasterxml.jackson.databind.ObjectMapper().findAndRegisterModules()
+                .writeValueAsBytes(buildRichRawTimeline("EUW1_POLL_1", targetPuuid = puuid))
+
+            val requestFactory = org.springframework.http.client.ClientHttpRequestFactory { uri, _ ->
+                object : org.springframework.http.client.ClientHttpRequest {
+                    private val headers = org.springframework.http.HttpHeaders()
+                    override fun getMethod() = org.springframework.http.HttpMethod.GET
+                    override fun getURI() = uri
+                    override fun getHeaders() = headers
+                    override fun getBody() = ByteArrayOutputStream()
+                    override fun getAttributes() = mutableMapOf<String, Any>()
+                    override fun execute(): org.springframework.http.client.ClientHttpResponse {
+                        if (hangHttp.get()) {
+                            httpWorkerStarted.countDown()
+                            awaitLatchIgnoringInterrupts(releaseHttpWorker, 5_000L)
+                        }
+                        return object : org.springframework.http.client.ClientHttpResponse {
+                            override fun getStatusCode() = org.springframework.http.HttpStatus.OK
+                            override fun getStatusText() = "OK"
+                            override fun close() {}
+                            override fun getBody() = java.io.ByteArrayInputStream(timelineJsonBytes)
+                            override fun getHeaders() = org.springframework.http.HttpHeaders().apply {
+                                contentType = org.springframework.http.MediaType.APPLICATION_JSON
+                            }
+                        }
+                    }
+                }
+            }
+            val rateLimiter = RiotApiRateLimiter(timeProvider)
+            val restClient = org.springframework.web.client.RestClient.builder().requestFactory(requestFactory).build()
+            val riotApiService = RiotApiService(restClient, rateLimiter, restClient, timeProvider)
+
+            val service = TimelineService(
+                riotApiService = riotApiService,
+                redisCacheService = redisCacheService,
+                timelineAnalysisService = TimelineAnalysisService(),
+                rateLimiter = rateLimiter,
+                timeProvider = timeProvider,
+                memoryStatsProvider = memoryProvider,
+                prepDeadlineMs = 130L,
+                maxConcurrentPreparations = 1,
+                lingeringWorkerPollMs = 25L
+            )
+
+            try {
+                val timedOut = service.prepareCoachTimelines("euw1", "puuid-poll-http", matchIds, matchDtos)
+                assertTrue(httpWorkerStarted.await(1_000L, TimeUnit.MILLISECONDS))
+                assertEquals("BLOCKED", timedOut.status)
+                assertEquals("DEADLINE_EXCEEDED", timedOut.stopReason)
+
+                // Wait 180ms (> 7x lingeringWorkerPollMs = 25ms) while HTTP worker is still alive ignoring interrupts
+                delay(180L)
+                assertEquals(1, riotApiService.getActiveBoundedHttpWorkers())
+                assertEquals(1, service.getActiveGlobalPreparations(), "Slot must NEVER release across poll timeouts while HTTP worker thread is alive")
+
+                val blockedWhileAlive = service.prepareCoachTimelines("euw1", puuid, matchIds, matchDtos)
+                assertEquals("BLOCKED", blockedWhileAlive.status)
+                assertEquals("CONCURRENCY_LIMIT_REACHED", blockedWhileAlive.stopReason)
+
+                hangHttp.set(false)
+                releaseHttpWorker.countDown()
+                val waitDeadline = System.currentTimeMillis() + 2_000L
+                while (service.getActiveGlobalPreparations() > 0 && System.currentTimeMillis() < waitDeadline) {
+                    delay(10L)
+                }
+                assertEquals(0, riotApiService.getActiveBoundedHttpWorkers())
+                assertEquals(0, service.getActiveGlobalPreparations())
+
+                val afterExit = service.prepareCoachTimelines("euw1", puuid, matchIds, matchDtos)
+                assertEquals("COMPLETE", afterExit.status)
+            } finally {
+                releaseHttpWorker.countDown()
+            }
+        }
+    }
 }

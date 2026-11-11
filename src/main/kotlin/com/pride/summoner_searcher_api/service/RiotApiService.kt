@@ -204,23 +204,25 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
         val workerDoneLatch = java.util.concurrent.CountDownLatch(1)
         val submittedFuture: java.util.concurrent.Future<T?> = try {
             boundedHttpExecutor.submit(java.util.concurrent.Callable<T?> {
+                val currentThread = Thread.currentThread()
+                workerThreadRef.set(currentThread)
                 if (!taskClaimedOrCancelled.compareAndSet(false, true)) {
+                    workerThreadRef.set(null)
                     workerDoneLatch.countDown()
                     return@Callable null
                 }
                 activeBoundedHttpWorkers.incrementAndGet()
-                workerThreadRef.set(Thread.currentThread())
                 try {
-                    if (cancellationHandle.isCancelled() || Thread.currentThread().isInterrupted) {
+                    if (cancellationHandle.isCancelled() || currentThread.isInterrupted) {
                         null
                     } else {
                         block(cancellationHandle)
                     }
                 } finally {
-                    workerThreadRef.set(null)
                     activeBoundedHttpWorkers.decrementAndGet()
                     Thread.interrupted()
                     workerDoneLatch.countDown()
+                    workerThreadRef.set(null)
                 }
             })
         } catch (e: java.util.concurrent.RejectedExecutionException) {
@@ -232,7 +234,7 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
         val activeHook = kotlin.coroutines.coroutineContext[LingeringWorkerHookElement]?.hook
         var cancelledBeforeStart = false
         return try {
-            withContext(Dispatchers.IO) {
+            kotlinx.coroutines.runInterruptible(Dispatchers.IO) {
                 try {
                     if (deadlineAtMs != null) {
                         val remainingBudgetMs = (deadlineAtMs - timeProvider.now()).coerceAtLeast(1L)
@@ -263,6 +265,16 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
             workerThreadRef.get()?.interrupt()
             submittedFuture.cancel(true)
             throw e
+        } catch (e: InterruptedException) {
+            cancellationHandle.cancel()
+            cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
+            workerThreadRef.get()?.interrupt()
+            submittedFuture.cancel(true)
+            Thread.currentThread().interrupt()
+            if (failureReasonHolder?.get() == null) {
+                failureReasonHolder?.set("DEADLINE_EXCEEDED")
+            }
+            null
         } catch (e: Throwable) {
             cancelledBeforeStart = taskClaimedOrCancelled.compareAndSet(false, true)
             var unwrapped: Throwable = e
@@ -271,15 +283,32 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
             }
             throw unwrapped
         } finally {
-            if (!cancelledBeforeStart) {
+            if (!cancelledBeforeStart && workerDoneLatch.count > 0L) {
                 val joined = withContext(kotlinx.coroutines.NonCancellable + Dispatchers.IO) {
                     workerDoneLatch.await(safeJoinMs, java.util.concurrent.TimeUnit.MILLISECONDS)
                 }
-                if (!joined) {
-                    activeHook?.invoke(workerDoneLatch)
+                if (!joined && workerDoneLatch.count > 0L) {
+                    activeHook?.invoke(LingeringWorkerHandle(workerDoneLatch, workerThreadRef))
                 }
             }
         }
+    }
+
+    internal class LingeringWorkerHandle(
+        val doneLatch: java.util.concurrent.CountDownLatch,
+        private val workerThreadRef: java.util.concurrent.atomic.AtomicReference<Thread?>
+    ) {
+        fun isStillRunning(): Boolean {
+            if (doneLatch.count <= 0L) return false
+            val workerThread = workerThreadRef.get() ?: return false
+            return workerThread.isAlive && doneLatch.count > 0L
+        }
+    }
+
+    internal class LingeringWorkerHookElement(
+        val hook: (LingeringWorkerHandle) -> Unit
+    ) : kotlin.coroutines.AbstractCoroutineContextElement(LingeringWorkerHookElement) {
+        companion object Key : kotlin.coroutines.CoroutineContext.Key<LingeringWorkerHookElement>
     }
 
     companion object {
@@ -288,14 +317,8 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
         const val MAX_TIMELINE_RESPONSE_BYTES = 4 * 1024 * 1024 // 4 MiB strict raw timeline bound
         const val DEFAULT_SINGLE_TIMELINE_DEADLINE_MS = 10_000L
 
-        private class LingeringWorkerHookElement(
-            val hook: (java.util.concurrent.CountDownLatch) -> Unit
-        ) : kotlin.coroutines.AbstractCoroutineContextElement(LingeringWorkerHookElement) {
-            companion object Key : kotlin.coroutines.CoroutineContext.Key<LingeringWorkerHookElement>
-        }
-
         internal suspend fun <R> withLingeringWorkerHook(
-            hook: (java.util.concurrent.CountDownLatch) -> Unit,
+            hook: (LingeringWorkerHandle) -> Unit,
             block: suspend () -> R
         ): R {
             return withContext(LingeringWorkerHookElement(hook)) {
