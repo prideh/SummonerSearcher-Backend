@@ -331,6 +331,7 @@ class AiAnalysisService(
         val naturalTimelineState = when {
             timelineStatus.equals("ANALYZED", ignoreCase = true) -> "timeline analyzed"
             timelineStatus.equals("PARTIAL", ignoreCase = true) -> "partial timeline analyzed"
+            timelineStatus.equals("BLOCKED", ignoreCase = true) -> "timeline temporarily unavailable"
             else -> "timeline not analyzed yet"
         }
         
@@ -563,7 +564,7 @@ class AiAnalysisService(
         fun estimateTokens(text: String): Int = heuristicTokenEstimate(text)
 
         private val INTERNAL_SCHEMA_LEAK_REGEX = Regex(
-            """\b(?:rankedRecord|savedHistory|recentMatchSample|savedHistoryAverages|savedHistorySideSplits|recentMatchSummary|omittedMatchesRollup|timelineStatus|timelineInsights|improvementStats|visionDataPrecision|avgLaneCsAt10|missingLaneCsAt10Matches|NOT_ANALYZED)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`(?:topChampions|opponentStats|championMatchups|topStrengths|topWeaknesses|phaseFarming|leadRetention|deathCost|unspentGold|teamObjectives|ANALYZED)`"""
+            """\b(?:rankedRecord|savedHistory|recentMatchSample|savedHistoryAverages|savedHistorySideSplits|recentMatchSummary|omittedMatchesRollup|timelineStatus|timelineCoverage|timelineInsights|improvementStats|visionDataPrecision|avgLaneCsAt10|missingLaneCsAt10Matches|NOT_ANALYZED)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`(?:topChampions|opponentStats|championMatchups|topStrengths|topWeaknesses|phaseFarming|leadRetention|deathCost|unspentGold|teamObjectives|ANALYZED)`"""
         )
 
         /**

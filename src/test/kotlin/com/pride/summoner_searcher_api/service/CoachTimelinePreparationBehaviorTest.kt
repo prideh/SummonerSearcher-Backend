@@ -13,9 +13,12 @@ import io.mockk.mockk
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
@@ -30,7 +33,9 @@ import java.nio.charset.StandardCharsets
 import java.time.Duration
 import java.util.Base64
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
@@ -2028,7 +2033,7 @@ class CoachTimelinePreparationBehaviorTest {
         assertTrue(partialPrompt.contains("When match timeline analysis is partial, cite the exact covered/requested game denominator from Timeline coverage"))
         assertFalse(partialPrompt.contains("5 plates per turret across 9 lane turrets"), "Unrelated Season 2026 turret-plate prompt hunk must be omitted")
 
-        // Verify BLOCKED context with null timelineInsights still emits TIMELINE COVERAGE BOUNDARY
+        // Verify BLOCKED context with null timelineInsights still emits natural blocked state, exact 0/20 denominator, and TIMELINE COVERAGE BOUNDARY
         val blockedContext = mapOf<String, Any>(
             "summonerName" to "Spear Shot",
             "rank" to "CHALLENGER I",
@@ -2048,11 +2053,18 @@ class CoachTimelinePreparationBehaviorTest {
             null,
             null
         ) as String
+        assertTrue(blockedPrompt.contains("Timeline (timeline temporarily unavailable)"))
         assertTrue(blockedPrompt.contains("Timeline coverage: status=blocked, covered=0/20 games, stop reason=memory headroom admission blocked"))
         assertTrue(blockedPrompt.contains("TIMELINE COVERAGE BOUNDARY"))
+        assertTrue(
+            blockedPrompt.contains(
+                "when match timeline analysis is blocked or covered games is 0, state plainly that minute-by-minute timeline data is temporarily unavailable and rely only on match summary stats"
+            )
+        )
 
-        // Verify #38 schema-leak detector remains intact
+        // Verify #38 schema-leak detector covers timelineStatus and timelineCoverage
         assertTrue(AiAnalysisService.containsInternalSchemaLeak("Your timelineStatus is NOT_ANALYZED"))
+        assertTrue(AiAnalysisService.containsInternalSchemaLeak("Your timelineCoverage is PARTIAL"))
         assertFalse(AiAnalysisService.containsInternalSchemaLeak("Minute-by-minute timeline data is available for 12 of your last 20 games."))
     }
 
@@ -3094,5 +3106,151 @@ class CoachTimelinePreparationBehaviorTest {
         assertEquals(listOf("EUW1_PLAIN_1", "EUW1_GZIP_2"), prepared.coveredMatchIds)
         assertEquals(2, prepared.analysis?.aggregateSummary?.gamesAnalyzed)
         coVerify(exactly = 0) { riotApiService.getMatchTimelineBounded(any(), any(), any(), any(), any(), any(), any(), any()) }
+
+        // 5. Intentional fail-closed compressed-cap tradeoff: concatenated empty GZIP members exceeding
+        // maxCompressedBytesForInflatedCap(1_024) (= 1,536 compressed bytes) fail closed with RESPONSE_TOO_LARGE
+        // even though inflated JSON (~180 bytes) is well under the 1,024-byte inflated cap.
+        val multiMemberBos = ByteArrayOutputStream()
+        repeat(90) {
+            GZIPOutputStream(multiMemberBos).use { /* empty 20-byte GZIP member */ }
+        }
+        GZIPOutputStream(multiMemberBos).use { gzipOut ->
+            mapper.writeValue(
+                gzipOut,
+                SummonerProfileDto("p-mm", "Multi", "EUW", 1, 1, null, emptyList(), emptyList())
+            )
+        }
+        val multiMemberCompressed = multiMemberBos.toByteArray()
+        assertTrue(multiMemberCompressed.size > RedisCacheService.maxCompressedBytesForInflatedCap(1_024))
+        store["player:profile:multimember"] = "GZIP_B64:" + Base64.getEncoder().encodeToString(multiMemberCompressed)
+        val multiMemberReason = AtomicReference<String?>(null)
+        val multiMemberDecoded = RedisCacheService.withBoundedInflateGuards(
+            RedisCacheService.BoundedInflateContext(
+                maxInflatedBytes = 1_024,
+                failureReasonHolder = multiMemberReason
+            )
+        ) {
+            redisCacheService.get("player:profile:multimember", SummonerProfileDto::class.java)
+        }
+        assertNull(multiMemberDecoded)
+        assertEquals("RESPONSE_TOO_LARGE", multiMemberReason.get())
+    }
+
+    @Test
+    fun `RiotApiRateLimiter SlidingWindowBucket snapshot-locking prevents ConcurrentModificationException under concurrent bursts while preserving HIGH and LOW caps and deadlines`() = runBlocking {
+        // Part 1: Deterministic verification of 80% LOW cap, 100% HIGH cap, window expiry, and mutex deadline bounds
+        val fakeClock = AtomicLong(100_000L)
+        val tp = object : TimeProvider {
+            override fun now(): Long = fakeClock.get()
+        }
+        val deterministicLimiter = RiotApiRateLimiter(tp)
+        deterministicLimiter.updateLimits("euw1", "20:10", "0:10", endpointKey = "timeline", methodLimitHeader = "20:10", methodCountHeader = "0:10")
+
+        // LOW priority is capped at 80% of 20 = 16 permits
+        repeat(16) { idx ->
+            assertTrue(
+                deterministicLimiter.tryAcquirePermit("euw1", ApiPriority.LOW, endpointKey = "timeline", maxWaitMs = 0L),
+                "LOW permit #${idx + 1} within 80% cap must succeed"
+            )
+        }
+        assertFalse(
+            deterministicLimiter.tryAcquirePermit("euw1", ApiPriority.LOW, endpointKey = "timeline", maxWaitMs = 0L),
+            "17th LOW permit must be rejected at 80% cap"
+        )
+
+        // HIGH priority can still consume the reserved 20% headroom (permits 17..20)
+        repeat(4) { idx ->
+            assertTrue(
+                deterministicLimiter.tryAcquirePermit("euw1", ApiPriority.HIGH, endpointKey = "timeline", maxWaitMs = 0L),
+                "HIGH permit #${17 + idx} must succeed using reserved headroom"
+            )
+        }
+        // 21st HIGH permit exceeds 20/10s capacity and required wait (~10,010ms) exceeds maxWaitMs=50ms -> immediate false
+        assertFalse(
+            deterministicLimiter.tryAcquirePermit("euw1", ApiPriority.HIGH, endpointKey = "timeline", maxWaitMs = 50L),
+            "21st HIGH permit must fail immediately when required wait exceeds deadline budget"
+        )
+
+        // Mutex contention deadline bound: holding app bucket mutex must bound tryAcquirePermit by maxWaitMs
+        val realLimiter = RiotApiRateLimiter(SystemTimeProvider())
+        realLimiter.updateLimits("euw1", "20:10", "0:10")
+        val lockEntered = CompletableDeferred<Unit>()
+        val releaseLock = CompletableDeferred<Unit>()
+        val holderJob = launch(Dispatchers.Default) {
+            realLimiter.withRegionAppBucketLockForTest("euw1", 10) {
+                lockEntered.complete(Unit)
+                releaseLock.await()
+            }
+        }
+        lockEntered.await()
+        val elapsedContendedMs = kotlin.system.measureTimeMillis {
+            val acquiredUnderContention = realLimiter.tryAcquirePermit("euw1", ApiPriority.HIGH, maxWaitMs = 45L)
+            assertFalse(acquiredUnderContention)
+        }
+        assertTrue(elapsedContendedMs < 500L, "Contended tryAcquirePermit must respect 45ms deadline (took ${elapsedContendedMs}ms)")
+        releaseLock.complete(Unit)
+        holderJob.join()
+
+        // Advancing fake clock past 10s window + 2s foreground yield restores both HIGH and LOW permits
+        fakeClock.addAndGet(12_500L)
+        assertTrue(deterministicLimiter.tryAcquirePermit("euw1", ApiPriority.LOW, endpointKey = "timeline", maxWaitMs = 0L))
+        assertTrue(deterministicLimiter.tryAcquirePermit("euw1", ApiPriority.HIGH, endpointKey = "timeline", maxWaitMs = 0L))
+
+        // Part 2: Multithreaded race between unlocked snapshot readers (tryAcquire requiredWaitMs + getVerificationSnapshot)
+        // and mutex-guarded ArrayDeque mutators (cleanUp removeFirst + addLast + syncCount resize)
+        val raceClock = AtomicLong(1_000_000L)
+        val raceLimiter = RiotApiRateLimiter(object : TimeProvider {
+            override fun now(): Long = raceClock.get()
+        })
+        raceLimiter.updateLimits("euw1", "50:1", "0:1", endpointKey = "match-timeline", methodLimitHeader = "50:1", methodCountHeader = "0:1")
+
+        val uncaughtErrors = ConcurrentLinkedQueue<Throwable>()
+        val pool = Executors.newFixedThreadPool(8)
+        try {
+            val dispatcher = pool.asCoroutineDispatcher()
+            coroutineScope {
+                val jobs = (0 until 8).map { workerIdx ->
+                    launch(dispatcher) {
+                        repeat(250) { step ->
+                            try {
+                                if (step % 5 == 0) {
+                                    raceClock.addAndGet(350L) // trigger frequent cleanUp() removeFirst() while readers iterate
+                                }
+                                when ((workerIdx + step) % 4) {
+                                    0 -> raceLimiter.tryAcquirePermit("euw1", ApiPriority.HIGH, endpointKey = "match-timeline", maxWaitMs = 5L)
+                                    1 -> raceLimiter.tryAcquirePermit("euw1", ApiPriority.LOW, endpointKey = "match-timeline", maxWaitMs = 0L)
+                                    2 -> raceLimiter.updateLimits(
+                                        region = "euw1",
+                                        limitHeader = "50:1",
+                                        countHeader = "${(step % 45) + 1}:1",
+                                        endpointKey = "match-timeline",
+                                        methodLimitHeader = "50:1",
+                                        methodCountHeader = "${(step % 45) + 1}:1",
+                                        deadlineAtMs = raceClock.get() + 20L
+                                    )
+                                    else -> {
+                                        val snap = raceLimiter.getVerificationSnapshot(
+                                            region = "euw1",
+                                            networkCollectionEnabled = true,
+                                            requiredEndpoints = setOf("match-timeline")
+                                        )
+                                        assertTrue(snap.activeAppBuckets.isNotEmpty())
+                                    }
+                                }
+                            } catch (t: Throwable) {
+                                uncaughtErrors.add(t)
+                            }
+                        }
+                    }
+                }
+                jobs.joinAll()
+            }
+        } finally {
+            pool.shutdownNow()
+        }
+        assertTrue(
+            uncaughtErrors.isEmpty(),
+            "Expected zero ConcurrentModificationException or race errors across 2,000 concurrent operations, got: ${uncaughtErrors.firstOrNull()}"
+        )
     }
 }
