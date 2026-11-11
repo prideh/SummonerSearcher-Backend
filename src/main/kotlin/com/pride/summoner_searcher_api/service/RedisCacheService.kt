@@ -131,22 +131,129 @@ class RedisCacheService(
     }
 
     private fun <T> deserializeValue(rawValue: String, type: Class<T>): T? {
+        val ctx = currentThreadInflateContext.get()
+        val effectiveMaxBytes = (ctx?.maxInflatedBytes ?: DEFAULT_MAX_INFLATED_CACHE_BYTES)
+            .coerceIn(1_024, HARD_MAX_INFLATED_CACHE_BYTES)
         return try {
             if (rawValue.startsWith(COMPRESSION_PREFIX)) {
+                val b64Len = rawValue.length - COMPRESSION_PREFIX.length
+                if (b64Len > HARD_MAX_COMPRESSED_BASE64_CHARS) {
+                    ctx?.failureReasonHolder?.set("RESPONSE_TOO_LARGE")
+                    return null
+                }
                 val b64Bytes = rawValue.substring(COMPRESSION_PREFIX.length)
                     .toByteArray(java.nio.charset.StandardCharsets.ISO_8859_1)
                 java.io.ByteArrayInputStream(b64Bytes).use { rawIn ->
                     java.util.Base64.getDecoder().wrap(rawIn).use { b64In ->
                         java.util.zip.GZIPInputStream(b64In, GZIP_BUFFER_SIZE).use { gzipIn ->
-                            objectMapper.readValue(gzipIn, type)
+                            BoundedInflatingInputStream(
+                                delegate = gzipIn,
+                                maxInflatedBytes = effectiveMaxBytes,
+                                deadlineAtMs = ctx?.deadlineAtMs,
+                                timeProvider = ctx?.timeProvider,
+                                headroomGuard = ctx?.headroomGuard,
+                                failureReasonHolder = ctx?.failureReasonHolder
+                            ).use { boundedIn ->
+                                objectMapper.readValue(boundedIn, type)
+                            }
                         }
                     }
                 }
             } else {
-                objectMapper.readValue(rawValue, type)
+                val utf8Bytes = rawValue.toByteArray(java.nio.charset.StandardCharsets.UTF_8)
+                java.io.ByteArrayInputStream(utf8Bytes).use { rawIn ->
+                    BoundedInflatingInputStream(
+                        delegate = rawIn,
+                        maxInflatedBytes = effectiveMaxBytes,
+                        deadlineAtMs = ctx?.deadlineAtMs,
+                        timeProvider = ctx?.timeProvider,
+                        headroomGuard = ctx?.headroomGuard,
+                        failureReasonHolder = ctx?.failureReasonHolder
+                    ).use { boundedIn ->
+                        objectMapper.readValue(boundedIn, type)
+                    }
+                }
             }
-        } catch (_: Exception) {
+        } catch (e: BoundedCacheReadAbortedException) {
+            ctx?.failureReasonHolder?.set(e.reason)
             null
+        } catch (e: Exception) {
+            val aborted = generateSequence<Throwable>(e) { it.cause }
+                .filterIsInstance<BoundedCacheReadAbortedException>()
+                .firstOrNull()
+            if (aborted != null) {
+                ctx?.failureReasonHolder?.set(aborted.reason)
+            } else if (ctx != null && (Thread.currentThread().isInterrupted ||
+                    (ctx.deadlineAtMs != null && (ctx.timeProvider?.now() ?: System.currentTimeMillis()) >= ctx.deadlineAtMs))
+            ) {
+                if (ctx.failureReasonHolder?.get() == null) {
+                    ctx.failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                }
+            }
+            null
+        }
+    }
+
+    internal class BoundedCacheReadAbortedException(val reason: String) : java.io.IOException(reason)
+
+    internal data class BoundedInflateContext(
+        val maxInflatedBytes: Int,
+        val deadlineAtMs: Long? = null,
+        val timeProvider: TimeProvider? = null,
+        val headroomGuard: (() -> Boolean)? = null,
+        val failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>? = null
+    )
+
+    internal class BoundedInflatingInputStream(
+        private val delegate: java.io.InputStream,
+        private val maxInflatedBytes: Int,
+        private val deadlineAtMs: Long? = null,
+        private val timeProvider: TimeProvider? = null,
+        private val headroomGuard: (() -> Boolean)? = null,
+        private val failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>? = null
+    ) : java.io.InputStream() {
+        private var totalBytesRead = 0
+
+        private fun checkGuardsOrThrow() {
+            val nowMs = timeProvider?.now() ?: System.currentTimeMillis()
+            if (Thread.currentThread().isInterrupted || (deadlineAtMs != null && nowMs >= deadlineAtMs)) {
+                failureReasonHolder?.set("DEADLINE_EXCEEDED")
+                throw BoundedCacheReadAbortedException("DEADLINE_EXCEEDED")
+            }
+            if (headroomGuard != null && !headroomGuard.invoke()) {
+                failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+                throw BoundedCacheReadAbortedException("MEMORY_HEADROOM_STOP")
+            }
+            if (totalBytesRead > maxInflatedBytes) {
+                failureReasonHolder?.set("RESPONSE_TOO_LARGE")
+                throw BoundedCacheReadAbortedException("RESPONSE_TOO_LARGE")
+            }
+        }
+
+        override fun read(): Int {
+            checkGuardsOrThrow()
+            val b = delegate.read()
+            if (b != -1) {
+                totalBytesRead++
+            }
+            checkGuardsOrThrow()
+            return b
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (len <= 0) return 0
+            checkGuardsOrThrow()
+            val boundedLen = len.coerceAtMost(1_024)
+            val n = delegate.read(b, off, boundedLen)
+            if (n > 0) {
+                totalBytesRead += n
+            }
+            checkGuardsOrThrow()
+            return n
+        }
+
+        override fun close() {
+            delegate.close()
         }
     }
 
@@ -155,5 +262,28 @@ class RedisCacheService(
         private const val GZIP_BUFFER_SIZE = 2048
         const val DEFAULT_MAX_SCAN_KEYS = 2_000
         const val HARD_MAX_SCAN_KEYS = 5_000
+        const val DEFAULT_MAX_INFLATED_CACHE_BYTES = 16 * 1024 * 1024 // 16 MiB default bomb guard
+        const val HARD_MAX_INFLATED_CACHE_BYTES = 32 * 1024 * 1024
+        private const val HARD_MAX_COMPRESSED_BASE64_CHARS = 12 * 1024 * 1024
+
+        private val currentThreadInflateContext = ThreadLocal<BoundedInflateContext?>()
+
+        internal fun <R> withBoundedInflateGuards(
+            context: BoundedInflateContext,
+            block: () -> R
+        ): R {
+            val previous = currentThreadInflateContext.get()
+            currentThreadInflateContext.set(context)
+            return try {
+                block()
+            } finally {
+                if (previous != null) {
+                    currentThreadInflateContext.set(previous)
+                } else {
+                    currentThreadInflateContext.remove()
+                }
+            }
+        }
     }
 }
+
