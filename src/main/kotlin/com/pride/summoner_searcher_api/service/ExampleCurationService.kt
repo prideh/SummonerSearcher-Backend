@@ -139,24 +139,12 @@ class ExampleCurationService(
     
     /**
      * Evaluate active A/B challenger PromptVersions that have accumulated sufficient feedback.
-     * Retires any legacy active champion or challenger PromptVersion whose template fails current
-     * schema-leak, CS@10 theoretical-maximum, or evidence-boundary directives, promotes winning
-     * eligible challengers to champion, and retires underperforming challengers.
+     * Preserves existing DB rows without bulk retirement (read-time eligibility gating happens in
+     * AiAnalysisService), promotes winning eligible challengers to champion, and retires
+     * underperforming challengers based on feedback thresholds.
      */
     private fun evaluateActiveChallengers() {
         try {
-            promptVersionRepository.findAll()
-                .filter { it.isActive && !AiAnalysisService.isEligiblePromptVersionDirective(it.promptTemplate) }
-                .forEach { polluted ->
-                    polluted.isActive = false
-                    promptVersionRepository.save(polluted)
-                    logger.info(
-                        "Retired legacy/ineligible active PromptVersion '{}' (scope={})",
-                        polluted.versionName,
-                        polluted.categoryScope ?: "global"
-                    )
-                }
-
             val activeChallengers = promptVersionRepository.findByIsActiveTrueAndIsChallengerTrue()
                 .filter { AiAnalysisService.isEligiblePromptVersionDirective(it.promptTemplate) }
             activeChallengers.forEach { challenger ->
@@ -220,7 +208,6 @@ class ExampleCurationService(
                         "negative rate over last 30 days ($totalCount interactions)."
                     )
                     val existingScoped = promptVersionRepository.findByIsActiveTrueAndCategoryScope(category)
-                        .filter { AiAnalysisService.isEligiblePromptVersionDirective(it.promptTemplate) }
                     if (existingScoped.none { it.isChallenger }) {
                         val safeCategorySlug = category.take(20).replace(Regex("[^a-zA-Z0-9_-]"), "")
                         val versionName = "v1.1-$safeCategorySlug-${Instant.now().epochSecond % 100000}"

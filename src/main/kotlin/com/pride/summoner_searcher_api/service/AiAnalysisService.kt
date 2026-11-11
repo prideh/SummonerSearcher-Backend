@@ -371,10 +371,11 @@ class AiAnalysisService(
         var improvementSection = buildImprovementStatsSection(context, compact = false)
         var promptVersionSection = promptVersion?.promptTemplate
             ?.takeIf { isEligiblePromptVersionDirective(it) }
+            ?.let { renderPromptVersionDirectiveSlice(it) }
             ?.let {
                 """
                 **CATEGORY COACHING DIRECTIVE:**
-                ${it.trim().take(1_200)}
+                $it
                 """.trimIndent()
             } ?: ""
 
@@ -620,14 +621,16 @@ class AiAnalysisService(
             return cleaned.replace('_', ' ').replace(Regex("""\s+"""), " ").trim()
         }
 
+        const val MAX_PROMPT_VERSION_DIRECTIVE_CHARS: Int = 1_200
+
         private val INTERNAL_SCHEMA_LEAK_REGEX = Regex(
-            """\b(?:rankedRecord|savedHistory|recentMatchSample|savedHistoryAverages|savedHistorySideSplits|recentMatchSummary|omittedMatchesRollup|timelineStatus|timelineInsights|improvementStats|visionDataPrecision|avgLaneCsAt10|missingLaneCsAt10Matches|avgTheoreticalMax|theoreticalMaxMatchCount|eligibleTimeDeadGames|personalLastHits|personalTakedowns|timelineInvolved|firstRate|NOT_ANALYZED|WARD_PLACED|topChampions|opponentStats|championMatchups|topStrengths|topWeaknesses|phaseFarming|leadRetention|deathCost|unspentGold|teamObjectives|wardsByTimeBucket|damageSplitPct|opponentDetails|itemSpikes|skillMaxOrder|cs_farming|vision_warding|wave_management|trading_laning|itemization_builds|macro_rotations|objective_control|jungle_pathing|back_timing|win_conditions|champion_pool|champion_mechanics|power_spikes|positional_spacing|resource_management|mental_state_tilt|review_methodology|full_analysis|opponent_specific)\b|\b(?:horde|tower|dragon|baron|riftHerald)\.firstRate\b|\bcs10\.theoreticalMax(?:Label)?\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`[^`\n]+`"""
+            """\b(?:savedHistorySideSplits|missingLaneCsAt10Matches|theoreticalMaxMatchCount|savedHistoryAverages|omittedMatchesRollup|visionDataPrecision|recentMatchSummary|totalGamesAnalyzed|recentMatchSample|championMatchups|timelineInsights|improvementStats|timelineInvolved|personalTakedowns|eligibleTimeDeadGames|avgTheoreticalMax|wardsByTimeBucket|challengeSummary|personalLastHits|targetMatchCount|opponentDetails|timelineStatus|damageSplitPct|teamObjectives|avgLaneCsAt10|recentMatches|opponentStats|roleBreakdown|skillMaxOrder|topWeaknesses|leadRetention|rankedRecord|savedHistory|topChampions|topStrengths|phaseFarming|unspentGold|NOT_ANALYZED|WARD_PLACED|itemSpikes|deathCost|firstRate|avgTarget|cs_farming|vision_warding|wave_management|trading_laning|itemization_builds|macro_rotations|objective_control|jungle_pathing|back_timing|win_conditions|champion_pool|champion_mechanics|power_spikes|positional_spacing|resource_management|mental_state_tilt|review_methodology|full_analysis|opponent_specific)\b|\b[a-z]+(?:SideSplits|Averages|MatchSample|MatchSummary|MatchesRollup|DataPrecision|TimeBucket|SplitPct|MaxOrder|LastHits)\b|\b(?:horde|tower|dragon|baron|riftHerald)\.firstRate\b|\bcs10\.(?:theoreticalMax(?:Label)?|target(?:Label)?|spawnedSupply|supplyLabel)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`"""
         )
 
         /**
          * Detects whether player-facing text, a PromptVersion directive, or a stored few-shot example exposes
-         * internal sample/metric keys, snake_case category slugs, bracketed `[sample: ...]` markers, legacy
-         * prompt header tags, status codes such as `NOT_ANALYZED`, or inline markdown backticks.
+         * internal sample/metric keys, camelCase-glued suffix residue, snake_case category slugs, bracketed
+         * `[sample: ...]` markers, legacy prompt header tags, status codes such as `NOT_ANALYZED`, or backticks.
          */
         fun containsInternalSchemaLeak(text: String): Boolean =
             INTERNAL_SCHEMA_LEAK_REGEX.containsMatchIn(text)
@@ -636,19 +639,30 @@ class AiAnalysisService(
             """(?i)(?:\bstep[- ]by[- ]step\s+in[- ]game\s+execution\b|\bspecify\s+exact\s+warding\b|\bwarding\s+timings?\s+and\s+locations?\b|\bpassive/stat\s+synergy\b|\b10:00\s+benchmark\b|\b[a-z]+_[a-z_]+\b)"""
         )
 
+        internal fun renderPromptVersionDirectiveSlice(template: String?): String? {
+            val full = template?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            return trimAtSentenceBoundary(full, MAX_PROMPT_VERSION_DIRECTIVE_CHARS)
+                .takeIf { it.isNotEmpty() }
+        }
+
+        private fun passesPromptVersionDirectiveGates(text: String): Boolean {
+            if (containsInternalSchemaLeak(text)) return false
+            if (containsCs10TheoreticalMaxMislabeling(text)) return false
+            if (containsEvidenceBoundaryViolation(text)) return false
+            if (LEGACY_POLLUTED_DIRECTIVE_REGEX.containsMatchIn(text)) return false
+            return true
+        }
+
         /**
-         * Gates active DB `PromptVersion` templates so pre-#36/#38/#39 directives (raw snake_case category
-         * slugs, "step-by-step in-game execution", "specify exact warding timings and locations",
-         * "passive/stat synergy", CS@10 target/benchmark mislabeling, or evidence-boundary violations)
-         * cannot pollute prompt assembly.
+         * Read-time gate for DB `PromptVersion` templates. Validates BOTH the full trimmed template
+         * AND the exact `<= 1,200`-char sentence-bounded slice injected into the prompt so neither
+         * violations past character 1,200 nor boundary-straddling slices can pass or be injected.
          */
         fun isEligiblePromptVersionDirective(template: String?): Boolean {
-            val bounded = template?.trim()?.takeIf { it.isNotEmpty() }?.take(1_200) ?: return false
-            if (containsInternalSchemaLeak(bounded)) return false
-            if (containsCs10TheoreticalMaxMislabeling(bounded)) return false
-            if (containsEvidenceBoundaryViolation(bounded)) return false
-            if (LEGACY_POLLUTED_DIRECTIVE_REGEX.containsMatchIn(bounded)) return false
-            return true
+            val full = template?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+            if (!passesPromptVersionDirectiveGates(full)) return false
+            val injectedSlice = renderPromptVersionDirectiveSlice(full) ?: return false
+            return passesPromptVersionDirectiveGates(injectedSlice)
         }
 
         internal fun trimAtSentenceBoundary(text: String, maxChars: Int): String {
@@ -784,7 +798,48 @@ class AiAnalysisService(
         fun requestsExpandedAnswer(question: String): Boolean =
             EXPANDED_ANSWER_REQUEST_REGEX.containsMatchIn(question)
 
-        private fun hasSentenceEvidenceViolation(sentence: String, timelineAnalyzed: Boolean): Boolean {
+        private fun extractUnambiguouslyGroundedTerms(context: Map<String, Any>): Set<String> {
+            if (context.isEmpty()) return emptySet()
+            val grounded = mutableSetOf<String>()
+            val recentMatches = (context["recentMatches"] as? List<*>)?.mapNotNull { it as? Map<*, *> } ?: emptyList()
+            for (match in recentMatches) {
+                (match["items"] as? List<*>)?.mapNotNull { it?.toString()?.trim()?.lowercase() }
+                    ?.filter { it.isNotEmpty() }
+                    ?.let { grounded.addAll(it) }
+            }
+            val distinctChampions = buildSet {
+                context["champion"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.lowercase()?.let { add(it) }
+                for (match in recentMatches) {
+                    match["champion"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.lowercase()?.let { add(it) }
+                }
+            }
+            if (distinctChampions.size == 1) {
+                val verifiedAbilities = when (val raw = context["verifiedAbilities"]) {
+                    is Collection<*> -> raw.mapNotNull { it?.toString()?.trim()?.lowercase() }
+                    is Map<*, *> -> raw.values.mapNotNull { it?.toString()?.trim()?.lowercase() }
+                    else -> emptyList()
+                }
+                grounded.addAll(verifiedAbilities.filter { it.isNotEmpty() })
+            }
+            return grounded
+        }
+
+        private fun hasUngroundedAbilityOrMythicClaim(
+            sentence: String,
+            context: Map<String, Any> = emptyMap()
+        ): Boolean {
+            val scrubbed = LOCAL_NEGATED_ABILITY_MYTHIC_REGEX.replace(sentence, " ")
+            val matches = INVENTED_ABILITY_OR_MYTHIC_REGEX.findAll(scrubbed).toList()
+            if (matches.isEmpty()) return false
+            val groundedTerms = extractUnambiguouslyGroundedTerms(context)
+            return matches.any { mr -> mr.value.trim().lowercase() !in groundedTerms }
+        }
+
+        private fun hasSentenceEvidenceViolation(
+            sentence: String,
+            timelineAnalyzed: Boolean,
+            context: Map<String, Any> = emptyMap()
+        ): Boolean {
             if (LIFETIME_RANKED_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_LIFETIME_RANKED_REGEX.replace(sentence, " "))) {
                 return true
             }
@@ -816,7 +871,7 @@ class AiAnalysisService(
             ) {
                 return true
             }
-            if (INVENTED_ABILITY_OR_MYTHIC_REGEX.containsMatchIn(LOCAL_NEGATED_ABILITY_MYTHIC_REGEX.replace(sentence, " "))) {
+            if (hasUngroundedAbilityOrMythicClaim(sentence, context)) {
                 return true
             }
             if (CHALLENGE_DIAGNOSIS_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_CHALLENGE_DIAGNOSIS_REGEX.replace(sentence, " "))) {
@@ -884,6 +939,8 @@ class AiAnalysisService(
          * Meaning-preserving rewrite of internal schema keys, bracketed `[sample: ...]` tags, status codes,
          * snake_case category slugs, and markdown backticks into natural player language while keeping every
          * supplied number, win/loss count, and sample distinction intact without inventing counts.
+         * Uses strict word boundaries (`\b`) and longest-token-first ordering so compound keys such as
+         * `savedHistoryAverages` / `savedHistorySideSplits` never partially match `savedHistory`.
          */
         internal fun rewriteInternalSchemaTokens(text: String, context: Map<String, Any> = emptyMap()): String {
             if (text.isBlank()) return text
@@ -904,10 +961,25 @@ class AiAnalysisService(
                 .replace("Saved Match History", "saved match history")
                 .replace("Detailed Match List", "recent detailed match sample")
 
-            // 2. Three core sample keys (preserving possessive/preposition agreement & singular verb compatibility)
-            out = Regex("""`?recentMatchSample`?\s+of\s+(\d+)\s+(games|matches)""", RegexOption.IGNORE_CASE)
+            // 2. Compound & core sample/status keys — longest tokens first with strict \b word boundaries
+            out = Regex("""\b(your|the|my)\s+`?\bsavedHistorySideSplits\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { "${it.groupValues[1]} saved-match side splits" }
+            out = Regex("""`?\bsavedHistorySideSplits\b`?""")
+                .replace(out, "saved-match side splits")
+
+            out = Regex("""\b(your|the|my)\s+`?\bsavedHistoryAverages\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { "${it.groupValues[1]} saved-match averages" }
+            out = Regex("""`?\bsavedHistoryAverages\b`?""")
+                .replace(out, "saved-match averages")
+
+            out = Regex("""\b(your|the|my)\s+`?\brecentMatchSummary\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { "${it.groupValues[1]} recent match summary" }
+            out = Regex("""`?\brecentMatchSummary\b`?""")
+                .replace(out, "recent match summary")
+
+            out = Regex("""`?\brecentMatchSample\b`?\s+of\s+(\d+)\s+(games|matches)""", RegexOption.IGNORE_CASE)
                 .replace(out) { "recent ${it.groupValues[1]}-game detailed sample" }
-            out = Regex("""\b(your|the|my)\s+`?recentMatchSample`?""", RegexOption.IGNORE_CASE)
+            out = Regex("""\b(your|the|my)\s+`?\brecentMatchSample\b`?""", RegexOption.IGNORE_CASE)
                 .replace(out) { mr ->
                     val determiner = mr.groupValues[1]
                     val suffix = out.substring(mr.range.last + 1).take(28)
@@ -918,7 +990,7 @@ class AiAnalysisService(
                         "$determiner recent detailed match sample"
                     }
                 }
-            out = Regex("""`?recentMatchSample`?""")
+            out = Regex("""`?\brecentMatchSample\b`?""")
                 .replace(out) { mr ->
                     val suffix = out.substring(mr.range.last + 1).take(28)
                     val alreadyHasCount = recentGames > 0 && Regex("""^\s*(?:\(|of\s+|across\s+)?$recentGames\b""").containsMatchIn(suffix)
@@ -929,83 +1001,116 @@ class AiAnalysisService(
                     }
                 }
 
-            out = Regex("""\b(your|the|my)\s+`?savedHistory`?""", RegexOption.IGNORE_CASE)
-                .replace(out) { "${it.groupValues[1]} saved match history" }
-            out = Regex("""`?savedHistory`?""").replace(out, "your saved match history")
-
-            out = Regex("""\b(your|the|my)\s+`?rankedRecord`?""", RegexOption.IGNORE_CASE)
-                .replace(out) { "${it.groupValues[1]} current-season ranked record" }
-            out = Regex("""`?rankedRecord`?""").replace(out, "your current-season ranked record")
-
-            // 3. Timeline & telemetry status tokens
-            out = Regex("""`?timelineStatus`?\s*(?:is|=|:)\s*`?NOT_ANALYZED`?""", RegexOption.IGNORE_CASE)
+            out = Regex("""`?\btimelineStatus\b`?\s*(?:is|=|:)\s*`?\bNOT_ANALYZED\b`?""", RegexOption.IGNORE_CASE)
                 .replace(out, "match timelines are not analyzed yet")
-            out = Regex("""`?timelineStatus`?\s*(?:is|=|:)\s*`?ANALYZED`?""", RegexOption.IGNORE_CASE)
+            out = Regex("""`?\btimelineStatus\b`?\s*(?:is|=|:)\s*`?\bANALYZED\b`?""", RegexOption.IGNORE_CASE)
                 .replace(out, "match timelines are analyzed")
-            out = Regex("""\b(your|the|my)\s+`?timelineStatus`?""", RegexOption.IGNORE_CASE)
+            out = Regex("""\b(your|the|my)\s+`?\btimelineStatus\b`?""", RegexOption.IGNORE_CASE)
                 .replace(out) { "${it.groupValues[1]} match timeline analysis" }
-            out = Regex("""`?timelineStatus`?""").replace(out, "match timeline analysis")
-            out = Regex("""`?NOT_ANALYZED`?""").replace(out, "not analyzed yet")
-            out = Regex("""`?WARD_PLACED`?""").replace(out, "ward-placed event")
+            out = Regex("""`?\btimelineStatus\b`?""")
+                .replace(out, "match timeline analysis")
 
-            // 4. Metric & section camelCase / dotted keys
-            val fieldReplacements = listOf(
-                Regex("""`?horde\.firstRate`?""") to "team first-Voidgrub rate",
-                Regex("""`?tower\.firstRate`?""") to "team first-tower rate",
-                Regex("""`?dragon\.firstRate`?""") to "team first-dragon rate",
-                Regex("""`?baron\.firstRate`?""") to "team first-Baron rate",
-                Regex("""`?riftHerald\.firstRate`?""") to "team first-Herald rate",
-                Regex("""`?firstRate`?""") to "team first-objective rate",
-                Regex("""`?savedHistoryAverages`?""") to "saved-match averages",
-                Regex("""`?savedHistorySideSplits`?""") to "saved-match side splits",
-                Regex("""`?recentMatchSummary`?""") to "recent match summary",
-                Regex("""`?omittedMatchesRollup`?""") to "other recent matches",
-                Regex("""`?timelineInsights`?""") to "timeline stats",
-                Regex("""`?improvementStats`?""") to "improvement stats",
-                Regex("""`?visionDataPrecision`?""") to "vision telemetry scope",
-                Regex("""`?avgLaneCsAt10`?""") to "average 10:00 lane CS",
-                Regex("""`?missingLaneCsAt10Matches`?""") to "matches missing 10:00 lane CS",
-                Regex("""`?cs10\.theoreticalMaxLabel`?""") to "10:00 theoretical maximum note",
-                Regex("""`?cs10\.theoreticalMax`?""") to "10:00 theoretical maximum CS",
-                Regex("""`?avgTheoreticalMax`?""") to "average 10:00 theoretical maximum CS",
-                Regex("""`?theoreticalMaxMatchCount`?""") to "supported 10:00 CS match count",
-                Regex("""`?cs10\.target(?:Label)?`?""") to "10:00 theoretical maximum CS",
-                Regex("""`?avgTarget`?""") to "average 10:00 theoretical maximum CS",
-                Regex("""`?targetMatchCount`?""") to "supported 10:00 CS match count",
-                Regex("""`?cs10\.(?:spawnedSupply|supplyLabel)`?""") to "10:00 theoretical maximum CS",
-                Regex("""`?eligibleTimeDeadGames`?""") to "games with death-time data",
-                Regex("""`?personalLastHits`?""") to "personal objective last-hits",
-                Regex("""`?personalTakedowns`?""") to "personal objective takedowns",
-                Regex("""`?timelineInvolved`?""") to "timeline objective involvement",
-                Regex("""`?topChampions`?""") to "most-played champions",
-                Regex("""`?opponentStats`?""") to "matched role-opponent averages",
-                Regex("""`?championMatchups`?""") to "champion matchups",
-                Regex("""`?topStrengths`?""") to "challenge strength frequencies",
-                Regex("""`?topWeaknesses`?""") to "challenge trail frequencies",
-                Regex("""`?phaseFarming`?""") to "post-lane farming",
-                Regex("""`?leadRetention`?""") to "lead retention",
-                Regex("""`?deathCost`?""") to "time spent dead",
-                Regex("""`?unspentGold`?""") to "unspent gold checkpoints",
-                Regex("""`?teamObjectives`?""") to "team objectives",
-                Regex("""`?wardsByTimeBucket`?""") to "ward timing buckets",
-                Regex("""`?damageSplitPct`?""") to "damage split",
-                Regex("""`?opponentDetails`?""") to "lane opponent stats",
-                Regex("""`?itemSpikes`?""") to "item timings",
-                Regex("""`?skillMaxOrder`?""") to "ability max order"
-            )
-            for ((pattern, replacement) in fieldReplacements) {
+            out = Regex("""\b(your|the|my)\s+`?\brecentMatches\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { mr ->
+                    val determiner = mr.groupValues[1]
+                    val suffix = out.substring(mr.range.last + 1).take(28)
+                    val alreadyHasCount = recentGames > 0 && Regex("""^\s*(?:\(|of\s+|across\s+)?$recentGames\b""").containsMatchIn(suffix)
+                    if (recentGames > 0 && !alreadyHasCount) {
+                        "$determiner last $recentGames detailed matches"
+                    } else {
+                        "$determiner recent detailed matches"
+                    }
+                }
+            out = Regex("""`?\brecentMatches\b`?""")
+                .replace(out) { mr ->
+                    val suffix = out.substring(mr.range.last + 1).take(28)
+                    val alreadyHasCount = recentGames > 0 && Regex("""^\s*(?:\(|of\s+|across\s+)?$recentGames\b""").containsMatchIn(suffix)
+                    if (recentGames > 0 && !alreadyHasCount) {
+                        "your last $recentGames detailed matches"
+                    } else {
+                        "your recent detailed matches"
+                    }
+                }
+
+            out = Regex("""\b(your|the|my)\s+`?\bsavedHistory\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { "${it.groupValues[1]} saved match history" }
+            out = Regex("""`?\bsavedHistory\b`?""")
+                .replace(out, "your saved match history")
+
+            out = Regex("""\b(your|the|my)\s+`?\brankedRecord\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { "${it.groupValues[1]} current-season ranked record" }
+            out = Regex("""`?\brankedRecord\b`?""")
+                .replace(out, "your current-season ranked record")
+
+            // 3. Remaining dotted & camelCase metric keys — strictly longest-token-first with word boundaries
+            val sortedFieldTokens = listOf(
+                "missingLaneCsAt10Matches" to "matches missing 10:00 lane CS",
+                "theoreticalMaxMatchCount" to "supported 10:00 CS match count",
+                "cs10.theoreticalMaxLabel" to "10:00 theoretical maximum note",
+                "eligibleTimeDeadGames" to "games with death-time data",
+                "omittedMatchesRollup" to "other recent matches",
+                "riftHerald.firstRate" to "team first-Herald rate",
+                "visionDataPrecision" to "vision telemetry scope",
+                "cs10.theoreticalMax" to "10:00 theoretical maximum CS",
+                "totalGamesAnalyzed" to "saved matches analyzed",
+                "cs10.spawnedSupply" to "10:00 theoretical maximum CS",
+                "personalTakedowns" to "personal objective takedowns",
+                "avgTheoreticalMax" to "average 10:00 theoretical maximum CS",
+                "wardsByTimeBucket" to "ward timing buckets",
+                "championMatchups" to "champion matchups",
+                "timelineInsights" to "timeline stats",
+                "improvementStats" to "improvement stats",
+                "timelineInvolved" to "timeline objective involvement",
+                "personalLastHits" to "personal objective last-hits",
+                "challengeSummary" to "challenge comparison summary",
+                "targetMatchCount" to "supported 10:00 CS match count",
+                "cs10.targetLabel" to "10:00 theoretical maximum CS",
+                "cs10.supplyLabel" to "10:00 theoretical maximum CS",
+                "dragon.firstRate" to "team first-dragon rate",
+                "opponentDetails" to "lane opponent stats",
+                "horde.firstRate" to "team first-Voidgrub rate",
+                "tower.firstRate" to "team first-tower rate",
+                "baron.firstRate" to "team first-Baron rate",
+                "damageSplitPct" to "damage split",
+                "teamObjectives" to "team objectives",
+                "avgLaneCsAt10" to "average 10:00 lane CS",
+                "opponentStats" to "matched role-opponent averages",
+                "roleBreakdown" to "per-role breakdown",
+                "skillMaxOrder" to "ability max order",
+                "topWeaknesses" to "challenge trail frequencies",
+                "leadRetention" to "lead retention",
+                "topChampions" to "most-played champions",
+                "topStrengths" to "challenge strength frequencies",
+                "phaseFarming" to "post-lane farming",
+                "NOT_ANALYZED" to "not analyzed yet",
+                "cs10.target" to "10:00 theoretical maximum CS",
+                "unspentGold" to "unspent gold checkpoints",
+                "WARD_PLACED" to "ward-placed event",
+                "itemSpikes" to "item timings",
+                "deathCost" to "time spent dead",
+                "avgTarget" to "average 10:00 theoretical maximum CS"
+            ).sortedByDescending { it.first.length }
+
+            for ((token, replacement) in sortedFieldTokens) {
+                val pattern = if (token.contains('.')) {
+                    Regex("""`?\b${Regex.escape(token)}\b`?""")
+                } else {
+                    Regex("""`?(?<![A-Za-z0-9_.])${Regex.escape(token)}\b`?""")
+                }
                 out = pattern.replace(out, replacement)
             }
+            out = Regex("""`?\b[A-Za-z]+\.firstRate\b`?""").replace(out, "team first-objective rate")
+            out = Regex("""`?(?<![A-Za-z0-9_.])firstRate\b`?""").replace(out, "team first-objective rate")
 
-            // 5. Internal snake_case category keys
-            for ((slug, naturalName) in CATEGORY_DISPLAY_NAMES) {
+            // 4. Internal snake_case category keys — longest-first with \b word boundaries
+            for ((slug, naturalName) in CATEGORY_DISPLAY_NAMES.entries.sortedByDescending { it.key.length }) {
                 if (slug.contains('_')) {
                     out = Regex("""`?\b${Regex.escape(slug)}\b`?""", RegexOption.IGNORE_CASE)
                         .replace(out, naturalName)
                 }
             }
 
-            // 6. Strip any remaining inline backticks so player prose & suggestions stay pure natural text
+            // 5. Strip any remaining inline backticks so player prose & suggestions stay pure natural text
             out = Regex("""`([^`\n]+)`""").replace(out) { it.groupValues[1] }
             out = out.replace("`", "")
             return out
@@ -1055,11 +1160,16 @@ class AiAnalysisService(
                 }
             }
 
-            // 3. Unsupported cross-window "better synergy" / "tighter macro" causes -> honest sample variance note
+            // 3. Unsupported cross-window "better synergy" / "tighter macro" causes -> state honestly that cause is not determined
             if (UNSUPPORTED_SYNERGY_MACRO_CAUSE_REGEX.containsMatchIn(LOCAL_NEGATED_SYNERGY_MACRO_REGEX.replace(s, " "))) {
                 s = Regex(
-                    """(?i)\b(?:tighter\s+macro\s+and\s+better\s+(?:team\s+|jungle\s+)?synergy|better\s+(?:team\s+|jungle\s+)?synergy\s+and\s+tighter\s+macro|better\s+(?:team\s+|jungle\s+)?synergy|tighter\s+macro)\b"""
-                ).replace(s, "short-window variance and observed summary stats (summary win rates alone cannot verify macro or synergy)")
+                    """(?i)\b(?:points?\s+to|pointing\s+to|suggests?(?:\s+that)?|suggesting(?:\s+that)?|reflects?|reflecting|indicates?|indicating|shows?|showing|stems?\s+from|is\s+(?:due\s+to|driven\s+by|because\s+of|from))\s+(?:tighter\s+macro\s+and\s+better\s+(?:team\s+|jungle\s+)?synergy|better\s+(?:team\s+|jungle\s+)?synergy\s+and\s+tighter\s+macro|better\s+(?:team\s+|jungle\s+)?synergy|tighter\s+macro)(?:\s+(?:lately|recently))?\b"""
+                ).replace(s, "has no verified cause in summary win-loss records alone (the cause is not determined from summary stats)")
+                if (UNSUPPORTED_SYNERGY_MACRO_CAUSE_REGEX.containsMatchIn(LOCAL_NEGATED_SYNERGY_MACRO_REGEX.replace(s, " "))) {
+                    s = Regex(
+                        """(?i)\b(?:tighter\s+macro\s+and\s+better\s+(?:team\s+|jungle\s+)?synergy|better\s+(?:team\s+|jungle\s+)?synergy\s+and\s+tighter\s+macro|better\s+(?:team\s+|jungle\s+)?synergy|tighter\s+macro)\b"""
+                    ).replace(s, "unverified factors whose cause is not determined from summary stats")
+                }
             }
 
             // 4. Team first-objective rates framed as personal weakness / poor personal stat
@@ -1159,15 +1269,12 @@ class AiAnalysisService(
                 }
             }
 
-            // 8. Invented ability names ("Aegis of Zealous") & removed Mythic-era items
-            if (INVENTED_ABILITY_OR_MYTHIC_REGEX.containsMatchIn(LOCAL_NEGATED_ABILITY_MYTHIC_REGEX.replace(s, " "))) {
-                s = Regex("""(?i)\baegis\s+of\s+zealous\b""").replace(s, "Shield Vault (W) or Aegis Assault (E)")
-                s = Regex(
-                    """(?i)\b(?:mythic\s+(?:items?|passives?|paths?|rushes?)|divine\s+sunderer|everfrost|galeforce|goredrinker|duskblade(?:\s+of\s+draktharr)?|prowler'?s\s+claw|crown\s+of\s+the\s+shattered\s+queen|night\s+harvester|radiant\s+virtue)\b"""
-                ).replace(s, "current legendary items")
-            }
+            // Note: Ungrounded ability names (e.g. "Aegis of Zealous") and obsolete Mythic items are
+            // intentionally NOT blanket-rewritten here so we never invent a wrong ability, action, or
+            // champion; unless unambiguously grounded in context, rewriteAndGateCoachingBody rejects
+            // the sentence and emits buildHonestSentenceFallback.
 
-            // 9. Challenge trail frequency turned into confident skill diagnosis
+            // 8. Challenge trail frequency turned into confident skill diagnosis
             if (CHALLENGE_DIAGNOSIS_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_CHALLENGE_DIAGNOSIS_REGEX.replace(s, " "))) {
                 s = Regex("""(?i)\b(?:proves?|confirms?|diagnoses|means\s+you\s+have)\s+((?:poor|weak|bad|broken)\s+\w+(?:\s+\w+)?)""")
                     .replace(s) { "is a head-to-head comparison frequency worth reviewing rather than proof of ${it.groupValues[1]}" }
@@ -1176,12 +1283,20 @@ class AiAnalysisService(
             return s.replace(Regex(""" {2,}"""), " ").trim()
         }
 
-        private fun buildHonestSentenceFallback(timelineAnalyzed: Boolean): String =
-            if (timelineAnalyzed) {
+        private fun buildHonestSentenceFallback(
+            failedSentence: String,
+            timelineAnalyzed: Boolean,
+            context: Map<String, Any> = emptyMap()
+        ): String {
+            if (hasUngroundedAbilityOrMythicClaim(failedSentence, context)) {
+                return "Available match context does not verify that specific ability or obsolete item claim, so rely only on the recorded champions, items, and stats in your match data."
+            }
+            return if (timelineAnalyzed) {
                 "Available match data cannot verify hidden matchmaking rating or unrecorded in-game causes for that claim."
             } else {
                 "End-of-game summary stats alone cannot verify that in-game claim because match timelines are not analyzed yet."
             }
+        }
 
         private val LINE_LIST_PREFIX_REGEX = Regex("""^(\s*(?:[-*•]|\d+[.)]|\(\d+\))\s+)(.*)$""")
         private val INLINE_SENTENCE_CHUNK_REGEX = Regex(""".+?(?:(?:\.(?!\d)|[!?])+\s*|$)""")
@@ -1190,8 +1305,7 @@ class AiAnalysisService(
             if (rawBody.isBlank()) return ""
             val timelineAnalyzed = isTimelineAnalyzedInContext(context)
             val schemaClean = rewriteInternalSchemaTokens(rawBody, context)
-            val honestSentenceFallback = buildHonestSentenceFallback(timelineAnalyzed)
-            var lastEmittedFallback = false
+            var lastEmittedFallbackText: String? = null
 
             val rewrittenLines = mutableListOf<String>()
             for (line in schemaClean.lines()) {
@@ -1220,7 +1334,7 @@ class AiAnalysisService(
 
                     val candidate = if (
                         containsCs10TheoreticalMaxMislabeling(trimmedChunk) ||
-                        hasSentenceEvidenceViolation(trimmedChunk, timelineAnalyzed)
+                        hasSentenceEvidenceViolation(trimmedChunk, timelineAnalyzed, context)
                     ) {
                         val rewrittenCore = rewriteViolatingSentence(coreWithoutPunct, timelineAnalyzed)
                         "$rewrittenCore$punctSuffix"
@@ -1238,13 +1352,16 @@ class AiAnalysisService(
                     if (
                         !containsInternalSchemaLeak(postSchemaClean) &&
                         !containsCs10TheoreticalMaxMislabeling(postSchemaClean) &&
-                        !hasSentenceEvidenceViolation(postSchemaClean, timelineAnalyzed)
+                        !hasSentenceEvidenceViolation(postSchemaClean, timelineAnalyzed, context)
                     ) {
                         keptChunks.add(postSchemaClean + trailingSpace)
-                        lastEmittedFallback = false
-                    } else if (!lastEmittedFallback) {
-                        keptChunks.add(honestSentenceFallback + trailingSpace)
-                        lastEmittedFallback = true
+                        lastEmittedFallbackText = null
+                    } else {
+                        val fallbackText = buildHonestSentenceFallback(postSchemaClean, timelineAnalyzed, context)
+                        if (lastEmittedFallbackText != fallbackText) {
+                            keptChunks.add(fallbackText + trailingSpace)
+                            lastEmittedFallbackText = fallbackText
+                        }
                     }
                 }
 
@@ -1257,7 +1374,7 @@ class AiAnalysisService(
             if (joined.isNotBlank()) return joined
 
             // Honest scope fallback when raw body had no usable text
-            return honestSentenceFallback
+            return buildHonestSentenceFallback(schemaClean, timelineAnalyzed, context)
         }
 
         internal fun sanitizeHistoryAssistantTurn(rawTurn: String, context: Map<String, Any>): String {
@@ -1317,7 +1434,7 @@ class AiAnalysisService(
             val cleaned = parsedCandidates.mapNotNull { candidate ->
                 val rewritten = rewriteInternalSchemaTokens(candidate, context)
                     .let {
-                        if (containsCs10TheoreticalMaxMislabeling(it) || hasSentenceEvidenceViolation(it, timelineAnalyzed)) {
+                        if (containsCs10TheoreticalMaxMislabeling(it) || hasSentenceEvidenceViolation(it, timelineAnalyzed, context)) {
                             rewriteViolatingSentence(it, timelineAnalyzed)
                         } else {
                             it
@@ -1328,6 +1445,7 @@ class AiAnalysisService(
                     it.isNotBlank() &&
                         !containsInternalSchemaLeak(it) &&
                         !containsCs10TheoreticalMaxMislabeling(it) &&
+                        !hasSentenceEvidenceViolation(it, timelineAnalyzed, context) &&
                         !containsEvidenceBoundaryViolation(it, timelineAnalyzed)
                 }
             }.distinct()

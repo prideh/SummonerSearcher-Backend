@@ -2548,11 +2548,111 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 fallbackResp.response shouldContain "End-of-game summary stats alone cannot verify that in-game claim because match timelines are not analyzed yet."
                 fallbackResp.response shouldNotContain "secretly Diamond"
                 AiAnalysisService.containsEvidenceBoundaryViolation(fallbackResp.response, timelineAnalyzed = false) shouldBe false
+
+                // 5. Compound schema keys (`savedHistoryAverages`, `savedHistorySideSplits`, `recentMatchSummary`, `recentMatches`)
+                // MUST run longest-first with strict word boundaries — NEVER yielding glued "historyAverages" / "historySideSplits"
+                AiAnalysisService.containsInternalSchemaLeak("your saved match historyAverages") shouldBe true
+                AiAnalysisService.containsInternalSchemaLeak("your saved match historySideSplits") shouldBe true
+                currentSyncText =
+                    "Your `savedHistoryAverages` show 6.2 CS/min, savedHistorySideSplits favor Blue side (54% WR), `savedHistory` stands at 48W-52L, and `recentMatchSummary` across `recentMatches` aligns with `recentMatchSample`."
+                val compoundKeyResp = controller.chat(
+                    user = null,
+                    request = com.pride.summoner_searcher_api.controller.AiChatRequest(
+                        context = qaContext,
+                        messages = emptyList(),
+                        userMessage = "How do my averages and side splits look?"
+                    )
+                )
+                compoundKeyResp.response shouldContain "Your saved-match averages show 6.2 CS/min"
+                compoundKeyResp.response shouldContain "saved-match side splits favor Blue side (54% WR)"
+                compoundKeyResp.response shouldContain "your saved match history stands at 48W-52L"
+                compoundKeyResp.response shouldContain "recent match summary across your last 20 detailed matches aligns with your recent 20-game detailed sample."
+                compoundKeyResp.response shouldNotContain "historyAverages"
+                compoundKeyResp.response shouldNotContain "historySideSplits"
+                compoundKeyResp.response shouldNotContain "savedHistory"
+                AiAnalysisService.containsInternalSchemaLeak(compoundKeyResp.response) shouldBe false
+
+                // 6. Unsupported ability claim ("Aegis of Zealous") MUST NOT blanket-rewrite to "Shield Vault (W) or Aegis Assault (E)";
+                // reject sentence with honest fallback on Pantheon, Jinx, or mixed pool unless context unambiguously grounds it
+                val jinxContext = qaContext.toMutableMap().apply {
+                    put("champion", "Jinx")
+                    put("recentMatches", listOf(mapOf("champion" to "Jinx", "role" to "BOTTOM", "win" to true, "kda" to "8/2/6", "csPerMin" to 8.1, "items" to listOf("Kraken Slayer", "Infinity Edge"))))
+                }
+                currentSyncText =
+                    "Across your last 20 detailed matches, you went 11W-9L (55.0% win rate). Hold Aegis of Zealous until the enemy jungler shows before engaging."
+                val ungroundedAbilityPantheonResp = controller.chat(
+                    user = null,
+                    request = com.pride.summoner_searcher_api.controller.AiChatRequest(
+                        context = qaContext,
+                        messages = emptyList(),
+                        userMessage = "How should I play fights?"
+                    )
+                )
+                val ungroundedAbilityJinxResp = freshService.analyze(
+                    jinxContext,
+                    emptyList(),
+                    "How should I play fights?"
+                ).block()!!
+                listOf(ungroundedAbilityPantheonResp.response, ungroundedAbilityJinxResp.response).forEach { respText ->
+                    respText shouldContain "Across your last 20 detailed matches, you went 11W-9L (55.0% win rate)."
+                    respText shouldContain "Available match context does not verify that specific ability or obsolete item claim, so rely only on the recorded champions, items, and stats in your match data."
+                    respText shouldNotContain "Aegis of Zealous"
+                    respText shouldNotContain "Shield Vault"
+                    respText shouldNotContain "Aegis Assault"
+                    AiAnalysisService.containsEvidenceBoundaryViolation(respText, timelineAnalyzed = false) shouldBe false
+                }
+
+                // Unambiguous single-champion verifiedAbilities grounding keeps sentence, whereas multi-champion context still rejects
+                val unambiguouslyGroundedSingleChampCtx = mapOf(
+                    "recentMatchSample" to mapOf("games" to 1, "wins" to 1, "losses" to 0, "winRate" to "100.0%"),
+                    "champion" to "CustomHero",
+                    "recentMatches" to listOf(mapOf("champion" to "CustomHero", "items" to listOf("Eclipse"))),
+                    "verifiedAbilities" to listOf("Aegis of Zealous")
+                )
+                val groundedSingleResp = freshService.analyze(
+                    unambiguouslyGroundedSingleChampCtx,
+                    emptyList(),
+                    "How should I play fights?"
+                ).block()!!
+                groundedSingleResp.response shouldContain "Hold Aegis of Zealous until the enemy jungler shows before engaging."
+
+                val ambiguousMultiChampCtx = mapOf(
+                    "recentMatchSample" to mapOf("games" to 2, "wins" to 1, "losses" to 1, "winRate" to "50.0%"),
+                    "recentMatches" to listOf(
+                        mapOf("champion" to "Pantheon", "items" to listOf("Eclipse")),
+                        mapOf("champion" to "Jinx", "items" to listOf("Infinity Edge"))
+                    ),
+                    "verifiedAbilities" to listOf("Aegis of Zealous")
+                )
+                val ambiguousMultiResp = freshService.analyze(
+                    ambiguousMultiChampCtx,
+                    emptyList(),
+                    "How should I play fights?"
+                ).block()!!
+                ambiguousMultiResp.response shouldNotContain "Aegis of Zealous"
+                ambiguousMultiResp.response shouldContain "Available match context does not verify that specific ability or obsolete item claim"
+
+                // 7. Synergy / tighter macro cross-window cause -> state cause is not determined (NEVER assert "short-window variance")
+                currentSyncText =
+                    "Your 55.0% win rate across your last 20 detailed matches versus 48.0% across 100 saved matches points to tighter macro and better jungle synergy lately."
+                val synergyCauseResp = controller.chat(
+                    user = null,
+                    request = com.pride.summoner_searcher_api.controller.AiChatRequest(
+                        context = qaContext,
+                        messages = emptyList(),
+                        userMessage = "Compare my win rates."
+                    )
+                )
+                synergyCauseResp.response shouldContain "Your 55.0% win rate across your last 20 detailed matches versus 48.0% across 100 saved matches has no verified cause in summary win-loss records alone (the cause is not determined from summary stats)."
+                synergyCauseResp.response shouldNotContain "short-window variance"
+                synergyCauseResp.response shouldNotContain "tighter macro"
+                synergyCauseResp.response shouldNotContain "better jungle synergy"
+                AiAnalysisService.containsEvidenceBoundaryViolation(synergyCauseResp.response, timelineAnalyzed = false) shouldBe false
             }
         }
 
         When("auditing assembled prompts for zero internal schema leaks, DB PromptVersion/DiscoveredPattern/AiLearnedExample/history pollution gates, and truncation cascade order") {
-            Then("every non-match-row prompt line is 100% free of internal schema keys/backticks, polluted DB directives are skipped, session history is sanitized, and optional sections drop before ground truth") {
+            Then("every non-match-row prompt line is 100% free of internal schema keys/backticks, polluted DB directives (including >1200-char templates) are skipped, session history is sanitized, and optional sections drop before ground truth") {
                 clearMocks(exampleRepository, interactionRepository, patternRepository, promptVersionRepository)
 
                 // Polluted pre-#36 PromptVersions in DB MUST be skipped by selectPromptVersion without incrementing totalUses
@@ -2585,11 +2685,43 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     isActive = true,
                     isChallenger = false
                 )
-                listOf(pollutedChampion, pollutedVision, pollutedItem, pollutedCs).forEach { badPv ->
+                // Full-template (>1,200 chars) boundary tests:
+                // (a) Violation strictly after char 1,200 MUST be rejected
+                val cleanPrefix1210 = ("Keep coaching concise with sample-scoped numbers and conditional checks. ").repeat(18) // 1,314 chars
+                val pollutedPast1200 = PromptVersion(
+                    versionName = "v1.2-long-tail-polluted",
+                    categoryScope = "full_analysis",
+                    promptTemplate = cleanPrefix1210 + "Structure advice as step-by-step in-game execution.",
+                    isActive = true,
+                    isChallenger = false
+                )
+                // (b) Backticked schema token straddling char 1,200 MUST be rejected
+                val exact1195Prefix = ("Keep coaching concise with sample-scoped numbers and conditional checks. ").repeat(17).take(1195)
+                val pollutedStraddling1200 = PromptVersion(
+                    versionName = "v1.2-straddle-polluted",
+                    categoryScope = "full_analysis",
+                    promptTemplate = "$exact1195Prefix`rankedRecord` shows your season wins.",
+                    isActive = true,
+                    isChallenger = false
+                )
+                listOf(pollutedChampion, pollutedVision, pollutedItem, pollutedCs, pollutedPast1200, pollutedStraddling1200).forEach { badPv ->
                     AiAnalysisService.isEligiblePromptVersionDirective(badPv.promptTemplate) shouldBe false
                 }
+                // (c) Clean >1,200-char template passes eligibility AND injects cleanly bounded <=1,200 chars at a sentence boundary
+                val cleanOver1200Pv = PromptVersion(
+                    versionName = "v1.2-long-clean",
+                    categoryScope = "full_analysis",
+                    promptTemplate = cleanPrefix1210 + "Final extra sentence past twelve hundred characters.",
+                    isActive = true,
+                    isChallenger = false
+                )
+                AiAnalysisService.isEligiblePromptVersionDirective(cleanOver1200Pv.promptTemplate) shouldBe true
+                val injectedSlice = AiAnalysisService.renderPromptVersionDirectiveSlice(cleanOver1200Pv.promptTemplate)!!
+                (injectedSlice.length <= AiAnalysisService.MAX_PROMPT_VERSION_DIRECTIVE_CHARS) shouldBe true
+                injectedSlice.endsWith(".") shouldBe true
+                injectedSlice shouldNotContain "Final extra sentence"
 
-                every { promptVersionRepository.findByIsActiveTrueAndCategoryScope("full_analysis") } returns listOf(pollutedChampion)
+                every { promptVersionRepository.findByIsActiveTrueAndCategoryScope("full_analysis") } returns listOf(pollutedChampion, pollutedPast1200, pollutedStraddling1200)
                 every { promptVersionRepository.findByIsActiveTrueAndCategoryScopeIsNull() } returns emptyList()
                 val auditService = createService()
                 val selectedPv = selectPromptVersionMethod.invoke(auditService, "full_analysis") as PromptVersion?

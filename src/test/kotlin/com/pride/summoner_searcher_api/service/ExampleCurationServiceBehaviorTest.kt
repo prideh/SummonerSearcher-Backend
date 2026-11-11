@@ -316,7 +316,7 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
         }
 
         When("curateNewExamples runs when legacy pre-#36 champion or challenger PromptVersions exist in Postgres") {
-            Then("it deactivates every legacy polluted PromptVersion (snake_case category slugs, step-by-step execution, exact warding locations, passive/stat synergy, and 10:00 benchmark) and never promotes an ineligible challenger") {
+            Then("it preserves all existing DB PromptVersion rows without bulk retirement or duplicate challenger creation, never promotes an ineligible challenger, and humanizes newly created directives") {
                 clearMocks(
                     interactionRepository,
                     feedbackRepository,
@@ -368,42 +368,45 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                         negativeFeedbackCount = 1
                     )
                 )
-                val cleanVersion = PromptVersion(
-                    id = UUID.randomUUID(),
-                    versionName = "v1.2-macro_rotations-clean",
-                    promptTemplate = "Answer the user's macro and rotations question concisely with key sample-scoped evidence, honest uncertainty, and at most two controllable, conditional next-game actions (expand only when explicitly asked).",
-                    isActive = true,
-                    isChallenger = false,
-                    categoryScope = "macro_rotations"
-                )
 
                 every { interactionRepository.findCandidatesForLearning(any()) } returns emptyList()
                 every { curationRunRepository.save(any<CurationRun>()) } answers { firstArg<CurationRun>() }
-                every { promptVersionRepository.findAll() } returns (pollutedPre36Versions + cleanVersion)
                 every { promptVersionRepository.findByIsActiveTrueAndIsChallengerTrue() } answers {
-                    (pollutedPre36Versions + cleanVersion).filter { it.isActive && it.isChallenger }
+                    pollutedPre36Versions.filter { it.isActive && it.isChallenger }
                 }
                 every { feedbackRepository.findNegativeRateByCategory(any(), any()) } returns listOf(
-                    arrayOf<Any>("full_analysis", 16L, 22L)
+                    arrayOf<Any>("full_analysis", 16L, 22L),
+                    arrayOf<Any>("vision_warding", 15L, 22L)
                 )
                 every { promptVersionRepository.findByIsActiveTrueAndCategoryScope("full_analysis") } answers {
                     pollutedPre36Versions.filter { it.isActive && it.categoryScope == "full_analysis" }
+                }
+                every { promptVersionRepository.findByIsActiveTrueAndCategoryScope("vision_warding") } answers {
+                    pollutedPre36Versions.filter { it.isActive && it.categoryScope == "vision_warding" }
                 }
                 val savedVersions = mutableListOf<PromptVersion>()
                 every { promptVersionRepository.save(capture(savedVersions)) } answers { firstArg<PromptVersion>() }
 
                 curationService.curateNewExamples()
 
+                // Zero bulk retirement or mutation of existing DB rows; gating occurs strictly at read/injection time
+                io.mockk.verify(exactly = 0) { promptVersionRepository.findAll() }
                 pollutedPre36Versions.forEach { legacy ->
-                    legacy.isActive shouldBe false
+                    legacy.isActive shouldBe true
                 }
-                cleanVersion.isActive shouldBe true
+                // Ineligible challenger in vision_warding is neither promoted nor duplicated
+                pollutedPre36Versions.first { it.categoryScope == "vision_warding" }.isChallenger shouldBe true
+                savedVersions.none { it.categoryScope == "vision_warding" } shouldBe true
 
-                val replacementChallenger = savedVersions.last { it.categoryScope == "full_analysis" && it.isChallenger }
-                replacementChallenger.isActive shouldBe true
-                AiAnalysisService.isEligiblePromptVersionDirective(replacementChallenger.promptTemplate) shouldBe true
-                replacementChallenger.promptTemplate.contains("full_analysis") shouldBe false
-                replacementChallenger.promptTemplate.contains("overall performance") shouldBe true
+                // Category without an existing challenger gets one humanized challenger directive
+                savedVersions.size shouldBe 1
+                val newChallenger = savedVersions.single()
+                newChallenger.categoryScope shouldBe "full_analysis"
+                newChallenger.isChallenger shouldBe true
+                newChallenger.isActive shouldBe true
+                AiAnalysisService.isEligiblePromptVersionDirective(newChallenger.promptTemplate) shouldBe true
+                newChallenger.promptTemplate.contains("full_analysis") shouldBe false
+                newChallenger.promptTemplate.contains("overall performance") shouldBe true
             }
         }
     }
