@@ -66,6 +66,11 @@ class AiController(
         // Block on the reactive Mono to make this a synchronous endpoint
         val result = aiAnalysisService.analyze(request.context, request.messages, request.userMessage, request.sessionId).block()
             ?: AiAnalysisResult("Error: No response from AI service", 0.7)
+        val safeResponse = AiAnalysisService.enforceFreshResponseBoundary(
+            result.response,
+            request.context,
+            request.userMessage
+        )
         
         val responseTime = System.currentTimeMillis() - startTime
         
@@ -76,7 +81,7 @@ class AiController(
             summonerRank = request.context["rank"]?.toString(),
             summonerRole = result.category.take(20),
             userQuestion = request.userMessage,
-            aiResponse = result.response,
+            aiResponse = safeResponse,
             contextFingerprint = request.sessionId ?: generateContextFingerprint(request.context),
             promptVersion = result.promptVersion,
             responseTimeMs = responseTime,
@@ -87,7 +92,7 @@ class AiController(
         logger.info("AI chat response generated (temp=${result.temperature}, version=${result.promptVersion}) for user: $userEmail (${responseTime}ms)")
         
         return AiChatResponse(
-            response = result.response,
+            response = safeResponse,
             interactionId = savedInteraction.id.toString()
         )
     }
@@ -149,7 +154,12 @@ class AiController(
             },
             {
                 val responseTime = System.currentTimeMillis() - startTime
-                val finalResponseText = fullResponse.toString().ifBlank { "No content generated." }
+                val rawFinal = fullResponse.toString().ifBlank { "No content generated." }
+                val finalResponseText = AiAnalysisService.enforceFreshResponseBoundary(
+                    rawFinal,
+                    request.context,
+                    request.userMessage
+                )
                 try {
                     val interaction = AiInteraction(
                         user = user,

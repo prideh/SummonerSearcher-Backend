@@ -139,11 +139,26 @@ class ExampleCurationService(
     
     /**
      * Evaluate active A/B challenger PromptVersions that have accumulated sufficient feedback.
-     * Promotes winning challengers to champion and retires underperforming challengers.
+     * Retires any legacy active champion or challenger PromptVersion whose template fails current
+     * schema-leak, CS@10 theoretical-maximum, or evidence-boundary directives, promotes winning
+     * eligible challengers to champion, and retires underperforming challengers.
      */
     private fun evaluateActiveChallengers() {
         try {
+            promptVersionRepository.findAll()
+                .filter { it.isActive && !AiAnalysisService.isEligiblePromptVersionDirective(it.promptTemplate) }
+                .forEach { polluted ->
+                    polluted.isActive = false
+                    promptVersionRepository.save(polluted)
+                    logger.info(
+                        "Retired legacy/ineligible active PromptVersion '{}' (scope={})",
+                        polluted.versionName,
+                        polluted.categoryScope ?: "global"
+                    )
+                }
+
             val activeChallengers = promptVersionRepository.findByIsActiveTrueAndIsChallengerTrue()
+                .filter { AiAnalysisService.isEligiblePromptVersionDirective(it.promptTemplate) }
             activeChallengers.forEach { challenger ->
                 val totalFeedback = challenger.positiveFeedbackCount + challenger.negativeFeedbackCount
                 if (challenger.totalUses >= 20 && totalFeedback >= 5) {
@@ -205,6 +220,7 @@ class ExampleCurationService(
                         "negative rate over last 30 days ($totalCount interactions)."
                     )
                     val existingScoped = promptVersionRepository.findByIsActiveTrueAndCategoryScope(category)
+                        .filter { AiAnalysisService.isEligiblePromptVersionDirective(it.promptTemplate) }
                     if (existingScoped.none { it.isChallenger }) {
                         val safeCategorySlug = category.take(20).replace(Regex("[^a-zA-Z0-9_-]"), "")
                         val versionName = "v1.1-$safeCategorySlug-${Instant.now().epochSecond % 100000}"
@@ -232,7 +248,7 @@ class ExampleCurationService(
             "matchups" -> "Answer concisely by citing the player's scoped matchup record with game counts and Q/W/E/R cooldown or spacing windows (use official ability names only when certain; frame unrecorded execution as hypotheses), plus two controllable next-game habits."
             "cs_farming" -> "Answer concisely with sample-scoped CS/min and actual 10:00 lane CS—treating 114 Top/Bot and 120 Mid on Patch 26.1+ strictly as the theoretical maximum passive wave spawn by 10:00 (not a target or benchmark, and never a missed-CS baseline)—and give at most two controllable wave-reset or recall checks."
             "vision_warding" -> "Answer concisely using ward counts, ward types, and timing buckets only (never claim specific bush or map coordinates), and give at most two practical objective-timer warding habits."
-            else -> "Answer the user's '$category' question concisely with key sample-scoped evidence, honest uncertainty, and at most two controllable next-game actions (expand only when explicitly asked)."
+            else -> "Answer the user's ${AiAnalysisService.humanizeCategoryName(category)} question concisely with key sample-scoped evidence, honest uncertainty, and at most two controllable, conditional next-game actions (expand only when explicitly asked)."
         }
     
     /**

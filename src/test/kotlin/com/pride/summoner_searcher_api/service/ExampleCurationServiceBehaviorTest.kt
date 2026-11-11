@@ -314,5 +314,97 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                 activeSaved.first { it.questionCategory == "matchups" }.qualityScore shouldBe java.math.BigDecimal("100")
             }
         }
+
+        When("curateNewExamples runs when legacy pre-#36 champion or challenger PromptVersions exist in Postgres") {
+            Then("it deactivates every legacy polluted PromptVersion (snake_case category slugs, step-by-step execution, exact warding locations, passive/stat synergy, and 10:00 benchmark) and never promotes an ineligible challenger") {
+                clearMocks(
+                    interactionRepository,
+                    feedbackRepository,
+                    exampleRepository,
+                    curationRunRepository,
+                    promptVersionRepository
+                )
+
+                val pollutedPre36Versions = listOf(
+                    PromptVersion(
+                        id = UUID.randomUUID(),
+                        versionName = "v1.1-full_analysis-10001",
+                        promptTemplate = "Focus strictly on the user's 'full_analysis' question with concrete, step-by-step in-game execution tailored to their champion and role, avoiding generic filler.",
+                        isActive = true,
+                        isChallenger = false,
+                        categoryScope = "full_analysis",
+                        totalUses = 85,
+                        positiveFeedbackCount = 12,
+                        negativeFeedbackCount = 4
+                    ),
+                    PromptVersion(
+                        id = UUID.randomUUID(),
+                        versionName = "v1.1-vision_warding-10002",
+                        promptTemplate = "When answering vision questions, specify exact warding timings and locations around upcoming neutral objectives, Control Ward value, and tracking the enemy jungler.",
+                        isActive = true,
+                        isChallenger = true,
+                        categoryScope = "vision_warding",
+                        totalUses = 30,
+                        positiveFeedbackCount = 9,
+                        negativeFeedbackCount = 1
+                    ),
+                    PromptVersion(
+                        id = UUID.randomUUID(),
+                        versionName = "v1.1-itemization_builds-10003",
+                        promptTemplate = "When answering item or build questions, name the exact items, explain their passive/stat synergy for this champion's kit, and state clearly when to build each situational option.",
+                        isActive = true,
+                        isChallenger = false,
+                        categoryScope = "itemization_builds"
+                    ),
+                    PromptVersion(
+                        id = UUID.randomUUID(),
+                        versionName = "v1.1-cs_farming-10004",
+                        promptTemplate = "When answering CS/farming questions, connect the player's early CS@10 numbers to concrete wave-management habits and the 10:00 benchmark.",
+                        isActive = true,
+                        isChallenger = true,
+                        categoryScope = "cs_farming",
+                        totalUses = 28,
+                        positiveFeedbackCount = 8,
+                        negativeFeedbackCount = 1
+                    )
+                )
+                val cleanVersion = PromptVersion(
+                    id = UUID.randomUUID(),
+                    versionName = "v1.2-macro_rotations-clean",
+                    promptTemplate = "Answer the user's macro and rotations question concisely with key sample-scoped evidence, honest uncertainty, and at most two controllable, conditional next-game actions (expand only when explicitly asked).",
+                    isActive = true,
+                    isChallenger = false,
+                    categoryScope = "macro_rotations"
+                )
+
+                every { interactionRepository.findCandidatesForLearning(any()) } returns emptyList()
+                every { curationRunRepository.save(any<CurationRun>()) } answers { firstArg<CurationRun>() }
+                every { promptVersionRepository.findAll() } returns (pollutedPre36Versions + cleanVersion)
+                every { promptVersionRepository.findByIsActiveTrueAndIsChallengerTrue() } answers {
+                    (pollutedPre36Versions + cleanVersion).filter { it.isActive && it.isChallenger }
+                }
+                every { feedbackRepository.findNegativeRateByCategory(any(), any()) } returns listOf(
+                    arrayOf<Any>("full_analysis", 16L, 22L)
+                )
+                every { promptVersionRepository.findByIsActiveTrueAndCategoryScope("full_analysis") } answers {
+                    pollutedPre36Versions.filter { it.isActive && it.categoryScope == "full_analysis" }
+                }
+                val savedVersions = mutableListOf<PromptVersion>()
+                every { promptVersionRepository.save(capture(savedVersions)) } answers { firstArg<PromptVersion>() }
+
+                curationService.curateNewExamples()
+
+                pollutedPre36Versions.forEach { legacy ->
+                    legacy.isActive shouldBe false
+                }
+                cleanVersion.isActive shouldBe true
+
+                val replacementChallenger = savedVersions.last { it.categoryScope == "full_analysis" && it.isChallenger }
+                replacementChallenger.isActive shouldBe true
+                AiAnalysisService.isEligiblePromptVersionDirective(replacementChallenger.promptTemplate) shouldBe true
+                replacementChallenger.promptTemplate.contains("full_analysis") shouldBe false
+                replacementChallenger.promptTemplate.contains("overall performance") shouldBe true
+            }
+        }
     }
 })
