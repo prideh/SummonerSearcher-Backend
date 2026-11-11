@@ -764,7 +764,8 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
 
                 val promptBytes = AiAnalysisService.utf8ByteSize(prompt)
                 val heuristicTokens = AiAnalysisService.heuristicTokenEstimate(prompt)
-                println("MEASURED_20_MATCH_FIXTURE_BYTES: rawContextJsonBytes=$rawContextJsonBytes, groundTruthBytes=$groundTruthBytes, finalPromptBytes=$promptBytes, heuristicTokens=$heuristicTokens")
+                val expandedGameLines = Regex("""^\s{4}Game \d+""", RegexOption.MULTILINE).findAll(prompt).count()
+                println("MEASURED_20_MATCH_FIXTURE_BYTES: rawContextJsonBytes=$rawContextJsonBytes, groundTruthBytes=$groundTruthBytes, finalPromptBytes=$promptBytes, heuristicTokens=$heuristicTokens, expandedGameLines=$expandedGameLines")
 
                 // 1. Hard size budget (strictly under MAX_PROMPT_BYTES = 16,000 bytes, vs old ~46.7k bytes)
                 (groundTruthBytes <= AiAnalysisService.MAX_GROUND_TRUTH_BYTES) shouldBe true
@@ -773,7 +774,6 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "User: $userQuestion"
 
                 // 2. Bounded match count + omitted rollup
-                val expandedGameLines = Regex("""^\s{4}Game \d+""", RegexOption.MULTILINE).findAll(prompt).count()
                 (expandedGameLines <= AiAnalysisService.MAX_SELECTED_MATCHES) shouldBe true
                 (expandedGameLines >= AiAnalysisService.MIN_SELECTED_MATCHES) shouldBe true
                 prompt shouldContain "omittedMatchesRollup:"
