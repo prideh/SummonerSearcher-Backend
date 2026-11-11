@@ -397,7 +397,10 @@ jobs:
 
         ready = False
         for _ in range(90):
-            st_boot, _ = http_req(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=5)
+            try:
+                st_boot, _ = http_req(f"{base_url}/api/riot/cohorts/euw1/collector/status?patch=16.7", headers=op_headers, timeout=5)
+            except Exception:
+                st_boot = 0
             if st_boot == 200:
                 ready = True
                 break
