@@ -48,7 +48,9 @@ class PlayerCacheService(
     @org.springframework.beans.factory.annotation.Value("\${cohort.collector.max-memory-utilization-ratio:0.78}")
     private val maxMemoryUtilizationRatio: Double = 0.78,
     @org.springframework.beans.factory.annotation.Value("\${cohort.collector.min-free-memory-bytes:67108864}")
-    private val minFreeMemoryBytes: Long = 67_108_864L
+    private val minFreeMemoryBytes: Long = 67_108_864L,
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private val timelineService: TimelineService? = null
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
@@ -1405,6 +1407,7 @@ class PlayerCacheService(
             )
             
             redisCacheService.set(cacheKey, updatedProfile, PROFILE_CACHE_TTL)
+            timelineService?.invalidatePlayerPreparedCache(normalizedRegion, puuid)
             val matchProcessingMs = timeProvider.now() - matchProcessingStartMs
             val totalRefreshMs = timeProvider.now() - refreshStartMs
             logger.info(
