@@ -88,7 +88,13 @@ class TimelineService @Autowired constructor(
     @Value("\${coach.timeline.prepared-cache-ttl-ms:900000}")
     private val preparedCacheTtlMs: Long = DEFAULT_PREPARED_CACHE_TTL_MS,
     @Value("\${coach.timeline.lingering-worker-poll-ms:5000}")
-    private val lingeringWorkerPollMs: Long = DEFAULT_LINGERING_WORKER_POLL_MS
+    private val lingeringWorkerPollMs: Long = DEFAULT_LINGERING_WORKER_POLL_MS,
+    @Value("\${coach.timeline.pre-admission-gc-enabled:false}")
+    private val preAdmissionGcEnabled: Boolean = false,
+    @Value("\${coach.timeline.pre-admission-gc-min-unused-committed-bytes:25165824}")
+    private val preAdmissionGcMinUnusedCommittedBytes: Long = DEFAULT_PRE_ADMISSION_GC_MIN_UNUSED_COMMITTED_BYTES,
+    @Value("\${coach.timeline.pre-admission-gc-cooldown-ms:30000}")
+    private val preAdmissionGcCooldownMs: Long = DEFAULT_PRE_ADMISSION_GC_COOLDOWN_MS
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
@@ -108,12 +114,55 @@ class TimelineService @Autowired constructor(
         const val DEFAULT_LINGERING_WORKER_POLL_MS: Long = 5_000L
         const val MAX_PROFILE_CACHE_INFLATE_BYTES: Int = 6 * 1024 * 1024       // 6 MiB profile inflate cap
         const val MAX_RAW_TIMELINE_CACHE_INFLATE_BYTES: Int = 4 * 1024 * 1024  // 4 MiB raw timeline inflate cap
+        const val DEFAULT_PRE_ADMISSION_GC_MIN_UNUSED_COMMITTED_BYTES: Long = 24L * 1024L * 1024L // 24 MiB
+        const val DEFAULT_PRE_ADMISSION_GC_COOLDOWN_MS: Long = 30_000L
 
         private const val ADMISSION_MAX_HEAP_RATIO: Double = 0.85
         private const val STOP_MAX_HEAP_RATIO: Double = 0.88
         private const val ADMISSION_MIN_HEAP_FREE_BYTES: Long = 32L * 1024L * 1024L
         private const val STOP_MIN_HEAP_FREE_BYTES: Long = 24L * 1024L * 1024L
+
+        internal fun formatPayloadFreeMemorySample(sample: RawMemorySample?): String {
+            if (sample == null) return "unavailable"
+            val validHeap = sample.jvmHeapMaxBytes > 0L &&
+                sample.jvmHeapUsedBytes >= 0L &&
+                sample.jvmHeapCommittedBytes > 0L &&
+                sample.jvmHeapCommittedBytes >= sample.jvmHeapUsedBytes &&
+                sample.jvmHeapCommittedBytes <= sample.jvmHeapMaxBytes
+            val unusedComm = if (validHeap) sample.jvmHeapCommittedBytes - sample.jvmHeapUsedBytes else -1L
+            return "cgroupCur=${sample.cgroupMemoryCurrentBytes ?: -1}," +
+                "cgroupMax=${sample.cgroupMemoryMaxBytes ?: -1}," +
+                "cgroupPeak=${sample.cgroupMemoryPeakBytes ?: -1}," +
+                "anon=${sample.cgroupAnonBytes ?: -1}," +
+                "file=${sample.cgroupFileCacheBytes ?: -1}," +
+                "inactiveFile=${sample.cgroupInactiveFileBytes ?: -1}," +
+                "heapUsed=${sample.jvmHeapUsedBytes}," +
+                "heapComm=${sample.jvmHeapCommittedBytes}," +
+                "heapUnusedComm=$unusedComm," +
+                "heapMax=${sample.jvmHeapMaxBytes}," +
+                "nonHeapUsed=${sample.jvmNonHeapUsedBytes}," +
+                "metaUsed=${sample.jvmMetaspaceUsedBytes}," +
+                "metaComm=${sample.jvmMetaspaceCommittedBytes}," +
+                "classUsed=${sample.jvmCompressedClassSpaceUsedBytes}," +
+                "classComm=${sample.jvmCompressedClassSpaceCommittedBytes}," +
+                "codeUsed=${sample.jvmCodeCacheUsedBytes}," +
+                "codeComm=${sample.jvmCodeCacheCommittedBytes}," +
+                "directUsed=${sample.directBufferUsedBytes}," +
+                "directCap=${sample.directBufferCapacityBytes}," +
+                "mappedUsed=${sample.mappedBufferUsedBytes}," +
+                "threads=${sample.jvmThreadCount}," +
+                "oldGc=${sample.oldGenGcCount}"
+        }
     }
+
+    internal data class PreAdmissionCheckResult(
+        val admitted: Boolean,
+        val initialSample: RawMemorySample?,
+        val postGcSample: RawMemorySample? = null,
+        val gcAttempted: Boolean = false,
+        val gcStatus: String,
+        val gcDurationMs: Long = 0L
+    )
 
     sealed class PlayerPreparationOutcome {
         data object ProfileNotFound : PlayerPreparationOutcome()
@@ -154,9 +203,18 @@ class TimelineService @Autowired constructor(
 
     private val activeGlobalPreparations = AtomicInteger(0)
     private val activeCacheReadWorkers = AtomicInteger(0)
+    private val preAdmissionGcLock = Any()
+    private var lastPreAdmissionGcStartedAtMs: Long = Long.MIN_VALUE
+    private var preAdmissionGcInProgress: Boolean = false
 
     @Volatile
     internal var warmCacheDecodeHook: (() -> Unit)? = null
+
+    @Volatile
+    internal var preAdmissionGcRunner: () -> Unit = { System.gc() }
+
+    @Volatile
+    internal var stageSummaryObserver: ((String) -> Unit)? = null
 
     private val cacheReadExecutor = ThreadPoolExecutor(
         2,
@@ -288,55 +346,225 @@ class TimelineService @Autowired constructor(
     internal fun evaluateMemoryHeadroom(maxUsedBytesThreshold: Long): Boolean {
         return try {
             val raw = memoryStatsProvider.sample()
-            val safeHeapMax = raw.jvmHeapMaxBytes
-            val safeHeapUsed = raw.jvmHeapUsedBytes
-            if (safeHeapMax <= 0L || safeHeapUsed < 0L || safeHeapUsed >= safeHeapMax) {
-                return false
-            }
-            if (safeHeapUsed >= maxUsedBytesThreshold) {
-                return false
-            }
-
-            val isAdmissionCheck = maxUsedBytesThreshold <= coachAdmissionMaxUsedBytes
-            val maxHeapRatio = if (isAdmissionCheck) ADMISSION_MAX_HEAP_RATIO else STOP_MAX_HEAP_RATIO
-            val minHeapFree = if (isAdmissionCheck) {
-                minOf(ADMISSION_MIN_HEAP_FREE_BYTES, (safeHeapMax * 0.15).toLong().coerceAtLeast(1L))
-            } else {
-                minOf(STOP_MIN_HEAP_FREE_BYTES, (safeHeapMax * 0.12).toLong().coerceAtLeast(1L))
-            }
-            val heapFreeBytes = safeHeapMax - safeHeapUsed
-            val heapRatio = safeHeapUsed.toDouble() / safeHeapMax.toDouble()
-            if (!heapRatio.isFinite() || heapRatio >= maxHeapRatio || heapFreeBytes < minHeapFree) {
-                return false
-            }
-
-            val hasBoundedContainerCgroupLimit = raw.cgroupMemoryMaxBytes != null &&
-                raw.cgroupMemoryMaxBytes in 1L..2_147_483_648L
-            if (hasBoundedContainerCgroupLimit) {
-                val cgroupCurrent = raw.cgroupMemoryCurrentBytes
-                if (cgroupCurrent == null || cgroupCurrent <= 0L) {
-                    logger.warn(
-                        "Bounded container cgroup limit={} detected with missing/invalid cgroupMemoryCurrentBytes={}; failing safe (false).",
-                        raw.cgroupMemoryMaxBytes,
-                        cgroupCurrent
-                    )
-                    return false
-                }
-                val safeContainerCap = configuredContainerLimitBytes.coerceAtLeast(1L)
-                val effectiveLimit = minOf(safeContainerCap, raw.cgroupMemoryMaxBytes)
-                val effectiveUsed = maxOf(cgroupCurrent, safeHeapUsed)
-                if (effectiveLimit <= 0L || effectiveUsed >= maxUsedBytesThreshold) {
-                    return false
-                }
-                val freeBytes = (effectiveLimit - effectiveUsed).coerceAtLeast(0L)
-                val ratio = effectiveUsed.toDouble() / effectiveLimit.toDouble()
-                return ratio.isFinite() && ratio < maxMemoryUtilizationRatio && freeBytes >= minFreeMemoryBytes
-            }
-
-            true
+            evaluateSampleHeadroom(raw, maxUsedBytesThreshold)
         } catch (e: Exception) {
             logger.warn("Memory headroom sample failed during coach timeline preparation guard; failing safe (false): {}", e.message)
             false
+        }
+    }
+
+    internal fun evaluateSampleHeadroom(raw: RawMemorySample, maxUsedBytesThreshold: Long): Boolean {
+        val safeHeapMax = raw.jvmHeapMaxBytes
+        val safeHeapUsed = raw.jvmHeapUsedBytes
+        if (safeHeapMax <= 0L || safeHeapUsed < 0L || safeHeapUsed >= safeHeapMax) {
+            return false
+        }
+        if (safeHeapUsed >= maxUsedBytesThreshold) {
+            return false
+        }
+
+        val isAdmissionCheck = maxUsedBytesThreshold <= coachAdmissionMaxUsedBytes
+        val maxHeapRatio = if (isAdmissionCheck) ADMISSION_MAX_HEAP_RATIO else STOP_MAX_HEAP_RATIO
+        val minHeapFree = if (isAdmissionCheck) {
+            minOf(ADMISSION_MIN_HEAP_FREE_BYTES, (safeHeapMax * 0.15).toLong().coerceAtLeast(1L))
+        } else {
+            minOf(STOP_MIN_HEAP_FREE_BYTES, (safeHeapMax * 0.12).toLong().coerceAtLeast(1L))
+        }
+        val heapFreeBytes = safeHeapMax - safeHeapUsed
+        val heapRatio = safeHeapUsed.toDouble() / safeHeapMax.toDouble()
+        if (!heapRatio.isFinite() || heapRatio >= maxHeapRatio || heapFreeBytes < minHeapFree) {
+            return false
+        }
+
+        val hasBoundedContainerCgroupLimit = raw.cgroupMemoryMaxBytes != null &&
+            raw.cgroupMemoryMaxBytes in 1L..2_147_483_648L
+        if (hasBoundedContainerCgroupLimit) {
+            val cgroupCurrent = raw.cgroupMemoryCurrentBytes
+            if (cgroupCurrent == null || cgroupCurrent <= 0L) {
+                logger.warn(
+                    "Bounded container cgroup limit={} detected with missing/invalid cgroupMemoryCurrentBytes={}; failing safe (false).",
+                    raw.cgroupMemoryMaxBytes,
+                    cgroupCurrent
+                )
+                return false
+            }
+            val safeContainerCap = configuredContainerLimitBytes.coerceAtLeast(1L)
+            val effectiveLimit = minOf(safeContainerCap, raw.cgroupMemoryMaxBytes)
+            val effectiveUsed = maxOf(cgroupCurrent, safeHeapUsed)
+            if (effectiveLimit <= 0L || effectiveUsed >= maxUsedBytesThreshold) {
+                return false
+            }
+            val freeBytes = (effectiveLimit - effectiveUsed).coerceAtLeast(0L)
+            val ratio = effectiveUsed.toDouble() / effectiveLimit.toDouble()
+            return ratio.isFinite() && ratio < maxMemoryUtilizationRatio && freeBytes >= minFreeMemoryBytes
+        }
+
+        return true
+    }
+
+    internal fun isValidSampleForGcEligibility(raw: RawMemorySample): Boolean {
+        if (raw.jvmHeapMaxBytes <= 0L) return false
+        if (raw.jvmHeapUsedBytes < 0L || raw.jvmHeapUsedBytes > raw.jvmHeapMaxBytes) return false
+        if (raw.jvmHeapCommittedBytes <= 0L ||
+            raw.jvmHeapCommittedBytes < raw.jvmHeapUsedBytes ||
+            raw.jvmHeapCommittedBytes > raw.jvmHeapMaxBytes
+        ) {
+            return false
+        }
+        val hasBoundedContainerCgroupLimit = raw.cgroupMemoryMaxBytes != null &&
+            raw.cgroupMemoryMaxBytes in 1L..2_147_483_648L
+        if (hasBoundedContainerCgroupLimit) {
+            if (configuredContainerLimitBytes <= 0L) return false
+            val cgroupCurrent = raw.cgroupMemoryCurrentBytes
+            if (cgroupCurrent == null || cgroupCurrent <= 0L) return false
+        }
+        return true
+    }
+
+    /**
+     * Pre-admission-only check preserving raw 350/360/78%/64 MiB/512 MiB criteria:
+     * - Never runs GC when initial admission already succeeds (`NOT_NEEDED`).
+     * - Never runs GC when `coach.timeline.pre-admission-gc-enabled` is false (`DISABLED_BY_CONFIG`).
+     * - Fails closed (`INVALID_INITIAL_SAMPLE`, zero GC) before any GC check if heap or bounded-cgroup
+     *   sample fields are negative, zero, inverted (`committed < used`), or missing.
+     * - Enforces hard safety floors: `minUnusedBytes >= 24 MiB` and `cooldownMs >= 30_000 ms`
+     *   (negative, zero, or lower config overrides cannot weaken either floor).
+     * - Concurrency-safe: at most ONE thread enters GC, enforcing `cooldownMs`, followed by ONE
+     *   validated post-GC sample recheck with zero retry loops.
+     */
+    internal fun evaluatePreAdmissionHeadroom(): PreAdmissionCheckResult {
+        val initialSample = try {
+            memoryStatsProvider.sample()
+        } catch (e: Exception) {
+            logger.warn("Memory headroom sample failed during coach timeline pre-admission guard; failing safe (false): {}", e.message)
+            return PreAdmissionCheckResult(
+                admitted = false,
+                initialSample = null,
+                gcStatus = "INITIAL_SAMPLE_ERROR"
+            )
+        }
+
+        if (!isValidSampleForGcEligibility(initialSample)) {
+            return PreAdmissionCheckResult(
+                admitted = false,
+                initialSample = initialSample,
+                gcStatus = "INVALID_INITIAL_SAMPLE"
+            )
+        }
+
+        if (evaluateSampleHeadroom(initialSample, coachAdmissionMaxUsedBytes)) {
+            return PreAdmissionCheckResult(
+                admitted = true,
+                initialSample = initialSample,
+                gcStatus = "NOT_NEEDED"
+            )
+        }
+
+        if (!preAdmissionGcEnabled) {
+            return PreAdmissionCheckResult(
+                admitted = false,
+                initialSample = initialSample,
+                gcStatus = "DISABLED_BY_CONFIG"
+            )
+        }
+
+        val unusedCommitted = initialSample.jvmHeapCommittedBytes - initialSample.jvmHeapUsedBytes
+        val minUnusedBytes = preAdmissionGcMinUnusedCommittedBytes
+            .coerceAtLeast(DEFAULT_PRE_ADMISSION_GC_MIN_UNUSED_COMMITTED_BYTES)
+        if (unusedCommitted < minUnusedBytes) {
+            return PreAdmissionCheckResult(
+                admitted = false,
+                initialSample = initialSample,
+                gcStatus = "SKIPPED_LOW_UNUSED_COMMITTED"
+            )
+        }
+
+        val cooldownMs = preAdmissionGcCooldownMs
+            .coerceAtLeast(DEFAULT_PRE_ADMISSION_GC_COOLDOWN_MS)
+        val nowMs = timeProvider.now()
+        val skipReason = synchronized(preAdmissionGcLock) {
+            when {
+                preAdmissionGcInProgress -> "SKIPPED_CONCURRENT_GC"
+                lastPreAdmissionGcStartedAtMs != Long.MIN_VALUE &&
+                    (nowMs - lastPreAdmissionGcStartedAtMs) < cooldownMs -> "SKIPPED_COOLDOWN"
+                else -> {
+                    preAdmissionGcInProgress = true
+                    lastPreAdmissionGcStartedAtMs = nowMs
+                    null
+                }
+            }
+        }
+        if (skipReason != null) {
+            return PreAdmissionCheckResult(
+                admitted = false,
+                initialSample = initialSample,
+                gcStatus = skipReason
+            )
+        }
+
+        var gcDurationMs = 0L
+        try {
+            val gcStartMs = timeProvider.now()
+            try {
+                preAdmissionGcRunner.invoke()
+            } catch (e: Exception) {
+                gcDurationMs = (timeProvider.now() - gcStartMs).coerceAtLeast(0L)
+                logger.warn("Pre-admission GC hint threw exception; failing safe (false): {}", e.message)
+                return PreAdmissionCheckResult(
+                    admitted = false,
+                    initialSample = initialSample,
+                    gcAttempted = true,
+                    gcStatus = "GC_RUNNER_ERROR",
+                    gcDurationMs = gcDurationMs
+                )
+            }
+            gcDurationMs = (timeProvider.now() - gcStartMs).coerceAtLeast(0L)
+
+            val postGcSample = try {
+                memoryStatsProvider.sample()
+            } catch (e: Exception) {
+                logger.warn("Post-GC memory headroom sample failed during pre-admission guard; failing safe (false): {}", e.message)
+                return PreAdmissionCheckResult(
+                    admitted = false,
+                    initialSample = initialSample,
+                    gcAttempted = true,
+                    gcStatus = "POST_GC_SAMPLE_ERROR",
+                    gcDurationMs = gcDurationMs
+                )
+            }
+
+            if (!isValidSampleForGcEligibility(postGcSample)) {
+                return PreAdmissionCheckResult(
+                    admitted = false,
+                    initialSample = initialSample,
+                    postGcSample = postGcSample,
+                    gcAttempted = true,
+                    gcStatus = "INVALID_POST_GC_SAMPLE",
+                    gcDurationMs = gcDurationMs
+                )
+            }
+
+            val admittedAfterGc = evaluateSampleHeadroom(postGcSample, coachAdmissionMaxUsedBytes)
+            return PreAdmissionCheckResult(
+                admitted = admittedAfterGc,
+                initialSample = initialSample,
+                postGcSample = postGcSample,
+                gcAttempted = true,
+                gcStatus = if (admittedAfterGc) "RECLAIMED_ADMITTED" else "STILL_BLOCKED_AFTER_GC",
+                gcDurationMs = gcDurationMs
+            )
+        } finally {
+            synchronized(preAdmissionGcLock) {
+                preAdmissionGcInProgress = false
+            }
+        }
+    }
+
+    private fun safeSampleForTelemetry(): RawMemorySample? {
+        return try {
+            memoryStatsProvider.sample()
+        } catch (_: Exception) {
+            null
         }
     }
 
@@ -761,8 +989,9 @@ class TimelineService @Autowired constructor(
         val startMs = timeProvider.now()
         val callerDeadlineMs = startMs + prepDeadlineMs.coerceAtLeast(100L)
 
-        // 1. Pre-decode 350 MiB admission guard
-        if (!hasCoachAdmissionHeadroom()) {
+        // 1. Pre-decode 350 MiB admission guard (only stage eligible for optional pre-admission GC hint)
+        val preAdmission = evaluatePreAdmissionHeadroom()
+        if (!preAdmission.admitted) {
             val blocked = buildBlockedResult(
                 normalizedRegion = normalizedRegion,
                 puuid = trimmedPuuid,
@@ -774,7 +1003,9 @@ class TimelineService @Autowired constructor(
                 normalizedRegion = normalizedRegion,
                 stage = "pre_admission",
                 result = blocked,
-                totalMs = (timeProvider.now() - startMs).coerceAtLeast(0L)
+                totalMs = (timeProvider.now() - startMs).coerceAtLeast(0L),
+                preAdmission = preAdmission,
+                captureEndSample = false
             )
             return PlayerPreparationOutcome.Ready(blocked)
         }
@@ -803,7 +1034,8 @@ class TimelineService @Autowired constructor(
                     normalizedRegion = normalizedRegion,
                     stage = "singleflight_caller_deadline",
                     result = blocked,
-                    totalMs = (timeProvider.now() - startMs).coerceAtLeast(0L)
+                    totalMs = (timeProvider.now() - startMs).coerceAtLeast(0L),
+                    preAdmission = preAdmission
                 )
                 PlayerPreparationOutcome.Ready(blocked)
             }
@@ -815,6 +1047,7 @@ class TimelineService @Autowired constructor(
                 analyzerVersion = analyzerVersion,
                 playerCacheKey = playerCacheKey,
                 includeEmptyFallbackAnalysisForLegacyRoute = includeEmptyFallbackAnalysisForLegacyRoute,
+                preAdmission = preAdmission,
                 profileLoader = profileLoader
             )
         }
@@ -828,39 +1061,39 @@ class TimelineService @Autowired constructor(
         warmLookupMs: Long = 0L,
         profileDecodeMs: Long = 0L,
         riotLoopMs: Long = 0L,
-        httpAttempts: Int = 0
+        httpAttempts: Int = 0,
+        preAdmission: PreAdmissionCheckResult? = null,
+        captureEndSample: Boolean = true
     ) {
-        if (result.status == "COMPLETE") {
-            logger.info(
-                "coachTimelinePrep summary region={} status={} stage={} covered={}/{} cacheHit={} totalMs={} warmLookupMs={} profileDecodeMs={} riotLoopMs={} httpAttempts={}",
-                normalizedRegion,
-                result.status,
-                stage,
-                result.coveredMatchIds.size,
-                result.requestedMatchIds.size,
-                result.cacheHit,
-                totalMs,
-                warmLookupMs,
-                profileDecodeMs,
-                riotLoopMs,
-                httpAttempts
-            )
+        val endSample = if (captureEndSample) {
+            safeSampleForTelemetry()
         } else {
-            logger.warn(
-                "coachTimelinePrep summary region={} status={} stopReason={} stage={} covered={}/{} cacheHit={} totalMs={} warmLookupMs={} profileDecodeMs={} riotLoopMs={} httpAttempts={}",
-                normalizedRegion,
-                result.status,
-                result.stopReason ?: "NONE",
-                stage,
-                result.coveredMatchIds.size,
-                result.requestedMatchIds.size,
-                result.cacheHit,
-                totalMs,
-                warmLookupMs,
-                profileDecodeMs,
-                riotLoopMs,
-                httpAttempts
-            )
+            preAdmission?.postGcSample ?: preAdmission?.initialSample
+        }
+        val memPreFormatted = formatPayloadFreeMemorySample(preAdmission?.initialSample)
+        val memPostGcFormatted = preAdmission?.postGcSample?.let(::formatPayloadFreeMemorySample) ?: "none"
+        val memEndFormatted = formatPayloadFreeMemorySample(endSample)
+        val gcAttempted = preAdmission?.gcAttempted ?: false
+        val gcStatus = preAdmission?.gcStatus ?: "NOT_APPLICABLE"
+        val gcMs = preAdmission?.gcDurationMs ?: 0L
+
+        if (result.status == "COMPLETE") {
+            val message = "coachTimelinePrep summary region=$normalizedRegion status=${result.status} stage=$stage " +
+                "covered=${result.coveredMatchIds.size}/${result.requestedMatchIds.size} cacheHit=${result.cacheHit} " +
+                "totalMs=$totalMs warmLookupMs=$warmLookupMs profileDecodeMs=$profileDecodeMs riotLoopMs=$riotLoopMs httpAttempts=$httpAttempts " +
+                "gcEnabled=$preAdmissionGcEnabled gcAttempted=$gcAttempted gcStatus=$gcStatus gcMs=$gcMs " +
+                "memPre={$memPreFormatted} memPostGc={$memPostGcFormatted} memEnd={$memEndFormatted}"
+            logger.info(message)
+            stageSummaryObserver?.invoke(message)
+        } else {
+            val stopReason = result.stopReason ?: "NONE"
+            val message = "coachTimelinePrep summary region=$normalizedRegion status=${result.status} stopReason=$stopReason stage=$stage " +
+                "covered=${result.coveredMatchIds.size}/${result.requestedMatchIds.size} cacheHit=${result.cacheHit} " +
+                "totalMs=$totalMs warmLookupMs=$warmLookupMs profileDecodeMs=$profileDecodeMs riotLoopMs=$riotLoopMs httpAttempts=$httpAttempts " +
+                "gcEnabled=$preAdmissionGcEnabled gcAttempted=$gcAttempted gcStatus=$gcStatus gcMs=$gcMs " +
+                "memPre={$memPreFormatted} memPostGc={$memPostGcFormatted} memEnd={$memEndFormatted}"
+            logger.warn(message)
+            stageSummaryObserver?.invoke(message)
         }
     }
 
@@ -871,12 +1104,13 @@ class TimelineService @Autowired constructor(
         analyzerVersion: String,
         playerCacheKey: String,
         includeEmptyFallbackAnalysisForLegacyRoute: Boolean,
+        preAdmission: PreAdmissionCheckResult,
         profileLoader: () -> SummonerProfileDto?
     ): PlayerPreparationOutcome {
         val ownerStartMs = timeProvider.now()
         val ownerDeadlineMs = ownerStartMs + prepDeadlineMs.coerceAtLeast(100L)
 
-        // Re-check 350 MiB admission headroom before slot & before any decode
+        // Re-check 350 MiB admission headroom before slot & before any decode (strictly GC-free post-pre-admission)
         if (!hasCoachAdmissionHeadroom()) {
             val blocked = buildBlockedResult(
                 normalizedRegion = normalizedRegion,
@@ -889,7 +1123,8 @@ class TimelineService @Autowired constructor(
                 normalizedRegion = normalizedRegion,
                 stage = "slot_admission",
                 result = blocked,
-                totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L)
+                totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
+                preAdmission = preAdmission
             )
             return PlayerPreparationOutcome.Ready(blocked)
         }
@@ -908,7 +1143,8 @@ class TimelineService @Autowired constructor(
                 normalizedRegion = normalizedRegion,
                 stage = "concurrency_slot",
                 result = blocked,
-                totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L)
+                totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
+                preAdmission = preAdmission
             )
             return PlayerPreparationOutcome.Ready(blocked)
         }
@@ -929,7 +1165,8 @@ class TimelineService @Autowired constructor(
                     normalizedRegion = normalizedRegion,
                     stage = "post_slot_admission",
                     result = blocked,
-                    totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L)
+                    totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
+                    preAdmission = preAdmission
                 )
                 return PlayerPreparationOutcome.Ready(blocked)
             }
@@ -945,7 +1182,8 @@ class TimelineService @Autowired constructor(
                         stage = "player_warm_cache",
                         result = warmPlayerLookup.result,
                         totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
-                        warmLookupMs = warmLookupMs
+                        warmLookupMs = warmLookupMs,
+                        preAdmission = preAdmission
                     )
                     return PlayerPreparationOutcome.Ready(warmPlayerLookup.result)
                 }
@@ -962,7 +1200,8 @@ class TimelineService @Autowired constructor(
                         stage = "player_warm_cache",
                         result = blocked,
                         totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
-                        warmLookupMs = warmLookupMs
+                        warmLookupMs = warmLookupMs,
+                        preAdmission = preAdmission
                     )
                     return PlayerPreparationOutcome.Ready(blocked)
                 }
@@ -1001,18 +1240,21 @@ class TimelineService @Autowired constructor(
                     result = blocked,
                     totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
                     warmLookupMs = warmLookupMs,
-                    profileDecodeMs = profileDecodeMs
+                    profileDecodeMs = profileDecodeMs,
+                    preAdmission = preAdmission
                 )
                 return PlayerPreparationOutcome.Ready(blocked)
             }
             if (slicedProfile == null) {
-                logger.info(
-                    "coachTimelinePrep summary region={} status=PROFILE_NOT_FOUND stage=profile_decode totalMs={} warmLookupMs={} profileDecodeMs={}",
-                    normalizedRegion,
-                    (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
-                    warmLookupMs,
-                    profileDecodeMs
-                )
+                val endFormatted = formatPayloadFreeMemorySample(safeSampleForTelemetry())
+                val preFormatted = formatPayloadFreeMemorySample(preAdmission.initialSample)
+                val postGcFormatted = preAdmission.postGcSample?.let(::formatPayloadFreeMemorySample) ?: "none"
+                val notFoundMessage = "coachTimelinePrep summary region=$normalizedRegion status=PROFILE_NOT_FOUND stage=profile_decode " +
+                    "totalMs=${(timeProvider.now() - ownerStartMs).coerceAtLeast(0L)} warmLookupMs=$warmLookupMs profileDecodeMs=$profileDecodeMs " +
+                    "gcEnabled=$preAdmissionGcEnabled gcAttempted=${preAdmission.gcAttempted} gcStatus=${preAdmission.gcStatus} gcMs=${preAdmission.gcDurationMs} " +
+                    "memPre={$preFormatted} memPostGc={$postGcFormatted} memEnd={$endFormatted}"
+                logger.info(notFoundMessage)
+                stageSummaryObserver?.invoke(notFoundMessage)
                 return PlayerPreparationOutcome.ProfileNotFound
             }
 
@@ -1038,7 +1280,8 @@ class TimelineService @Autowired constructor(
                     result = blocked,
                     totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
                     warmLookupMs = warmLookupMs,
-                    profileDecodeMs = profileDecodeMs
+                    profileDecodeMs = profileDecodeMs,
+                    preAdmission = preAdmission
                 )
                 return PlayerPreparationOutcome.Ready(blocked)
             }
@@ -1060,7 +1303,8 @@ class TimelineService @Autowired constructor(
                         result = warmDirectLookup.result,
                         totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
                         warmLookupMs = warmLookupMs,
-                        profileDecodeMs = profileDecodeMs
+                        profileDecodeMs = profileDecodeMs,
+                        preAdmission = preAdmission
                     )
                     return PlayerPreparationOutcome.Ready(warmDirectLookup.result)
                 }
@@ -1078,7 +1322,8 @@ class TimelineService @Autowired constructor(
                         result = blocked,
                         totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
                         warmLookupMs = warmLookupMs,
-                        profileDecodeMs = profileDecodeMs
+                        profileDecodeMs = profileDecodeMs,
+                        preAdmission = preAdmission
                     )
                     return PlayerPreparationOutcome.Ready(blocked)
                 }
@@ -1111,7 +1356,8 @@ class TimelineService @Autowired constructor(
                 warmLookupMs = warmLookupMs,
                 profileDecodeMs = profileDecodeMs,
                 riotLoopMs = riotLoopMs,
-                httpAttempts = httpAttempts.get()
+                httpAttempts = httpAttempts.get(),
+                preAdmission = preAdmission
             )
 
             val nonTransientEmptyAnalysis = if (
@@ -1231,14 +1477,24 @@ class TimelineService @Autowired constructor(
         val startMs = timeProvider.now()
         val callerDeadlineMs = startMs + prepDeadlineMs.coerceAtLeast(100L)
 
-        if (!hasCoachAdmissionHeadroom()) {
-            return buildBlockedResult(
+        val preAdmission = evaluatePreAdmissionHeadroom()
+        if (!preAdmission.admitted) {
+            val blocked = buildBlockedResult(
                 normalizedRegion = normalizedRegion,
                 puuid = trimmedPuuid,
                 orderedMatchIds = orderedMatchIds,
                 stopReason = "MEMORY_HEADROOM_ADMISSION_BLOCKED",
                 analyzerVersion = analyzerVersion
             )
+            logCoachPrepStageSummary(
+                normalizedRegion = normalizedRegion,
+                stage = "direct_pre_admission",
+                result = blocked,
+                totalMs = (timeProvider.now() - startMs).coerceAtLeast(0L),
+                preAdmission = preAdmission,
+                captureEndSample = false
+            )
+            return blocked
         }
 
         val playerScopeKey = "$normalizedRegion:$trimmedPuuid"
@@ -1686,8 +1942,15 @@ class TimelineService @Autowired constructor(
         if (normalizedRegion.isEmpty() || trimmedMatchId.isEmpty()) {
             return SingleTimelineOutcome.Success(null)
         }
-        if (!hasCoachAdmissionHeadroom()) {
-            logger.warn("Single timeline fetch blocked at 350 MiB admission guard for matchId={} region={}", trimmedMatchId, normalizedRegion)
+        val preAdmission = evaluatePreAdmissionHeadroom()
+        if (!preAdmission.admitted) {
+            val preFormatted = formatPayloadFreeMemorySample(preAdmission.initialSample)
+            val postGcFormatted = preAdmission.postGcSample?.let(::formatPayloadFreeMemorySample) ?: "none"
+            logger.warn(
+                "singleTimelineFetch summary region=$normalizedRegion status=BLOCKED stopReason=MEMORY_HEADROOM_ADMISSION_BLOCKED " +
+                    "stage=pre_admission gcEnabled=$preAdmissionGcEnabled gcAttempted=${preAdmission.gcAttempted} " +
+                    "gcStatus=${preAdmission.gcStatus} gcMs=${preAdmission.gcDurationMs} memPre={$preFormatted} memPostGc={$postGcFormatted}"
+            )
             return SingleTimelineOutcome.Blocked("MEMORY_HEADROOM_ADMISSION_BLOCKED")
         }
         val safeMaxConcurrent = maxConcurrentPreparations.coerceAtLeast(1)
@@ -1792,8 +2055,15 @@ class TimelineService @Autowired constructor(
         val normalizedRegion = region.trim().lowercase()
         val trimmedMatchId = matchId.trim()
         if (normalizedRegion.isEmpty() || trimmedMatchId.isEmpty()) return null
-        if (!hasCoachAdmissionHeadroom()) {
-            logger.warn("Single timeline fetch blocked at 350 MiB admission guard for matchId={} region={}", trimmedMatchId, normalizedRegion)
+        val preAdmission = evaluatePreAdmissionHeadroom()
+        if (!preAdmission.admitted) {
+            val preFormatted = formatPayloadFreeMemorySample(preAdmission.initialSample)
+            val postGcFormatted = preAdmission.postGcSample?.let(::formatPayloadFreeMemorySample) ?: "none"
+            logger.warn(
+                "singleTimelineFetch summary region=$normalizedRegion status=BLOCKED stopReason=MEMORY_HEADROOM_ADMISSION_BLOCKED " +
+                    "stage=pre_admission gcEnabled=$preAdmissionGcEnabled gcAttempted=${preAdmission.gcAttempted} " +
+                    "gcStatus=${preAdmission.gcStatus} gcMs=${preAdmission.gcDurationMs} memPre={$preFormatted} memPostGc={$postGcFormatted}"
+            )
             return null
         }
         val safeMaxConcurrent = maxConcurrentPreparations.coerceAtLeast(1)
