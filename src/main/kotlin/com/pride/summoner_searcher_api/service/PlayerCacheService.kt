@@ -1,7 +1,12 @@
 package com.pride.summoner_searcher_api.service
 
+import com.pride.summoner_searcher_api.dto.DeathCostStatsDto
+import com.pride.summoner_searcher_api.dto.ImprovementStatsBreakdownDto
+import com.pride.summoner_searcher_api.dto.ImprovementStatsDto
 import com.pride.summoner_searcher_api.dto.MatchDto
+import com.pride.summoner_searcher_api.dto.ObjectiveTypeSummaryDto
 import com.pride.summoner_searcher_api.dto.SummonerProfileDto
+import com.pride.summoner_searcher_api.dto.TeamObjectivesStatsDto
 import com.pride.summoner_searcher_api.repository.indexParticipantsFromMatchesBounded
 import com.pride.summoner_searcher_api.repository.upsertPlayerIfNewer
 import org.slf4j.LoggerFactory
@@ -88,6 +93,7 @@ class PlayerCacheService(
     private val legacyRoleQuestBackfillSkippedMatchCooldownCounter = java.util.concurrent.atomic.AtomicLong(0L)
     private val legacyRoleQuestBackfillSkippedHeadroomCounter = java.util.concurrent.atomic.AtomicLong(0L)
     private val legacyRoleQuestBackfillSkippedRateCooldownCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val legacyRoleQuestBackfillSkippedCasOrTtlCounter = java.util.concurrent.atomic.AtomicLong(0L)
 
     companion object {
         private const val RECENT_MATCHES_LIMIT = 20
@@ -128,7 +134,8 @@ class PlayerCacheService(
         "legacyRoleQuestBackfillSkippedGlobalBudget" to legacyRoleQuestBackfillSkippedGlobalBudgetCounter.get(),
         "legacyRoleQuestBackfillSkippedMatchCooldown" to legacyRoleQuestBackfillSkippedMatchCooldownCounter.get(),
         "legacyRoleQuestBackfillSkippedHeadroom" to legacyRoleQuestBackfillSkippedHeadroomCounter.get(),
-        "legacyRoleQuestBackfillSkippedRateCooldown" to legacyRoleQuestBackfillSkippedRateCooldownCounter.get()
+        "legacyRoleQuestBackfillSkippedRateCooldown" to legacyRoleQuestBackfillSkippedRateCooldownCounter.get(),
+        "legacyRoleQuestBackfillSkippedCasOrTtl" to legacyRoleQuestBackfillSkippedCasOrTtlCounter.get()
     )
 
     private fun countDistinctLiveMatchDtos(vararg collections: Iterable<MatchDto?>?): Int {
@@ -642,14 +649,26 @@ class PlayerCacheService(
         SKIPPED_MATCH_COOLDOWN,
         SKIPPED_GLOBAL_BUDGET,
         SKIPPED_HEADROOM,
-        SKIPPED_RATE_COOLDOWN
+        SKIPPED_RATE_COOLDOWN,
+        SKIPPED_CAS_OR_TTL
     }
 
     private data class SingleLegacyBackfillOutcome(
         val status: SingleLegacyBackfillStatus,
         val match: MatchDto? = null,
-        val failureReason: String? = null
+        val failureReason: String? = null,
+        val consumedCallBudget: Boolean = false
     )
+
+    private sealed class PermitExecutionResult {
+        data class UpgradedFromCache(val match: MatchDto) : PermitExecutionResult()
+        data class Skipped(val status: SingleLegacyBackfillStatus) : PermitExecutionResult()
+        data class Fetched(
+            val expectedRawPayload: String,
+            val fetched: MatchDto?,
+            val failureReason: String?
+        ) : PermitExecutionResult()
+    }
 
     private suspend fun refreshSingleLegacyMatchSingleflight(
         matchId: String,
@@ -683,17 +702,28 @@ class PlayerCacheService(
         try {
             kotlin.coroutines.coroutineContext.ensureActive()
 
-            // Check whether another node/caller already upgraded `match:{region}:{matchId}` in Redis
-            val latestCached = redisCacheService.get(matchCacheKey, MatchDto::class.java)
-            if (latestCached?.info != null && !needsLegacyRoleQuestRefresh(latestCached)) {
+            // Read versioned existing Redis entry; fail closed if missing, unparseable, or TTL unknown/persistent
+            val preVersioned = redisCacheService.getVersioned(matchCacheKey, MatchDto::class.java)
+            if (preVersioned != null && preVersioned.value.info != null && !needsLegacyRoleQuestRefresh(preVersioned.value)) {
                 legacyRoleQuestBackfillCacheUpgradesCounter.incrementAndGet()
-                ownDeferred.complete(latestCached)
-                return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.UPGRADED_FROM_CACHE, latestCached)
+                ownDeferred.complete(preVersioned.value)
+                return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.UPGRADED_FROM_CACHE, preVersioned.value)
+            }
+            val preKnownTtl = if (preVersioned?.value?.info != null) {
+                redisCacheService.getRemainingTtl(matchCacheKey)?.takeIf { !it.isZero && !it.isNegative }
+            } else {
+                null
+            }
+            if (preVersioned == null || preKnownTtl == null) {
+                legacyRoleQuestBackfillSkippedCasOrTtlCounter.incrementAndGet()
+                ownDeferred.complete(null)
+                return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.SKIPPED_CAS_OR_TTL)
             }
 
-            val nowMs = timeProvider.now()
-            val cooldownUntil = legacyMatchAttemptCooldownUntilMs[singleflightKey]
-            if (cooldownUntil != null && nowMs < cooldownUntil) {
+            // Fast-fail pre-queue checks before waiting on global Semaphore(2)
+            val preNowMs = timeProvider.now()
+            val preCooldownUntil = legacyMatchAttemptCooldownUntilMs[singleflightKey]
+            if (preCooldownUntil != null && preNowMs < preCooldownUntil) {
                 legacyRoleQuestBackfillSkippedMatchCooldownCounter.incrementAndGet()
                 ownDeferred.complete(null)
                 return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.SKIPPED_MATCH_COOLDOWN)
@@ -711,59 +741,135 @@ class PlayerCacheService(
                 return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.SKIPPED_RATE_COOLDOWN)
             }
 
-            if (!tryAcquireGlobalLegacyBackfillBudgetSlot(nowMs)) {
-                legacyRoleQuestBackfillSkippedGlobalBudgetCounter.incrementAndGet()
-                ownDeferred.complete(null)
-                return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.SKIPPED_GLOBAL_BUDGET)
-            }
-
-            // Record per-match attempt cooldown BEFORE outbound call so failed attempts also cool down for 30m
-            recordLegacyMatchAttemptCooldown(singleflightKey, nowMs)
-            legacyRoleQuestBackfillAttemptsCounter.incrementAndGet()
-
-            val failureReason = java.util.concurrent.atomic.AtomicReference<String?>(null)
-            val fetched = globalLegacyBackfillSemaphore.withPermit {
+            // Re-check all admission/TTL/headroom/Retry-After guards INSIDE global Semaphore(2) immediately before outbound HTTP
+            val permitResult = globalLegacyBackfillSemaphore.withPermit {
                 kotlin.coroutines.coroutineContext.ensureActive()
-                try {
-                    riotApiService.getMatchByIdLowPriority(
-                        matchId = matchId,
-                        region = normalizedRegion,
-                        maxRetries = 0,
-                        failureReasonHolder = failureReason
-                    )
-                } catch (e: kotlinx.coroutines.CancellationException) {
-                    throw e
-                } catch (_: Exception) {
-                    null
+
+                val permitVersioned = redisCacheService.getVersioned(matchCacheKey, MatchDto::class.java)
+                if (permitVersioned != null && permitVersioned.value.info != null && !needsLegacyRoleQuestRefresh(permitVersioned.value)) {
+                    PermitExecutionResult.UpgradedFromCache(permitVersioned.value)
+                } else {
+                    val permitKnownTtl = if (permitVersioned?.value?.info != null) {
+                        redisCacheService.getRemainingTtl(matchCacheKey)?.takeIf { !it.isZero && !it.isNegative }
+                    } else {
+                        null
+                    }
+                    if (permitVersioned == null || permitKnownTtl == null) {
+                        PermitExecutionResult.Skipped(SingleLegacyBackfillStatus.SKIPPED_CAS_OR_TTL)
+                    } else {
+                        val permitNowMs = timeProvider.now()
+                        val permitCooldownUntil = legacyMatchAttemptCooldownUntilMs[singleflightKey]
+                        when {
+                            permitCooldownUntil != null && permitNowMs < permitCooldownUntil ->
+                                PermitExecutionResult.Skipped(SingleLegacyBackfillStatus.SKIPPED_MATCH_COOLDOWN)
+                            !hasMemoryHeadroomForSeasonBackfill() ->
+                                PermitExecutionResult.Skipped(SingleLegacyBackfillStatus.SKIPPED_HEADROOM)
+                            riotApiService.getActiveRetryAfterWaitMs(normalizedRegion) > 0L ->
+                                PermitExecutionResult.Skipped(SingleLegacyBackfillStatus.SKIPPED_RATE_COOLDOWN)
+                            !tryAcquireGlobalLegacyBackfillBudgetSlot(permitNowMs) ->
+                                PermitExecutionResult.Skipped(SingleLegacyBackfillStatus.SKIPPED_GLOBAL_BUDGET)
+                            else -> {
+                                // Record per-match attempt cooldown BEFORE outbound call so failed attempts also cool down for 30m
+                                recordLegacyMatchAttemptCooldown(singleflightKey, permitNowMs)
+                                legacyRoleQuestBackfillAttemptsCounter.incrementAndGet()
+                                val failureReason = java.util.concurrent.atomic.AtomicReference<String?>(null)
+                                val fetched = try {
+                                    riotApiService.getMatchByIdLowPriority(
+                                        matchId = matchId,
+                                        region = normalizedRegion,
+                                        maxRetries = 0,
+                                        failureReasonHolder = failureReason
+                                    )
+                                } catch (e: kotlinx.coroutines.CancellationException) {
+                                    throw e
+                                } catch (_: Exception) {
+                                    null
+                                }
+                                PermitExecutionResult.Fetched(
+                                    expectedRawPayload = permitVersioned.rawPayload,
+                                    fetched = fetched,
+                                    failureReason = failureReason.get()
+                                )
+                            }
+                        }
+                    }
                 }
             }
 
             kotlin.coroutines.coroutineContext.ensureActive()
 
-            if (fetched?.info != null &&
-                fetched.info.participants.isNotEmpty() &&
-                (fetched.metadata?.matchId == null || fetched.metadata.matchId == matchId)
-            ) {
-                // Stamp ONLY freshly decoded Riot Match-V5 responses; never mutate or reset TTL on failure
-                val freshStamped = if ((fetched.dtoSchemaVersion ?: 0) >= MatchDto.CURRENT_DTO_SCHEMA_VERSION) {
-                    fetched
-                } else {
-                    fetched.copy(dtoSchemaVersion = MatchDto.CURRENT_DTO_SCHEMA_VERSION)
+            return when (permitResult) {
+                is PermitExecutionResult.UpgradedFromCache -> {
+                    legacyRoleQuestBackfillCacheUpgradesCounter.incrementAndGet()
+                    ownDeferred.complete(permitResult.match)
+                    SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.UPGRADED_FROM_CACHE, permitResult.match)
                 }
-                val preservedTtl = redisCacheService.getRemainingTtl(matchCacheKey)
-                    ?.takeIf { !it.isZero && !it.isNegative }
-                    ?: MATCH_CACHE_TTL
-                redisCacheService.set(matchCacheKey, freshStamped, preservedTtl)
-                legacyRoleQuestBackfillUpdatedCounter.incrementAndGet()
-                ownDeferred.complete(freshStamped)
-                return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.UPDATED_FROM_API, freshStamped)
-            } else {
-                legacyRoleQuestBackfillFailedCounter.incrementAndGet()
-                ownDeferred.complete(null)
-                return SingleLegacyBackfillOutcome(
-                    status = SingleLegacyBackfillStatus.FAILED_API,
-                    failureReason = failureReason.get()
-                )
+                is PermitExecutionResult.Skipped -> {
+                    when (permitResult.status) {
+                        SingleLegacyBackfillStatus.SKIPPED_CAS_OR_TTL -> legacyRoleQuestBackfillSkippedCasOrTtlCounter.incrementAndGet()
+                        SingleLegacyBackfillStatus.SKIPPED_MATCH_COOLDOWN -> legacyRoleQuestBackfillSkippedMatchCooldownCounter.incrementAndGet()
+                        SingleLegacyBackfillStatus.SKIPPED_HEADROOM -> legacyRoleQuestBackfillSkippedHeadroomCounter.incrementAndGet()
+                        SingleLegacyBackfillStatus.SKIPPED_RATE_COOLDOWN -> legacyRoleQuestBackfillSkippedRateCooldownCounter.incrementAndGet()
+                        SingleLegacyBackfillStatus.SKIPPED_GLOBAL_BUDGET -> legacyRoleQuestBackfillSkippedGlobalBudgetCounter.incrementAndGet()
+                        else -> {}
+                    }
+                    ownDeferred.complete(null)
+                    SingleLegacyBackfillOutcome(permitResult.status)
+                }
+                is PermitExecutionResult.Fetched -> {
+                    val fetched = permitResult.fetched
+                    if (fetched?.info != null &&
+                        fetched.info.participants.isNotEmpty() &&
+                        (fetched.metadata?.matchId == null || fetched.metadata.matchId == matchId)
+                    ) {
+                        // Stamp ONLY freshly decoded Riot Match-V5 responses; write ONLY via atomic CAS preserving remaining PTTL
+                        val freshStamped = if ((fetched.dtoSchemaVersion ?: 0) >= MatchDto.CURRENT_DTO_SCHEMA_VERSION) {
+                            fetched
+                        } else {
+                            fetched.copy(dtoSchemaVersion = MatchDto.CURRENT_DTO_SCHEMA_VERSION)
+                        }
+                        val casCommitted = redisCacheService.compareAndSetPreservingTtl(
+                            key = matchCacheKey,
+                            expectedRawPayload = permitResult.expectedRawPayload,
+                            newValue = freshStamped
+                        )
+                        if (casCommitted) {
+                            legacyRoleQuestBackfillUpdatedCounter.incrementAndGet()
+                            ownDeferred.complete(freshStamped)
+                            SingleLegacyBackfillOutcome(
+                                status = SingleLegacyBackfillStatus.UPDATED_FROM_API,
+                                match = freshStamped,
+                                consumedCallBudget = true
+                            )
+                        } else {
+                            val afterRace = redisCacheService.getVersioned(matchCacheKey, MatchDto::class.java)?.value
+                            if (afterRace?.info != null && !needsLegacyRoleQuestRefresh(afterRace)) {
+                                legacyRoleQuestBackfillCacheUpgradesCounter.incrementAndGet()
+                                ownDeferred.complete(afterRace)
+                                SingleLegacyBackfillOutcome(
+                                    status = SingleLegacyBackfillStatus.UPGRADED_FROM_CACHE,
+                                    match = afterRace,
+                                    consumedCallBudget = true
+                                )
+                            } else {
+                                legacyRoleQuestBackfillSkippedCasOrTtlCounter.incrementAndGet()
+                                ownDeferred.complete(null)
+                                SingleLegacyBackfillOutcome(
+                                    status = SingleLegacyBackfillStatus.SKIPPED_CAS_OR_TTL,
+                                    consumedCallBudget = true
+                                )
+                            }
+                        }
+                    } else {
+                        legacyRoleQuestBackfillFailedCounter.incrementAndGet()
+                        ownDeferred.complete(null)
+                        SingleLegacyBackfillOutcome(
+                            status = SingleLegacyBackfillStatus.FAILED_API,
+                            failureReason = permitResult.failureReason,
+                            consumedCallBudget = true
+                        )
+                    }
+                }
             }
         } catch (t: Throwable) {
             ownDeferred.complete(null)
@@ -780,7 +886,8 @@ class PlayerCacheService(
      * - Disabled by default (`legacyRoleQuestBackfillEnabled = false`) so existing Redis cache is untouched unless opted in.
      * - Enforces per-call cap (`3`), global sliding-window cap (`10/min`) + global concurrency semaphore (`2`),
      *   per-match singleflight, and 30m per-match attempt cooldown (including failed attempts).
-     * - Preserves remaining Redis TTL on success and leaves original cache & TTL completely untouched on failure.
+     * - Fails closed when existing Redis entry or positive remaining TTL is missing/persistent/changed concurrently,
+     *   updating existing keys strictly via atomic compare-and-set preserving remaining `PTTL`.
      */
     internal suspend fun refreshLegacyRoleQuestMatchesBounded(
         matches: List<MatchDto>,
@@ -820,19 +927,17 @@ class PlayerCacheService(
             val matchId = targetMatch.metadata?.matchId?.trim()?.takeIf { it.isNotEmpty() } ?: continue
 
             val outcome = refreshSingleLegacyMatchSingleflight(matchId, normalizedRegion)
+            if (outcome.consumedCallBudget) {
+                callBudgetConsumed++
+            }
             when (outcome.status) {
-                SingleLegacyBackfillStatus.UPDATED_FROM_API -> {
-                    callBudgetConsumed++
-                    updatedList[matchIdx] = outcome.match!!
-                    updatedCount++
-                }
+                SingleLegacyBackfillStatus.UPDATED_FROM_API,
                 SingleLegacyBackfillStatus.UPGRADED_FROM_CACHE,
                 SingleLegacyBackfillStatus.JOINED_SINGLEFLIGHT_UPDATED -> {
                     updatedList[matchIdx] = outcome.match!!
                     updatedCount++
                 }
                 SingleLegacyBackfillStatus.FAILED_API -> {
-                    callBudgetConsumed++
                     if (outcome.failureReason == "HTTP_429_TOO_MANY_REQUESTS" || outcome.failureReason == "RATE_LIMIT_COOLDOWN") {
                         val remaining = eligibleIndices.size - (pos + 1)
                         if (remaining > 0) {
@@ -863,8 +968,9 @@ class PlayerCacheService(
                     break
                 }
                 SingleLegacyBackfillStatus.SKIPPED_MATCH_COOLDOWN,
+                SingleLegacyBackfillStatus.SKIPPED_CAS_OR_TTL,
                 SingleLegacyBackfillStatus.JOINED_SINGLEFLIGHT_FAILED -> {
-                    // Continue checking next eligible displayed match without consuming outbound Riot budget
+                    // Continue checking next eligible displayed match
                 }
             }
         }
@@ -872,10 +978,184 @@ class PlayerCacheService(
         return updatedList to updatedCount
     }
 
+    private fun hasTimelineEvidenceInSlice(
+        totalGamesConsidered: Int,
+        excludedMissingTimelineGames: Int,
+        phaseFarming: com.pride.summoner_searcher_api.dto.PhaseFarmingStatsDto,
+        leadRetention: com.pride.summoner_searcher_api.dto.LeadRetentionStatsDto,
+        deathCost: DeathCostStatsDto,
+        unspentGold: com.pride.summoner_searcher_api.dto.UnspentGoldStatsDto,
+        teamObjectives: TeamObjectivesStatsDto
+    ): Boolean {
+        return excludedMissingTimelineGames < totalGamesConsidered ||
+            phaseFarming.perMatch.isNotEmpty() ||
+            phaseFarming.min10To20.eligibleGames > 0 ||
+            phaseFarming.min20ToEnd.eligibleGames > 0 ||
+            leadRetention.perMatch.isNotEmpty() ||
+            leadRetention.eligibleGamesAt10 > 0 ||
+            unspentGold.perMatch.isNotEmpty() ||
+            unspentGold.eligibleGames > 0 ||
+            deathCost.bountyOnPlayerDeaths.eligibleTimelineGames > 0 ||
+            deathCost.perMatch.any { it.hasTimeline } ||
+            teamObjectives.tower.timelineEligibleGames > 0 ||
+            teamObjectives.dragon.timelineEligibleGames > 0 ||
+            teamObjectives.baron.timelineEligibleGames > 0 ||
+            teamObjectives.riftHerald.timelineEligibleGames > 0 ||
+            teamObjectives.horde.timelineEligibleGames > 0
+    }
+
+    private fun mergeDeathCostPreservingTimelineEvidence(
+        existing: DeathCostStatsDto,
+        matchOnlyRecomputed: DeathCostStatsDto
+    ): DeathCostStatsDto {
+        val existingTimelineByMatchId = existing.perMatch
+            .filter { it.hasTimeline }
+            .associateBy { it.matchId }
+        val mergedPerMatch = matchOnlyRecomputed.perMatch.map { recomputedRow ->
+            val prev = existingTimelineByMatchId[recomputedRow.matchId]
+            if (prev != null) {
+                recomputedRow.copy(
+                    hasTimeline = true,
+                    recordedDeathsCount = prev.recordedDeathsCount,
+                    totalBaseKillBountyGold = prev.totalBaseKillBountyGold,
+                    totalShutdownBountyGold = prev.totalShutdownBountyGold,
+                    totalCombinedBountyGold = prev.totalCombinedBountyGold,
+                    recordedDeaths = prev.recordedDeaths
+                )
+            } else {
+                recomputedRow
+            }
+        }
+        return matchOnlyRecomputed.copy(
+            bountyOnPlayerDeaths = existing.bountyOnPlayerDeaths,
+            perMatch = mergedPerMatch
+        )
+    }
+
+    private fun mergeObjectiveSummaryPreservingTimelineEvidence(
+        existing: ObjectiveTypeSummaryDto,
+        matchOnlyRecomputed: ObjectiveTypeSummaryDto
+    ): ObjectiveTypeSummaryDto {
+        return matchOnlyRecomputed.copy(
+            timelineEligibleGames = existing.timelineEligibleGames,
+            timelinePersonalInvolvements = existing.timelinePersonalInvolvements
+        )
+    }
+
+    private fun mergeTeamObjectivesPreservingTimelineEvidence(
+        existing: TeamObjectivesStatsDto,
+        matchOnlyRecomputed: TeamObjectivesStatsDto
+    ): TeamObjectivesStatsDto {
+        return matchOnlyRecomputed.copy(
+            tower = mergeObjectiveSummaryPreservingTimelineEvidence(existing.tower, matchOnlyRecomputed.tower),
+            dragon = mergeObjectiveSummaryPreservingTimelineEvidence(existing.dragon, matchOnlyRecomputed.dragon),
+            baron = mergeObjectiveSummaryPreservingTimelineEvidence(existing.baron, matchOnlyRecomputed.baron),
+            riftHerald = mergeObjectiveSummaryPreservingTimelineEvidence(existing.riftHerald, matchOnlyRecomputed.riftHerald),
+            horde = mergeObjectiveSummaryPreservingTimelineEvidence(existing.horde, matchOnlyRecomputed.horde)
+        )
+    }
+
+    private fun mergeBreakdownSlicePreservingTimelineEvidence(
+        existing: ImprovementStatsBreakdownDto?,
+        matchOnlyRecomputed: ImprovementStatsBreakdownDto
+    ): ImprovementStatsBreakdownDto {
+        if (existing == null) return matchOnlyRecomputed
+        val sliceHasTimeline = hasTimelineEvidenceInSlice(
+            totalGamesConsidered = existing.totalGamesConsidered,
+            excludedMissingTimelineGames = existing.excludedMissingTimelineGames,
+            phaseFarming = existing.phaseFarming,
+            leadRetention = existing.leadRetention,
+            deathCost = existing.deathCost,
+            unspentGold = existing.unspentGold,
+            teamObjectives = existing.teamObjectives
+        )
+        if (!sliceHasTimeline) return matchOnlyRecomputed
+        if (existing.totalGamesConsidered != matchOnlyRecomputed.totalGamesConsidered ||
+            existing.excludedInvalidDurationGames != matchOnlyRecomputed.excludedInvalidDurationGames
+        ) {
+            return existing
+        }
+        return matchOnlyRecomputed.copy(
+            excludedMissingTimelineGames = existing.excludedMissingTimelineGames,
+            phaseFarming = existing.phaseFarming,
+            leadRetention = existing.leadRetention,
+            deathCost = mergeDeathCostPreservingTimelineEvidence(existing.deathCost, matchOnlyRecomputed.deathCost),
+            unspentGold = existing.unspentGold,
+            teamObjectives = mergeTeamObjectivesPreservingTimelineEvidence(existing.teamObjectives, matchOnlyRecomputed.teamObjectives)
+        )
+    }
+
     /**
-     * Safely syncs refreshed `MatchDto` entries into a cached `SummonerProfileDto.recentMatches` under short
-     * non-blocking profile lock, re-reading the latest profile so newer `lastRefreshed` / `overallStats` /
-     * `allMatchIds` are never overwritten and preserving remaining profile TTL.
+     * Preserves all existing timeline-derived evidence (`phaseFarming`, `leadRetention`, `unspentGold`,
+     * `deathCost` death bounties, `teamObjectives` timeline involvements, and `byChampion`/`byRole` breakdowns)
+     * whenever a cached `SummonerProfileDto` has in-place `MatchDto` upgrades without raw timelines in hand.
+     */
+    internal fun preserveTimelineEvidenceInImprovementStats(
+        existing: ImprovementStatsDto?,
+        matchOnlyRecomputed: ImprovementStatsDto
+    ): ImprovementStatsDto {
+        if (existing == null) return matchOnlyRecomputed
+        val topHasTimeline = hasTimelineEvidenceInSlice(
+            totalGamesConsidered = existing.totalGamesConsidered,
+            excludedMissingTimelineGames = existing.excludedMissingTimelineGames,
+            phaseFarming = existing.phaseFarming,
+            leadRetention = existing.leadRetention,
+            deathCost = existing.deathCost,
+            unspentGold = existing.unspentGold,
+            teamObjectives = existing.teamObjectives
+        ) || existing.byChampion.values.any {
+            hasTimelineEvidenceInSlice(
+                it.totalGamesConsidered,
+                it.excludedMissingTimelineGames,
+                it.phaseFarming,
+                it.leadRetention,
+                it.deathCost,
+                it.unspentGold,
+                it.teamObjectives
+            )
+        } || existing.byRole.values.any {
+            hasTimelineEvidenceInSlice(
+                it.totalGamesConsidered,
+                it.excludedMissingTimelineGames,
+                it.phaseFarming,
+                it.leadRetention,
+                it.deathCost,
+                it.unspentGold,
+                it.teamObjectives
+            )
+        }
+        if (!topHasTimeline) return matchOnlyRecomputed
+        if (existing.totalGamesConsidered != matchOnlyRecomputed.totalGamesConsidered ||
+            existing.excludedInvalidDurationGames != matchOnlyRecomputed.excludedInvalidDurationGames
+        ) {
+            return existing
+        }
+        val mergedByChampion = matchOnlyRecomputed.byChampion.mapValues { (champ, slice) ->
+            mergeBreakdownSlicePreservingTimelineEvidence(existing.byChampion[champ], slice)
+        }
+        val mergedByRole = matchOnlyRecomputed.byRole.mapValues { (roleKey, slice) ->
+            mergeBreakdownSlicePreservingTimelineEvidence(existing.byRole[roleKey], slice)
+        }
+        return matchOnlyRecomputed.copy(
+            excludedMissingTimelineGames = existing.excludedMissingTimelineGames,
+            phaseFarming = existing.phaseFarming,
+            leadRetention = existing.leadRetention,
+            deathCost = mergeDeathCostPreservingTimelineEvidence(existing.deathCost, matchOnlyRecomputed.deathCost),
+            unspentGold = existing.unspentGold,
+            teamObjectives = mergeTeamObjectivesPreservingTimelineEvidence(existing.teamObjectives, matchOnlyRecomputed.teamObjectives),
+            byChampion = mergedByChampion,
+            byRole = mergedByRole
+        )
+    }
+
+    /**
+     * Safely syncs refreshed `MatchDto` entries into a cached `SummonerProfileDto.recentMatches`:
+     * - Acquires short non-blocking profile lock (`setIfAbsent`),
+     * - Reads versioned `SummonerProfileDto` + requires known positive remaining TTL (fails closed otherwise),
+     * - Preserves newer `lastRefreshed` / `overallStats` / `allMatchIds` AND preserves all existing timeline
+     *   evidence inside `improvementStats`, and
+     * - Commits strictly via atomic `compareAndSetPreservingTtl` so concurrent writers and expired keys are never
+     *   overwritten or resurrected and profile TTL is never reset to 14d.
      */
     private fun syncEmbeddedProfileRecentMatchesIfSafe(
         puuid: String,
@@ -890,7 +1170,8 @@ class PlayerCacheService(
         }
         try {
             val profileKey = getProfileCacheKey(puuid, normalizedRegion)
-            val currentProfile = redisCacheService.get(profileKey, SummonerProfileDto::class.java) ?: return
+            val profileVersioned = redisCacheService.getVersioned(profileKey, SummonerProfileDto::class.java) ?: return
+            val currentProfile = profileVersioned.value
             val existingRecent = currentProfile.recentMatches ?: return
             var changed = false
             val mergedRecent = existingRecent.map { existing ->
@@ -903,21 +1184,37 @@ class PlayerCacheService(
                     existing
                 }
             }
-            if (changed) {
-                val recomputedImp = timelineAnalysisService.computeImprovementStats(
-                    timelines = emptyList(),
-                    puuid = puuid,
-                    allMatches = mergedRecent
-                )
-                val preservedTtl = redisCacheService.getRemainingTtl(profileKey)
-                    ?.takeIf { !it.isZero && !it.isNegative }
-                    ?: PROFILE_CACHE_TTL
-                redisCacheService.set(
-                    profileKey,
-                    currentProfile.copy(recentMatches = mergedRecent, improvementStats = recomputedImp),
-                    preservedTtl
-                )
+            if (!changed) return
+
+            val knownProfileTtl = redisCacheService.getRemainingTtl(profileKey)
+                ?.takeIf { !it.isZero && !it.isNegative }
+            if (knownProfileTtl == null) {
+                legacyRoleQuestBackfillSkippedCasOrTtlCounter.incrementAndGet()
+                return
+            }
+
+            val matchOnlyImp = timelineAnalysisService.computeImprovementStats(
+                timelines = emptyList(),
+                puuid = puuid,
+                allMatches = mergedRecent
+            )
+            val preservedImp = preserveTimelineEvidenceInImprovementStats(
+                existing = currentProfile.improvementStats,
+                matchOnlyRecomputed = matchOnlyImp
+            )
+            val updatedProfile = currentProfile.copy(
+                recentMatches = mergedRecent,
+                improvementStats = preservedImp
+            )
+            val casCommitted = redisCacheService.compareAndSetPreservingTtl(
+                key = profileKey,
+                expectedRawPayload = profileVersioned.rawPayload,
+                newValue = updatedProfile
+            )
+            if (casCommitted) {
                 timelineService?.invalidatePlayerPreparedCache(normalizedRegion, puuid)
+            } else {
+                legacyRoleQuestBackfillSkippedCasOrTtlCounter.incrementAndGet()
             }
         } finally {
             redisCacheService.delete(lockKey)
@@ -1248,10 +1545,14 @@ class PlayerCacheService(
                 } else {
                     (cachedProfile.recentMatches ?: emptyList()) to 0
                 }
-                val fastImprovementStats = if (legacyUpdatedCount > 0 || cachedProfile.improvementStats == null) {
-                    timelineAnalysisService.computeImprovementStats(emptyList(), puuid, fastRecentMatches)
-                } else {
-                    cachedProfile.improvementStats
+                val fastImprovementStats = when {
+                    cachedProfile.improvementStats == null ->
+                        timelineAnalysisService.computeImprovementStats(emptyList(), puuid, fastRecentMatches)
+                    legacyUpdatedCount > 0 -> {
+                        val matchOnlyImp = timelineAnalysisService.computeImprovementStats(emptyList(), puuid, fastRecentMatches)
+                        preserveTimelineEvidenceInImprovementStats(cachedProfile.improvementStats, matchOnlyImp)
+                    }
+                    else -> cachedProfile.improvementStats
                 }
                 val fastUpdatedProfile = cachedProfile.copy(
                     gameName = summonerName,
