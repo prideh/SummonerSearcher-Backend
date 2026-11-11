@@ -106,13 +106,17 @@ class AiAnalysisService(
     }
 
     /**
-     * Selects the active PromptVersion for the given question category, supporting A/B testing
-     * between a champion and challenger version when both are active, and increments totalUses.
+     * Selects an eligible active PromptVersion for the given question category, filtering out legacy or
+     * boundary-violating directives before A/B routing and incrementing totalUses.
      */
     fun selectPromptVersion(category: String): PromptVersion? {
         return try {
-            val candidates = promptVersionRepository.findByIsActiveTrueAndCategoryScope(category)
-                .ifEmpty { promptVersionRepository.findByIsActiveTrueAndCategoryScopeIsNull() }
+            val scopedCandidates = promptVersionRepository.findByIsActiveTrueAndCategoryScope(category)
+                .filter { isEligiblePromptVersionDirective(it.promptTemplate) }
+            val candidates = scopedCandidates.ifEmpty {
+                promptVersionRepository.findByIsActiveTrueAndCategoryScopeIsNull()
+                    .filter { isEligiblePromptVersionDirective(it.promptTemplate) }
+            }
             if (candidates.isEmpty()) return null
 
             val selected = if (candidates.size == 1) {
@@ -134,6 +138,12 @@ class AiAnalysisService(
             null
         }
     }
+
+    fun enforceFreshResponseBoundary(
+        rawText: String,
+        context: Map<String, Any> = emptyMap(),
+        userMessage: String = ""
+    ): String = Companion.enforceFreshResponseBoundary(rawText, context, userMessage)
 
     class PromptBudgetExceededException(message: String) : IllegalArgumentException(message)
 
@@ -190,7 +200,8 @@ class AiAnalysisService(
             )
             .map { response ->
                 val generatedText = extractContent(response)
-                AiAnalysisResult(generatedText, temperature, detectedIntent.category, versionName)
+                val safeResponse = enforceFreshResponseBoundary(generatedText, context, userMessage)
+                AiAnalysisResult(safeResponse, temperature, detectedIntent.category, versionName)
             }
     }
 
@@ -228,7 +239,7 @@ class AiAnalysisService(
         )
 
         val sseType = object : ParameterizedTypeReference<ServerSentEvent<String>>() {}
-        val chunks = webClient.post()
+        val rawChunks = webClient.post()
             .uri("models/{model}:streamGenerateContent?alt=sse&key={key}", geminiModel, apiKey)
             .bodyValue(requestBody)
             .retrieve()
@@ -249,7 +260,8 @@ class AiAnalysisService(
             .mapNotNull { event -> event.data()?.let { extractStreamDelta(it) } }
             .filter { it.isNotEmpty() }
 
-        return AiStreamContext(chunks, temperature, detectedIntent.category, versionName)
+        val safeChunks = sanitizeStreamChunks(rawChunks, context, userMessage)
+        return AiStreamContext(safeChunks, temperature, detectedIntent.category, versionName)
     }
 
     private fun constructPrompt(
@@ -270,12 +282,12 @@ class AiAnalysisService(
         val resolvedIntent = intent ?: detectIntent(userMessage, messages)
         val questionCategory = resolvedIntent.category
 
-        // 🎯 DYNAMIC FEW-SHOT LEARNING (bounded to at most 2 examples & MAX_FEW_SHOT_BYTES; skip stale schema-leaking examples)
+        // 🎯 DYNAMIC FEW-SHOT LEARNING (bounded to at most 2 concise, schema-, CS@10-, & boundary-clean examples)
         val fewShotExamples = try {
             exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc(
                 questionCategory,
-                PageRequest.of(0, 4)
-            ).filterNot { containsInternalSchemaLeak(it.aiResponse) || containsInternalSchemaLeak(it.userQuestion) }
+                PageRequest.of(0, 6)
+            ).filter { isEligibleCuratedExample(it.userQuestion, it.aiResponse) }
                 .take(2)
         } catch (e: Exception) {
             emptyList() // If repository not initialized yet
@@ -283,7 +295,7 @@ class AiAnalysisService(
         
         var fewShotSection = if (fewShotExamples.isNotEmpty()) {
             val formattedExamples = fewShotExamples.joinToString("\n\n") { example ->
-                val trimmedAnswer = example.aiResponse.take(450)
+                val trimmedAnswer = trimAtSentenceBoundary(stripSuggestionsBlock(example.aiResponse), 450)
                 """
                 Example:
                 User: "${example.userQuestion.take(160)}"
@@ -297,19 +309,27 @@ class AiAnalysisService(
             """.trimIndent()
         } else ""
         
-        // 🧠 BEHAVIORAL PATTERN INJECTION
-        // Discovered from real user sessions: what do users ask AFTER this category?
+        // 🧠 BEHAVIORAL PATTERN INJECTION (humanized topics only—never raw snake_case category slugs)
         var patternHints = try {
             val patterns = patternRepository.findByTriggerCategoryAndIsActiveTrue(questionCategory)
+                .filter {
+                    it.triggerCategory in VALID_CATEGORIES &&
+                        it.followUpCategory in VALID_CATEGORIES &&
+                        it.confidenceScore.isFinite() &&
+                        it.confidenceScore > 0.0
+                }
             if (patterns.isNotEmpty()) {
+                val naturalTrigger = humanizeCategoryName(questionCategory)
                 val hints = patterns
                     .sortedByDescending { it.confidenceScore }
                     .take(2)
-                    .joinToString(", ") { "${it.followUpCategory} (${(it.confidenceScore * 100).toInt()}% of users ask this next)" }
+                    .joinToString(", ") {
+                        "${humanizeCategoryName(it.followUpCategory)} (${(it.confidenceScore * 100).toInt()}% of players ask about this next)"
+                    }
                 """
                 **COACHING INSIGHT (from real user data):**
-                After answering $questionCategory questions, users commonly follow up about: $hints
-                Use these topics in natural player wording when generating your 3 `---SUGGESTIONS---` follow-up options at the end (do not echo raw category keys or derail your main answer away from the user's question).
+                After answering $naturalTrigger questions, players commonly follow up about: $hints
+                Use these topics in plain player language without internal category slugs or backticks when generating your 3 "---SUGGESTIONS---" follow-up options at the end (never derail your main answer away from the user's question).
                 """.trimIndent()
             } else ""
         } catch (e: Exception) { "" }
@@ -334,7 +354,7 @@ class AiAnalysisService(
             else -> "timeline not analyzed yet"
         }
         
-        var historyString = formatBoundedHistory(messages, MAX_HISTORY_MESSAGES, MAX_HISTORY_BYTES)
+        var historyString = formatBoundedHistory(messages, MAX_HISTORY_MESSAGES, MAX_HISTORY_BYTES, context)
         var groundTruth = buildGroundTruthSection(
             context = context,
             userMessage = userMessage,
@@ -349,34 +369,33 @@ class AiAnalysisService(
 
         var timelineSection = buildTimelineInsightsSection(context)
         var improvementSection = buildImprovementStatsSection(context, compact = false)
-        var promptVersionSection = promptVersion?.promptTemplate?.takeIf { it.isNotBlank() }?.let {
-            """
-            **CATEGORY COACHING DIRECTIVE (${promptVersion.versionName.take(64)}):**
-            ${it.take(1_200)}
-            """.trimIndent()
-        } ?: ""
+        var promptVersionSection = promptVersion?.promptTemplate
+            ?.takeIf { isEligiblePromptVersionDirective(it) }
+            ?.let { renderPromptVersionDirectiveSlice(it) }
+            ?.let {
+                """
+                **CATEGORY COACHING DIRECTIVE:**
+                $it
+                """.trimIndent()
+            } ?: ""
 
         fun assemblePrompt(gt: String, fs: String, ph: String, hist: String, pv: String, tl: String, imp: String): String = """
-            You are an experienced, evidence-driven League of Legends coach analyzing ranked performance data. Calibrate your coaching depth and terminology to the player's actual rank ($playerRank) while using a constructive, natural, and analytical coaching methodology.
+            You are an experienced, evidence-driven League of Legends coach analyzing ranked performance data. Calibrate your coaching depth and terminology to the player's actual rank ($playerRank).
             
             **ANALYSIS FRAMEWORK (INTERNAL CHECKLIST):**
-            1. **Identify Context**: Rank ($playerRank), Role, Game Count ($recentSampleGameCount), Timeline ($naturalTimelineState), and the user's exact question.
-            2. **Answer the Question First**: Directly address what the user asked before anything else.
-            3. **Formulate Response**: Offer actionable, evidence-tied insight calibrated to the player's rank.
+            1. **Identify Context**: Rank ($playerRank), Role, Game Count ($recentSampleGameCount), Timeline ($naturalTimelineState).
+            2. **Answer First**: Lead with key scoped evidence, natural sample names, exact denominators, and missing-data limits.
+            3. **Two Practical Actions**: Give at most two controllable, conditional next-game actions (expand only when asked).
             
             $rankOptimization
             $pv
             
             **COACHING STYLE & TONE:**
-            - NEVER start a response with the player's name. NEVER address the player by their rank (e.g., do not say "Master I..."). Do not use the player's name ($playerName) more than once per response, and only when it's genuinely natural to do so mid-sentence. Most responses should use no name at all.
-            - Converse naturally. Avoid sounding like a rigid, automated report. Use natural paragraphs or short bullet points only when explaining complex concepts like wave management or ability combos.
-            - **Natural Player Language (No Internal Keys or Backticks):** In prose and `---SUGGESTIONS---`, speak naturally—never output internal field keys, `[sample: ...]` markers, `NOT_ANALYZED`, or backticks around stat/sample names.
-            - **Direct Answer Priority (#1 Rule):** ALWAYS directly and thoroughly answer the user's specific question first. Do NOT pivot to unrelated stat weaknesses (such as vision score or CS) when the user asks a focused question about a different topic (such as an item description, build path, champion mechanic, or matchup). Only bring up broader stat weaknesses when the user asks for an overall/general performance review or when it directly relates to their question.
-            - **Socratic Method:** When reviewing player mistakes, you may ask a brief guiding question to help them recognize the pattern, after answering their direct question.
-            - Be professional and honest about weaknesses. Do not use overly fluffy praise unless a stat is truly exceptional.
-            - **Concise & Natural Depth:** Keep responses concise, natural, and free of filler for straightforward questions, but allow longer, fuller explanations when the question needs depth (such as multi-game reviews, matchup breakdowns, build trade-offs, or macro walkthroughs). Tie every claim to specific evidence from the stats.
-            - **IMPORTANT: You MUST ALWAYS output the suggestions block at the very end of your response, absolutely nothing else should follow it. FORMAT:** `---SUGGESTIONS--- ["Option 1", "Option 2", "Option 3"]`
-            - **Formatting Highlight:** Use **bold text** strategically to emphasize key points, concepts, or statistics, making your answer easy to scan and read.
+            - NEVER start with the player's name or address them by rank (e.g., "Master I..."). Use $playerName at most once mid-sentence when natural (usually not at all). Converse naturally, not like an automated report, and use **bold text** for key points.
+            - **Natural Player Language (No Internal Keys or Backticks):** Speak naturally in prose and "---SUGGESTIONS---"—never output internal field names, camelCase or snake_case keys, bracketed tags, status codes, or markdown backticks around stat/sample names. Cite samples in plain player words with their own game counts (such as "your current-season ranked record", "your saved matches", and "$naturalRecentMatchesPhrase").
+            - **Direct Answer Priority (#1 Rule):** ALWAYS directly answer the user's specific question first; do NOT pivot to unrelated weaknesses unless asked for an overall review.
+            - **Default Short Answer & Two Practical Actions (Expand When Asked):** Default to a short, scannable answer with **no filler** and **no invented character or word limit**: cite key scoped evidence (natural sample names, exact denominators/win rates, and necessary uncertainty) and **at most two practical, controllable actions** without invented baseline targets. Expand into fuller detail only when the user explicitly asks.
+            - **Invited Bluntness & Playful Roasting:** Skip fluffy praise. When a roast or bluntness is invited, keep a sharp, playful edge on **verified personal, sample-scoped stats** only (such as personal KDA, kill participation, damage/min, or grey-screen time)—NEVER blame 5-player team objective rates (such as first-secure rate on Voidgrubs or first tower rate), NEVER invent unrecorded effort, autopilot, single-player farming, or teammates-dying-4v5 narratives from summary stats, and NEVER assume unrecorded camp-clear or passive-vision habits or command unconditional early skirmish forcing.
             
             $fs
             
@@ -390,26 +409,19 @@ class AiAnalysisService(
             $imp
             
             **DATA-DRIVEN COACHING & DATA-BOUNDARY RULES:**
-            - For player-specific claims (win rates, KDA, CS/min, match history, or matchups played), rely strictly on the provided GROUND TRUTH STATS and recent-match summary/rows. Do not invent game events, player stats, or match results that are not listed in the data.
-            - **Strict Sample Scope & Denominator Separation (`rankedRecord` vs. `savedHistory` vs. `recentMatchSample`):** Ground-truth stats come from three distinct samples with different game counts: (1) `rankedRecord` ("your ranked record": Solo/Duo W/L, games, and win rate), (2) `savedHistory` ("your saved matches", with the saved-match count when relevant and always paired with saved-match W/L or win rate: `savedHistoryAverages`, `savedHistorySideSplits`, `topChampions`, `opponentStats`), and (3) `recentMatchSample` ("$naturalRecentMatchesPhrase" / "your last N detailed matches", with its own games and win rate: `recentMatchSummary`, `Game 1..N`, `championMatchups`, `topStrengths`, `topWeaknesses`). NEVER combine samples, remove counts from win-rate/record claims, or pair one sample's win rate with another sample's game count (e.g., `savedHistory` win rate with `rankedRecord` or `recentMatchSample` games). Cite each sample in plain player language with its own denominator (never raw keys or header tags), and treat `unavailable` samples as unavailable without substituting another denominator.
-            - For general League of Legends domain questions (such as item descriptions, build paths, rune interactions, ability mechanics, or macro concepts), answer directly using functional League of Legends concepts connected to the player's champions or stats when relevant, without asserting stale patch numbers or unsupported item-effect specifics.
-            - If the user asks for specific player data that is missing from the stats block, state clearly what data is unavailable.
-            - **Timeline Status (`timelineStatus` = $timelineStatus):** When `timelineStatus` is `NOT_ANALYZED`, state clearly that only end-of-game summary and challenge stats are available in plain language (never `timelineStatus` or `NOT_ANALYZED`); never make claims about exact item completion minutes, early gold/XP diffs at 10/15 minutes, or death locations.
-            - **Vision Boundary:** Discuss ward counts, ward types, and timing buckets only; never claim ward placement in specific bushes, river entrances, or map areas (`WARD_PLACED` events carry no coordinates).
-            - **Deaths & Assist Attribution:** Treat "assisted" deaths as multi-enemy kill participation only—assisted deaths are not necessarily jungle ganks (lane 2v2s, support roams, and skirmishes/teamfights produce assists too). Treat "unassisted" deaths as single-enemy kill credit with zero recorded assists—never equate unassisted deaths with 1v1 duels (solo picks, roam catches, or delayed finishes after assist timers expire also record zero assists). Describe recorded enemy involvement rather than inferring how the fight started.
-            - **Observed Facts vs. Hypotheses & Conditional Recommendations:** Death events do **not** prove bad trades, overextension, greed, or mechanical misplays. Always separate **observed facts** (timestamps, approximate zones, killers, recorded assistants, gold/XP/CS diffs, items built) from **hypotheses** about why they happened, and frame all coaching recommendations **conditionally** (e.g., *"If this death happened while pushing without river vision, consider...; if it happened rotating to a skirmish, instead..."*).
-            - **No Stale Mythic-Era or Unsupported Build-Effect Claims (Including `---SUGGESTIONS---`):** The Mythic item system was removed in Season 14. NEVER propose or mention "Mythic items", "Mythic passives", "Mythic paths/rushes", or removed Mythic-era items (e.g., Divine Sunderer, Everfrost, Galeforce, Goredrinker, Duskblade, Prowler's Claw, Crown of the Shattered Queen, Night Harvester, Radiant Virtue). Do not claim specific patch-dependent item stats, gold costs, or build-effect numbers unless the supplied patch/context data explicitly supports them; anchor build discussion to the items present in context (`items`, `opponentDetails.items`, `itemSpikes`) and their functional purpose. Apply this same rule to the 3 `---SUGGESTIONS---` follow-up questions.
-            - **Early Lane CS Target (`cs10.target`, `cs10.targetLabel`, `avgLaneCsAt10`, `missingLaneCsAt10Matches`):** `cs10.target` (114 for Top/Bot, 120 for Mid on verified patch 26.1+ games only; `null` for `JUNGLE`, `UTILITY`/`SUPPORT`, short `<600s` games, or pre-26.1 patches) is a role-specific 10:00 lane benchmark definition, **not** farmable supply or a missed-CS counter. NEVER subtract `actual` from `target` to claim exact "missed CS" or "missed last-hits", and never resurrect obsolete `spawnedSupply` claims. Keep `actual` (`laneCs@10`), benchmark definition (`cs10.target` / `cs10.targetLabel`), `patch`, `role`, denominator (`matchCount` vs `targetMatchCount`), and missingness (`missingLaneCsAt10Matches`, `null`) distinct (`avgTarget` is `null` on mixed-patch samples where `targetMatchCount < matchCount`).
-            - **5-Stat Improvement Evidence (`phaseFarming`, `leadRetention`, `deathCost`, `unspentGold`, `teamObjectives`):** Cite exact denominators (`eligibleGames`, `eligibleGamesAt10` vs `eligibleGamesAt20`, `eligibleTimeDeadGames`, `eligibleTimelineGames`, `eligibleTeamObjectiveGames`) and exclusions (`shortGames`, `excludedMissingTimeline`, `missingOpponentGames`) in plain words. Never claim missed CS in `phaseFarming`; treat `10-20m` objective/tower events in `leadRetention` as temporal association only (never proof of a throw or solo credit); never infer lost farm or death avoidability from `deathCost`; treat `>=1600g` 1-minute `currentGold` snapshots in `unspentGold` as descriptive balance checkpoints (never a mistake score or recall event); and keep team objective outcomes (`firstRate`, `teamAvg` vs `enemyAvg`) strictly separate from personal `personalLastHits`/`personalTakedowns`/`timelineInvolved`.
-            - **Incomplete Legacy Cache Fields:** When any stat or timeline breakdown (such as `assistedDeaths`, `unassistedDeaths`, `wardsByTimeBucket`, or `cs10.target`) is `null` or marked `incomplete`, treat it as unavailable/incomplete data—never treat `null` or `incomplete` fields as `0`.
-            
-            **MATCHUP GURU EXPERTISE:**
-            When discussing champion matchups, utilize the provided data. Go beyond basic win rates: explain *why* a matchup is favored or difficult by discussing specific ability interactions, cooldown windows, tethering, or power spikes.
-            
-            **ADVANCED LOL CONCEPTS TO CONSIDER:**
-            - **Fundamentals:** CS optimization, vision control, wave manipulation (freeze/slow push/crash), trading patterns.
-            - **Macro:** Rotation timing, objective priority, jungle pathing, roaming windows, tempo alignment.
-            - **Advanced Tactics:** Dive execution, tethering micro, cooldown tracking, cursor precision, FOW manipulation.
+            - Rely strictly on GROUND TRUTH STATS for player claims; state clearly when requested player data is unavailable.
+            - **Strict Sample Scope & Denominator Separation (Current-Season Ranked Record vs. Saved Matches vs. Recent Detailed Matches):** Keep the three samples separate in plain player language with exact denominators: (1) **your current-season ranked record** (Solo/Duo W/L, games, and win rate), (2) **your saved matches** (with the saved-match count when relevant and always paired with saved-match W/L or win rate: saved-match averages, Blue/Red side splits, most-played champions, and matched role-opponent averages), and (3) **$naturalRecentMatchesPhrase** ("your last N detailed matches", with its own games and win rate: detailed match summary, Game 1..N, champion matchups, and challenge beat/trail frequencies). NEVER combine samples, remove counts from win-rate/record claims, or pair one sample's win rate with another sample's game count. Your Solo/Duo counter is Riot's **current ranked season/split** record—NEVER call it a "lifetime", "all-time", or "career" ranked record. Riot does **not** expose hidden MMR ("matchmaking rating")—NEVER claim MMR has stabilized, converged, or shifted. Frame cross-sample win-rate differences via sample size / normal short-window variance and observed stats—NEVER invent unmeasured causes such as "better synergy" or "tighter macro". Treat unavailable samples as unavailable without substituting another sample's denominator.
+            - For general League of Legends domain questions (such as item descriptions, build paths, rune interactions, ability mechanics, or macro concepts), use functional LoL concepts without stale patch numbers.
+            - **Verified Champion Ability Names Only:** Use official ability names only when certain; otherwise use ability keys (Passive, Q, W, E, R)—NEVER invent, guess, or blend ability names (such as "Aegis of Zealous").
+            - **Match Timeline Boundary ($naturalTimelineState):** When match timeline analysis is not analyzed yet, state clearly in plain player words that only end-of-game summary and challenge stats are available; never claim item completion minutes, 10/15m gold/XP diffs, death locations, "low-percentage fights", bad engages, overextending, wave-sequencing errors, or unrecorded camp-clear and vision-setup habits.
+            - **Vision Boundary:** Use ward counts, types, and timing buckets only; never claim ward placement in specific bushes, river entrances, or map areas (Riot ward-placed events carry no coordinates).
+            - **Deaths & Assist Attribution:** Assisted deaths mean multi-enemy participation—assisted deaths are not necessarily jungle ganks. Unassisted deaths mean single-enemy kill credit—never equate unassisted deaths with 1v1 duels.
+            - **Observed Facts vs. Hypotheses & Conditional Recommendations:** Death events, low kill participation, damage totals, and grey-screen time do **not** prove bad trades, overextension, greed, mechanical misplays, "low-percentage fights", lack of effort, autopilot farming, or wave errors. Challenge beat/trail frequencies only count how often you beat or trailed your matched role opponent on a raw challenge stat in recent main-role games—NEVER turn challenge trail frequencies into confident skill diagnoses. Separate **observed facts** from **hypotheses**, and frame all coaching recommendations **conditionally** (for example: "If allied lanes have priority around an upcoming objective, pan early to join a numbers-advantaged skirmish; if lanes lack priority, finish your camp or wave and trade cross-map"—NEVER command unconditional early skirmish forcing).
+            - **No Stale Mythic-Era or Unsupported Build-Effect Claims (Including "---SUGGESTIONS---"):** The Mythic item system was removed in Season 14. NEVER propose or mention "Mythic items", "Mythic passives", "Mythic paths/rushes", or removed Mythic items (Divine Sunderer, Everfrost, Galeforce, Goredrinker, Duskblade, Prowler's Claw, Crown of the Shattered Queen, Night Harvester, Radiant Virtue). Do not claim specific patch-dependent item stats, gold costs, or build-effect numbers unless the supplied patch/context data explicitly supports them; anchor builds to items present in GROUND TRUTH STATS.
+            - **Early Lane CS Theoretical Maximum (10:00 Lane CS & Theoretical Max):** The 10:00 theoretical maximum (114 for TOP/BOTTOM, 120 for MIDDLE on verified Patch 26.1+ >=600s games; null for non-laners, <600s, or pre-26.1/unknown patches) is strictly the **theoretical maximum** passive lane wave spawn by 10:00—**never** an empirical benchmark, target/expected CS, farmable supply, or missed-CS baseline (including "---SUGGESTIONS---"). NEVER call 114/120 a "target" or "benchmark", NEVER invent substitute wave/pacing numbers (such as 107, 101-107, 100, or 70-85), NEVER subtract actual 10:00 CS from 114/120 to claim "missed CS" or "missed last-hits", and NEVER treat a gap below 114/120 by itself as proof of poor farming or a "#1 focus area". Keep actual 10:00 CS, supported subset (null max when mixed), patch, role, missingness, and empirical cohort/opponent benchmarks distinct.
+            - **5-Stat Improvement Evidence (Post-Lane Farming, Lead Retention, Death Cost, Unspent Gold, Team Objectives):** Cite exact denominators and exclusions in plain words. Never claim missed CS in Post-Lane Farming; treat 10-20m events in Lead Retention as temporal association only; in Death Cost, personal grey-screen time and game-time share remain valid personal stats even without timeline analysis when scoped to their eligible game count, but never infer lost farm, death avoidability, or "low-percentage fights" from Death Cost; treat Unspent Gold 1-min checkpoints descriptively (not recall mistakes); and in Team Objectives, team first-objective counts/rates and team kills/averages are **5-player team outcomes**—NEVER frame low team first-objective rates (such as first-secure rate on Voidgrubs or first tower rate) as a personal weakness, personal fault, or player roast even when bluntness is invited, keeping them separate from personal objective last-hits, takedowns, and timeline involvement.
+            - **Incomplete Legacy Cache Fields:** Treat null or incomplete fields (such as assisted deaths, unassisted deaths, ward timing buckets, or 10:00 theoretical maximum) as unavailable/incomplete—never as 0.
+            - **Matchups:** Cite scoped matchup records with game counts and explain Q/W/E/R cooldown/spacing windows as hypotheses when unrecorded.
             
             **DATA QUALITY NOTES:**
             $sampleSizeWarning
@@ -417,10 +429,8 @@ class AiAnalysisService(
             **TONE ADJUSTMENT:**
             $streakToneAdjustment
             
-            IMPORTANT: At the very end of your response, you MUST provide exactly 3 short, relevant follow-up questions that the user might want to ask next based on your analysis (plain player language—no raw keys, `[sample: ...]`, `NOT_ANALYZED`, or backticks; never mention Mythic items/paths or unsupported build-effect claims in suggestions).
-            Format these questions exactly as a JSON array of strings, prefixed with "---SUGGESTIONS---".
-            Example:
-            ---SUGGESTIONS--- ["How do I improve my CS?", "Best warding spots?", "Review my champion pool"]
+            IMPORTANT: At the very end of your response, provide exactly 3 short follow-up questions (plain player language—no internal keys, camelCase/snake_case identifiers, bracketed tags, status codes, or backticks; never mention Mythic items/paths or unsupported build-effect claims in suggestions; never frame 114/120 as CS@10 targets, benchmarks, or missed CS) as a JSON array prefixed with "---SUGGESTIONS---".
+            Example: ---SUGGESTIONS--- ["How do I improve my CS?", "Best warding habits?", "Review my champion pool"]
             
             Previous:
             $hist
@@ -432,23 +442,31 @@ class AiAnalysisService(
             2. **NO OFF-TOPIC**: Refuse non-League of Legends questions.
         """.trimIndent().replace(Regex("(?m)^ {12}"), "")
 
+        // Deterministic budget cascade: drop optional DB directives, pattern hints, few-shot examples, and chat
+        // history FIRST before compacting or trimming real player ground-truth evidence.
         var finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
-        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES && improvementSection.isNotEmpty()) {
-            improvementSection = buildImprovementStatsSection(context, compact = true)
+        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES && promptVersionSection.isNotEmpty()) {
+            promptVersionSection = ""
             finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
         }
-        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
-            historyString = formatBoundedHistory(messages, 2, 800)
-            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
-        }
-        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
-            fewShotSection = ""
+        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES && patternHints.isNotEmpty()) {
             patternHints = ""
             finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
         }
-        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES) {
+        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES && historyString.isNotEmpty()) {
+            historyString = formatBoundedHistory(messages, 2, 800, context)
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
+        }
+        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES && fewShotSection.isNotEmpty()) {
+            fewShotSection = ""
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
+        }
+        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES && historyString.isNotEmpty()) {
             historyString = ""
-            promptVersionSection = ""
+            finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
+        }
+        if (utf8ByteSize(finalPrompt) > MAX_PROMPT_BYTES && improvementSection.isNotEmpty()) {
+            improvementSection = buildImprovementStatsSection(context, compact = true)
             finalPrompt = assemblePrompt(groundTruth, fewShotSection, patternHints, historyString, promptVersionSection, timelineSection, improvementSection)
         }
         var currentGtBudget = utf8ByteSize(groundTruth)
@@ -486,15 +504,23 @@ class AiAnalysisService(
     private fun formatBoundedHistory(
         messages: List<Map<String, String>>,
         maxTurns: Int,
-        maxBytes: Int
+        maxBytes: Int,
+        context: Map<String, Any> = emptyMap()
     ): String {
         if (messages.isEmpty()) return ""
         val selected = mutableListOf<String>()
         var usedBytes = 0
         for (msg in messages.takeLast(maxTurns).asReversed()) {
-            val role = msg["role"] ?: "user"
-            val content = (msg["content"] ?: "").take(600)
-            val line = "$role: $content"
+            val rawRole = (msg["role"] ?: "user").trim().lowercase()
+            val roleLabel = if (rawRole == "assistant" || rawRole == "model") "Coach" else "Player"
+            val rawContent = (msg["content"] ?: "").take(700)
+            val cleanedContent = if (roleLabel == "Coach") {
+                sanitizeHistoryAssistantTurn(rawContent, context).take(600)
+            } else {
+                rewriteInternalSchemaTokens(rawContent, context).take(600)
+            }
+            if (cleanedContent.isBlank()) continue
+            val line = "$roleLabel: $cleanedContent"
             val lineBytes = utf8ByteSize(line) + 1
             if (selected.isNotEmpty() && usedBytes + lineBytes > maxBytes) break
             selected.add(line)
@@ -562,16 +588,1191 @@ class AiAnalysisService(
         fun heuristicTokenEstimate(text: String): Int = (utf8ByteSize(text) + 3) / 4
         fun estimateTokens(text: String): Int = heuristicTokenEstimate(text)
 
+        private val CATEGORY_DISPLAY_NAMES: Map<String, String> = mapOf(
+            "cs_farming" to "CS and farming",
+            "vision_warding" to "vision and warding",
+            "wave_management" to "wave management",
+            "trading_laning" to "laning and trading",
+            "itemization_builds" to "item builds",
+            "macro_rotations" to "macro and rotations",
+            "teamfighting" to "teamfighting",
+            "objective_control" to "objective setups",
+            "jungle_pathing" to "jungle pathing",
+            "roaming" to "roaming timers",
+            "back_timing" to "recall timing",
+            "win_conditions" to "win conditions",
+            "champion_pool" to "champion pool",
+            "matchups" to "champion matchups",
+            "champion_mechanics" to "champion mechanics",
+            "power_spikes" to "power spikes",
+            "positional_spacing" to "positioning and spacing",
+            "resource_management" to "mana and cooldown management",
+            "mental_state_tilt" to "mental reset habits",
+            "review_methodology" to "VOD review habits",
+            "full_analysis" to "overall performance",
+            "opponent_specific" to "opponent matchups",
+            "frustration" to "focused coaching",
+            "general" to "overall gameplay"
+        )
+
+        fun humanizeCategoryName(category: String?): String {
+            val cleaned = category?.trim()?.lowercase()?.takeIf { it.isNotEmpty() } ?: return "overall gameplay"
+            CATEGORY_DISPLAY_NAMES[cleaned]?.let { return it }
+            return cleaned.replace('_', ' ').replace(Regex("""\s+"""), " ").trim()
+        }
+
+        const val MAX_PROMPT_VERSION_DIRECTIVE_CHARS: Int = 1_200
+
         private val INTERNAL_SCHEMA_LEAK_REGEX = Regex(
-            """\b(?:rankedRecord|savedHistory|recentMatchSample|savedHistoryAverages|savedHistorySideSplits|recentMatchSummary|omittedMatchesRollup|timelineStatus|timelineInsights|improvementStats|visionDataPrecision|avgLaneCsAt10|missingLaneCsAt10Matches|NOT_ANALYZED)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`(?:topChampions|opponentStats|championMatchups|topStrengths|topWeaknesses|phaseFarming|leadRetention|deathCost|unspentGold|teamObjectives|ANALYZED)`"""
+            """\b(?:savedHistorySideSplits|missingLaneCsAt10Matches|theoreticalMaxMatchCount|savedHistoryAverages|omittedMatchesRollup|visionDataPrecision|recentMatchSummary|totalGamesAnalyzed|recentMatchSample|championMatchups|timelineInsights|improvementStats|timelineInvolved|personalTakedowns|eligibleTimeDeadGames|avgTheoreticalMax|wardsByTimeBucket|challengeSummary|personalLastHits|targetMatchCount|opponentDetails|timelineStatus|damageSplitPct|teamObjectives|avgLaneCsAt10|recentMatches|opponentStats|roleBreakdown|skillMaxOrder|topWeaknesses|leadRetention|rankedRecord|savedHistory|topChampions|topStrengths|phaseFarming|unspentGold|NOT_ANALYZED|WARD_PLACED|itemSpikes|deathCost|firstRate|avgTarget|cs_farming|vision_warding|wave_management|trading_laning|itemization_builds|macro_rotations|objective_control|jungle_pathing|back_timing|win_conditions|champion_pool|champion_mechanics|power_spikes|positional_spacing|resource_management|mental_state_tilt|review_methodology|full_analysis|opponent_specific)\b|\b[a-z]+(?:SideSplits|Averages|MatchSample|MatchSummary|MatchesRollup|DataPrecision|TimeBucket|SplitPct|MaxOrder|LastHits)\b|\b(?:horde|tower|dragon|baron|riftHerald)\.firstRate\b|\bcs10\.(?:theoreticalMax(?:Label)?|target(?:Label)?|spawnedSupply|supplyLabel)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`"""
         )
 
         /**
-         * Detects whether player-facing text or a stored few-shot example exposes internal sample keys,
-         * bracketed `[sample: ...]` schema markers, prompt header tags, or status codes such as `NOT_ANALYZED`.
+         * Detects whether player-facing text, a PromptVersion directive, or a stored few-shot example exposes
+         * internal sample/metric keys, camelCase-glued suffix residue, snake_case category slugs, bracketed
+         * `[sample: ...]` markers, legacy prompt header tags, status codes such as `NOT_ANALYZED`, or backticks.
          */
         fun containsInternalSchemaLeak(text: String): Boolean =
             INTERNAL_SCHEMA_LEAK_REGEX.containsMatchIn(text)
+
+        private val LEGACY_POLLUTED_DIRECTIVE_REGEX = Regex(
+            """(?i)(?:\bstep[- ]by[- ]step\s+in[- ]game\s+execution\b|\bspecify\s+exact\s+warding\b|\bwarding\s+timings?\s+and\s+locations?\b|\bpassive/stat\s+synergy\b|\b10:00\s+benchmark\b|\b[a-z]+_[a-z_]+\b)"""
+        )
+
+        internal fun renderPromptVersionDirectiveSlice(template: String?): String? {
+            val full = template?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+            return trimAtSentenceBoundary(full, MAX_PROMPT_VERSION_DIRECTIVE_CHARS)
+                .takeIf { it.isNotEmpty() }
+        }
+
+        private fun passesPromptVersionDirectiveGates(text: String): Boolean {
+            if (containsInternalSchemaLeak(text)) return false
+            if (containsCs10TheoreticalMaxMislabeling(text)) return false
+            if (containsEvidenceBoundaryViolation(text)) return false
+            if (LEGACY_POLLUTED_DIRECTIVE_REGEX.containsMatchIn(text)) return false
+            return true
+        }
+
+        /**
+         * Read-time gate for DB `PromptVersion` templates. Validates BOTH the full trimmed template
+         * AND the exact `<= 1,200`-char sentence-bounded slice injected into the prompt so neither
+         * violations past character 1,200 nor boundary-straddling slices can pass or be injected.
+         */
+        fun isEligiblePromptVersionDirective(template: String?): Boolean {
+            val full = template?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+            if (!passesPromptVersionDirectiveGates(full)) return false
+            val injectedSlice = renderPromptVersionDirectiveSlice(full) ?: return false
+            return passesPromptVersionDirectiveGates(injectedSlice)
+        }
+
+        internal fun trimAtSentenceBoundary(text: String, maxChars: Int): String {
+            val cleaned = text.trim()
+            if (cleaned.length <= maxChars) return cleaned
+            val slice = cleaned.substring(0, maxChars)
+            val sentenceEndIdx = Regex("""(?:\.(?!\d)|[!?])(?=\s|$)""")
+                .findAll(slice)
+                .lastOrNull()
+                ?.range
+                ?.last
+            if (sentenceEndIdx != null && sentenceEndIdx >= 120) {
+                return slice.substring(0, sentenceEndIdx + 1).trim()
+            }
+            val lastSpace = slice.lastIndexOf(' ')
+            return if (lastSpace >= 80) {
+                slice.substring(0, lastSpace).trimEnd(',', ';', ':') + "..."
+            } else {
+                slice
+            }
+        }
+
+        private val SUGGESTIONS_BLOCK_REGEX = Regex("""\s*---SUGGESTIONS---[\s\S]*$""")
+
+        private val EXPANDED_ANSWER_REQUEST_REGEX = Regex(
+            """(?i)\b(?:in[- ]detail|in[- ]depth|detailed\s+breakdown|deep\s+dive|elaborate|expand(?:\s+on)?|walk\s+me\s+through|walkthrough|step[- ]by[- ]step|thorough(?:ly)?|comprehensive(?:ly)?|full\s+breakdown|game[- ]by[- ]game|explain\s+(?:more|further)|tell\s+me\s+more|go\s+deeper|break\s+down\s+each)\b"""
+        )
+
+        // Splits sentences and ellipses without breaking decimal numbers such as 147.05, 7.84%, 30.0%, or 26.1
+        private val SENTENCE_SPLIT_REGEX = Regex("""(?:\.(?!\d)|[!?\n])+""")
+
+        private val LOCAL_NEGATED_LIFETIME_RANKED_REGEX = Regex(
+            """(?i)\b(?:not|never|neither|nor|isn't|is\s+not|aren't|are\s+not|rather\s+than|instead\s+of)\s+(?:a\s+|an\s+|the\s+|your\s+)?(?:lifetime|all[- ]time|career)\s+(?:ranked|solo/?duo)\s+record\b"""
+        )
+
+        private val LIFETIME_RANKED_CLAIM_REGEX = Regex(
+            """(?i)\b(?:lifetime|all[- ]time|career)\s+(?:ranked|solo/?duo)\s+record\b"""
+        )
+
+        private val LOCAL_NEGATED_MMR_CLAIM_REGEX = Regex(
+            """(?i)\b(?:(?:does\s+not|doesn't|do\s+not|don't|cannot|can't|unable\s+to|never)\s+(?:prove|show|tell|mean|indicate|confirm|suggest|know|reveal)|no\s+(?:way|data|evidence)\s+to\s+(?:tell|know|verify|show|confirm))\s+(?:if\s+|whether\s+|that\s+)?(?:your\s+)?(?:overall\s+|hidden\s+)?(?:matchmaking\s+rating|\bmmr\b)(?:\s+(?:has\s+|have\s+|is\s+)?(?:stabilized|converged|leveled\s+off|plateaued|peaked|tanked|climbed|dropped|inflated|normali[sz]ed))?"""
+        )
+
+        private val MMR_CLAIM_REGEX = Regex(
+            """(?i)(?:\bsuggests\s+(?:that\s+)?your\s+(?:overall\s+)?(?:matchmaking\s+rating|\bmmr\b)|(?:matchmaking\s+rating|\bmmr\b)[^,;:.!?\n]{0,55}\b(?:has\s+|have\s+|is\s+)?(?:stabilized|converged|leveled\s+off|plateaued|peaked|tanked|climbed|dropped|inflated|normali[sz]ed)\b)"""
+        )
+
+        private val LOCAL_NEGATED_SYNERGY_MACRO_REGEX = Regex(
+            """(?i)\b(?:(?:does\s+not|doesn't|do\s+not|don't|cannot|can't|never)\s+(?:prove|show|confirm|mean|indicate|establish|suggest)|not\s+(?:proof|evidence)\s+of|rather\s+than|instead\s+of|neither)\s+(?:that\s+|any\s+)?(?:better\s+(?:team\s+|jungle\s+)?synergy|tighter\s+macro)(?:\s+(?:or|nor)\s+(?:better\s+(?:team\s+|jungle\s+)?synergy|tighter\s+macro))?"""
+        )
+
+        private val UNSUPPORTED_SYNERGY_MACRO_CAUSE_REGEX = Regex(
+            """(?i)\b(?:better\s+(?:team\s+|jungle\s+)?synergy|tighter\s+macro)\b"""
+        )
+
+        private val LOCAL_NEGATED_PERSONAL_OBJECTIVE_REGEX = Regex(
+            """(?i)\b(?:not|never|neither|nor|rather\s+than|instead\s+of)\s+(?:a\s+|an\s+|your\s+)?(?:personal\s+)?(?:weakness|weaknesses|fault|failing|problem|issue|liability|stat|stats|metric)\b"""
+        )
+
+        private val TEAM_OBJECTIVE_TOPIC_REGEX = Regex(
+            """(?i)\b(?:first[- ](?:secure\s+rate|voidgrubs?|grubs?|horde|towers?|turrets?|dragons?|heralds?|barons?)|(?:voidgrubs?|grubs?|horde|towers?|turrets?)\s+first[- ](?:secure\s+)?rate|6\s+of\s+20|8\s+of\s+20)\b"""
+        )
+
+        private val PERSONAL_BLAME_ON_TEAM_STAT_REGEX = Regex(
+            """(?i)\b(?:personal\s+(?:weakness|weaknesses|fault|failing|problem|issue|liability)|your\s+(?:bottom\s+|top\s+|biggest\s+|main\s+|glaring\s+|key\s+)?weakness(?:es)?|your\s+personal\s+first[- ](?:secure|tower|turret|grub|voidgrub|dragon|herald|baron)|you\s+(?:personally\s+)?(?:only\s+)?secured\s+first\s+(?:voidgrubs?|grubs?|towers?|turrets?))\b"""
+        )
+
+        private val PEJORATIVE_TEAM_FIRST_RATE_REGEX = Regex(
+            """(?i)\b(?:poor|weak|abysmal|awful|terrible|pathetic|sloppy|dismal|embarrassing|mediocre|rough|lacking)\s+(?:\d+(?:\.\d+)?%\s+)?(?:first[- ]secure\s+rate(?:\s+on\s+(?:voidgrubs?|grubs?|horde|towers?|turrets?|dragons?|heralds?|barons?))?|first[- ](?:voidgrubs?|grubs?|horde|towers?|turrets?|dragons?|heralds?|barons?)\s+rate|(?:voidgrubs?|grubs?|horde|towers?|turrets?)\s+first[- ](?:secure\s+)?rate)\b"""
+        )
+
+        private val LOCAL_NEGATED_LOW_PCT_FIGHTS_REGEX = Regex(
+            """(?i)\b(?:(?:does\s+not|doesn't|do\s+not|don't|cannot|can't|unable\s+to|never)\s+(?:prove|show|confirm|mean|indicate|tell|know|verify|see|establish)|no\s+(?:way|data|evidence|timeline)\s+to\s+(?:tell|know|verify|prove|show|confirm)|not\s+(?:proof|evidence)\s+of)\s+(?:if\s+|whether\s+|that\s+)?(?:you(?:'re|\s+are)?\s+)?(?:(?:take|takes|taking|took|force|forces|forcing|pick|picking)\s+)?low[- ]percentage\s+fights\b"""
+        )
+
+        private val LOW_PERCENTAGE_FIGHTS_CLAIM_REGEX = Regex(
+            """(?i)\blow[- ]percentage\s+fights\b"""
+        )
+
+        private val LOCAL_NEGATED_EFFORT_OR_PVE_REGEX = Regex(
+            """(?i)\b(?:(?:does\s+not|doesn't|do\s+not|don't|cannot|can't|unable\s+to|never)\s+(?:prove|show|confirm|mean|indicate|tell|know|verify|establish)|no\s+(?:way|data|evidence|summary\s+stat)\s+to\s+(?:prove|show|tell|know|verify|confirm)|not\s+(?:proof|evidence)\s+(?:that\s+you(?:'re|\s+are)?\s+|of\s+)?)\s*(?:if\s+|whether\s+|that\s+)?(?:you(?:'re|\s+are)?\s+)?(?:(?:actively|just|basically|essentially)\s+coasting|coasting(?:\s+through)?|autopiloting|on\s+autopilot|afk[- ]farming|(?:effectively\s+)?playing\s+pve(?:\s+while\s+your\s+team\s+bleeds?\s+out)?|(?:watching|letting)\s+your\s+team\s+bleed\s+out)(?:\s+(?:or|nor)\s+(?:(?:you(?:'re|\s+are)?\s+)?(?:effectively\s+)?playing\s+pve(?:\s+while\s+your\s+team\s+bleeds?\s+out)?|(?:actively\s+)?coasting|autopiloting|(?:watching|letting)\s+your\s+team\s+bleed\s+out))*"""
+        )
+
+        private val UNSUPPORTED_EFFORT_OR_PVE_NARRATIVE_REGEX = Regex(
+            """(?i)(?:\b(?:actively|just|basically|essentially|purely|merely)\s+coasting\b|\bcoasting\s+(?:through|in|around)\b|\b(?:autopiloting|on\s+autopilot|afk[- ]farming)\b|\bplaying\s+pve\b|\bpve\s+simulator\b|\b(?:while|as)\s+your\s+team\s+(?:bleeds?\s+out|dies?\s+4v5|fights?\s+4v5)\b|\b(?:watching|letting)\s+your\s+team\s+bleed\s+out\b)"""
+        )
+
+        private val LOCAL_NEGATED_FORCE_SKIRMISH_REGEX = Regex(
+            """(?i)\b(?:do\s+not|don't|should\s+not|shouldn't|cannot|can't|must\s+not|never|avoid|instead\s+of|rather\s+than|without)\s+(?:blindly\s+)?forc(?:e|ing)\s+(?:yourself\s+into\s+)?(?:active\s+|early\s+|bad\s+|coinflip\s+|more\s+)?(?:skirmishes|fights|river\s+fights)(?:\s+earlier)?\b"""
+        )
+
+        private val UNCONDITIONAL_FORCE_SKIRMISH_REGEX = Regex(
+            """(?i)(?:\bforce\s+yourself\s+into\s+(?:active\s+|early\s+|more\s+)?(?:skirmishes|fights|river\s+fights)\b|\bforce\s+(?:active|early)\s+skirmishes\s+earlier\b)"""
+        )
+
+        private val LOCAL_NEGATED_UNVERIFIED_PATHING_REGEX = Regex(
+            """(?i)\b(?:(?:does\s+not|doesn't|do\s+not|don't|cannot|can't|unable\s+to|never)\s+(?:prove|show|confirm|mean|indicate|tell|know|verify|see)|no\s+(?:way|data|evidence|timeline)\s+to\s+(?:tell|know|verify|prove|show|confirm)|not\s+(?:proof|evidence)\s+of)\s+(?:if\s+|whether\s+|that\s+)?(?:you(?:'re|\s+are)?\s+)?(?:default(?:ing|s|ed)?\s+to\s+full\s+clears?(?:\s+and\s+passive\s+vision\s+setup)?|passive\s+vision\s+setup)\b"""
+        )
+
+        private val UNVERIFIED_CLEAR_OR_VISION_HABIT_REGEX = Regex(
+            """(?i)\b(?:default(?:ing|s|ed)?\s+to\s+full\s+clears?|full[- ]clearing\s+while\s+your\s+team|passive\s+vision\s+setup)\b"""
+        )
+
+        private val LOCAL_NEGATED_ABILITY_MYTHIC_REGEX = Regex(
+            """(?i)\b(?:(?:no|never\s+(?:mention|build|buy|recommend|propose|cite)|removed|obsolete)\s+(?:removed\s+)?(?:mythic\s+(?:items?|passives?|paths?|rushes?)|divine\s+sunderer|everfrost|galeforce|goredrinker|duskblade(?:\s+of\s+draktharr)?|prowler'?s\s+claw|crown\s+of\s+the\s+shattered\s+queen|night\s+harvester|radiant\s+virtue)|mythic\s+(?:item\s+system|items?)\s+(?:was|were)\s+removed|(?:no|not\s+an?)\s+ability\s+(?:called|named)\s+aegis\s+of\s+zealous)\b"""
+        )
+
+        private val INVENTED_ABILITY_OR_MYTHIC_REGEX = Regex(
+            """(?i)\b(?:aegis\s+of\s+zealous|mythic\s+(?:items?|passives?|paths?|rushes?)|divine\s+sunderer|everfrost|galeforce|goredrinker|duskblade(?:\s+of\s+draktharr)?|prowler'?s\s+claw|crown\s+of\s+the\s+shattered\s+queen|night\s+harvester|radiant\s+virtue)\b"""
+        )
+
+        private val LOCAL_NEGATED_CHALLENGE_DIAGNOSIS_REGEX = Regex(
+            """(?i)\b(?:(?:does\s+not|doesn't|do\s+not|don't|cannot|can't|never)\s+(?:prove|confirm|diagnose|mean)|not\s+(?:proof|evidence|a\s+diagnosis)\s+of)\s+(?:(?:that\s+you\s+have\s+)?(?:poor|weak|bad|broken)\s+\w+(?:\s+\w+)?)?"""
+        )
+
+        private val CHALLENGE_DIAGNOSIS_CLAIM_REGEX = Regex(
+            """(?i)(?:\b(?:trail(?:ed|ing)?|behind\s+your\s+(?:role|lane)\s+opponent|weakness\s+(?:rate|consistency|frequency))[^.!?\n]{0,90}\b(?:proves?|confirms?|diagnoses|means\s+you\s+have\s+(?:poor|weak|bad|broken))\b|\b\d+(?:\.\d+)?%\s+of\s+(?:your\s+)?(?:main[- ]role\s+)?(?:games|matches)[^.!?\n]{0,70}\b(?:proves?|confirms?)\s+(?:poor|weak|bad|broken)\b)"""
+        )
+
+        const val MAX_DEFAULT_CURATED_EXAMPLE_WORDS: Int = 220
+
+        /**
+         * Strips the trailing `---SUGGESTIONS--- [...]` block so coaching prose length and content
+         * can be evaluated or injected cleanly without follow-up JSON noise.
+         */
+        fun stripSuggestionsBlock(text: String): String =
+            text.replace(SUGGESTIONS_BLOCK_REGEX, "").trim()
+
+        /**
+         * Returns true when the player explicitly asks for a fuller, expanded, or game-by-game breakdown
+         * rather than the default short coaching answer.
+         */
+        fun requestsExpandedAnswer(question: String): Boolean =
+            EXPANDED_ANSWER_REQUEST_REGEX.containsMatchIn(question)
+
+        private fun extractUnambiguouslyGroundedTerms(context: Map<String, Any>): Set<String> {
+            if (context.isEmpty()) return emptySet()
+            val grounded = mutableSetOf<String>()
+            val recentMatches = (context["recentMatches"] as? List<*>)?.mapNotNull { it as? Map<*, *> } ?: emptyList()
+            for (match in recentMatches) {
+                (match["items"] as? List<*>)?.mapNotNull { it?.toString()?.trim()?.lowercase() }
+                    ?.filter { it.isNotEmpty() }
+                    ?.let { grounded.addAll(it) }
+            }
+            val distinctChampions = buildSet {
+                context["champion"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.lowercase()?.let { add(it) }
+                for (match in recentMatches) {
+                    match["champion"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.lowercase()?.let { add(it) }
+                }
+            }
+            if (distinctChampions.size == 1) {
+                val verifiedAbilities = when (val raw = context["verifiedAbilities"]) {
+                    is Collection<*> -> raw.mapNotNull { it?.toString()?.trim()?.lowercase() }
+                    is Map<*, *> -> raw.values.mapNotNull { it?.toString()?.trim()?.lowercase() }
+                    else -> emptyList()
+                }
+                grounded.addAll(verifiedAbilities.filter { it.isNotEmpty() })
+            }
+            return grounded
+        }
+
+        private fun hasUngroundedAbilityOrMythicClaim(
+            sentence: String,
+            context: Map<String, Any> = emptyMap()
+        ): Boolean {
+            val scrubbed = LOCAL_NEGATED_ABILITY_MYTHIC_REGEX.replace(sentence, " ")
+            val matches = INVENTED_ABILITY_OR_MYTHIC_REGEX.findAll(scrubbed).toList()
+            if (matches.isEmpty()) return false
+            val groundedTerms = extractUnambiguouslyGroundedTerms(context)
+            return matches.any { mr -> mr.value.trim().lowercase() !in groundedTerms }
+        }
+
+        private fun hasSentenceEvidenceViolation(
+            sentence: String,
+            timelineAnalyzed: Boolean,
+            context: Map<String, Any> = emptyMap()
+        ): Boolean {
+            if (LIFETIME_RANKED_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_LIFETIME_RANKED_REGEX.replace(sentence, " "))) {
+                return true
+            }
+            if (MMR_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_MMR_CLAIM_REGEX.replace(sentence, " "))) {
+                return true
+            }
+            if (UNSUPPORTED_SYNERGY_MACRO_CAUSE_REGEX.containsMatchIn(LOCAL_NEGATED_SYNERGY_MACRO_REGEX.replace(sentence, " "))) {
+                return true
+            }
+            val scrubbedObj = LOCAL_NEGATED_PERSONAL_OBJECTIVE_REGEX.replace(sentence, " ")
+            if (
+                PEJORATIVE_TEAM_FIRST_RATE_REGEX.containsMatchIn(scrubbedObj) ||
+                (TEAM_OBJECTIVE_TOPIC_REGEX.containsMatchIn(scrubbedObj) &&
+                    PERSONAL_BLAME_ON_TEAM_STAT_REGEX.containsMatchIn(scrubbedObj))
+            ) {
+                return true
+            }
+            if (LOW_PERCENTAGE_FIGHTS_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_LOW_PCT_FIGHTS_REGEX.replace(sentence, " "))) {
+                return true
+            }
+            if (UNSUPPORTED_EFFORT_OR_PVE_NARRATIVE_REGEX.containsMatchIn(LOCAL_NEGATED_EFFORT_OR_PVE_REGEX.replace(sentence, " "))) {
+                return true
+            }
+            if (UNCONDITIONAL_FORCE_SKIRMISH_REGEX.containsMatchIn(LOCAL_NEGATED_FORCE_SKIRMISH_REGEX.replace(sentence, " "))) {
+                return true
+            }
+            if (!timelineAnalyzed &&
+                UNVERIFIED_CLEAR_OR_VISION_HABIT_REGEX.containsMatchIn(LOCAL_NEGATED_UNVERIFIED_PATHING_REGEX.replace(sentence, " "))
+            ) {
+                return true
+            }
+            if (hasUngroundedAbilityOrMythicClaim(sentence, context)) {
+                return true
+            }
+            if (CHALLENGE_DIAGNOSIS_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_CHALLENGE_DIAGNOSIS_REGEX.replace(sentence, " "))) {
+                return true
+            }
+            return false
+        }
+
+        /**
+         * Deterministically detects known evidence-boundary violations in coaching prose or candidate
+         * few-shot examples (such as mislabeling `rankedRecord` as a "lifetime ranked record", claiming
+         * hidden MMR stabilized, asserting unsupported "better synergy"/"tighter macro" cross-window causes,
+         * roasting or blaming 5-player team `firstRate` objectives as a personal weakness/fault, asserting
+         * "low-percentage fights", "actively coasting", "playing PvE while your team bleeds out",
+         * "defaulting to full clears", or "passive vision setup" without timeline proof, commanding
+         * unconditional "Force yourself into active skirmishes earlier", inventing ability names like
+         * "Aegis of Zealous", turning challenge trail frequencies into confident skill diagnoses, or citing
+         * removed Mythic-era items). Uses strict per-rule local negated-clause scrubbing so unrelated
+         * negations elsewhere in a sentence never exempt an unsupported claim.
+         */
+        fun containsEvidenceBoundaryViolation(text: String, timelineAnalyzed: Boolean = false): Boolean {
+            val body = stripSuggestionsBlock(text)
+            if (body.isBlank()) {
+                val tailOnly = text.substringAfter("---SUGGESTIONS---", "")
+                if (tailOnly.isBlank()) return false
+                val scrubbedTailOnly = LOCAL_NEGATED_ABILITY_MYTHIC_REGEX.replace(tailOnly, " ")
+                return INVENTED_ABILITY_OR_MYTHIC_REGEX.containsMatchIn(scrubbedTailOnly)
+            }
+
+            val sentences = body.split(SENTENCE_SPLIT_REGEX).map { it.trim() }.filter { it.isNotEmpty() }
+            for (sentence in sentences) {
+                if (hasSentenceEvidenceViolation(sentence, timelineAnalyzed)) {
+                    return true
+                }
+            }
+            val suggestionsTail = text.substringAfter("---SUGGESTIONS---", "")
+            if (suggestionsTail.isNotBlank()) {
+                val scrubbedTail = LOCAL_NEGATED_ABILITY_MYTHIC_REGEX.replace(suggestionsTail, " ")
+                if (INVENTED_ABILITY_OR_MYTHIC_REGEX.containsMatchIn(scrubbedTail)) {
+                    return true
+                }
+            }
+            return false
+        }
+
+        private fun resolveExplicitRecentSampleGamesStatic(context: Map<String, Any>): Int {
+            val sampleMap = context["recentMatchSample"] as? Map<*, *>
+            if (sampleMap != null) {
+                val explicitGames = (sampleMap["games"] as? Number)?.toInt()
+                    ?: sampleMap["games"]?.toString()?.toDoubleOrNull()?.toInt()
+                if (explicitGames != null && explicitGames > 0) return explicitGames
+                return 0
+            }
+            val recentMatchesSize = (context["recentMatches"] as? List<*>)?.size ?: 0
+            return if (recentMatchesSize in 1..20) recentMatchesSize else 0
+        }
+
+        private fun isTimelineAnalyzedInContext(context: Map<String, Any>): Boolean {
+            val status = context["timelineStatus"]?.toString()?.trim()?.takeIf { it.isNotBlank() }
+                ?: if (context["timelineInsights"] != null) "ANALYZED" else "NOT_ANALYZED"
+            return status.equals("ANALYZED", ignoreCase = true)
+        }
+
+        /**
+         * Meaning-preserving rewrite of internal schema keys, bracketed `[sample: ...]` tags, status codes,
+         * snake_case category slugs, and markdown backticks into natural player language while keeping every
+         * supplied number, win/loss count, and sample distinction intact without inventing counts.
+         * Uses strict word boundaries (`\b`) and longest-token-first ordering so compound keys such as
+         * `savedHistoryAverages` / `savedHistorySideSplits` never partially match `savedHistory`.
+         */
+        internal fun rewriteInternalSchemaTokens(text: String, context: Map<String, Any> = emptyMap()): String {
+            if (text.isBlank()) return text
+            val recentGames = resolveExplicitRecentSampleGamesStatic(context)
+            var out = text
+
+            // 1. Bracketed [sample: ...] tags & legacy header names
+            out = Regex("""\[sample:\s*savedHistory\s*\((\d+)g\)\]""", RegexOption.IGNORE_CASE)
+                .replace(out) { "(across ${it.groupValues[1]} saved matches)" }
+            out = Regex("""\[sample:\s*savedHistory[^\]]*\]""", RegexOption.IGNORE_CASE)
+                .replace(out, "(across saved matches)")
+            out = Regex("""\[sample:\s*recentMatchSample[^\]]*\]""", RegexOption.IGNORE_CASE)
+                .replace(out) {
+                    if (recentGames > 0) "(across your last $recentGames detailed matches)" else "(across recent detailed matches)"
+                }
+            out = Regex("""\[sample:[^\]]*\]""", RegexOption.IGNORE_CASE).replace(out, "")
+            out = out.replace("Solo/Duo Queue Counter", "current-season Solo/Duo record")
+                .replace("Saved Match History", "saved match history")
+                .replace("Detailed Match List", "recent detailed match sample")
+
+            // 2. Compound & core sample/status keys — longest tokens first with strict \b word boundaries
+            out = Regex("""\b(your|the|my)\s+`?\bsavedHistorySideSplits\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { "${it.groupValues[1]} saved-match side splits" }
+            out = Regex("""`?\bsavedHistorySideSplits\b`?""")
+                .replace(out, "saved-match side splits")
+
+            out = Regex("""\b(your|the|my)\s+`?\bsavedHistoryAverages\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { "${it.groupValues[1]} saved-match averages" }
+            out = Regex("""`?\bsavedHistoryAverages\b`?""")
+                .replace(out, "saved-match averages")
+
+            out = Regex("""\b(your|the|my)\s+`?\brecentMatchSummary\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { "${it.groupValues[1]} recent match summary" }
+            out = Regex("""`?\brecentMatchSummary\b`?""")
+                .replace(out, "recent match summary")
+
+            out = Regex("""`?\brecentMatchSample\b`?\s+of\s+(\d+)\s+(games|matches)""", RegexOption.IGNORE_CASE)
+                .replace(out) { "recent ${it.groupValues[1]}-game detailed sample" }
+            out = Regex("""\b(your|the|my)\s+`?\brecentMatchSample\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { mr ->
+                    val determiner = mr.groupValues[1]
+                    val suffix = out.substring(mr.range.last + 1).take(28)
+                    val alreadyHasCount = recentGames > 0 && Regex("""^\s*(?:\(|of\s+|across\s+)?$recentGames\b""").containsMatchIn(suffix)
+                    if (recentGames > 0 && !alreadyHasCount) {
+                        "$determiner recent ${recentGames}-game detailed sample"
+                    } else {
+                        "$determiner recent detailed match sample"
+                    }
+                }
+            out = Regex("""`?\brecentMatchSample\b`?""")
+                .replace(out) { mr ->
+                    val suffix = out.substring(mr.range.last + 1).take(28)
+                    val alreadyHasCount = recentGames > 0 && Regex("""^\s*(?:\(|of\s+|across\s+)?$recentGames\b""").containsMatchIn(suffix)
+                    if (recentGames > 0 && !alreadyHasCount) {
+                        "your recent ${recentGames}-game detailed sample"
+                    } else {
+                        "your recent detailed match sample"
+                    }
+                }
+
+            out = Regex("""`?\btimelineStatus\b`?\s*(?:is|=|:)\s*`?\bNOT_ANALYZED\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out, "match timelines are not analyzed yet")
+            out = Regex("""`?\btimelineStatus\b`?\s*(?:is|=|:)\s*`?\bANALYZED\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out, "match timelines are analyzed")
+            out = Regex("""\b(your|the|my)\s+`?\btimelineStatus\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { "${it.groupValues[1]} match timeline analysis" }
+            out = Regex("""`?\btimelineStatus\b`?""")
+                .replace(out, "match timeline analysis")
+
+            out = Regex("""\b(your|the|my)\s+`?\brecentMatches\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { mr ->
+                    val determiner = mr.groupValues[1]
+                    val suffix = out.substring(mr.range.last + 1).take(28)
+                    val alreadyHasCount = recentGames > 0 && Regex("""^\s*(?:\(|of\s+|across\s+)?$recentGames\b""").containsMatchIn(suffix)
+                    if (recentGames > 0 && !alreadyHasCount) {
+                        "$determiner last $recentGames detailed matches"
+                    } else {
+                        "$determiner recent detailed matches"
+                    }
+                }
+            out = Regex("""`?\brecentMatches\b`?""")
+                .replace(out) { mr ->
+                    val suffix = out.substring(mr.range.last + 1).take(28)
+                    val alreadyHasCount = recentGames > 0 && Regex("""^\s*(?:\(|of\s+|across\s+)?$recentGames\b""").containsMatchIn(suffix)
+                    if (recentGames > 0 && !alreadyHasCount) {
+                        "your last $recentGames detailed matches"
+                    } else {
+                        "your recent detailed matches"
+                    }
+                }
+
+            out = Regex("""\b(your|the|my)\s+`?\bsavedHistory\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { "${it.groupValues[1]} saved match history" }
+            out = Regex("""`?\bsavedHistory\b`?""")
+                .replace(out, "your saved match history")
+
+            out = Regex("""\b(your|the|my)\s+`?\brankedRecord\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { "${it.groupValues[1]} current-season ranked record" }
+            out = Regex("""`?\brankedRecord\b`?""")
+                .replace(out, "your current-season ranked record")
+
+            // 3. Remaining dotted & camelCase metric keys — strictly longest-token-first with word boundaries
+            val sortedFieldTokens = listOf(
+                "missingLaneCsAt10Matches" to "matches missing 10:00 lane CS",
+                "theoreticalMaxMatchCount" to "supported 10:00 CS match count",
+                "cs10.theoreticalMaxLabel" to "10:00 theoretical maximum note",
+                "eligibleTimeDeadGames" to "games with death-time data",
+                "omittedMatchesRollup" to "other recent matches",
+                "riftHerald.firstRate" to "team first-Herald rate",
+                "visionDataPrecision" to "vision telemetry scope",
+                "cs10.theoreticalMax" to "10:00 theoretical maximum CS",
+                "totalGamesAnalyzed" to "saved matches analyzed",
+                "cs10.spawnedSupply" to "10:00 theoretical maximum CS",
+                "personalTakedowns" to "personal objective takedowns",
+                "avgTheoreticalMax" to "average 10:00 theoretical maximum CS",
+                "wardsByTimeBucket" to "ward timing buckets",
+                "championMatchups" to "champion matchups",
+                "timelineInsights" to "timeline stats",
+                "improvementStats" to "improvement stats",
+                "timelineInvolved" to "timeline objective involvement",
+                "personalLastHits" to "personal objective last-hits",
+                "challengeSummary" to "challenge comparison summary",
+                "targetMatchCount" to "supported 10:00 CS match count",
+                "cs10.targetLabel" to "10:00 theoretical maximum CS",
+                "cs10.supplyLabel" to "10:00 theoretical maximum CS",
+                "dragon.firstRate" to "team first-dragon rate",
+                "opponentDetails" to "lane opponent stats",
+                "horde.firstRate" to "team first-Voidgrub rate",
+                "tower.firstRate" to "team first-tower rate",
+                "baron.firstRate" to "team first-Baron rate",
+                "damageSplitPct" to "damage split",
+                "teamObjectives" to "team objectives",
+                "avgLaneCsAt10" to "average 10:00 lane CS",
+                "opponentStats" to "matched role-opponent averages",
+                "roleBreakdown" to "per-role breakdown",
+                "skillMaxOrder" to "ability max order",
+                "topWeaknesses" to "challenge trail frequencies",
+                "leadRetention" to "lead retention",
+                "topChampions" to "most-played champions",
+                "topStrengths" to "challenge strength frequencies",
+                "phaseFarming" to "post-lane farming",
+                "NOT_ANALYZED" to "not analyzed yet",
+                "cs10.target" to "10:00 theoretical maximum CS",
+                "unspentGold" to "unspent gold checkpoints",
+                "WARD_PLACED" to "ward-placed event",
+                "itemSpikes" to "item timings",
+                "deathCost" to "time spent dead",
+                "avgTarget" to "average 10:00 theoretical maximum CS"
+            ).sortedByDescending { it.first.length }
+
+            for ((token, replacement) in sortedFieldTokens) {
+                val pattern = if (token.contains('.')) {
+                    Regex("""`?\b${Regex.escape(token)}\b`?""")
+                } else {
+                    Regex("""`?(?<![A-Za-z0-9_.])${Regex.escape(token)}\b`?""")
+                }
+                out = pattern.replace(out, replacement)
+            }
+            out = Regex("""`?\b[A-Za-z]+\.firstRate\b`?""").replace(out, "team first-objective rate")
+            out = Regex("""`?(?<![A-Za-z0-9_.])firstRate\b`?""").replace(out, "team first-objective rate")
+
+            // 4. Internal snake_case category keys — longest-first with \b word boundaries
+            for ((slug, naturalName) in CATEGORY_DISPLAY_NAMES.entries.sortedByDescending { it.key.length }) {
+                if (slug.contains('_')) {
+                    out = Regex("""`?\b${Regex.escape(slug)}\b`?""", RegexOption.IGNORE_CASE)
+                        .replace(out, naturalName)
+                }
+            }
+
+            // 5. Strip any remaining inline backticks so player prose & suggestions stay pure natural text
+            out = Regex("""`([^`\n]+)`""").replace(out) { it.groupValues[1] }
+            out = out.replace("`", "")
+            return out
+        }
+
+        private fun rewriteViolatingSentence(sentence: String, timelineAnalyzed: Boolean): String {
+            var s = sentence
+
+            // CS@10 theoretical-maximum mislabeling rewrites (zero invented patch/CS numbers)
+            if (containsCs10TheoreticalMaxMislabeling(s)) {
+                s = Regex(
+                    """(?i)\b(?:meaning\s+you\s+|so\s+you\s+|you\s+)?(?:missed|missing|lost|dropped)\s+~?\d+(?:\.\d+)?\s*(?:lane\s+)?(?:cs|minions?|last[- ]hits?)(?:\s+by\s+10(?::00|\s*minutes?|\s*m))?"""
+                ).replace(s, "finished below the passive wave-spawn ceiling (which is a theoretical maximum, not missed CS)")
+                s = Regex("""(?i)\b(114|120)(?:\.0)?\s+(?:top|mid|middle|bot|bottom)\s+lane\s+target\b""")
+                    .replace(s) { "${it.groupValues[1]} theoretical maximum passive wave spawn by 10:00 (not a target or benchmark)" }
+                s = Regex("""(?i)\b(?:top|mid|middle|bot|bottom)\s+lane\s+target\b""")
+                    .replace(s, "theoretical maximum passive wave spawn by 10:00 (not a target or benchmark)")
+                s = Regex("""(?i)\b(114|120|118)(?:\.0)?\s+(?:cs\s*(?:@|at)\s*10(?::00)?\s+)?(?:target|benchmark|expected\s+cs|farmable\s+supply)\b""")
+                    .replace(s) { "${it.groupValues[1]} theoretical maximum passive wave spawn by 10:00 (not a target or benchmark)" }
+                s = Regex("""(?i)\b(?:target|benchmark|expected\s+cs|farmable\s+supply)\s+(?:of\s+|is\s+|at\s+)?(114|120|118)(?:\.0)?\b""")
+                    .replace(s) { "theoretical maximum passive wave spawn of ${it.groupValues[1]} by 10:00 (not a target or benchmark)" }
+                s = Regex("""(?i)\b(?:cs\s*(?:@|at)\s*10|10[- ]minute\s+(?:lane\s+)?cs)\s+(?:target|benchmark)\b""")
+                    .replace(s, "10:00 theoretical maximum passive wave spawn (not a target or benchmark)")
+                s = Regex("""(?i)\b(?:only\s+)?107\s+(?:lane\s+)?(?:minions?|cs)\s+(?:are\s+)?farmable(?:\s+by\s+10:00)?""")
+                    .replace(s, "passive wave-spawn counts represent a theoretical maximum ceiling rather than a farmable target or benchmark")
+                s = Regex("""(?i)\b(?:101\s*[-–—]\s*107|70\s*[-–—]\s*85\s*(?:lane\s+)?cs(?:\s*@\s*10m?)?|100\s+cs\s*(?:@|at)\s*10)\b""")
+                    .replace(s, "supplied opponent or rank-cohort comparisons (not an unverified CS@10 target)")
+            }
+
+            // 1. Lifetime / all-time / career ranked record -> current-season ranked record
+            if (LIFETIME_RANKED_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_LIFETIME_RANKED_REGEX.replace(s, " "))) {
+                s = LIFETIME_RANKED_CLAIM_REGEX.replace(s) { mr ->
+                    val kind = if (mr.value.lowercase().contains("solo")) "Solo/Duo" else "ranked"
+                    "current-season $kind record"
+                }
+            }
+
+            // 2. Hidden MMR stabilization / convergence claims -> honest MMR unavailability
+            if (MMR_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_MMR_CLAIM_REGEX.replace(s, " "))) {
+                s = Regex(
+                    """(?i)\bsuggests\s+(?:that\s+)?your\s+(?:overall\s+|hidden\s+)?(?:matchmaking\s+rating|\bmmr\b)\s+(?:has\s+|have\s+|is\s+)?(?:stabilized|converged|leveled\s+off|plateaued|peaked|tanked|climbed|dropped|inflated|normali[sz]ed)(?:\s+around\s+[A-Za-z0-9 ]+)?"""
+                ).replace(s, "reflects your current-season Solo/Duo record (Riot does not expose hidden matchmaking rating)")
+                if (MMR_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_MMR_CLAIM_REGEX.replace(s, " "))) {
+                    s = Regex(
+                        """(?i)(?:your\s+)?(?:overall\s+|hidden\s+)?(?:matchmaking\s+rating|\bmmr\b)[^,;:.!?\n]{0,55}\b(?:has\s+|have\s+|is\s+)?(?:stabilized|converged|leveled\s+off|plateaued|peaked|tanked|climbed|dropped|inflated|normali[sz]ed)(?:\s+around\s+[A-Za-z0-9 ]+)?"""
+                    ).replace(s, "your current-season win rate reflects observed Solo/Duo results (Riot does not expose hidden matchmaking rating)")
+                }
+            }
+
+            // 3. Unsupported cross-window "better synergy" / "tighter macro" causes -> state honestly that cause is not determined
+            if (UNSUPPORTED_SYNERGY_MACRO_CAUSE_REGEX.containsMatchIn(LOCAL_NEGATED_SYNERGY_MACRO_REGEX.replace(s, " "))) {
+                s = Regex(
+                    """(?i)\b(?:points?\s+to|pointing\s+to|suggests?(?:\s+that)?|suggesting(?:\s+that)?|reflects?|reflecting|indicates?|indicating|shows?|showing|stems?\s+from|is\s+(?:due\s+to|driven\s+by|because\s+of|from))\s+(?:tighter\s+macro\s+and\s+better\s+(?:team\s+|jungle\s+)?synergy|better\s+(?:team\s+|jungle\s+)?synergy\s+and\s+tighter\s+macro|better\s+(?:team\s+|jungle\s+)?synergy|tighter\s+macro)(?:\s+(?:lately|recently))?\b"""
+                ).replace(s, "has no verified cause in summary win-loss records alone (the cause is not determined from summary stats)")
+                if (UNSUPPORTED_SYNERGY_MACRO_CAUSE_REGEX.containsMatchIn(LOCAL_NEGATED_SYNERGY_MACRO_REGEX.replace(s, " "))) {
+                    s = Regex(
+                        """(?i)\b(?:tighter\s+macro\s+and\s+better\s+(?:team\s+|jungle\s+)?synergy|better\s+(?:team\s+|jungle\s+)?synergy\s+and\s+tighter\s+macro|better\s+(?:team\s+|jungle\s+)?synergy|tighter\s+macro)\b"""
+                    ).replace(s, "unverified factors whose cause is not determined from summary stats")
+                }
+            }
+
+            // 4. Team first-objective rates framed as personal weakness / poor personal stat
+            val scrubbedObj = LOCAL_NEGATED_PERSONAL_OBJECTIVE_REGEX.replace(s, " ")
+            if (
+                PEJORATIVE_TEAM_FIRST_RATE_REGEX.containsMatchIn(scrubbedObj) ||
+                (TEAM_OBJECTIVE_TOPIC_REGEX.containsMatchIn(scrubbedObj) &&
+                    PERSONAL_BLAME_ON_TEAM_STAT_REGEX.containsMatchIn(scrubbedObj))
+            ) {
+                s = Regex(
+                    """(?i),?\s*(?:alongside\s+your\s+damage\s+per\s+minute\s+)?and\s+a\s+(?:poor|weak|abysmal|awful|terrible|pathetic|sloppy|dismal|embarrassing|mediocre|rough|lacking)\s+(\d+(?:\.\d+)?%)\s+first[- ]secure\s+rate\s+on\s+(voidgrubs?|grubs?|horde|towers?|turrets?|dragons?|heralds?|barons?)\b"""
+                ).replace(s) { mr ->
+                    val keptDpm = if (mr.value.lowercase().contains("damage per minute")) ", alongside your damage per minute" else ""
+                    val pct = mr.groupValues[1]
+                    val obj = mr.groupValues[2]
+                    "$keptDpm (while the $pct first-secure rate on $obj is a 5-player team outcome rather than a personal weakness)"
+                }
+                s = PEJORATIVE_TEAM_FIRST_RATE_REGEX.replace(s, "5-player team first-objective rate (not a personal weakness)")
+                if (
+                    TEAM_OBJECTIVE_TOPIC_REGEX.containsMatchIn(LOCAL_NEGATED_PERSONAL_OBJECTIVE_REGEX.replace(s, " ")) &&
+                    PERSONAL_BLAME_ON_TEAM_STAT_REGEX.containsMatchIn(LOCAL_NEGATED_PERSONAL_OBJECTIVE_REGEX.replace(s, " "))
+                ) {
+                    s = PERSONAL_BLAME_ON_TEAM_STAT_REGEX.replace(s, "a 5-player team outcome rather than a personal weakness")
+                }
+            }
+
+            // 5. Unverified "low-percentage fights" claims -> honest timeline-unavailability boundary (zero invented skirmish facts)
+            if (LOW_PERCENTAGE_FIGHTS_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_LOW_PCT_FIGHTS_REGEX.replace(s, " "))) {
+                s = Regex(
+                    """(?i)your\s+teammates\s+aren't\s+forcing\s+you\s+to\s+take\s+low[- ]percentage\s+fights(?:\s+or\s+drop\s+map\s+objectives)?"""
+                ).replace(s, "Match timelines are not analyzed yet, so summary stats cannot show how individual fights or objective contests unfolded")
+                if (LOW_PERCENTAGE_FIGHTS_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_LOW_PCT_FIGHTS_REGEX.replace(s, " "))) {
+                    s = Regex("""(?i)\b(?:take|takes|taking|took|force|forces|forcing|pick|picking)\s+low[- ]percentage\s+fights\b""")
+                        .replace(s, "enter fights whose setup odds are not shown in summary stats")
+                    s = LOW_PERCENTAGE_FIGHTS_CLAIM_REGEX.replace(s, "unverified fight setups")
+                }
+            }
+
+            // 6. Summary-only effort / PvE / "while your team bleeds out" roast inventions -> honest scope boundary (zero invented KP/DPM/movement facts)
+            if (UNSUPPORTED_EFFORT_OR_PVE_NARRATIVE_REGEX.containsMatchIn(LOCAL_NEGATED_EFFORT_OR_PVE_REGEX.replace(s, " "))) {
+                val scopeReason = if (timelineAnalyzed) {
+                    "recorded match stats cannot measure in-game effort or intent"
+                } else {
+                    "without timeline analysis, end-of-game summary stats cannot show in-game effort, map movement, or how teamfights unfolded"
+                }
+                s = Regex(
+                    """(?i)\byou(?:'re|\s+are)\s+(?:actively\s+|just\s+|basically\s+|essentially\s+|purely\s+|merely\s+)?coasting,?\s*(?:and\s+)?(?:effectively\s+|basically\s+|essentially\s+)?playing\s+pve(?:\s+simulator)?\s+(?:while|as)\s+your\s+team\s+(?:bleeds?\s+out|dies?\s+4v5|fights?\s+4v5)\b"""
+                ).replace(s, "Summary totals only record end-of-game numbers—$scopeReason")
+                s = Regex(
+                    """(?i)\b(?:effectively\s+|basically\s+|essentially\s+)?playing\s+pve(?:\s+simulator)?\s+(?:while|as)\s+your\s+team\s+(?:bleeds?\s+out|dies?\s+4v5|fights?\s+4v5)\b"""
+                ).replace(s, "relying on summary totals ($scopeReason)")
+                s = Regex("""(?i)\byou(?:'re|\s+are)\s+(?:effectively\s+|basically\s+|essentially\s+)?(?:playing\s+pve|in\s+a\s+pve\s+simulator)\b""")
+                    .replace(s, "Summary stats alone cannot show map movement ($scopeReason)")
+                s = Regex("""(?i)\b(?:effectively\s+|basically\s+|essentially\s+)?(?:playing\s+pve|in\s+a\s+pve\s+simulator|pve\s+simulator)\b""")
+                    .replace(s, "unverified map-movement assumptions ($scopeReason)")
+                s = Regex("""(?i)\b(?:watching|letting)\s+your\s+team\s+bleed\s+out\b""")
+                    .replace(s, "unverified teamfight absence ($scopeReason)")
+                s = Regex("""(?i)\b(?:while|as)\s+your\s+team\s+(?:bleeds?\s+out|dies?\s+4v5|fights?\s+4v5)\b""")
+                    .replace(s, "(summary stats do not show how teamfights unfolded)")
+                s = Regex("""(?i)\byou(?:'re|\s+are)\s+(?:actively|just|basically|essentially|purely|merely)\s+coasting\b|\byou(?:'re|\s+are)\s+coasting\s+(?:through|in|around)(?:\s+(?:games|matches))?\b""")
+                    .replace(s, "Summary stats alone cannot show in-game effort ($scopeReason)")
+                s = Regex("""(?i)\b(?:actively|just|basically|essentially|purely|merely)\s+coasting\b|\bcoasting\s+(?:through|in|around)(?:\s+(?:games|matches))?\b""")
+                    .replace(s, "unverified effort assumptions ($scopeReason)")
+                s = Regex("""(?i)\b(?:autopiloting|on\s+autopilot|afk[- ]farming)\b""")
+                    .replace(s, "unverified autopilot assumptions ($scopeReason)")
+            }
+
+            // 7. Unconditional skirmish-forcing & unverified full-clear / passive-vision claims -> conditional priority check + honest scope note
+            val hasForceSkirmish = UNCONDITIONAL_FORCE_SKIRMISH_REGEX.containsMatchIn(
+                LOCAL_NEGATED_FORCE_SKIRMISH_REGEX.replace(s, " ")
+            )
+            val hasUnverifiedPathing = !timelineAnalyzed &&
+                UNVERIFIED_CLEAR_OR_VISION_HABIT_REGEX.containsMatchIn(
+                    LOCAL_NEGATED_UNVERIFIED_PATHING_REGEX.replace(s, " ")
+                )
+            if (hasForceSkirmish || hasUnverifiedPathing) {
+                val pathingScopeNote = if (timelineAnalyzed) {
+                    "rather than forcing fights without lane priority"
+                } else {
+                    "(summary stats alone do not show your camp-clear pathing or ward setup)"
+                }
+                s = Regex(
+                    """(?i)\bforce\s+(?:yourself\s+into\s+)?(?:active\s+|early\s+|more\s+)?(?:skirmishes|fights|river\s+fights)(?:\s+earlier)?\s+(?:rather\s+than|instead\s+of)\s+default(?:ing|s|ed)?\s+to\s+full\s+clears?(?:\s+and\s+passive\s+vision\s+setup)?"""
+                ).replace(
+                    s,
+                    "When allied lanes hold priority near an upcoming objective or river contest, look to rotate early to numbers-advantaged skirmishes $pathingScopeNote"
+                )
+                s = Regex("""(?i)\bforce\s+yourself\s+into\s+(?:active\s+|early\s+|more\s+)?(?:skirmishes|fights|river\s+fights)(?:\s+earlier)?\b|\bforce\s+(?:active|early)\s+skirmishes\s+earlier\b""")
+                    .replace(s, "When allied lanes hold priority and numbers advantage, look to rotate early to nearby skirmishes rather than forcing fights blindly")
+                if (!timelineAnalyzed) {
+                    s = Regex("""(?i)\bdefault(?:ing|s|ed)?\s+to\s+full\s+clears?\s+and\s+passive\s+vision\s+setup\b""")
+                        .replace(s, "assuming camp-clear or vision habits not shown in summary stats")
+                    s = Regex("""(?i)\bdefault(?:ing|s|ed)?\s+to\s+full\s+clears?\b|\bfull[- ]clearing\s+while\s+your\s+team\b""")
+                        .replace(s, "assuming camp-clear habits not shown in summary stats")
+                    s = Regex("""(?i)\bpassive\s+vision\s+setup\b""")
+                        .replace(s, "ward habits not shown in summary stats")
+                }
+            }
+
+            // Note: Ungrounded ability names (e.g. "Aegis of Zealous") and obsolete Mythic items are
+            // intentionally NOT blanket-rewritten here so we never invent a wrong ability, action, or
+            // champion; unless unambiguously grounded in context, rewriteAndGateCoachingBody rejects
+            // the sentence and emits buildHonestSentenceFallback.
+
+            // 8. Challenge trail frequency turned into confident skill diagnosis
+            if (CHALLENGE_DIAGNOSIS_CLAIM_REGEX.containsMatchIn(LOCAL_NEGATED_CHALLENGE_DIAGNOSIS_REGEX.replace(s, " "))) {
+                s = Regex("""(?i)\b(?:proves?|confirms?|diagnoses|means\s+you\s+have)\s+((?:poor|weak|bad|broken)\s+\w+(?:\s+\w+)?)""")
+                    .replace(s) { "is a head-to-head comparison frequency worth reviewing rather than proof of ${it.groupValues[1]}" }
+            }
+
+            return s.replace(Regex(""" {2,}"""), " ").trim()
+        }
+
+        private fun buildHonestSentenceFallback(
+            failedSentence: String,
+            timelineAnalyzed: Boolean,
+            context: Map<String, Any> = emptyMap()
+        ): String {
+            if (hasUngroundedAbilityOrMythicClaim(failedSentence, context)) {
+                return "Available match context does not verify that specific ability or obsolete item claim, so rely only on the recorded champions, items, and stats in your match data."
+            }
+            return if (timelineAnalyzed) {
+                "Available match data cannot verify hidden matchmaking rating or unrecorded in-game causes for that claim."
+            } else {
+                "End-of-game summary stats alone cannot verify that in-game claim because match timelines are not analyzed yet."
+            }
+        }
+
+        private val LINE_LIST_PREFIX_REGEX = Regex("""^(\s*(?:[-*•]|\d+[.)]|\(\d+\))\s+)(.*)$""")
+        private val INLINE_SENTENCE_CHUNK_REGEX = Regex(""".+?(?:(?:\.(?!\d)|[!?])+\s*|$)""")
+
+        private fun rewriteAndGateCoachingBody(rawBody: String, context: Map<String, Any>): String {
+            if (rawBody.isBlank()) return ""
+            val timelineAnalyzed = isTimelineAnalyzedInContext(context)
+            val schemaClean = rewriteInternalSchemaTokens(rawBody, context)
+            var lastEmittedFallbackText: String? = null
+
+            val rewrittenLines = mutableListOf<String>()
+            for (line in schemaClean.lines()) {
+                if (line.isBlank()) {
+                    if (rewrittenLines.isNotEmpty() && rewrittenLines.last().isNotBlank()) {
+                        rewrittenLines.add("")
+                    }
+                    continue
+                }
+                val prefixMatch = LINE_LIST_PREFIX_REGEX.matchEntire(line)
+                val linePrefix = prefixMatch?.groupValues?.get(1) ?: ""
+                val lineCore = prefixMatch?.groupValues?.get(2) ?: line
+
+                val keptChunks = mutableListOf<String>()
+                for (chunkMatch in INLINE_SENTENCE_CHUNK_REGEX.findAll(lineCore)) {
+                    val rawChunk = chunkMatch.value
+                    if (rawChunk.isBlank()) continue
+                    val trailingSpace = rawChunk.takeLastWhile { it == ' ' || it == '\t' }
+                    val trimmedChunk = rawChunk.trim()
+                    val punctSuffix = Regex("""(?:\.(?!\d)|[!?])+$""").find(trimmedChunk)?.value ?: ""
+                    val coreWithoutPunct = if (punctSuffix.isNotEmpty()) {
+                        trimmedChunk.dropLast(punctSuffix.length)
+                    } else {
+                        trimmedChunk
+                    }
+
+                    val candidate = if (
+                        containsCs10TheoreticalMaxMislabeling(trimmedChunk) ||
+                        hasSentenceEvidenceViolation(trimmedChunk, timelineAnalyzed, context)
+                    ) {
+                        val rewrittenCore = rewriteViolatingSentence(coreWithoutPunct, timelineAnalyzed)
+                        "$rewrittenCore$punctSuffix"
+                    } else {
+                        trimmedChunk
+                    }
+
+                    val postSchemaClean = if (containsInternalSchemaLeak(candidate)) {
+                        rewriteInternalSchemaTokens(candidate, context)
+                    } else {
+                        candidate
+                    }
+
+                    // Never silently truncate: if a sentence passes verification, emit it; otherwise emit an explicit honest scope fallback
+                    if (
+                        !containsInternalSchemaLeak(postSchemaClean) &&
+                        !containsCs10TheoreticalMaxMislabeling(postSchemaClean) &&
+                        !hasSentenceEvidenceViolation(postSchemaClean, timelineAnalyzed, context)
+                    ) {
+                        keptChunks.add(postSchemaClean + trailingSpace)
+                        lastEmittedFallbackText = null
+                    } else {
+                        val fallbackText = buildHonestSentenceFallback(postSchemaClean, timelineAnalyzed, context)
+                        if (lastEmittedFallbackText != fallbackText) {
+                            keptChunks.add(fallbackText + trailingSpace)
+                            lastEmittedFallbackText = fallbackText
+                        }
+                    }
+                }
+
+                if (keptChunks.isNotEmpty()) {
+                    rewrittenLines.add(linePrefix + keptChunks.joinToString("").trimEnd())
+                }
+            }
+
+            val joined = rewrittenLines.joinToString("\n").trim()
+            if (joined.isNotBlank()) return joined
+
+            // Honest scope fallback when raw body had no usable text
+            return buildHonestSentenceFallback(schemaClean, timelineAnalyzed, context)
+        }
+
+        internal fun sanitizeHistoryAssistantTurn(rawTurn: String, context: Map<String, Any>): String {
+            val stripped = stripSuggestionsBlock(rawTurn)
+            if (stripped.isBlank()) return ""
+            return rewriteAndGateCoachingBody(stripped, context)
+        }
+
+        private fun buildFallbackSuggestions(userMessage: String): List<String> {
+            val category = categorizeQuestion(userMessage)
+            return when (category) {
+                "cs_farming", "wave_management" -> listOf(
+                    "How do my early wave resets affect my 10-minute CS?",
+                    "Compare my ranked, saved, and recent match win rates",
+                    "What two habits should I track in my next game?"
+                )
+                "itemization_builds" -> listOf(
+                    "When should I adjust defensive boots or second item?",
+                    "How do my damage splits look across recent matches?",
+                    "Review my most-played champion builds"
+                )
+                "matchups" -> listOf(
+                    "Which recent champion matchups went best for me?",
+                    "How should I play around enemy cooldown windows?",
+                    "What two laning checks should I focus on next game?"
+                )
+                else -> listOf(
+                    "Compare my current-season ranked, saved, and recent win rates",
+                    "What two controllable habits should I focus on next game?",
+                    "How do my Blue side and Red side results compare?"
+                )
+            }
+        }
+
+        private fun sanitizeSuggestionsTail(
+            rawSuggestionsTail: String?,
+            context: Map<String, Any>,
+            userMessage: String
+        ): String? {
+            if (rawSuggestionsTail == null) return null
+            val timelineAnalyzed = isTimelineAnalyzedInContext(context)
+            val mapper = com.fasterxml.jackson.databind.ObjectMapper()
+            val parsedCandidates: List<String> = try {
+                val jsonStart = rawSuggestionsTail.indexOf('[')
+                val jsonEnd = rawSuggestionsTail.lastIndexOf(']')
+                if (jsonStart >= 0 && jsonEnd > jsonStart) {
+                    val node = mapper.readTree(rawSuggestionsTail.substring(jsonStart, jsonEnd + 1))
+                    if (node.isArray) node.mapNotNull { it.asText(null)?.trim() } else emptyList()
+                } else {
+                    emptyList()
+                }
+            } catch (_: Exception) {
+                emptyList()
+            }
+
+            val fallbacks = buildFallbackSuggestions(userMessage)
+            val cleaned = parsedCandidates.mapNotNull { candidate ->
+                val rewritten = rewriteInternalSchemaTokens(candidate, context)
+                    .let {
+                        if (containsCs10TheoreticalMaxMislabeling(it) || hasSentenceEvidenceViolation(it, timelineAnalyzed, context)) {
+                            rewriteViolatingSentence(it, timelineAnalyzed)
+                        } else {
+                            it
+                        }
+                    }
+                    .trim()
+                rewritten.takeIf {
+                    it.isNotBlank() &&
+                        !containsInternalSchemaLeak(it) &&
+                        !containsCs10TheoreticalMaxMislabeling(it) &&
+                        !hasSentenceEvidenceViolation(it, timelineAnalyzed, context) &&
+                        !containsEvidenceBoundaryViolation(it, timelineAnalyzed)
+                }
+            }.distinct()
+
+            val finalThree = (cleaned + fallbacks).distinct().take(3)
+            return "---SUGGESTIONS--- " + mapper.writeValueAsString(finalThree)
+        }
+
+        /**
+         * Deterministic fresh-response boundary + meaning-preserving rewrite (or explicit honest scope fallback)
+         * applied to every fresh AI response (`analyze` and `analyzeStream`) before returning to the user or
+         * persisting to `ai_interactions`. Never silently truncates sentences or invents player facts, and makes
+         * zero extra provider or Riot calls.
+         */
+        fun enforceFreshResponseBoundary(
+            rawText: String,
+            context: Map<String, Any> = emptyMap(),
+            userMessage: String = ""
+        ): String {
+            if (rawText.isBlank()) return rawText
+            if (
+                rawText.startsWith("I cannot process this request because the input exceeds the safe coaching context budget") ||
+                rawText == "No content generated." ||
+                rawText.startsWith("Error parsing AI response:") ||
+                rawText.startsWith("Error:")
+            ) {
+                return rawText
+            }
+
+            val hasSuggestionsMarker = rawText.contains("---SUGGESTIONS---")
+            val rawBody = stripSuggestionsBlock(rawText)
+            val rawSuggestionsTail = if (hasSuggestionsMarker) {
+                rawText.substringAfter("---SUGGESTIONS---").trim()
+            } else {
+                null
+            }
+
+            val cleanBody = rewriteAndGateCoachingBody(rawBody, context)
+            val cleanSuggestions = sanitizeSuggestionsTail(rawSuggestionsTail, context, userMessage)
+            return if (cleanSuggestions != null) {
+                if (cleanBody.isNotBlank()) "$cleanBody\n$cleanSuggestions" else cleanSuggestions
+            } else {
+                cleanBody
+            }
+        }
+
+        /**
+         * Buffers streaming token deltas up to complete sentence boundaries (holding any `---SUGGESTIONS---`
+         * tail until completion) so streamed SSE chunks never leak partial schema keys, silently drop sentences,
+         * or emit boundary-violating claims mid-stream.
+         */
+        internal fun sanitizeStreamChunks(
+            rawChunks: Flux<String>,
+            context: Map<String, Any>,
+            userMessage: String
+        ): Flux<String> = Flux.defer {
+            val buffer = StringBuilder()
+            val emittedAnyBody = java.util.concurrent.atomic.AtomicBoolean(false)
+
+            rawChunks.concatMapIterable { delta ->
+                buffer.append(delta)
+                val current = buffer.toString()
+                if (
+                    current.contains("---SUGGESTIONS---") ||
+                    current.contains("---SUGGEST") ||
+                    Regex("""-{2,}[A-Z]*$""").containsMatchIn(current.trimEnd())
+                ) {
+                    emptyList()
+                } else {
+                    // Flush only up to a completed sentence terminator followed by whitespace (safe against split tokens & decimals)
+                    val safeBoundary = Regex("""(?:\.(?!\d)|[!?\n])(?=\s+\S)""")
+                        .findAll(current)
+                        .lastOrNull()
+                    if (safeBoundary == null) {
+                        emptyList()
+                    } else {
+                        val splitAt = safeBoundary.range.last + 1
+                        val readySegment = current.substring(0, splitAt)
+                        val trailingSpaceEnd = splitAt + current.substring(splitAt).takeWhile { it == ' ' || it == '\n' }.length
+                        val trailingSep = current.substring(splitAt, trailingSpaceEnd)
+                        buffer.delete(0, trailingSpaceEnd)
+                        val cleaned = rewriteAndGateCoachingBody(readySegment, context)
+                        if (cleaned.isNotBlank()) {
+                            emittedAnyBody.set(true)
+                            listOf(cleaned + trailingSep)
+                        } else {
+                            emptyList()
+                        }
+                    }
+                }
+            }.concatWith(
+                Mono.fromCallable {
+                    val remaining = buffer.toString()
+                    buffer.setLength(0)
+                    if (remaining.isBlank()) {
+                        ""
+                    } else if (!emittedAnyBody.get()) {
+                        enforceFreshResponseBoundary(remaining, context, userMessage)
+                    } else {
+                        val hasSugg = remaining.contains("---SUGGESTIONS---")
+                        val remBody = stripSuggestionsBlock(remaining)
+                        val remSugg = if (hasSugg) remaining.substringAfter("---SUGGESTIONS---").trim() else null
+                        val cleanedBody = if (remBody.isNotBlank()) rewriteAndGateCoachingBody(remBody, context) else ""
+                        val cleanedSugg = sanitizeSuggestionsTail(remSugg, context, userMessage)
+                        when {
+                            cleanedBody.isNotBlank() && cleanedSugg != null -> "$cleanedBody\n$cleanedSugg"
+                            cleanedSugg != null -> "\n$cleanedSugg"
+                            else -> cleanedBody
+                        }
+                    }
+                }.filter { it.isNotEmpty() }
+            )
+        }
+
+        /**
+         * Validates whether a candidate or stored `AiLearnedExample` passes all three few-shot safety gates
+         * (#38 schema/natural-language filter, #39 CS@10 theoretical-maximum filter, and #36/Nov 10 evidence
+         * boundary + default-brevity filter) before entering or being injected from `PROVEN EXAMPLES`.
+         */
+        fun isEligibleCuratedExample(userQuestion: String, aiResponse: String): Boolean {
+            if (userQuestion.isBlank() || aiResponse.isBlank()) return false
+            if (containsInternalSchemaLeak(userQuestion) || containsInternalSchemaLeak(aiResponse)) return false
+            if (containsCs10TheoreticalMaxMislabeling(userQuestion) || containsCs10TheoreticalMaxMislabeling(aiResponse)) {
+                return false
+            }
+            if (containsEvidenceBoundaryViolation(aiResponse)) return false
+            val bodyWords = stripSuggestionsBlock(aiResponse)
+                .split(Regex("""\s+"""))
+                .count { it.isNotBlank() }
+            if (bodyWords == 0) return false
+            if (!requestsExpandedAnswer(userQuestion) && bodyWords > MAX_DEFAULT_CURATED_EXAMPLE_WORDS) {
+                return false
+            }
+            return true
+        }
+
+        const val DEFAULT_CS10_THEORETICAL_MAX_LABEL: String =
+            "Patch 26.1+ theoretical maximum wave spawn by 10:00 (114 Top/Bot, 120 Mid; not a target or benchmark)"
+
+        private val NEGATED_CS10_CLAUSE_REGEX = Regex(
+            """(?i)\b(?:not|never|neither|nor|rather\s+than|instead\s+of|without\s+(?:treating|framing|calling|using)\s+[^.;,\n]{0,40}?as)\s+(?:a\s+|an\s+|the\s+)?(?:realistic\s+|empirical\s+|performance\s+|expected\s+|practical\s+|role\s+|rank\s+|missed[- ]cs\s+)*(?:target|benchmark|baseline|goal|standard|farmable\s+supply)(?:\s+(?:or|nor)\s+(?:a\s+|an\s+|the\s+)?(?:realistic\s+|empirical\s+|performance\s+|missed[- ]cs\s+)*(?:target|benchmark|baseline|goal|standard|farmable\s+supply))*|\b(?:not|never|no|without|avoid)\s+(?:a\s+)?(?:claim(?:ing)?\s+|infer(?:ring)?\s+|count(?:ing)?\s+)?(?:exact\s+|measured\s+)?missed[- ]cs(?:\s+baseline)?"""
+        )
+
+        private val CS10_RAW_LEGACY_KEY_OR_UNSUPPORTED_SUB_REGEX = Regex(
+            """(?i)\b(?:cs10\.target(?:Label)?|avgTarget|targetMatchCount|cs10\.(?:spawnedSupply|supplyLabel))\b|\b(?:101\s*[-–—]\s*107|107\s+(?:lane\s+)?(?:minions?|cs)|70\s*[-–—]\s*85\s*(?:lane\s+)?cs|100\s+cs\s*(?:@|at)\s*10)\b"""
+        )
+
+        private val CS10_MISLABELED_PROSE_REGEX = Regex(
+            """(?i)\b(?:top|mid|middle|bot|bottom)\s+lane\s+target\b|\b(?:114|120|118)(?:\.0)?\b[^,;.\n]{0,45}?\b(?:target|benchmark|expected\s+cs|farmable\s+supply)\b|\b(?:target|benchmark|expected\s+cs|farmable\s+supply)\b[^,;.\n]{0,45}?\b(?:114|120|118)(?:\.0)?\b|\b(?:cs\s*(?:@|at)\s*10|10[- ]minute\s+(?:lane\s+)?cs)\s+(?:target|benchmark)\b|\b(?:missed|missing|lost|dropped)\s+~?\d+(?:\.\d+)?\s*(?:lane\s+)?(?:cs|minions?|last[- ]hits?)\b"""
+        )
+
+        /**
+         * Detects legacy/mislabeled CS@10 framing that treats the 114/120 theoretical wave-spawn ceiling
+         * as a target, benchmark, farmable supply, or missed-CS baseline, or substitutes ungrounded
+         * 107 / 101-107 / 70-85 / 100 CS@10 heuristics. Allows explicit negations ("not a target or benchmark").
+         */
+        fun containsCs10TheoreticalMaxMislabeling(text: String): Boolean {
+            if (text.isBlank()) return false
+            if (CS10_RAW_LEGACY_KEY_OR_UNSUPPORTED_SUB_REGEX.containsMatchIn(text)) return true
+            val scrubbed = NEGATED_CS10_CLAUSE_REGEX.replace(text, " ")
+            return CS10_MISLABELED_PROSE_REGEX.containsMatchIn(scrubbed)
+        }
+
+        /**
+         * Fail-closed Patch 26.1+ (Riot `gameVersion` `16.1+` or display `26.1+`) verifier.
+         * Requires at least `major.minor` where EVERY dot-separated segment is non-empty ASCII digits (`0-9`),
+         * `major >= 16`, and `minor >= 1`. Rejects malformed strings such as `"16.x"`, `"16"`, `"16."`, `"16.0"`.
+         */
+        fun isVerifiedPost26_1Patch(patchVersion: String?): Boolean {
+            val cleaned = patchVersion?.trim()?.takeIf { it.isNotEmpty() } ?: return false
+            val parts = cleaned.split('.')
+            if (parts.size < 2) return false
+            if (parts.any { segment -> segment.isEmpty() || segment.any { ch -> ch !in '0'..'9' } }) {
+                return false
+            }
+            val major = parts[0].toIntOrNull() ?: return false
+            val minor = parts[1].toIntOrNull() ?: return false
+            return major >= 16 && minor >= 1
+        }
+
+        /**
+         * Canonical Patch 26.1+ passive single-lane wave spawn theoretical maximum by 10:00:
+         * `114` for `TOP` / `BOTTOM`, `120` for `MIDDLE`, `null` for `JUNGLE`, `UTILITY`/`SUPPORT`, or unknown.
+         */
+        fun post26_1RoleTheoreticalMaxCsAt10(role: String?): Int? =
+            when (role?.trim()?.uppercase()) {
+                "TOP", "BOTTOM" -> 114
+                "MIDDLE" -> 120
+                else -> null
+            }
+
+        fun normalizeCs10TheoreticalMaxLabel(rawLabel: Any?): String {
+            val candidate = rawLabel?.toString()?.trim()?.takeIf { it.isNotEmpty() && it != "null" }
+                ?: return DEFAULT_CS10_THEORETICAL_MAX_LABEL
+            if (
+                containsCs10TheoreticalMaxMislabeling(candidate) ||
+                !candidate.contains("theoretical maximum", ignoreCase = true)
+            ) {
+                return DEFAULT_CS10_THEORETICAL_MAX_LABEL
+            }
+            return candidate.replace("\"", "'").take(160)
+        }
+
+        internal fun parseStrictFiniteDouble(value: Any?): Double? =
+            when (value) {
+                is Number -> value.toDouble().takeIf { it.isFinite() }
+                is String -> {
+                    val trimmed = value.trim()
+                    if (trimmed.isEmpty() || trimmed.equals("null", ignoreCase = true)) null
+                    else trimmed.toDoubleOrNull()?.takeIf { it.isFinite() }
+                }
+                else -> null
+            }
+
+        internal fun parseStrictNonNegativeInt(value: Any?): Int? =
+            when (value) {
+                is Int -> value.takeIf { it >= 0 }
+                is Long -> value.takeIf { it in 0L..Int.MAX_VALUE.toLong() }?.toInt()
+                is Short -> value.toInt().takeIf { it >= 0 }
+                is Byte -> value.toInt().takeIf { it >= 0 }
+                is Double -> if (value.isFinite() && value >= 0.0 && value <= Int.MAX_VALUE.toDouble() && value % 1.0 == 0.0) value.toInt() else null
+                is Float -> if (value.isFinite() && value >= 0f && value <= Int.MAX_VALUE.toFloat() && value % 1.0f == 0.0f) value.toInt() else null
+                is java.math.BigDecimal -> runCatching { value.intValueExact() }.getOrNull()?.takeIf { it >= 0 }
+                is String -> {
+                    val trimmed = value.trim()
+                    if (trimmed.isNotEmpty() && trimmed.all { it in '0'..'9' }) trimmed.toIntOrNull() else null
+                }
+                else -> null
+            }
+
+        /**
+         * Fail-closed per-match CS@10 theoretical maximum resolver.
+         * Returns the canonical role ceiling (`114` Top/Bot, `120` Mid) ONLY when:
+         * 1. Match is not an early surrender (`gameEndedInEarlySurrender != true`),
+         * 2. Explicit valid duration is present and `>= 600s` (`gameDurationSeconds >= 600`) / `>= 10.0m` (`gameDuration >= 10.0`),
+         * 3. Explicit role (`role` / `teamPosition`) is `TOP`, `MIDDLE`, or `BOTTOM`,
+         * 4. Explicit patch (`patch` / `gameVersion`) passes [isVerifiedPost26_1Patch], AND
+         * 5. Provided `theoreticalMax` (or legacy `target`) is explicitly present and equals the canonical ceiling.
+         * Any absent, malformed, unsupported, or mismatched input fails closed to `null`.
+         */
+        fun resolveMatchCs10TheoreticalMax(
+            match: Map<String, Any?>,
+            cs10Map: Map<String, Any?>
+        ): Int? {
+            val earlySurrender = match["gameEndedInEarlySurrender"]
+            if (earlySurrender == true || earlySurrender?.toString()?.equals("true", ignoreCase = true) == true) {
+                return null
+            }
+
+            val rawDurationSeconds = match["gameDurationSeconds"]
+            val rawDurationMinutes = match["gameDuration"]
+            if (rawDurationSeconds == null && rawDurationMinutes == null) {
+                return null
+            }
+            if (rawDurationSeconds != null) {
+                val seconds = parseStrictFiniteDouble(rawDurationSeconds) ?: return null
+                if (seconds < 600.0) return null
+            }
+            if (rawDurationMinutes != null) {
+                if (rawDurationMinutes is String && rawDurationMinutes.contains(':')) {
+                    val mmSs = rawDurationMinutes.trim().split(':')
+                    if (mmSs.size != 2 || mmSs[0].isEmpty() || mmSs[1].length != 2) return null
+                    if (mmSs[0].any { it !in '0'..'9' } || mmSs[1].any { it !in '0'..'9' }) return null
+                    val mm = mmSs[0].toIntOrNull() ?: return null
+                    val ss = mmSs[1].toIntOrNull() ?: return null
+                    if (ss !in 0..59 || mm * 60 + ss < 600) return null
+                } else {
+                    val cleanedMinutes = if (rawDurationMinutes is String) {
+                        rawDurationMinutes.trim().removeSuffix("m").trim()
+                    } else {
+                        rawDurationMinutes
+                    }
+                    val minutes = parseStrictFiniteDouble(cleanedMinutes) ?: return null
+                    if (minutes < 10.0) return null
+                }
+            }
+
+            val roleRaw = (match["role"] ?: match["teamPosition"])?.toString()
+            val canonicalRoleMax = post26_1RoleTheoreticalMaxCsAt10(roleRaw) ?: return null
+
+            val patchRaw = (match["patch"] ?: match["gameVersion"])?.toString()
+            if (!isVerifiedPost26_1Patch(patchRaw)) return null
+
+            val rawProvided = if (cs10Map.containsKey("theoreticalMax")) {
+                cs10Map["theoreticalMax"]
+            } else {
+                cs10Map["target"]
+            }
+            val providedInt = parseStrictNonNegativeInt(rawProvided) ?: return null
+            return canonicalRoleMax.takeIf { providedInt == canonicalRoleMax }
+        }
+
+        /**
+         * Verifies that a candidate top-level `avgTheoreticalMax` equals the canonical role-weighted
+         * theoretical maximum (`sum(roleGames * canonicalRoleMax) / totalMatches`) within exact IEEE-754
+         * tolerance or standard 1-decimal / 2-decimal rounding (`HALF_UP` / JS `Math.round` / `HALF_EVEN`),
+         * rejecting impossible aggregates such as `TOP 14` paired with `avgTheoreticalMax = 118.0`.
+         */
+        internal fun matchesCanonicalWeightedCs10Max(
+            candidateAvgMax: Double,
+            weightedCanonicalMaxSum: Long,
+            totalMatches: Int
+        ): Boolean {
+            if (!candidateAvgMax.isFinite() || totalMatches <= 0 || weightedCanonicalMaxSum <= 0L) return false
+            val exact = weightedCanonicalMaxSum.toDouble() / totalMatches.toDouble()
+            val jsRound1dp = kotlin.math.floor(exact * 10.0 + 0.5) / 10.0
+            val jsRound2dp = kotlin.math.floor(exact * 100.0 + 0.5) / 100.0
+            val halfUp1dp = java.math.BigDecimal(weightedCanonicalMaxSum)
+                .divide(java.math.BigDecimal(totalMatches), 1, java.math.RoundingMode.HALF_UP)
+                .toDouble()
+            val halfUp2dp = java.math.BigDecimal(weightedCanonicalMaxSum)
+                .divide(java.math.BigDecimal(totalMatches), 2, java.math.RoundingMode.HALF_UP)
+                .toDouble()
+            val halfEven1dp = java.math.BigDecimal(weightedCanonicalMaxSum)
+                .divide(java.math.BigDecimal(totalMatches), 1, java.math.RoundingMode.HALF_EVEN)
+                .toDouble()
+            val halfEven2dp = java.math.BigDecimal(weightedCanonicalMaxSum)
+                .divide(java.math.BigDecimal(totalMatches), 2, java.math.RoundingMode.HALF_EVEN)
+                .toDouble()
+            return kotlin.math.abs(candidateAvgMax - exact) < 1e-6 ||
+                kotlin.math.abs(candidateAvgMax - jsRound1dp) < 1e-6 ||
+                kotlin.math.abs(candidateAvgMax - jsRound2dp) < 1e-6 ||
+                kotlin.math.abs(candidateAvgMax - halfUp1dp) < 1e-6 ||
+                kotlin.math.abs(candidateAvgMax - halfUp2dp) < 1e-6 ||
+                kotlin.math.abs(candidateAvgMax - halfEven1dp) < 1e-6 ||
+                kotlin.math.abs(candidateAvgMax - halfEven2dp) < 1e-6
+        }
 
         val VALID_CATEGORIES: Set<String> = setOf(
             "cs_farming", "vision_warding", "wave_management", "trading_laning",
@@ -869,27 +2070,27 @@ class AiAnalysisService(
         // 1. Top-priority atomic sample scope lines (kept first so budget cascade down to 256B never drops scope labels or splits rates from denominators)
         if (rankedSample != null) {
             headerLines.add(
-                "  rankedRecord (Solo/Duo Queue Counter): ${rankedSample.wins}W ${rankedSample.losses}L across ${rankedSample.games} games (${rankedSample.winRatePct} WR)"
+                "  Current-season ranked record (Solo/Duo): ${rankedSample.wins}W ${rankedSample.losses}L across ${rankedSample.games} games (${rankedSample.winRatePct} WR)"
             )
         } else if (hasStructuredSamples || context.containsKey("totalWins") || context.containsKey("totalLosses")) {
             headerLines.add(
-                "  rankedRecord (Solo/Duo Queue Counter): unavailable (unranked or no valid ranked W/L counter)"
+                "  Current-season ranked record (Solo/Duo): unavailable (unranked or no valid Solo/Duo W/L counter)"
             )
         }
 
         if (savedSample != null) {
             headerLines.add(
-                "  savedHistory (Saved Match History): ${savedSample.wins}W ${savedSample.losses}L across ${savedSample.games} games (${savedSample.winRatePct} WR)"
+                "  Saved matches record: ${savedSample.wins}W ${savedSample.losses}L across ${savedSample.games} games (${savedSample.winRatePct} WR)"
             )
         } else if (hasStructuredSamples || context.containsKey("winRate") || context.containsKey("overallStats")) {
             headerLines.add(
-                "  savedHistory (Saved Match History): unavailable (missing W/L counter; do NOT use rankedRecord)"
+                "  Saved matches record: unavailable (missing saved-match W/L counter; do NOT substitute current-season ranked record)"
             )
         }
 
         if (recentSampleFromMap != null) {
             headerLines.add(
-                "  recentMatchSample (Detailed Match List): ${recentSampleFromMap.wins}W ${recentSampleFromMap.losses}L across ${recentSampleFromMap.games} games (${recentSampleFromMap.winRatePct} WR)"
+                "  Recent detailed matches record: ${recentSampleFromMap.wins}W ${recentSampleFromMap.losses}L across ${recentSampleFromMap.games} games (${recentSampleFromMap.winRatePct} WR)"
             )
         } else if (!recentMatches.isNullOrEmpty()) {
             val capped = recentMatches.take(20)
@@ -898,29 +2099,42 @@ class AiAnalysisService(
             val l = g - w
             val wr = String.format(java.util.Locale.US, "%.1f%%", w * 100.0 / g)
             headerLines.add(
-                "  recentMatchSample (Detailed Match List): ${w}W ${l}L across $g games ($wr WR)"
+                "  Recent detailed matches record: ${w}W ${l}L across $g games ($wr WR)"
             )
         } else {
             val rawGames = resolveRecentSampleGameCount(context)
             if (rawGames > 0) {
                 headerLines.add(
-                    "  recentMatchSample (Detailed Match List): $rawGames games (per-match W/L not loaded)"
+                    "  Recent detailed matches record: $rawGames games (per-match W/L not loaded)"
                 )
             } else if (hasStructuredSamples) {
                 headerLines.add(
-                    "  recentMatchSample (Detailed Match List): unavailable (0 detailed matches loaded)"
+                    "  Recent detailed matches record: unavailable (0 detailed matches loaded)"
                 )
             }
         }
 
-        // 2. Profile identity & status scalars (NEVER include unscoped totalWins, totalLosses, totalGamesAnalyzed, winRate, blueSideWinRate, redSideWinRate)
-        val profileScalarKeys = listOf("rank", "role", "primaryRole", "timelineStatus", "visionDataPrecision")
-        profileScalarKeys.forEach { key ->
-            context[key]?.let { headerLines.add("  $key: ${it.toString().take(160)}") }
+        // 2. Profile identity & status scalars (NEVER include unscoped totalWins, totalLosses, totalGamesAnalyzed, winRate, blueSideWinRate, redSideWinRate, or raw status tokens)
+        context["rank"]?.let { headerLines.add("  Rank: ${it.toString().take(160)}") }
+        context["role"]?.let { headerLines.add("  Queue role: ${it.toString().take(160)}") }
+        context["primaryRole"]?.let { headerLines.add("  Primary role: ${it.toString().take(160)}") }
+        val rawTimelineStatus = context["timelineStatus"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+            ?: if (headerLines.isNotEmpty()) {
+                if (context["timelineInsights"] != null) "ANALYZED" else "NOT_ANALYZED"
+            } else {
+                null
+            }
+        if (rawTimelineStatus != null) {
+            val naturalTimelineStatus = when {
+                rawTimelineStatus.equals("ANALYZED", ignoreCase = true) -> "analyzed"
+                rawTimelineStatus.equals("NOT_ANALYZED", ignoreCase = true) ->
+                    "not analyzed yet (end-of-game summary and challenge stats only)"
+                else -> rewriteInternalSchemaTokens(rawTimelineStatus.take(160), context)
+            }
+            headerLines.add("  Match timeline analysis: $naturalTimelineStatus")
         }
-        if (context["timelineStatus"] == null && headerLines.isNotEmpty()) {
-            val inferredStatus = if (context["timelineInsights"] != null) "ANALYZED" else "NOT_ANALYZED"
-            headerLines.add("  timelineStatus: $inferredStatus")
+        context["visionDataPrecision"]?.let {
+            headerLines.add("  Vision telemetry scope: ${rewriteInternalSchemaTokens(it.toString().take(160), context)}")
         }
         (context["timelineCoverage"] as? Map<*, *>)?.let { cov ->
             val covStatus = (cov["status"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: "UNKNOWN").take(24)
@@ -931,81 +2145,258 @@ class AiAnalysisService(
             headerLines.add("  timelineCoverage: {status=$covStatus, covered=${covCount}/${reqCount} games$stopSuffix}")
         }
 
-        // 3. Saved-history per-game averages & side splits (explicitly scoped to savedHistory; omitted if structured savedHistory is invalid/null)
+        // 3. Saved-history per-game averages & side splits (explicitly scoped to saved matches; omitted if structured savedHistory is invalid/null)
         val allowSavedHistoryDerivedMetrics = !hasStructuredSaved || savedSample != null
-        val savedScopeTag = if (savedSample != null) {
-            "sample: savedHistory (${savedSample.games}g)"
+        val savedScopeLabel = if (savedSample != null) {
+            "across ${savedSample.games} saved matches"
         } else {
-            "sample: savedHistory (denominator unavailable)"
+            "across saved matches; game count unavailable"
         }
         if (allowSavedHistoryDerivedMetrics) {
-            val avgKeys = listOf(
-                "kda", "avgKda", "avgKills", "avgDeaths", "avgAssists",
-                "avgKillsPerGame", "avgDeathsPerGame", "avgAssistsPerGame",
-                "avgCsPerMin", "avgVisionScore", "avgDamagePerMin", "avgGoldPerMin",
-                "avgKillParticipation", "avgSoloKills", "avgTurretPlates"
+            val avgKeyLabels = listOf(
+                "kda" to "KDA",
+                "avgKda" to "avg KDA",
+                "avgKills" to "kills/g",
+                "avgDeaths" to "deaths/g",
+                "avgAssists" to "assists/g",
+                "avgKillsPerGame" to "kills/game",
+                "avgDeathsPerGame" to "deaths/game",
+                "avgAssistsPerGame" to "assists/game",
+                "avgCsPerMin" to "CS/min",
+                "avgVisionScore" to "vision score",
+                "avgDamagePerMin" to "damage/min",
+                "avgGoldPerMin" to "gold/min",
+                "avgKillParticipation" to "kill participation",
+                "avgSoloKills" to "solo kills/g",
+                "avgTurretPlates" to "turret plates/g"
             )
-            val avgPairs = avgKeys.mapNotNull { key ->
+            val avgPairs = avgKeyLabels.mapNotNull { (key, label) ->
                 val v = context[key]?.toString()?.trim()?.take(32) ?: return@mapNotNull null
-                if (v.isBlank() || v == "0" || v == "0.0" || v == "0.00" || v == "0.0%") null else "$key=$v"
+                if (v.isBlank() || v == "0" || v == "0.0" || v == "0.00" || v == "0.0%") null else "$label=$v"
             }
             if (avgPairs.isNotEmpty()) {
-                headerLines.add("  savedHistoryAverages [$savedScopeTag]: ${avgPairs.joinToString(", ")}")
+                headerLines.add("  Saved-match averages ($savedScopeLabel): ${avgPairs.joinToString(", ")}")
             }
 
             val blueSample = parseValidatedWinLossSample(context["blueSide"])
             val redSample = parseValidatedWinLossSample(context["redSide"])
             if (blueSample != null || redSample != null) {
                 val sideParts = listOfNotNull(
-                    blueSample?.let { "blueSide=${it.wins}W ${it.losses}L (${it.games}g, ${it.winRatePct} WR)" },
-                    redSample?.let { "redSide=${it.wins}W ${it.losses}L (${it.games}g, ${it.winRatePct} WR)" }
+                    blueSample?.let { "Blue side=${it.wins}W ${it.losses}L (${it.games}g, ${it.winRatePct} WR)" },
+                    redSample?.let { "Red side=${it.wins}W ${it.losses}L (${it.games}g, ${it.winRatePct} WR)" }
                 )
-                headerLines.add("  savedHistorySideSplits [$savedScopeTag]: ${sideParts.joinToString(", ")}")
+                headerLines.add("  Saved-match side splits ($savedScopeLabel): ${sideParts.joinToString(", ")}")
             } else if (!context.containsKey("blueSide") && !context.containsKey("redSide")) {
                 val legacyBlue = context["blueSideWinRate"]?.toString()?.trim()?.takeIf { it.isNotBlank() && it != "0.0" && it != "0.0%" }
                 val legacyRed = context["redSideWinRate"]?.toString()?.trim()?.takeIf { it.isNotBlank() && it != "0.0" && it != "0.0%" }
                 val legacySideParts = listOfNotNull(
-                    legacyBlue?.let { "blueSideWinRate=$it" },
-                    legacyRed?.let { "redSideWinRate=$it" }
+                    legacyBlue?.let { "Blue side win rate=$it" },
+                    legacyRed?.let { "Red side win rate=$it" }
                 )
                 if (legacySideParts.isNotEmpty()) {
                     headerLines.add(
-                        "  savedHistorySideSplits [sample: savedHistory (side game counts unavailable)]: ${legacySideParts.joinToString(", ")}"
+                        "  Saved-match side splits (across saved matches; side game counts unavailable): ${legacySideParts.joinToString(", ")}"
                     )
                 }
             }
         }
 
-        // Aggregate Early Lane CS@10 summary (actual, benchmark definition, role breakdown, denominators, missingness)
+        // Aggregate Early Lane CS@10 summary (actual, theoretical maximum ceiling, role breakdown, denominators, missingness)
         val avgLaneCsAt10 = context["avgLaneCsAt10"] as? Map<*, *>
         if (avgLaneCsAt10 != null) {
             val avgActual = avgLaneCsAt10["avgActual"] ?: "null"
-            val matchCount = avgLaneCsAt10["matchCount"] ?: 0
-            val avgTarget = avgLaneCsAt10["avgTarget"] ?: "null"
-            val targetMatchCount = avgLaneCsAt10["targetMatchCount"] ?: 0
+            val matchCountInt = parseStrictNonNegativeInt(avgLaneCsAt10["matchCount"])
+            val rawAvgMax = if (avgLaneCsAt10.containsKey("avgTheoreticalMax")) {
+                avgLaneCsAt10["avgTheoreticalMax"]
+            } else {
+                avgLaneCsAt10["avgTarget"]
+            }
+            val avgMaxDouble = parseStrictFiniteDouble(rawAvgMax)
+            val rawSupportedCount = if (avgLaneCsAt10.containsKey("theoreticalMaxMatchCount")) {
+                avgLaneCsAt10["theoreticalMaxMatchCount"]
+            } else {
+                avgLaneCsAt10["targetMatchCount"]
+            }
+            val supportedCountInt = parseStrictNonNegativeInt(rawSupportedCount)
             val avgSupportedActual = avgLaneCsAt10["avgSupportedActual"] ?: "null"
-            val targetLabel = avgLaneCsAt10["targetLabel"] ?: "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
-            val roleBreakdownList = (avgLaneCsAt10["roleBreakdown"] as? List<*>)?.mapNotNull { entry ->
-                val rm = entry as? Map<*, *> ?: return@mapNotNull null
-                val r = rm["role"] ?: return@mapNotNull null
-                val mc = rm["matchCount"] ?: 0
-                val aa = rm["avgActual"] ?: "null"
-                val at = rm["avgTarget"] ?: "null"
-                val tmc = rm["targetMatchCount"] ?: 0
-                val asa = rm["avgSupportedActual"] ?: "null"
-                "$r(actual=$aa in ${mc}g, target=$at in ${tmc}g, supportedActual=$asa)"
-            } ?: emptyList()
-            val roleBreakdownStr = if (roleBreakdownList.isNotEmpty()) ", roleBreakdown=[${roleBreakdownList.joinToString("; ")}]" else ""
+            val rawLabel = if (avgLaneCsAt10.containsKey("theoreticalMaxLabel")) {
+                avgLaneCsAt10["theoreticalMaxLabel"]
+            } else {
+                avgLaneCsAt10["targetLabel"]
+            }
+            val normalizedLabel = normalizeCs10TheoreticalMaxLabel(rawLabel)
+
+            var roleBreakdownAllowsTopMax = false
+            var canonicalWeightedMaxSum: Long? = null
+            val rawRoleBreakdown = avgLaneCsAt10["roleBreakdown"]
+            val roleBreakdownItems: List<String> = when (rawRoleBreakdown) {
+                is List<*> -> {
+                    if (rawRoleBreakdown.isEmpty()) {
+                        emptyList()
+                    } else {
+                        val items = mutableListOf<String>()
+                        val seenRoles = mutableSetOf<String>()
+                        var listValidForTopMax = true
+                        var listMatchSum = 0L
+                        var listSupportedSum = 0L
+                        var listWeightedMaxSum = 0L
+                        for (entry in rawRoleBreakdown) {
+                            val rm = entry as? Map<*, *>
+                            if (rm == null) {
+                                listValidForTopMax = false
+                                continue
+                            }
+                            val rRaw = rm["role"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+                            if (rRaw == null || !seenRoles.add(rRaw.uppercase())) {
+                                listValidForTopMax = false
+                                if (rRaw == null) continue
+                            }
+                            val canonicalRoleMax = post26_1RoleTheoreticalMaxCsAt10(rRaw)
+                            val mcInt = parseStrictNonNegativeInt(rm["matchCount"])
+                            val rawRoleSupported = when {
+                                rm.containsKey("theoreticalMaxMatchCount") -> rm["theoreticalMaxMatchCount"]
+                                rm.containsKey("supportedMatchCount") -> rm["supportedMatchCount"]
+                                else -> rm["targetMatchCount"]
+                            }
+                            val tmcInt = parseStrictNonNegativeInt(rawRoleSupported)
+                            val rawRoleMax = when {
+                                rm.containsKey("theoreticalMax") -> rm["theoreticalMax"]
+                                rm.containsKey("avgTheoreticalMax") -> rm["avgTheoreticalMax"]
+                                else -> rm["avgTarget"]
+                            }
+                            val roleMaxDouble = parseStrictFiniteDouble(rawRoleMax)
+                            val aa = rm["avgActual"] ?: "null"
+                            val asaRaw = rm["avgSupportedActual"] ?: "null"
+
+                            val roleAllSupported = canonicalRoleMax != null &&
+                                mcInt != null &&
+                                mcInt > 0 &&
+                                tmcInt != null &&
+                                tmcInt == mcInt &&
+                                roleMaxDouble != null &&
+                                kotlin.math.abs(roleMaxDouble - canonicalRoleMax.toDouble()) < 1e-6
+
+                            if (mcInt == null || tmcInt == null || tmcInt > mcInt) {
+                                listValidForTopMax = false
+                            } else if (mcInt == 0) {
+                                if (tmcInt != 0) listValidForTopMax = false
+                            } else if (!roleAllSupported) {
+                                listValidForTopMax = false
+                            } else {
+                                listMatchSum += mcInt.toLong()
+                                listSupportedSum += tmcInt.toLong()
+                                listWeightedMaxSum += mcInt.toLong() * canonicalRoleMax!!.toLong()
+                            }
+
+                            val roleMaxStr = if (roleAllSupported) canonicalRoleMax!!.toDouble().toString() else "null"
+                            val mcVal = mcInt ?: 0
+                            val tmcVal = if (tmcInt != null && mcInt != null && tmcInt <= mcInt) tmcInt else 0
+                            val asaVal = if (tmcVal > 0) asaRaw else "null"
+                            items.add(
+                                "$rRaw(actual=$aa in ${mcVal}g, theoretical max=$roleMaxStr, supported=${tmcVal}g, supported actual=$asaVal)"
+                            )
+                        }
+                        if (
+                            listValidForTopMax &&
+                            matchCountInt != null &&
+                            matchCountInt > 0 &&
+                            supportedCountInt != null &&
+                            supportedCountInt == matchCountInt &&
+                            listMatchSum == matchCountInt.toLong() &&
+                            listSupportedSum == supportedCountInt.toLong()
+                        ) {
+                            roleBreakdownAllowsTopMax = true
+                            canonicalWeightedMaxSum = listWeightedMaxSum
+                        }
+                        items
+                    }
+                }
+                is Map<*, *> -> {
+                    if (rawRoleBreakdown.isEmpty()) {
+                        emptyList()
+                    } else {
+                        val parsedEntries = mutableListOf<Pair<String, Int>>()
+                        val seenRoles = mutableSetOf<String>()
+                        var malformedEntry = false
+                        for ((k, v) in rawRoleBreakdown) {
+                            val roleStr = k?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+                            val gamesInt = parseStrictNonNegativeInt(v)
+                            if (roleStr == null || gamesInt == null || !seenRoles.add(roleStr.uppercase())) {
+                                malformedEntry = true
+                                continue
+                            }
+                            if (gamesInt > 0) {
+                                parsedEntries.add(roleStr to gamesInt)
+                            }
+                        }
+                        val mapMatchSum = parsedEntries.sumOf { it.second.toLong() }
+                        val allRolesSupported = parsedEntries.isNotEmpty() &&
+                            parsedEntries.all { post26_1RoleTheoreticalMaxCsAt10(it.first) != null }
+                        val mapWeightedMaxSum = if (allRolesSupported) {
+                            parsedEntries.sumOf { (r, g) ->
+                                g.toLong() * post26_1RoleTheoreticalMaxCsAt10(r)!!.toLong()
+                            }
+                        } else {
+                            0L
+                        }
+                        val mapAllSupported = !malformedEntry &&
+                            matchCountInt != null &&
+                            matchCountInt > 0 &&
+                            supportedCountInt != null &&
+                            supportedCountInt == matchCountInt &&
+                            allRolesSupported &&
+                            mapMatchSum == matchCountInt.toLong() &&
+                            avgMaxDouble != null &&
+                            matchesCanonicalWeightedCs10Max(avgMaxDouble, mapWeightedMaxSum, matchCountInt)
+                        if (mapAllSupported) {
+                            roleBreakdownAllowsTopMax = true
+                            canonicalWeightedMaxSum = mapWeightedMaxSum
+                        }
+                        parsedEntries.map { (roleStr, gamesInt) ->
+                            val roleMaxStr = if (mapAllSupported) {
+                                post26_1RoleTheoreticalMaxCsAt10(roleStr).toString()
+                            } else {
+                                "null"
+                            }
+                            "$roleStr(${gamesInt}g, theoretical max=$roleMaxStr)"
+                        }
+                    }
+                }
+                else -> emptyList()
+            }
+
+            val exposeTopAvgMax = matchCountInt != null &&
+                matchCountInt > 0 &&
+                supportedCountInt != null &&
+                supportedCountInt == matchCountInt &&
+                avgMaxDouble != null &&
+                roleBreakdownAllowsTopMax &&
+                canonicalWeightedMaxSum != null &&
+                matchesCanonicalWeightedCs10Max(avgMaxDouble, canonicalWeightedMaxSum, matchCountInt)
+
+            val formattedMatchCount = matchCountInt ?: 0
+            val formattedSupportedCount = if (supportedCountInt != null && matchCountInt != null && supportedCountInt <= matchCountInt) {
+                supportedCountInt
+            } else {
+                0
+            }
+            val formattedAvgMax = if (exposeTopAvgMax) rawAvgMax.toString().trim() else "null"
+            val formattedSupportedActual = if (formattedSupportedCount > 0) avgSupportedActual else "null"
+            val roleBreakdownStr = if (roleBreakdownItems.isNotEmpty()) {
+                ", role breakdown=[${roleBreakdownItems.joinToString("; ")}]"
+            } else {
+                ""
+            }
             headerLines.add(
-                "  avgLaneCsAt10: {avgActual=$avgActual (matchCount=$matchCount), avgTarget=$avgTarget (targetMatchCount=$targetMatchCount, avgSupportedActual=$avgSupportedActual), targetLabel=\"$targetLabel\"$roleBreakdownStr}"
+                "  Average 10:00 lane CS: {actual=$avgActual (matches=$formattedMatchCount), theoretical max=$formattedAvgMax (supported matches=$formattedSupportedCount, supported actual=$formattedSupportedActual), label=\"$normalizedLabel\"$roleBreakdownStr}"
             )
         }
         if (context.containsKey("missingLaneCsAt10Matches")) {
             val missingCs10 = context["missingLaneCsAt10Matches"] ?: "null"
-            headerLines.add("  missingLaneCsAt10Matches: $missingCs10")
+            headerLines.add("  Matches missing 10:00 lane CS: $missingCs10")
         }
 
-        // Top champions pool (cap at 5; scoped to savedHistory)
+        // Top champions pool (cap at 5; scoped to saved matches)
         val topChampions = context["topChampions"] as? List<*>
         if (allowSavedHistoryDerivedMetrics && !topChampions.isNullOrEmpty()) {
             val formattedChamps = topChampions.take(5).mapNotNull { entry ->
@@ -1026,30 +2417,52 @@ class AiAnalysisService(
                 }
             }
             if (formattedChamps.isNotEmpty()) {
-                headerLines.add("  topChampions: ${formattedChamps.joinToString(", ")} [$savedScopeTag]")
+                headerLines.add("  Most-played champions ($savedScopeLabel): ${formattedChamps.joinToString(", ")}")
             }
         }
 
-        // Opponent stats block (compact single line; scoped to savedHistory)
+        // Opponent stats block (compact single line; scoped to saved matches)
         val opponentStats = context["opponentStats"] as? Map<String, Any>
         if (allowSavedHistoryDerivedMetrics && !opponentStats.isNullOrEmpty()) {
+            val oppKeyLabels = mapOf(
+                "avgKda" to "avg KDA",
+                "kda" to "KDA",
+                "avgCsPerMin" to "CS/min",
+                "csPerMin" to "CS/min",
+                "avgKillParticipation" to "kill participation",
+                "avgSoloKills" to "solo kills/g",
+                "avgTurretPlates" to "turret plates/g",
+                "avgVisionScore" to "vision score",
+                "avgDamagePerMin" to "damage/min",
+                "avgGoldPerMin" to "gold/min"
+            )
             val nonZeroOppEntries = opponentStats.entries.filter { (_, v) ->
                 val s = v.toString().trim()
                 s.isNotBlank() && s != "0" && s != "0.0" && s != "0.00" && s != "0.0%"
             }
             if (nonZeroOppEntries.isNotEmpty()) {
-                val compactOppStats = nonZeroOppEntries.take(8).joinToString(", ") { (k, v) -> "$k=${v.toString().take(48)}" }
-                headerLines.add("  opponentStats: {$compactOppStats} [$savedScopeTag]")
+                val compactOppStats = nonZeroOppEntries.take(8).joinToString(", ") { (k, v) ->
+                    val naturalKey = oppKeyLabels[k] ?: rewriteInternalSchemaTokens(k, context)
+                    "$naturalKey=${v.toString().take(48)}"
+                }
+                headerLines.add("  Matched role-opponent averages ($savedScopeLabel): {$compactOppStats}")
             }
         }
 
-        // Top strengths / weaknesses (cap at 4 each; scoped to recentMatchSample)
+        val recentGamesForTag = resolveRecentSampleGameCount(context)
+        val recentScopeLabel = if (recentGamesForTag > 0) {
+            "across last $recentGamesForTag detailed matches"
+        } else {
+            "across recent detailed matches"
+        }
+
+        // Top strengths / weaknesses (cap at 4 each; scoped to recent detailed matches; challenge comparison frequency vs matched role opponent)
         val strengths = context["topStrengths"] as? List<*>
         if (!strengths.isNullOrEmpty()) {
             val formatted = strengths.take(4).joinToString(", ") { item ->
                 if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString().take(48)
             }
-            headerLines.add("  topStrengths: $formatted [sample: recentMatchSample]")
+            headerLines.add("  Challenge beat-opponent frequency ($recentScopeLabel): $formatted")
         }
 
         val weaknesses = context["topWeaknesses"] as? List<*>
@@ -1057,10 +2470,10 @@ class AiAnalysisService(
             val formatted = weaknesses.take(4).joinToString(", ") { item ->
                 if (item is Map<*, *>) "${item["name"] ?: "?"} (${item["consistency"] ?: "?"})" else item.toString().take(48)
             }
-            headerLines.add("  topWeaknesses: $formatted [sample: recentMatchSample]")
+            headerLines.add("  Challenge trail-opponent frequency ($recentScopeLabel): $formatted")
         }
 
-        // Champion Matchups (prioritize any champion mentioned in userMessage, up to 5; scoped to recentMatchSample)
+        // Champion Matchups (prioritize any champion mentioned in userMessage, up to 5; scoped to recent detailed matches)
         val matchups = context["championMatchups"] as? Map<String, Map<String, Any>>
         if (!matchups.isNullOrEmpty()) {
             val lowerQ = userMessage.lowercase()
@@ -1078,7 +2491,7 @@ class AiAnalysisService(
                     "vs $champ: ${wins}W ${losses}L ($winRate)"
                 }
             if (formattedMatchups.isNotEmpty()) {
-                headerLines.add("  championMatchups: $formattedMatchups [sample: recentMatchSample]")
+                headerLines.add("  Champion matchups ($recentScopeLabel): $formattedMatchups")
             }
         }
 
@@ -1093,7 +2506,7 @@ class AiAnalysisService(
         val chronological = recentMatches.take(20).reversed()
         val total = chronological.size
         val wins = chronological.count { it["win"] == true }
-        headerLines.add("  recentMatchSummary: $wins wins / ${total - wins} losses in last $total games")
+        headerLines.add("  Detailed match summary: $wins wins / ${total - wins} losses in last $total detailed matches")
 
         val scoredMatches = chronological.mapIndexed { idx, m ->
             ScoredMatch(
@@ -1277,23 +2690,23 @@ class AiAnalysisService(
                 .sortedByDescending { it.value }
                 .take(5)
                 .joinToString(", ") { "${it.key} ${it.value}g" }
-            lines.add("  omittedMatchesRollup: ${omitted.size} games not expanded (${omittedWins}W/${omittedLosses}L, champs=[$champCounts])")
+            lines.add("  Other detailed matches not expanded: ${omitted.size} games (${omittedWins}W/${omittedLosses}L, champs=[$champCounts])")
         }
 
-        var emittedTargetLabel = false
+        var emittedTheoreticalMaxLabel = false
         for (sm in selectedChronological) {
             val isFullDetail = sm.chronologicalIndex in fullDetailIndices || totalMatches <= MAX_FULL_DETAIL_MATCHES
-            val includeTargetLabel = !emittedTargetLabel
-            val (line, usedTargetLabel) = formatMatchLine(
+            val includeTheoreticalMaxLabel = !emittedTheoreticalMaxLabel
+            val (line, usedTheoreticalMaxLabel) = formatMatchLine(
                 i = sm.chronologicalIndex,
                 totalMatches = totalMatches,
                 m = sm.match,
                 fullDetail = isFullDetail,
-                includeTargetLabel = includeTargetLabel,
+                includeTheoreticalMaxLabel = includeTheoreticalMaxLabel,
                 questionCategory = questionCategory,
                 userMessage = userMessage
             )
-            if (usedTargetLabel) emittedTargetLabel = true
+            if (usedTheoreticalMaxLabel) emittedTheoreticalMaxLabel = true
             lines.add(line)
         }
 
@@ -1306,7 +2719,7 @@ class AiAnalysisService(
         totalMatches: Int,
         m: Map<String, Any?>,
         fullDetail: Boolean,
-        includeTargetLabel: Boolean,
+        includeTheoreticalMaxLabel: Boolean,
         questionCategory: String,
         userMessage: String
     ): Pair<String, Boolean> {
@@ -1396,19 +2809,23 @@ class AiAnalysisService(
         (m["goldPerMinute"] ?: m["goldPerMin"])?.let { advStats.add("gold/min=$it") }
         m["soloKills"]?.let { advStats.add("soloKills=$it") }
         m["laneMinionsFirst10Minutes"]?.let { advStats.add("laneCs@10=$it") }
-        var usedTargetLabel = false
+        var usedTheoreticalMaxLabel = false
         val cs10Map = (m["laneCsAt10"] ?: m["cs10"]) as? Map<String, Any?>
         if (cs10Map != null) {
             val actual = cs10Map["actual"]
-            val target = cs10Map["target"]
-            val targetLabel = cs10Map["targetLabel"]
+            val resolvedTheoreticalMax = resolveMatchCs10TheoreticalMax(m, cs10Map)
+            val rawLabel = if (cs10Map.containsKey("theoreticalMaxLabel")) {
+                cs10Map["theoreticalMaxLabel"]
+            } else {
+                cs10Map["targetLabel"]
+            }
             if (m["laneMinionsFirst10Minutes"] == null && actual != null) {
                 advStats.add("laneCs@10=$actual")
             }
-            advStats.add("cs10.target=${target ?: "null"}")
-            if (targetLabel != null && includeTargetLabel) {
-                advStats.add("cs10.targetLabel=$targetLabel")
-                usedTargetLabel = true
+            advStats.add("10m theoretical max=${resolvedTheoreticalMax ?: "null"}")
+            if (resolvedTheoreticalMax != null && includeTheoreticalMaxLabel) {
+                advStats.add("10m theoretical max note=\"${normalizeCs10TheoreticalMaxLabel(rawLabel)}\"")
+                usedTheoreticalMaxLabel = true
             }
         }
         m["jungleCsBefore10Minutes"]?.let { advStats.add("jungleCs@10=$it") }
@@ -1442,7 +2859,7 @@ class AiAnalysisService(
             else -> ""
         }
         val line = "    Game ${i + 1}$recencyLabel: $win on $champion vs $oppName ($oppChamp), kda=$kda, cs/min=$cs$advStr"
-        return line to usedTargetLabel
+        return line to usedTheoreticalMaxLabel
     }
 
     @Suppress("UNCHECKED_CAST")
@@ -1519,7 +2936,7 @@ class AiAnalysisService(
 
     /**
      * Renders the 5 structured improvementStats evidence groups into a dedicated ground-truth section,
-     * preserving exact denominators, missingness/exclusion counts, and telemetry boundaries.
+     * preserving exact denominators, missingness/exclusion counts, and telemetry boundaries without internal schema keys.
      */
     @Suppress("UNCHECKED_CAST")
     private fun buildImprovementStatsSection(context: Map<String, Any>, compact: Boolean = false): String {
@@ -1532,9 +2949,9 @@ class AiAnalysisService(
         val hasTimeline = imp["hasTimelineAnalysis"]
         val headerMeta = buildList {
             add("considered=${totalConsidered}g")
-            add("excludedInvalidDuration=${excludedInvalidDur}g")
-            topExcludedMissingTimeline?.let { add("excludedMissingTimeline=${it}g") }
-            hasTimeline?.let { add("hasTimelineAnalysis=$it") }
+            add("excluded invalid duration=${excludedInvalidDur}g")
+            topExcludedMissingTimeline?.let { add("excluded missing timeline=${it}g") }
+            hasTimeline?.let { add("timeline analyzed=$it") }
         }.joinToString(", ")
 
         lines.add("\n**📈 5-STAT IMPROVEMENT EVIDENCE ($headerMeta):**")
@@ -1555,9 +2972,9 @@ class AiAnalysisService(
                 val laneGain = w["avgLaneCsGained"] ?: "null"
                 val jgGain = w["avgJungleCsGained"] ?: "null"
                 return if (compact) {
-                    "eligible=${elig}g (short=${shortG}g, missingFrame=${missFrame}g), totalCS/m=$totalCsm (lane=$laneCsm, jg=$jgCsm)"
+                    "eligible=${elig}g (short=${shortG}g, missing frame=${missFrame}g), total CS/m=$totalCsm (lane=$laneCsm, jg=$jgCsm)"
                 } else {
-                    "eligible=${elig}g (short=${shortG}g, missingFrame=${missFrame}g), avgTotalCsPerMin=$totalCsm (laneCsPerMin=$laneCsm, jungleCsPerMin=$jgCsm, avgLaneCsGained=$laneGain, avgJungleCsGained=$jgGain)"
+                    "eligible=${elig}g (short=${shortG}g, missing frame=${missFrame}g), total CS/m=$totalCsm (lane CS/m=$laneCsm, jungle CS/m=$jgCsm, lane CS gained=$laneGain, jungle CS gained=$jgGain)"
                 }
             }
             lines.add("  - Phase Farming (Post-Lane CS): 10-20m=[${fmtWindow(m10)}]; 20m-End=[${fmtWindow(m20)}]")
@@ -1588,11 +3005,11 @@ class AiAnalysisService(
             val allyTow = lr["allyTowers10To20"] ?: lr["totalAllyTowerKills10To20WhenAheadAt10"] ?: 0
             val enemyTow = lr["enemyTowers10To20"] ?: lr["totalEnemyTowerKills10To20WhenAheadAt10"] ?: 0
             lines.add(
-                "  - Lead Retention (10m->20m vs role opponent): eligible@10m=${elig10}g, eligible@20m=${elig20}g (missingOpponent=${missOpp}g, short<10m=${short10}g, short<20m=${short20}g); " +
-                    "avgLead@10m=(gold=$gold10, xp=$xp10), avgLead@20m=(gold=$gold20, xp=$xp20); " +
-                    "goldRetention=$retG20/${reachG20}g reaching 20m (ahead@10m=${aheadG10}g, rate=$retGRate), " +
-                    "xpRetention=$retX20/${reachX20}g reaching 20m (ahead@10m=${aheadX10}g, rate=$retXRate); " +
-                    "whenAheadGold@10m_10to20m=(allyObj=$allyObj vs enemyObj=$enemyObj, allyTowers=$allyTow vs enemyTowers=$enemyTow)"
+                "  - Lead Retention (10m->20m vs role opponent): eligible@10m=${elig10}g, eligible@20m=${elig20}g (missing opponent=${missOpp}g, short<10m=${short10}g, short<20m=${short20}g); " +
+                    "avg lead@10m=(gold=$gold10, xp=$xp10), avg lead@20m=(gold=$gold20, xp=$xp20); " +
+                    "gold retention=$retG20/${reachG20}g reaching 20m (ahead@10m=${aheadG10}g, rate=$retGRate), " +
+                    "xp retention=$retX20/${reachX20}g reaching 20m (ahead@10m=${aheadX10}g, rate=$retXRate); " +
+                    "10-20m team objectives when ahead gold@10m=(ally objectives=$allyObj vs enemy=$enemyObj, ally towers=$allyTow vs enemy=$enemyTow)"
             )
         }
 
@@ -1615,17 +3032,17 @@ class AiAnalysisService(
                 val shutGold = bounty["totalShutdownBountyGold"] ?: "null"
                 val combGold = bounty["totalCombinedBountyGold"] ?: "null"
                 val avgComb = bounty["avgCombinedBountyPerDeath"] ?: "null"
-                "bounty(eligibleTimeline=${eligTl}g, recordedDeaths=$totDeaths, withBounty=$withBounty, missingBounty=$missBounty, baseGold=$baseGold, shutdownGold=$shutGold, combinedGold=$combGold, avgCombinedPerDeath=$avgComb)"
+                "bounty(timeline games=${eligTl}g, recorded deaths=$totDeaths, with bounty=$withBounty, missing bounty=$missBounty, base gold=$baseGold, shutdown gold=$shutGold, combined gold=$combGold, avg combined/death=$avgComb)"
             } else {
                 "bounty=unavailable"
             }
             lines.add(
-                "  - Death Cost (Time Dead & Direct Kill Bounty Only): eligibleTimeDead=${eligTd}g (missingTimeDead=${missTd}g), " +
-                    "totalDead=${totDeadSec}s, avgDeadPerGame=${avgDeadSec}s, avgGameShare=${avgShare}%, overallShare=${ovrShare}%; $bountyStr"
+                "  - Death Cost (Time Dead & Direct Kill Bounty Only): eligible death-time games=${eligTd}g (missing=${missTd}g), " +
+                    "total dead=${totDeadSec}s, avg dead/game=${avgDeadSec}s, avg game share=${avgShare}%, overall share=${ovrShare}%; $bountyStr"
             )
         }
 
-        // 4. Unspent Gold (`currentGold` at 1-Min Frame Checkpoints & Pre-Purchase Windows)
+        // 4. Unspent Gold (1-Min Gold-in-Hand Checkpoints & Pre-Purchase Windows)
         val ug = imp["unspentGold"] as? Map<String, Any?>
         if (ug != null) {
             val eligG = ug["eligibleGames"] ?: 0
@@ -1648,11 +3065,11 @@ class AiAnalysisService(
                     val nextItem = sm["nextPurchaseItemName"] ?: sm["nextPurchaseItemId"] ?: "?"
                     "$champ @${min}m (${cg}g -> bought $nextItem @${nextMin}m)"
                 }
-                if (formattedSamples.isNotEmpty()) ", prePurchaseSamples=[${formattedSamples.joinToString("; ")}]" else ""
+                if (formattedSamples.isNotEmpty()) ", pre-purchase examples=[${formattedSamples.joinToString("; ")}]" else ""
             } else ""
             lines.add(
-                "  - Unspent Gold (1-min checkpoint currentGold, NOT recall events): eligible=${eligG}g (missingSamples=${missSamp}g, checkpoints=$sampCnt), " +
-                    "median=${medGold}g, avg=${avgGold}g, max=${maxGold}g, highBalance(>=$thresh)=${highCnt} checkpoints (followedByPurchaseWithin2m=$prePurchCnt)$sampleStr"
+                "  - Unspent Gold (1-min gold-in-hand checkpoints, NOT recall events): eligible=${eligG}g (missing=${missSamp}g, checkpoints=$sampCnt), " +
+                    "median=${medGold}g, avg=${avgGold}g, max=${maxGold}g, high balance(>=$thresh)=${highCnt} checkpoints (followed by purchase within 2m=$prePurchCnt)$sampleStr"
             )
         }
 
@@ -1674,17 +3091,17 @@ class AiAnalysisService(
                 val lh = om["personalLh"] ?: om["totalPersonalLastHits"] ?: "null"
                 val td = om["personalTd"] ?: om["totalPersonalTakedowns"] ?: "null"
                 val tlInv = om["timelineInvolved"] ?: om["timelineObjectivesInvolved"] ?: "null"
-                return "$label(elig=${elig}g, miss=${miss}g, first=$firstCnt/$elig [$firstRate], teamKills=$teamKills [avg $teamAvg vs enemy $enemyAvg], personalLastHits=$lh, personalTakedowns=$td, timelineInvolved=$tlInv)"
+                return "$label(elig=${elig}g, miss=${miss}g, team first=$firstCnt/$elig [$firstRate], team kills=$teamKills [avg $teamAvg vs enemy $enemyAvg], personal last-hits=$lh, personal takedowns=$td, timeline involved=$tlInv)"
             }
             val objSummaries = listOfNotNull(
                 fmtObj("tower", "tower"),
                 fmtObj("dragon", "dragon"),
                 fmtObj("baron", "baron"),
-                fmtObj("riftHerald", "riftHerald"),
+                fmtObj("riftHerald", "rift herald"),
                 fmtObj("horde", "voidgrubs")
             )
             lines.add(
-                "  - Team Objectives (team totals vs personal credits): eligibleTeam=${eligTeam}g (missingTeams=${missTeams}g, timelineEligible=${tlElig}g); " +
+                "  - Team Objectives (5-player team totals vs personal credits): eligible team games=${eligTeam}g (missing=${missTeams}g, timeline games=${tlElig}g); " +
                     objSummaries.joinToString("; ")
             )
         }
@@ -1717,7 +3134,7 @@ class AiAnalysisService(
         
         return when {
             wins >= 4 -> "Player is on a win streak. Be encouraging about current performance and momentum."
-            wins <= 1 -> "Player is struggling. Use extra supportive tone and focus on small, achievable improvements. Build confidence."
+            wins <= 1 -> "Player had a rough last-5 stretch. Keep constructive focus on two controllable next-game habits (unless playful bluntness/roasting was explicitly invited)."
             else -> "Standard coaching tone."
         }
     }
