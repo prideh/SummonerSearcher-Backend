@@ -617,6 +617,7 @@ class RiotApiRateLimiter(
         private val name: String
     ) {
         private val timestamps = ArrayDeque<Long>()
+        private val timestampsLock = Any()
         private val mutex = Mutex()
         val windowSeconds = window.seconds.toInt()
         private val windowMs = window.toMillis()
@@ -626,7 +627,9 @@ class RiotApiRateLimiter(
         }
 
         fun currentUsage(now: Long): Int {
-            return timestamps.count { now - it < windowMs }
+            return synchronized(timestampsLock) {
+                timestamps.count { now - it < windowMs }
+            }
         }
 
         fun hasHeadroomForLowPriority(now: Long): Boolean {
@@ -639,11 +642,13 @@ class RiotApiRateLimiter(
                 ApiPriority.HIGH -> capacity
                 ApiPriority.LOW -> (capacity * LOW_PRIORITY_CAP_RATIO).toInt().coerceAtLeast(1)
             }
-            val active = timestamps.filter { now - it < windowMs }
-            if (active.size < effectiveCapacity) return 0L
-            val targetIndex = (active.size - effectiveCapacity).coerceIn(0, active.size - 1)
-            val expiryTime = active[targetIndex] + windowMs
-            return (expiryTime - now).coerceAtLeast(0L)
+            return synchronized(timestampsLock) {
+                val active = timestamps.filter { now - it < windowMs }
+                if (active.size < effectiveCapacity) return@synchronized 0L
+                val targetIndex = (active.size - effectiveCapacity).coerceIn(0, active.size - 1)
+                val expiryTime = active[targetIndex] + windowMs
+                (expiryTime - now).coerceAtLeast(0L)
+            }
         }
 
         suspend fun updateConfig(newCapacity: Int, remoteCount: Int, deadlineAtMs: Long? = null): Boolean {
@@ -668,14 +673,16 @@ class RiotApiRateLimiter(
             }
             try {
                 val now = timeProvider.now()
-                cleanUp(now)
+                synchronized(timestampsLock) {
+                    cleanUp(now)
 
-                val localCount = timestamps.size
-                if (remoteCount > localCount) {
-                    val diff = remoteCount - localCount
-                    logger.trace("[{}] Syncing count: Local {} < Remote {}. Adding {} fake entries.", name, localCount, remoteCount, diff)
-                    repeat(diff) {
-                        timestamps.addLast(now)
+                    val localCount = timestamps.size
+                    if (remoteCount > localCount) {
+                        val diff = remoteCount - localCount
+                        logger.trace("[{}] Syncing count: Local {} < Remote {}. Adding {} fake entries.", name, localCount, remoteCount, diff)
+                        repeat(diff) {
+                            timestamps.addLast(now)
+                        }
                     }
                 }
             } finally {
@@ -687,26 +694,33 @@ class RiotApiRateLimiter(
             mutex.withLock {
                 while (true) {
                     val now = timeProvider.now()
-                    cleanUp(now)
-
-                    // Reserve 20% headroom for HIGH priority requests by capping LOW priority at 80% capacity
                     val effectiveCapacity = when (priority) {
                         ApiPriority.HIGH -> capacity
                         ApiPriority.LOW -> (capacity * LOW_PRIORITY_CAP_RATIO).toInt().coerceAtLeast(1)
                     }
 
-                    if (timestamps.size < effectiveCapacity) {
-                        timestamps.addLast(timeProvider.now())
+                    var acquired = false
+                    var waitTime = 0L
+                    var currentSize = 0
+                    synchronized(timestampsLock) {
+                        cleanUp(now)
+                        if (timestamps.size < effectiveCapacity) {
+                            timestamps.addLast(timeProvider.now())
+                            acquired = true
+                        } else {
+                            currentSize = timestamps.size
+                            val targetIndex = (timestamps.size - effectiveCapacity).coerceIn(0, timestamps.size - 1)
+                            val targetTimestamp = timestamps[targetIndex]
+                            val expiryTime = targetTimestamp + windowMs
+                            waitTime = expiryTime - now
+                        }
+                    }
+                    if (acquired) {
                         return
                     }
 
-                    val targetIndex = (timestamps.size - effectiveCapacity).coerceIn(0, timestamps.size - 1)
-                    val targetTimestamp = timestamps[targetIndex]
-                    val expiryTime = targetTimestamp + windowMs
-                    val waitTime = expiryTime - now
-
                     if (waitTime > 0) {
-                        logger.debug("[{}] Limit reached for {} ({}/{}). Waiting {}ms...", name, priority, timestamps.size, effectiveCapacity, waitTime)
+                        logger.debug("[{}] Limit reached for {} ({}/{}). Waiting {}ms...", name, priority, currentSize, effectiveCapacity, waitTime)
                         mutex.unlock()
                         try {
                             delay(waitTime + 10)
@@ -726,25 +740,39 @@ class RiotApiRateLimiter(
             try {
                 while (true) {
                     val now = timeProvider.now()
-                    cleanUp(now)
-
                     val effectiveCapacity = when (priority) {
                         ApiPriority.HIGH -> capacity
                         ApiPriority.LOW -> (capacity * LOW_PRIORITY_CAP_RATIO).toInt().coerceAtLeast(1)
                     }
 
-                    if (timestamps.size < effectiveCapacity) {
-                        if (now > deadlineAtMs) {
-                            return false
+                    var acquired = false
+                    var deadlineAlreadyPast = false
+                    var waitTime = 0L
+                    var currentSize = 0
+                    synchronized(timestampsLock) {
+                        cleanUp(now)
+                        if (timestamps.size < effectiveCapacity) {
+                            if (now > deadlineAtMs) {
+                                deadlineAlreadyPast = true
+                            } else {
+                                timestamps.addLast(now)
+                                acquired = true
+                            }
+                        } else {
+                            currentSize = timestamps.size
+                            val targetIndex = (timestamps.size - effectiveCapacity).coerceIn(0, timestamps.size - 1)
+                            val targetTimestamp = timestamps[targetIndex]
+                            val expiryTime = targetTimestamp + windowMs
+                            waitTime = expiryTime - now
                         }
-                        timestamps.addLast(now)
+                    }
+                    if (deadlineAlreadyPast) {
+                        return false
+                    }
+                    if (acquired) {
                         return true
                     }
 
-                    val targetIndex = (timestamps.size - effectiveCapacity).coerceIn(0, timestamps.size - 1)
-                    val targetTimestamp = timestamps[targetIndex]
-                    val expiryTime = targetTimestamp + windowMs
-                    val waitTime = expiryTime - now
                     val sleepMs = (waitTime + 10L).coerceAtLeast(1L)
                     val remainingMs = deadlineAtMs - now
 
@@ -752,7 +780,7 @@ class RiotApiRateLimiter(
                         if (sleepMs > remainingMs) {
                             logger.debug(
                                 "[{}] Limit reached for {} ({}/{}). Required wait {}ms exceeds remaining budget {}ms.",
-                                name, priority, timestamps.size, effectiveCapacity, sleepMs, remainingMs
+                                name, priority, currentSize, effectiveCapacity, sleepMs, remainingMs
                             )
                             return false
                         }

@@ -1042,7 +1042,7 @@ class CoachTimelinePreparationBehaviorTest {
             val prefix = """{"metadata":{"matchId":"EUW1_BOMB","participants":[]},"info":{"frameInterval":60000,"frames":[],"participants":[""".toByteArray()
             System.arraycopy(prefix, 0, it, 0, prefix.size)
         }
-        val gzipBombPayload = "GZIP:" + Base64.getEncoder().encodeToString(
+        val gzipBombPayload = "GZIP_B64:" + Base64.getEncoder().encodeToString(
             ByteArrayOutputStream().use { bos ->
                 GZIPOutputStream(bos).use { gz -> gz.write(oversizedJsonBytes) }
                 bos.toByteArray()
@@ -1050,7 +1050,7 @@ class CoachTimelinePreparationBehaviorTest {
         )
         assertTrue(gzipBombPayload.length < 64_000, "Compressed GZIP bomb should be tiny on wire (< 64 KB)")
 
-        val validTimelineGzipPayload = "GZIP:" + Base64.getEncoder().encodeToString(
+        val validTimelineGzipPayload = "GZIP_B64:" + Base64.getEncoder().encodeToString(
             ByteArrayOutputStream().use { bos ->
                 GZIPOutputStream(bos).use { gz -> gz.write(mapper.writeValueAsBytes(buildRichRawTimeline("EUW1_MID_INF"))) }
                 bos.toByteArray()
@@ -2588,5 +2588,507 @@ class CoachTimelinePreparationBehaviorTest {
                 releaseHttpWorker.countDown()
             }
         }
+    }
+
+    private fun measureCurrentThreadAllocatedBytes(block: () -> Unit): Long {
+        val mxBean = java.lang.management.ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
+        assertTrue(mxBean.isThreadAllocatedMemorySupported, "JDK 21 HotSpot must support thread-allocated memory measurement")
+        if (!mxBean.isThreadAllocatedMemoryEnabled) {
+            mxBean.isThreadAllocatedMemoryEnabled = true
+        }
+        val tid = Thread.currentThread().threadId()
+        val before = mxBean.getThreadAllocatedBytes(tid)
+        block()
+        val after = mxBean.getThreadAllocatedBytes(tid)
+        return (after - before).coerceAtLeast(0L)
+    }
+
+    @Test
+    fun `RedisCacheService plain JSON deserialization enforces size and UTF-8 byte bounds before whole-payload conversion without toByteArray copies`() {
+        val store = ConcurrentHashMap<String, String>()
+        val redisTemplate = mockk<StringRedisTemplate>()
+        val valueOps = mockk<ValueOperations<String, String>>(relaxed = true)
+        every { redisTemplate.opsForValue() } returns valueOps
+        every { valueOps.get(any()) } answers { store[firstArg()] }
+        every { valueOps.multiGet(any()) } answers {
+            firstArg<Collection<String>>().map { store[it] }
+        }
+
+        val lenientMapper = mapper.copy().configure(
+            com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES,
+            false
+        )
+        val redisCacheService = RedisCacheService(redisTemplate, lenientMapper)
+
+        // Warm up Jackson Reader parser & BufferRecycler on this thread before measuring bytes
+        store["warmup:profile"] = lenientMapper.writeValueAsString(
+            SummonerProfileDto(
+                puuid = "warmup-puuid",
+                gameName = "Warmup 페이커 🔥",
+                tagLine = "EUW",
+                summonerLevel = 100,
+                profileIconId = 1,
+                soloQueueRank = null,
+                recentMatches = emptyList(),
+                allMatchIds = emptyList()
+            )
+        )
+        assertNotNull(redisCacheService.get("warmup:profile", SummonerProfileDto::class.java))
+
+        // 1. Oversized plain ASCII JSON (8 MiB > 4 MiB cap; 17 MiB > 16 MiB default cap): rejected in O(1) before any copy
+        val eightMiBAsciiJson = buildString(8 * 1024 * 1024 + 128) {
+            append("""{"puuid":"p1","gameName":"""")
+            repeat(8 * 1024 * 1024) { append('A') }
+            append("""","tagLine":"EUW","summonerLevel":1,"profileIconId":1,"soloQueueRank":null,"recentMatches":[],"allMatchIds":[]}""")
+        }
+        store["plain:ascii:8m"] = eightMiBAsciiJson
+
+        val reason8m = AtomicReference<String?>(null)
+        var result8m: SummonerProfileDto? = null
+        val alloc8m = measureCurrentThreadAllocatedBytes {
+            result8m = RedisCacheService.withBoundedInflateGuards(
+                RedisCacheService.BoundedInflateContext(
+                    maxInflatedBytes = 4 * 1024 * 1024,
+                    failureReasonHolder = reason8m
+                )
+            ) {
+                redisCacheService.get("plain:ascii:8m", SummonerProfileDto::class.java)
+            }
+        }
+        assertNull(result8m)
+        assertEquals("RESPONSE_TOO_LARGE", reason8m.get())
+        assertTrue(
+            alloc8m < 128 * 1024L,
+            "Oversized 8 MiB plain ASCII JSON must be rejected before conversion (< 128 KiB incl. MockK stub overhead, got $alloc8m bytes)"
+        )
+
+        val seventeenMiBAsciiJson = "A".repeat(17 * 1024 * 1024)
+        store["plain:ascii:17m"] = seventeenMiBAsciiJson
+        var unguarded17m: SummonerProfileDto? = null
+        val alloc17m = measureCurrentThreadAllocatedBytes {
+            unguarded17m = redisCacheService.get("plain:ascii:17m", SummonerProfileDto::class.java)
+        }
+        assertNull(unguarded17m)
+        assertTrue(
+            alloc17m < 128 * 1024L,
+            "Unguarded 17 MiB plain payload (> 16 MiB default cap) must abort in O(1) (< 128 KiB incl. MockK stub overhead, got $alloc17m bytes)"
+        )
+        store.remove("plain:ascii:8m")
+        store.remove("plain:ascii:17m")
+
+        // 2. Multi-byte non-ASCII UTF-8 plain JSON where rawValue.length (~2.8M chars) <= 4 MiB cap,
+        //    but true UTF-8 byte length (~8.4 MiB) > 4 MiB cap: must abort mid-stream WITHOUT an 8.4 MiB toByteArray(UTF_8) copy!
+        val koreanCharsCount = 2_800_000
+        val oversizedKoreanJson = buildString(koreanCharsCount + 256) {
+            append("""{"puuid":"p-kr","gameName":"Faker","tagLine":"KR1","summonerLevel":500,"profileIconId":1,"soloQueueRank":null,"recentMatches":[],"allMatchIds":[],"extra":"""")
+            repeat(koreanCharsCount) { append('페') } // 1 UTF-16 char = 3 UTF-8 bytes -> ~8.4 MiB UTF-8
+            append(""""}""")
+        }
+        assertTrue(oversizedKoreanJson.length < 4 * 1024 * 1024, "Char length (${oversizedKoreanJson.length}) must be below 4 MiB")
+        store["plain:utf8:kr"] = oversizedKoreanJson
+
+        val reasonKr = AtomicReference<String?>(null)
+        var resultKr: SummonerProfileDto? = null
+        val allocKr = measureCurrentThreadAllocatedBytes {
+            resultKr = RedisCacheService.withBoundedInflateGuards(
+                RedisCacheService.BoundedInflateContext(
+                    maxInflatedBytes = 4 * 1024 * 1024,
+                    failureReasonHolder = reasonKr
+                )
+            ) {
+                redisCacheService.get("plain:utf8:kr", SummonerProfileDto::class.java)
+            }
+        }
+        assertNull(resultKr)
+        assertEquals("RESPONSE_TOO_LARGE", reasonKr.get())
+        assertTrue(
+            allocKr < 512 * 1024L,
+            "Streaming UTF-8 reader must abort without 8.4 MiB toByteArray(UTF_8) copy (< 512 KiB allocated, got $allocKr bytes)"
+        )
+        store.remove("plain:utf8:kr")
+
+        // Also test oversized multi-byte unread tail after root '}' closes
+        val oversizedTailJson = buildString(2_000_256) {
+            append("""{"puuid":"p-tail","gameName":"Valid","tagLine":"KR1","summonerLevel":100,"profileIconId":1,"soloQueueRank":null,"recentMatches":[],"allMatchIds":[]}""")
+            append("   ")
+            repeat(1_500_000) { append('페') } // 4.5 MiB UTF-8 trailing after root '}' closes!
+        }
+        assertTrue(oversizedTailJson.length < 4 * 1024 * 1024)
+        store["plain:utf8:tail"] = oversizedTailJson
+
+        val reasonTail = AtomicReference<String?>(null)
+        var resultTail: SummonerProfileDto? = null
+        val allocTail = measureCurrentThreadAllocatedBytes {
+            resultTail = RedisCacheService.withBoundedInflateGuards(
+                RedisCacheService.BoundedInflateContext(
+                    maxInflatedBytes = 4 * 1024 * 1024,
+                    failureReasonHolder = reasonTail
+                )
+            ) {
+                redisCacheService.get("plain:utf8:tail", SummonerProfileDto::class.java)
+            }
+        }
+        assertNull(resultTail)
+        assertEquals("RESPONSE_TOO_LARGE", reasonTail.get())
+        assertTrue(
+            allocTail < 256 * 1024L,
+            "Unread multi-byte tail after root '}' must be bounded without whole-payload allocation (got $allocTail bytes)"
+        )
+        store.remove("plain:utf8:tail")
+
+        // 3. Exact UTF-8 byte boundary (8,192 bytes) with mixed 1/2/3/4-byte UTF-8 and a '🔥' surrogate pair straddling index 1023..1024
+        val prefixTemplate = """{"puuid":"p-exact","gameName":""""
+        val padBeforeChunkBoundary = 1_023 - prefixTemplate.length
+        assertTrue(padBeforeChunkBoundary > 0)
+        val baseMixedName = "A".repeat(padBeforeChunkBoundary) + "🔥" + "é페🔥".repeat(400)
+        val baseProfile = SummonerProfileDto(
+            puuid = "p-exact",
+            gameName = baseMixedName,
+            tagLine = "KR1",
+            summonerLevel = 42,
+            profileIconId = 7,
+            soloQueueRank = null,
+            recentMatches = emptyList(),
+            allMatchIds = emptyList()
+        )
+        val baseJson = lenientMapper.writeValueAsString(baseProfile)
+        assertTrue(baseJson[1_023].isHighSurrogate() && baseJson[1_024].isLowSurrogate(), "Surrogate pair must straddle 1024-char reader chunk boundary")
+        val baseUtf8Bytes = baseJson.toByteArray(StandardCharsets.UTF_8).size
+        val targetCapBytes = 8_192
+        val neededPaddingBytes = targetCapBytes - baseUtf8Bytes
+        assertTrue(neededPaddingBytes > 10)
+        val exactProfile = baseProfile.copy(tagLine = "KR1" + "B".repeat(neededPaddingBytes))
+        val exactJson = lenientMapper.writeValueAsString(exactProfile)
+        assertEquals(targetCapBytes, exactJson.toByteArray(StandardCharsets.UTF_8).size)
+        assertTrue(exactJson.length < targetCapBytes, "Multi-byte chars ensure char length < UTF-8 byte length")
+        assertTrue(exactJson[1_023].isHighSurrogate() && exactJson[1_024].isLowSurrogate())
+
+        store["plain:utf8:exact"] = exactJson
+        val passReason = AtomicReference<String?>(null)
+        val decodedExact = RedisCacheService.withBoundedInflateGuards(
+            RedisCacheService.BoundedInflateContext(
+                maxInflatedBytes = targetCapBytes,
+                failureReasonHolder = passReason
+            )
+        ) {
+            redisCacheService.get("plain:utf8:exact", SummonerProfileDto::class.java)
+        }
+        assertNull(passReason.get())
+        assertEquals(exactProfile, decodedExact)
+
+        val failByOneByteReason = AtomicReference<String?>(null)
+        val rejectedByOneByte = RedisCacheService.withBoundedInflateGuards(
+            RedisCacheService.BoundedInflateContext(
+                maxInflatedBytes = targetCapBytes - 1,
+                failureReasonHolder = failByOneByteReason
+            )
+        ) {
+            redisCacheService.get("plain:utf8:exact", SummonerProfileDto::class.java)
+        }
+        assertNull(rejectedByOneByte)
+        assertEquals("RESPONSE_TOO_LARGE", failByOneByteReason.get())
+    }
+
+    @Test
+    fun `RedisCacheService compressed GZIP_B64 deserialization enforces context-proportional Base64 and compressed bounds before allocation without substring or ISO_8859_1 copies`() = runBlocking {
+        val store = ConcurrentHashMap<String, String>()
+        val redisTemplate = mockk<StringRedisTemplate>()
+        val valueOps = mockk<ValueOperations<String, String>>(relaxed = true)
+        every { redisTemplate.opsForValue() } returns valueOps
+        every { valueOps.get(any()) } answers { store[firstArg()] }
+        every { valueOps.set(any(), any()) } answers { store[firstArg()] = secondArg() }
+        every { valueOps.set(any(), any(), any<Duration>()) } answers { store[firstArg()] = secondArg() }
+
+        val redisCacheService = RedisCacheService(redisTemplate, mapper)
+
+        // Warm up compressed set + get path once before measuring thread allocations
+        redisCacheService.set(
+            "warmup:gzip",
+            SummonerProfileDto("w", "Warmup", "EUW", 1, 1, null, emptyList(), emptyList()),
+            Duration.ofMinutes(5)
+        )
+        assertNotNull(redisCacheService.get("warmup:gzip", SummonerProfileDto::class.java))
+
+        // 1. 6.0 MiB Base64 payload (< old 12 MiB static limit!) must be rejected in O(1) before copies under 4 MiB timeline cap
+        val sixMiBB64 = "GZIP_B64:" + "A".repeat(6 * 1024 * 1024)
+        store["timeline:euw1:EUW1_6M_B64"] = sixMiBB64
+
+        val reason4m = AtomicReference<String?>(null)
+        var rejected4m: MatchTimelineDto? = null
+        val alloc4m = measureCurrentThreadAllocatedBytes {
+            rejected4m = RedisCacheService.withBoundedInflateGuards(
+                RedisCacheService.BoundedInflateContext(
+                    maxInflatedBytes = 4 * 1024 * 1024,
+                    failureReasonHolder = reason4m
+                )
+            ) {
+                redisCacheService.get("timeline:euw1:EUW1_6M_B64", MatchTimelineDto::class.java)
+            }
+        }
+        assertNull(rejected4m)
+        assertEquals("RESPONSE_TOO_LARGE", reason4m.get())
+        assertTrue(
+            alloc4m < 128 * 1024L,
+            "6 MiB Base64 must be rejected before substring/ISO_8859_1 copies under 4 MiB cap (< 128 KiB incl. MockK overhead, got $alloc4m bytes)"
+        )
+
+        // Verify TimelineService surfaces OVERSIZED_TIMELINE directly without falling back to Riot HTTP
+        val riotApiService = mockk<RiotApiService>()
+        val timelineService = TimelineService(
+            riotApiService = riotApiService,
+            redisCacheService = redisCacheService,
+            memoryStatsProvider = MutableMemoryStatsProvider(cgroupUsedBytes = 310L * 1024L * 1024L)
+        )
+        val prepRes = timelineService.prepareCoachTimelines(
+            "euw1",
+            puuid,
+            listOf("EUW1_6M_B64"),
+            listOf(buildMatchDto("EUW1_6M_B64"))
+        )
+        assertEquals("BLOCKED", prepRes.status)
+        assertEquals("OVERSIZED_TIMELINE", prepRes.stopReason)
+        coVerify(exactly = 0) { riotApiService.getMatchTimelineBounded(any(), any(), any(), any(), any(), any(), any(), any()) }
+        store.remove("timeline:euw1:EUW1_6M_B64")
+
+        // 2. 8.5 MiB Base64 payload (< old 12 MiB static limit!) must be rejected in O(1) before copies under 6 MiB profile cap
+        val eightPointFiveMiBB64 = "GZIP_B64:" + "A".repeat((8.5 * 1024 * 1024).toInt())
+        store["player:profile:euw1:p-8m5"] = eightPointFiveMiBB64
+
+        val reason6m = AtomicReference<String?>(null)
+        var rejected6m: SummonerProfileDto? = null
+        val alloc6m = measureCurrentThreadAllocatedBytes {
+            rejected6m = RedisCacheService.withBoundedInflateGuards(
+                RedisCacheService.BoundedInflateContext(
+                    maxInflatedBytes = 6 * 1024 * 1024,
+                    failureReasonHolder = reason6m
+                )
+            ) {
+                redisCacheService.get("player:profile:euw1:p-8m5", SummonerProfileDto::class.java)
+            }
+        }
+        assertNull(rejected6m)
+        assertEquals("RESPONSE_TOO_LARGE", reason6m.get())
+        assertTrue(
+            alloc6m < 128 * 1024L,
+            "8.5 MiB Base64 must be rejected before substring/ISO_8859_1 copies under 6 MiB cap (< 128 KiB incl. MockK overhead, got $alloc6m bytes)"
+        )
+        store.remove("player:profile:euw1:p-8m5")
+
+        // Also verify GZIP stream with valid small root JSON followed by 5 MiB of trailing inflated spaces after '}' is rejected!
+        val trailingGzipBomb = "GZIP_B64:" + Base64.getEncoder().encodeToString(
+            ByteArrayOutputStream().use { bos ->
+                GZIPOutputStream(bos).use { gz ->
+                    gz.write(mapper.writeValueAsBytes(SummonerProfileDto("p", "G", "T", 1, 1, null, emptyList(), emptyList())))
+                    val spaces = ByteArray(8_192) { ' '.code.toByte() }
+                    repeat(640) { gz.write(spaces) } // 5 MiB trailing whitespace after '}'
+                }
+                bos.toByteArray()
+            }
+        )
+        store["player:profile:euw1:p-trail-bomb"] = trailingGzipBomb
+        val trailBombReason = AtomicReference<String?>(null)
+        val rejectedTrailBomb = RedisCacheService.withBoundedInflateGuards(
+            RedisCacheService.BoundedInflateContext(
+                maxInflatedBytes = 4 * 1024 * 1024,
+                failureReasonHolder = trailBombReason
+            )
+        ) {
+            redisCacheService.get("player:profile:euw1:p-trail-bomb", SummonerProfileDto::class.java)
+        }
+        assertNull(rejectedTrailBomb)
+        assertEquals("RESPONSE_TOO_LARGE", trailBombReason.get())
+        store.remove("player:profile:euw1:p-trail-bomb")
+
+        // 3. Valid worst-case stored-block incompressible GZIP_B64 DTO (~2.93M Base64 chars) decodes without whole-payload
+        //    substring + ISO_8859_1 copies, AND exact 4 MiB incompressible JSON (where GZIP output > 4 MiB due to deflate headers) round-trips cleanly!
+        fun encodeStoredBlockGzipB64(rawBytes: ByteArray): String {
+            val bos = ByteArrayOutputStream(rawBytes.size + 1_024)
+            bos.write("GZIP_B64:".toByteArray(StandardCharsets.ISO_8859_1))
+            Base64.getEncoder().wrap(bos).use { b64Out ->
+                object : GZIPOutputStream(b64Out, 2_048) {
+                    init {
+                        def.setLevel(java.util.zip.Deflater.NO_COMPRESSION)
+                    }
+                }.use { gz ->
+                    gz.write(rawBytes)
+                }
+            }
+            return bos.toString(StandardCharsets.ISO_8859_1)
+        }
+
+        val lenientMapper = mapper.copy().configure(
+            com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES,
+            false
+        )
+        val lenientRedisCacheService = RedisCacheService(redisTemplate, lenientMapper)
+        store["warmup:lenient:gzip"] = store["warmup:gzip"]!!
+        assertNotNull(lenientRedisCacheService.get("warmup:lenient:gzip", SummonerProfileDto::class.java))
+
+        val rng = java.util.Random(42L)
+        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+        val incompressibleChars = CharArray(2_200_000) { alphabet[rng.nextInt(alphabet.length)] }
+
+        // 3a. 2.93M-char stored-block GZIP_B64 payload with skipped field: isolates RedisCacheService stream pipeline from Jackson String materialization,
+        //     proving < 256 KiB total heap allocation across the entire 2.93M-char decode (vs ~5.86 MiB from old substring + toByteArray copies)!
+        val skippedFieldJsonBytes = buildString(2_200_256) {
+            append("""{"puuid":"p-skip","gameName":"ZeroCopy","tagLine":"EUW","summonerLevel":300,"profileIconId":10,"soloQueueRank":null,"recentMatches":[],"allMatchIds":[],"championStats":[],"overallStats":null,"improvementStats":null,"totalMatches":0,"lastRefreshed":null,"pad":"""")
+            append(incompressibleChars)
+            append(""""}""")
+        }.toByteArray(StandardCharsets.UTF_8)
+        val storedSkippedCompressed = encodeStoredBlockGzipB64(skippedFieldJsonBytes)
+        assertTrue(storedSkippedCompressed.length > 2_900_000)
+        store["player:profile:euw1:p-skip-incomp"] = storedSkippedCompressed
+
+        var decodedSkipped: SummonerProfileDto? = null
+        val allocSkipped = measureCurrentThreadAllocatedBytes {
+            decodedSkipped = RedisCacheService.withBoundedInflateGuards(
+                RedisCacheService.BoundedInflateContext(maxInflatedBytes = 4 * 1024 * 1024)
+            ) {
+                lenientRedisCacheService.get("player:profile:euw1:p-skip-incomp", SummonerProfileDto::class.java)
+            }
+        }
+        assertEquals("ZeroCopy", decodedSkipped?.gameName)
+        assertTrue(
+            allocSkipped < 256 * 1024L,
+            "Streaming 2.93M-char GZIP_B64 slice decode must allocate < 256 KiB total (vs ~5.86 MiB substring + ISO_8859_1 copies, got $allocSkipped bytes)"
+        )
+        store.remove("player:profile:euw1:p-skip-incomp")
+
+        // 3b. Full 2.2M-char retained String field round-trips identically without ~5.86 MiB upfront copies
+        val incompressibleProfile = SummonerProfileDto(
+            puuid = "p-incomp",
+            gameName = "Incompressible",
+            tagLine = String(incompressibleChars),
+            summonerLevel = 300,
+            profileIconId = 10,
+            soloQueueRank = null,
+            recentMatches = emptyList(),
+            allMatchIds = emptyList()
+        )
+        val storedCompressed = encodeStoredBlockGzipB64(mapper.writeValueAsBytes(incompressibleProfile))
+        store["player:profile:euw1:p-incomp"] = storedCompressed
+        assertTrue(storedCompressed.startsWith("GZIP_B64:"))
+        assertTrue(storedCompressed.length > 2_900_000, "Stored-block Base64 fixture should exceed 2.9M chars (got ${storedCompressed.length})")
+
+        var decodedIncomp: SummonerProfileDto? = null
+        val allocIncomp = measureCurrentThreadAllocatedBytes {
+            decodedIncomp = RedisCacheService.withBoundedInflateGuards(
+                RedisCacheService.BoundedInflateContext(maxInflatedBytes = 4 * 1024 * 1024)
+            ) {
+                redisCacheService.get("player:profile:euw1:p-incomp", SummonerProfileDto::class.java)
+            }
+        }
+        assertEquals(incompressibleProfile, decodedIncomp)
+        // Jackson TextBuffer + final String materialization for 2.2M chars is ~8.8 MiB; old code added ~5.86 MiB upfront copies (~14.7 MiB).
+        assertTrue(
+            allocIncomp < 10_000_000L,
+            "Streaming Base64 slice decode must avoid ~5.86 MiB upfront substring + toByteArray copies (allocated $allocIncomp bytes)"
+        )
+        store.remove("player:profile:euw1:p-incomp")
+
+        // Maximal stored-block incompressible fixture at exact 4 MiB inflated cap (whose GZIP bytes exceed 4 MiB due to deflate block headers + 18B GZIP framing)
+        val emptyTagSize = mapper.writeValueAsBytes(incompressibleProfile.copy(tagLine = "")).size
+        val near4mChars = CharArray(4 * 1024 * 1024 - emptyTagSize) { alphabet[rng.nextInt(alphabet.length)] }
+        val near4mProfile = incompressibleProfile.copy(tagLine = String(near4mChars))
+        val near4mJsonBytes = mapper.writeValueAsBytes(near4mProfile)
+        assertEquals(4 * 1024 * 1024, near4mJsonBytes.size)
+        store["player:profile:euw1:p-near4m"] = encodeStoredBlockGzipB64(near4mJsonBytes)
+        val near4mReason = AtomicReference<String?>(null)
+        val decodedNear4m = RedisCacheService.withBoundedInflateGuards(
+            RedisCacheService.BoundedInflateContext(
+                maxInflatedBytes = 4 * 1024 * 1024,
+                failureReasonHolder = near4mReason
+            )
+        ) {
+            redisCacheService.get("player:profile:euw1:p-near4m", SummonerProfileDto::class.java)
+        }
+        assertNull(near4mReason.get())
+        assertEquals(near4mProfile, decodedNear4m)
+    }
+
+    @Test
+    fun `RedisCacheService preserves full compatibility for valid legacy plain JSON and GZIP_B64 cache fixtures across single get multiGet non-ASCII DTOs and TimelineService`() = runBlocking {
+        val store = ConcurrentHashMap<String, String>()
+        val redisTemplate = mockk<StringRedisTemplate>()
+        val valueOps = mockk<ValueOperations<String, String>>(relaxed = true)
+        every { redisTemplate.opsForValue() } returns valueOps
+        every { valueOps.get(any()) } answers { store[firstArg()] }
+        every { valueOps.multiGet(any()) } answers {
+            firstArg<Collection<String>>().map { store[it] }
+        }
+        every { valueOps.set(any(), any()) } answers { store[firstArg()] = secondArg() }
+        every { valueOps.set(any(), any(), any<Duration>()) } answers { store[firstArg()] = secondArg() }
+
+        val redisCacheService = RedisCacheService(redisTemplate, mapper)
+
+        // 1. SummonerProfileDto with Korean + accented Latin + emoji in both legacy plain JSON and GZIP_B64
+        val sampleMatchPlain = buildMatchDto("EUW1_PLAIN_1")
+        val sampleMatchGzip = buildMatchDto("EUW1_GZIP_2")
+        val nonAsciiProfile = SummonerProfileDto(
+            puuid = puuid,
+            gameName = "페이커 Hide on bush",
+            tagLine = "KR1 🔥é",
+            summonerLevel = 777,
+            profileIconId = 29,
+            soloQueueRank = null,
+            recentMatches = listOf(sampleMatchPlain, sampleMatchGzip),
+            allMatchIds = listOf("EUW1_PLAIN_1", "EUW1_GZIP_2")
+        )
+        store["player:profile:plain"] = mapper.writeValueAsString(nonAsciiProfile)
+        redisCacheService.set("player:profile:gzip", nonAsciiProfile, Duration.ofMinutes(30))
+        assertTrue(store["player:profile:gzip"]!!.startsWith("GZIP_B64:"))
+
+        assertEquals(nonAsciiProfile, redisCacheService.get("player:profile:plain", SummonerProfileDto::class.java))
+        assertEquals(nonAsciiProfile, redisCacheService.get("player:profile:gzip", SummonerProfileDto::class.java))
+
+        // 2. MatchDto multiGet mixing legacy plain JSON, GZIP_B64, and missing key
+        store["match:euw1:EUW1_PLAIN_1"] = mapper.writeValueAsString(sampleMatchPlain)
+        redisCacheService.set("match:euw1:EUW1_GZIP_2", sampleMatchGzip, Duration.ofHours(1))
+        val batchMatches = redisCacheService.multiGet(
+            listOf("match:euw1:EUW1_PLAIN_1", "match:euw1:EUW1_GZIP_2", "match:euw1:EUW1_MISS_3"),
+            MatchDto::class.java
+        )
+        assertEquals(sampleMatchPlain, batchMatches["match:euw1:EUW1_PLAIN_1"])
+        assertEquals(sampleMatchGzip, batchMatches["match:euw1:EUW1_GZIP_2"])
+        assertNull(batchMatches["match:euw1:EUW1_MISS_3"])
+
+        // 3. CachedLeaderboardDto + String fixtures in both legacy plain JSON and GZIP_B64
+        val leaderboardFixture = CachedLeaderboardDto(
+            lastRefreshed = java.time.Instant.parse("2026-03-01T12:00:00Z"),
+            leaderboard = null
+        )
+        store["lb:plain"] = mapper.writeValueAsString(leaderboardFixture)
+        redisCacheService.set("lb:gzip", leaderboardFixture, Duration.ofMinutes(15))
+        assertEquals(leaderboardFixture, redisCacheService.get("lb:plain", CachedLeaderboardDto::class.java))
+        assertEquals(leaderboardFixture, redisCacheService.get("lb:gzip", CachedLeaderboardDto::class.java))
+
+        store["patch:plain"] = mapper.writeValueAsString("16.5.1")
+        redisCacheService.set("patch:gzip", "16.5.1", Duration.ofHours(6))
+        assertEquals("16.5.1", redisCacheService.get("patch:plain", String::class.java))
+        assertEquals("16.5.1", redisCacheService.get("patch:gzip", String::class.java))
+
+        // 4. MatchTimelineDto end-to-end through TimelineService.prepareCoachTimelines mixing legacy plain JSON + GZIP_B64
+        val rawTimeline1 = buildRichRawTimeline("EUW1_PLAIN_1", seed = 1)
+        val rawTimeline2 = buildRichRawTimeline("EUW1_GZIP_2", seed = 2)
+        store["timeline:euw1:EUW1_PLAIN_1"] = mapper.writeValueAsString(rawTimeline1)
+        redisCacheService.set("timeline:euw1:EUW1_GZIP_2", rawTimeline2, Duration.ofHours(24))
+
+        val riotApiService = mockk<RiotApiService>()
+        val timelineService = TimelineService(
+            riotApiService = riotApiService,
+            redisCacheService = redisCacheService,
+            timelineAnalysisService = TimelineAnalysisService(),
+            memoryStatsProvider = MutableMemoryStatsProvider(cgroupUsedBytes = 310L * 1024L * 1024L)
+        )
+        val prepared = timelineService.prepareCoachTimelines(
+            "euw1",
+            puuid,
+            listOf("EUW1_PLAIN_1", "EUW1_GZIP_2"),
+            listOf(sampleMatchPlain, sampleMatchGzip)
+        )
+        assertEquals("COMPLETE", prepared.status)
+        assertEquals(listOf("EUW1_PLAIN_1", "EUW1_GZIP_2"), prepared.coveredMatchIds)
+        assertEquals(2, prepared.analysis?.aggregateSummary?.gamesAnalyzed)
+        coVerify(exactly = 0) { riotApiService.getMatchTimelineBounded(any(), any(), any(), any(), any(), any(), any(), any()) }
     }
 }
