@@ -50,7 +50,9 @@ class PlayerCacheService(
     @org.springframework.beans.factory.annotation.Value("\${cohort.collector.min-free-memory-bytes:67108864}")
     private val minFreeMemoryBytes: Long = 67_108_864L,
     @org.springframework.beans.factory.annotation.Autowired(required = false)
-    private val timelineService: TimelineService? = null
+    private val timelineService: TimelineService? = null,
+    @org.springframework.beans.factory.annotation.Value("\${cache.legacy-role-quest-backfill-enabled:false}")
+    private val legacyRoleQuestBackfillEnabled: Boolean = false
 ) {
 
     private val logger = LoggerFactory.getLogger(javaClass)
@@ -65,6 +67,14 @@ class PlayerCacheService(
     private val verifiedCompleteRedisOnlySeasons = LinkedHashMap<String, VerifiedRedisSeasonMarker>()
     private val backgroundRefreshScope = CoroutineScope(SupervisorJob() + Dispatchers.IO.limitedParallelism(64))
 
+    // Global & per-match concurrency/cooldown guards for opt-in legacy MatchDto Role Quest backfill
+    private val legacyBackfillMutex = Mutex()
+    private val inFlightLegacyMatchBackfills = ConcurrentHashMap<String, CompletableDeferred<MatchDto?>>()
+    private val legacyMatchAttemptCooldownUntilMs = ConcurrentHashMap<String, Long>()
+    private val globalLegacyBackfillLock = Any()
+    private val globalLegacyBackfillTimestampsMs = ArrayDeque<Long>()
+    private val globalLegacyBackfillSemaphore = kotlinx.coroutines.sync.Semaphore(MAX_CONCURRENT_GLOBAL_LEGACY_BACKFILLS)
+
     private val indexedPlayersUpsertedCounter = java.util.concurrent.atomic.AtomicLong(0L)
     private val indexedPlayersStaleSkippedCounter = java.util.concurrent.atomic.AtomicLong(0L)
     private val seasonStatsDbSavesCounter = java.util.concurrent.atomic.AtomicLong(0L)
@@ -72,6 +82,16 @@ class PlayerCacheService(
     private val lastRefreshPeakRetainedMatchDtos = java.util.concurrent.atomic.AtomicInteger(0)
     private val lastRefreshPeakCrossChunkRetainedMatchDtos = java.util.concurrent.atomic.AtomicInteger(0)
     private val lastRefreshPeakLiveMatchJsonBytes = java.util.concurrent.atomic.AtomicLong(0L)
+    private val legacyRoleQuestBackfillAttemptsCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val legacyRoleQuestBackfillUpdatedCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val legacyRoleQuestBackfillFailedCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val legacyRoleQuestBackfillSingleflightJoinsCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val legacyRoleQuestBackfillCacheUpgradesCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val legacyRoleQuestBackfillSkippedBudgetCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val legacyRoleQuestBackfillSkippedGlobalBudgetCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val legacyRoleQuestBackfillSkippedMatchCooldownCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val legacyRoleQuestBackfillSkippedHeadroomCounter = java.util.concurrent.atomic.AtomicLong(0L)
+    private val legacyRoleQuestBackfillSkippedRateCooldownCounter = java.util.concurrent.atomic.AtomicLong(0L)
 
     private data class InFlightRefreshEntry(
         val deferred: CompletableDeferred<SummonerProfileDto?>,
@@ -120,6 +140,13 @@ class PlayerCacheService(
         private const val MAX_MATCHES_FOR_PARTICIPANT_INDEXING = 20
         private const val MAX_INDEXED_PLAYERS_PER_BATCH = 200
         private const val MAX_OPTIMISTIC_LOCK_RETRIES = 2
+        const val MAX_LEGACY_ROLE_QUEST_BACKFILLS_PER_CALL = 3
+        const val MAX_GLOBAL_LEGACY_BACKFILLS_PER_WINDOW = 10
+        const val GLOBAL_LEGACY_BACKFILL_WINDOW_MS = 60_000L
+        const val MAX_CONCURRENT_GLOBAL_LEGACY_BACKFILLS = 2
+        const val LEGACY_MATCH_ATTEMPT_COOLDOWN_MS = 30L * 60L * 1000L // 30m cooldown including failed attempts
+        private const val MAX_TRACKED_LEGACY_COOLDOWN_KEYS = 2048
+        private val ROLE_QUEST_QUEUE_IDS = setOf(400, 420, 440, 700)
         private val PROFILE_CACHE_TTL = Duration.ofDays(14)
         private val MATCH_CACHE_TTL = Duration.ofDays(60)
         val PROFILE_FRESHNESS_WINDOW: Duration = Duration.ofMinutes(5)
@@ -144,7 +171,17 @@ class PlayerCacheService(
             "lastRefreshPeakRetainedMatchDtos" to lastRefreshPeakRetainedMatchDtos.get().toLong(),
             "lastRefreshPeakLiveMatchDtos" to lastRefreshPeakRetainedMatchDtos.get().toLong(),
             "lastRefreshPeakCrossChunkRetainedMatchDtos" to lastRefreshPeakCrossChunkRetainedMatchDtos.get().toLong(),
-            "lastRefreshPeakLiveMatchJsonBytes" to lastRefreshPeakLiveMatchJsonBytes.get()
+            "lastRefreshPeakLiveMatchJsonBytes" to lastRefreshPeakLiveMatchJsonBytes.get(),
+            "legacyRoleQuestBackfillAttempts" to legacyRoleQuestBackfillAttemptsCounter.get(),
+            "legacyRoleQuestBackfillUpdated" to legacyRoleQuestBackfillUpdatedCounter.get(),
+            "legacyRoleQuestBackfillFailed" to legacyRoleQuestBackfillFailedCounter.get(),
+            "legacyRoleQuestBackfillSingleflightJoins" to legacyRoleQuestBackfillSingleflightJoinsCounter.get(),
+            "legacyRoleQuestBackfillCacheUpgrades" to legacyRoleQuestBackfillCacheUpgradesCounter.get(),
+            "legacyRoleQuestBackfillSkippedBudget" to legacyRoleQuestBackfillSkippedBudgetCounter.get(),
+            "legacyRoleQuestBackfillSkippedGlobalBudget" to legacyRoleQuestBackfillSkippedGlobalBudgetCounter.get(),
+            "legacyRoleQuestBackfillSkippedMatchCooldown" to legacyRoleQuestBackfillSkippedMatchCooldownCounter.get(),
+            "legacyRoleQuestBackfillSkippedHeadroom" to legacyRoleQuestBackfillSkippedHeadroomCounter.get(),
+            "legacyRoleQuestBackfillSkippedRateCooldown" to legacyRoleQuestBackfillSkippedRateCooldownCounter.get()
         ) + indexStats
     }
 
@@ -646,6 +683,352 @@ class PlayerCacheService(
     private fun needsMatchBackfill(cached: MatchDto?): Boolean {
         val info = cached?.info ?: return true
         return info.gameVersion == null || info.teams == null
+    }
+
+    private fun parseMajorPatch(gameVersion: String?): Int? {
+        val trimmed = gameVersion?.trim()?.takeIf { it.isNotEmpty() } ?: return null
+        return trimmed.substringBefore('.').toIntOrNull()
+    }
+
+    /**
+     * Narrow, idempotent eligibility predicate for recovering Season 2026 `roleBoundItem` on legacy
+     * 60-day Redis `MatchDto` entries cached before `ParticipantDto.roleBoundItem` existed:
+     * - Never triggers on entries already stamped with `dtoSchemaVersion >= CURRENT_DTO_SCHEMA_VERSION` (at-most-once).
+     * - Never triggers on pre-2026 patches (`major < 16`), non-Role-Quest queues, remakes/aborts (`< 180s`), or synthetic `< 10` participant test fixtures.
+     * - Does NOT block `isProfileReadyForImmediateServe` warm reads.
+     */
+    internal fun needsLegacyRoleQuestRefresh(cached: MatchDto?): Boolean {
+        if (cached == null) return false
+        if ((cached.dtoSchemaVersion ?: 0) >= MatchDto.CURRENT_DTO_SCHEMA_VERSION) return false
+        val info = cached.info ?: return false
+        if (info.queueId !in ROLE_QUEST_QUEUE_IDS) return false
+        val majorPatch = parseMajorPatch(info.gameVersion) ?: return false
+        if (majorPatch < 16) return false
+        if ((info.gameDuration ?: 0L) < 180L) return false
+        val participants = info.participants
+        if (participants.size < 10) return false
+        if (participants.any { it.gameEndedInEarlySurrender == true }) return false
+        return participants.all { it.roleBoundItem == null }
+    }
+
+    private fun tryAcquireGlobalLegacyBackfillBudgetSlot(nowMs: Long): Boolean {
+        synchronized(globalLegacyBackfillLock) {
+            val cutoff = nowMs - GLOBAL_LEGACY_BACKFILL_WINDOW_MS
+            while (globalLegacyBackfillTimestampsMs.isNotEmpty() && globalLegacyBackfillTimestampsMs.first() <= cutoff) {
+                globalLegacyBackfillTimestampsMs.removeFirst()
+            }
+            if (globalLegacyBackfillTimestampsMs.size >= MAX_GLOBAL_LEGACY_BACKFILLS_PER_WINDOW) {
+                return false
+            }
+            globalLegacyBackfillTimestampsMs.addLast(nowMs)
+            return true
+        }
+    }
+
+    private fun recordLegacyMatchAttemptCooldown(singleflightKey: String, nowMs: Long) {
+        if (legacyMatchAttemptCooldownUntilMs.size >= MAX_TRACKED_LEGACY_COOLDOWN_KEYS) {
+            val iter = legacyMatchAttemptCooldownUntilMs.entries.iterator()
+            var removed = 0
+            while (iter.hasNext() && removed < 256) {
+                val entry = iter.next()
+                if (entry.value <= nowMs || removed < 64) {
+                    iter.remove()
+                    removed++
+                }
+            }
+        }
+        legacyMatchAttemptCooldownUntilMs[singleflightKey] = nowMs + LEGACY_MATCH_ATTEMPT_COOLDOWN_MS
+    }
+
+    private enum class SingleLegacyBackfillStatus {
+        UPDATED_FROM_API,
+        UPGRADED_FROM_CACHE,
+        JOINED_SINGLEFLIGHT_UPDATED,
+        JOINED_SINGLEFLIGHT_FAILED,
+        FAILED_API,
+        SKIPPED_MATCH_COOLDOWN,
+        SKIPPED_GLOBAL_BUDGET,
+        SKIPPED_HEADROOM,
+        SKIPPED_RATE_COOLDOWN
+    }
+
+    private data class SingleLegacyBackfillOutcome(
+        val status: SingleLegacyBackfillStatus,
+        val match: MatchDto? = null,
+        val failureReason: String? = null
+    )
+
+    private suspend fun refreshSingleLegacyMatchSingleflight(
+        matchId: String,
+        normalizedRegion: String
+    ): SingleLegacyBackfillOutcome {
+        val singleflightKey = "$normalizedRegion:$matchId"
+        val matchCacheKey = getMatchCacheKey(matchId, normalizedRegion)
+
+        var joinedDeferred: CompletableDeferred<MatchDto?>? = null
+        val ownDeferred = CompletableDeferred<MatchDto?>()
+        legacyBackfillMutex.withLock {
+            val existing = inFlightLegacyMatchBackfills[singleflightKey]
+            if (existing != null) {
+                joinedDeferred = existing
+            } else {
+                inFlightLegacyMatchBackfills[singleflightKey] = ownDeferred
+            }
+        }
+
+        if (joinedDeferred != null) {
+            legacyRoleQuestBackfillSingleflightJoinsCounter.incrementAndGet()
+            val joinedResult = joinedDeferred!!.await()
+            kotlinx.coroutines.ensureActive(kotlin.coroutines.coroutineContext)
+            return if (joinedResult != null) {
+                SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.JOINED_SINGLEFLIGHT_UPDATED, joinedResult)
+            } else {
+                SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.JOINED_SINGLEFLIGHT_FAILED)
+            }
+        }
+
+        try {
+            kotlinx.coroutines.ensureActive(kotlin.coroutines.coroutineContext)
+
+            // Check whether another node/caller already upgraded `match:{region}:{matchId}` in Redis
+            val latestCached = redisCacheService.get(matchCacheKey, MatchDto::class.java)
+            if (latestCached?.info != null && !needsLegacyRoleQuestRefresh(latestCached)) {
+                legacyRoleQuestBackfillCacheUpgradesCounter.incrementAndGet()
+                ownDeferred.complete(latestCached)
+                return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.UPGRADED_FROM_CACHE, latestCached)
+            }
+
+            val nowMs = timeProvider.now()
+            val cooldownUntil = legacyMatchAttemptCooldownUntilMs[singleflightKey]
+            if (cooldownUntil != null && nowMs < cooldownUntil) {
+                legacyRoleQuestBackfillSkippedMatchCooldownCounter.incrementAndGet()
+                ownDeferred.complete(null)
+                return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.SKIPPED_MATCH_COOLDOWN)
+            }
+
+            if (!hasMemoryHeadroomForSeasonBackfill()) {
+                legacyRoleQuestBackfillSkippedHeadroomCounter.incrementAndGet()
+                ownDeferred.complete(null)
+                return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.SKIPPED_HEADROOM)
+            }
+
+            if (riotApiService.getActiveRetryAfterWaitMs(normalizedRegion) > 0L) {
+                legacyRoleQuestBackfillSkippedRateCooldownCounter.incrementAndGet()
+                ownDeferred.complete(null)
+                return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.SKIPPED_RATE_COOLDOWN)
+            }
+
+            if (!tryAcquireGlobalLegacyBackfillBudgetSlot(nowMs)) {
+                legacyRoleQuestBackfillSkippedGlobalBudgetCounter.incrementAndGet()
+                ownDeferred.complete(null)
+                return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.SKIPPED_GLOBAL_BUDGET)
+            }
+
+            // Record per-match attempt cooldown BEFORE outbound call so failed attempts also cool down for 30m
+            recordLegacyMatchAttemptCooldown(singleflightKey, nowMs)
+            legacyRoleQuestBackfillAttemptsCounter.incrementAndGet()
+
+            val failureReason = java.util.concurrent.atomic.AtomicReference<String?>(null)
+            val fetched = globalLegacyBackfillSemaphore.withPermit {
+                kotlinx.coroutines.ensureActive(kotlin.coroutines.coroutineContext)
+                try {
+                    riotApiService.getMatchByIdLowPriority(
+                        matchId = matchId,
+                        region = normalizedRegion,
+                        maxRetries = 0,
+                        failureReasonHolder = failureReason
+                    )
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (_: Exception) {
+                    null
+                }
+            }
+
+            kotlinx.coroutines.ensureActive(kotlin.coroutines.coroutineContext)
+
+            if (fetched?.info != null &&
+                fetched.info.participants.isNotEmpty() &&
+                (fetched.metadata?.matchId == null || fetched.metadata.matchId == matchId)
+            ) {
+                // Stamp ONLY freshly decoded Riot Match-V5 responses; never mutate or reset TTL on failure
+                val freshStamped = if ((fetched.dtoSchemaVersion ?: 0) >= MatchDto.CURRENT_DTO_SCHEMA_VERSION) {
+                    fetched
+                } else {
+                    fetched.copy(dtoSchemaVersion = MatchDto.CURRENT_DTO_SCHEMA_VERSION)
+                }
+                val preservedTtl = redisCacheService.getRemainingTtl(matchCacheKey)
+                    ?.takeIf { !it.isZero && !it.isNegative }
+                    ?: MATCH_CACHE_TTL
+                redisCacheService.set(matchCacheKey, freshStamped, preservedTtl)
+                legacyRoleQuestBackfillUpdatedCounter.incrementAndGet()
+                ownDeferred.complete(freshStamped)
+                return SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.UPDATED_FROM_API, freshStamped)
+            } else {
+                legacyRoleQuestBackfillFailedCounter.incrementAndGet()
+                ownDeferred.complete(null)
+                return SingleLegacyBackfillOutcome(
+                    status = SingleLegacyBackfillStatus.FAILED_API,
+                    failureReason = failureReason.get()
+                )
+            }
+        } catch (t: Throwable) {
+            ownDeferred.complete(null)
+            throw t
+        } finally {
+            legacyBackfillMutex.withLock {
+                inFlightLegacyMatchBackfills.remove(singleflightKey, ownDeferred)
+            }
+        }
+    }
+
+    /**
+     * Bounded, globally rate-capped, singleflight, cancellation-safe legacy `MatchDto` refresh.
+     * - Disabled by default (`legacyRoleQuestBackfillEnabled = false`) so existing Redis cache is untouched unless opted in.
+     * - Enforces per-call cap (`3`), global sliding-window cap (`10/min`) + global concurrency semaphore (`2`),
+     *   per-match singleflight, and 30m per-match attempt cooldown (including failed attempts).
+     * - Preserves remaining Redis TTL on success and leaves original cache & TTL completely untouched on failure.
+     */
+    internal suspend fun refreshLegacyRoleQuestMatchesBounded(
+        matches: List<MatchDto>,
+        region: String,
+        excludedIds: Set<String> = emptySet(),
+        maxBackfills: Int = MAX_LEGACY_ROLE_QUEST_BACKFILLS_PER_CALL
+    ): Pair<List<MatchDto>, Int> {
+        kotlinx.coroutines.ensureActive(kotlin.coroutines.coroutineContext)
+        if (!legacyRoleQuestBackfillEnabled || matches.isEmpty() || maxBackfills <= 0) {
+            return matches to 0
+        }
+
+        val normalizedRegion = region.trim().lowercase()
+        val eligibleIndices = ArrayList<Int>()
+        for (i in matches.indices) {
+            val candidate = matches[i]
+            val mid = candidate.metadata?.matchId?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+            if (mid in excludedIds) continue
+            if (needsLegacyRoleQuestRefresh(candidate)) {
+                eligibleIndices.add(i)
+            }
+        }
+        if (eligibleIndices.isEmpty()) return matches to 0
+
+        val updatedList = matches.toMutableList()
+        var callBudgetConsumed = 0
+        var updatedCount = 0
+
+        for ((pos, matchIdx) in eligibleIndices.withIndex()) {
+            kotlinx.coroutines.ensureActive(kotlin.coroutines.coroutineContext)
+            if (callBudgetConsumed >= maxBackfills) {
+                legacyRoleQuestBackfillSkippedBudgetCounter.addAndGet((eligibleIndices.size - pos).toLong())
+                break
+            }
+
+            val targetMatch = updatedList[matchIdx]
+            val matchId = targetMatch.metadata?.matchId?.trim()?.takeIf { it.isNotEmpty() } ?: continue
+
+            val outcome = refreshSingleLegacyMatchSingleflight(matchId, normalizedRegion)
+            when (outcome.status) {
+                SingleLegacyBackfillStatus.UPDATED_FROM_API -> {
+                    callBudgetConsumed++
+                    updatedList[matchIdx] = outcome.match!!
+                    updatedCount++
+                }
+                SingleLegacyBackfillStatus.UPGRADED_FROM_CACHE,
+                SingleLegacyBackfillStatus.JOINED_SINGLEFLIGHT_UPDATED -> {
+                    updatedList[matchIdx] = outcome.match!!
+                    updatedCount++
+                }
+                SingleLegacyBackfillStatus.FAILED_API -> {
+                    callBudgetConsumed++
+                    if (outcome.failureReason == "HTTP_429_TOO_MANY_REQUESTS" || outcome.failureReason == "RATE_LIMIT_COOLDOWN") {
+                        val remaining = eligibleIndices.size - (pos + 1)
+                        if (remaining > 0) {
+                            legacyRoleQuestBackfillSkippedRateCooldownCounter.addAndGet(remaining.toLong())
+                        }
+                        break
+                    }
+                }
+                SingleLegacyBackfillStatus.SKIPPED_HEADROOM -> {
+                    val remaining = eligibleIndices.size - (pos + 1)
+                    if (remaining > 0) {
+                        legacyRoleQuestBackfillSkippedHeadroomCounter.addAndGet(remaining.toLong())
+                    }
+                    break
+                }
+                SingleLegacyBackfillStatus.SKIPPED_RATE_COOLDOWN -> {
+                    val remaining = eligibleIndices.size - (pos + 1)
+                    if (remaining > 0) {
+                        legacyRoleQuestBackfillSkippedRateCooldownCounter.addAndGet(remaining.toLong())
+                    }
+                    break
+                }
+                SingleLegacyBackfillStatus.SKIPPED_GLOBAL_BUDGET -> {
+                    val remaining = eligibleIndices.size - (pos + 1)
+                    if (remaining > 0) {
+                        legacyRoleQuestBackfillSkippedGlobalBudgetCounter.addAndGet(remaining.toLong())
+                    }
+                    break
+                }
+                SingleLegacyBackfillStatus.SKIPPED_MATCH_COOLDOWN,
+                SingleLegacyBackfillStatus.JOINED_SINGLEFLIGHT_FAILED -> {
+                    // Continue checking next eligible displayed match without consuming outbound Riot budget
+                }
+            }
+        }
+
+        return updatedList to updatedCount
+    }
+
+    /**
+     * Safely syncs refreshed `MatchDto` entries into a cached `SummonerProfileDto.recentMatches` under short
+     * non-blocking profile lock, re-reading the latest profile so newer `lastRefreshed` / `overallStats` /
+     * `allMatchIds` are never overwritten and preserving remaining profile TTL.
+     */
+    private fun syncEmbeddedProfileRecentMatchesIfSafe(
+        puuid: String,
+        region: String,
+        refreshedById: Map<String, MatchDto>
+    ) {
+        if (refreshedById.isEmpty()) return
+        val normalizedRegion = region.trim().lowercase()
+        val lockKey = getProfileLockKey(puuid, normalizedRegion)
+        if (!redisCacheService.setIfAbsent(lockKey, "locked", Duration.ofSeconds(10))) {
+            return
+        }
+        try {
+            val profileKey = getProfileCacheKey(puuid, normalizedRegion)
+            val currentProfile = redisCacheService.get(profileKey, SummonerProfileDto::class.java) ?: return
+            val existingRecent = currentProfile.recentMatches ?: return
+            var changed = false
+            val mergedRecent = existingRecent.map { existing ->
+                val mid = existing.metadata?.matchId?.trim()
+                val replacement = if (mid != null) refreshedById[mid] else null
+                if (replacement != null && (existing.dtoSchemaVersion ?: 0) < (replacement.dtoSchemaVersion ?: 0)) {
+                    changed = true
+                    replacement
+                } else {
+                    existing
+                }
+            }
+            if (changed) {
+                val recomputedImp = timelineAnalysisService.computeImprovementStats(
+                    timelines = emptyList(),
+                    puuid = puuid,
+                    allMatches = mergedRecent
+                )
+                val preservedTtl = redisCacheService.getRemainingTtl(profileKey)
+                    ?.takeIf { !it.isZero && !it.isNegative }
+                    ?: PROFILE_CACHE_TTL
+                redisCacheService.set(
+                    profileKey,
+                    currentProfile.copy(recentMatches = mergedRecent, improvementStats = recomputedImp),
+                    preservedTtl
+                )
+                timelineService?.invalidatePlayerPreparedCache(normalizedRegion, puuid)
+            }
+        } finally {
+            redisCacheService.delete(lockKey)
+        }
     }
 
     /**
@@ -1336,18 +1719,30 @@ class PlayerCacheService(
                     unexcludedCandidateIds.size == cachedProfile.allMatchIds.size &&
                     cachedProfile.overallStats != null)
             )) {
-                val fastImprovementStats = cachedProfile.improvementStats
-                    ?: timelineAnalysisService.computeImprovementStats(emptyList(), puuid, cachedProfile.recentMatches ?: emptyList())
+                val (fastRecentMatches, legacyUpdatedCount) = if (legacyRoleQuestBackfillEnabled && !cachedProfile.recentMatches.isNullOrEmpty()) {
+                    refreshLegacyRoleQuestMatchesBounded(cachedProfile.recentMatches, normalizedRegion)
+                } else {
+                    (cachedProfile.recentMatches ?: emptyList()) to 0
+                }
+                val fastImprovementStats = if (legacyUpdatedCount > 0 || cachedProfile.improvementStats == null) {
+                    timelineAnalysisService.computeImprovementStats(emptyList(), puuid, fastRecentMatches)
+                } else {
+                    cachedProfile.improvementStats
+                }
                 val fastUpdatedProfile = cachedProfile.copy(
                     gameName = summonerName,
                     tagLine = tagLine,
                     summonerLevel = refreshedLevel,
                     profileIconId = refreshedIconId,
                     soloQueueRank = freshRank,
+                    recentMatches = if (cachedProfile.recentMatches == null && legacyUpdatedCount == 0) null else fastRecentMatches,
                     improvementStats = fastImprovementStats,
                     lastRefreshed = Instant.ofEpochMilli(timeProvider.now())
                 )
                 redisCacheService.set(cacheKey, fastUpdatedProfile, PROFILE_CACHE_TTL)
+                if (legacyUpdatedCount > 0) {
+                    timelineService?.invalidatePlayerPreparedCache(normalizedRegion, puuid)
+                }
                 val totalFastMs = timeProvider.now() - refreshStartMs
                 logger.info(
                     "Fast-path refresh for {}#{} ({}): totalMs={}, metadataAndIdsMs={}, totalMatches={} (no new matches since {}).",
@@ -1882,6 +2277,16 @@ class PlayerCacheService(
                 }
             }
 
+            if (legacyRoleQuestBackfillEnabled && recentMatches.isNotEmpty()) {
+                val (refreshedRecent, _) = refreshLegacyRoleQuestMatchesBounded(
+                    matches = recentMatches,
+                    region = normalizedRegion,
+                    excludedIds = alreadyFetchedIds
+                )
+                recentMatches.clear()
+                recentMatches.addAll(refreshedRecent)
+            }
+
             val (championStats, overallStats) = finalAccumulator.getResult()
             val matchOnlyImprovementStats = timelineAnalysisService.computeImprovementStats(
                 timelines = emptyList(),
@@ -1966,7 +2371,12 @@ class PlayerCacheService(
         return redisCacheService.get(cacheKey, SummonerProfileDto::class.java)
     }
 
-    suspend fun getMatchesByIds(matchIds: List<String>, region: String): List<com.pride.summoner_searcher_api.dto.MatchDto> = kotlinx.coroutines.coroutineScope {
+    @JvmOverloads
+    suspend fun getMatchesByIds(
+        matchIds: List<String>,
+        region: String,
+        ownerPuuid: String? = null
+    ): List<com.pride.summoner_searcher_api.dto.MatchDto> = kotlinx.coroutines.coroutineScope {
         if (matchIds.isEmpty()) return@coroutineScope emptyList()
         
         val redisKeys = matchIds.map { getMatchCacheKey(it, region) }
@@ -1982,6 +2392,8 @@ class PlayerCacheService(
                 fetchSemaphore.acquire()
                 try {
                     riotApiService.getMatchById(matchId, region)
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     null
                 } finally {
@@ -2005,9 +2417,27 @@ class PlayerCacheService(
             indexPlayersFromMatches(fetchedMatches, region)
         }
         
-        matchIds.mapNotNull { id ->
+        val assembled = matchIds.mapNotNull { id ->
             fetchedById[id] ?: cachedMatchesMap[getMatchCacheKey(id, region)]
         }
+
+        if (!legacyRoleQuestBackfillEnabled || assembled.isEmpty()) {
+            return@coroutineScope assembled
+        }
+
+        val (refreshedList, updatedCount) = refreshLegacyRoleQuestMatchesBounded(
+            matches = assembled,
+            region = region,
+            excludedIds = fetchedById.keys.filterNotNull().toSet()
+        )
+        if (updatedCount > 0 && !ownerPuuid.isNullOrBlank()) {
+            val refreshedById = refreshedList
+                .filter { (it.dtoSchemaVersion ?: 0) >= MatchDto.CURRENT_DTO_SCHEMA_VERSION }
+                .mapNotNull { m -> m.metadata?.matchId?.trim()?.takeIf { it.isNotEmpty() }?.let { it to m } }
+                .toMap()
+            syncEmbeddedProfileRecentMatchesIfSafe(ownerPuuid, region, refreshedById)
+        }
+        refreshedList
     }
 
     /**

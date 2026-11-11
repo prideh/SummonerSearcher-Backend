@@ -24,6 +24,9 @@ class TimelineAnalysisService {
     companion object {
         private val RELEVANT_TIMELINE_EVENT_TYPES = setOf(
             "ITEM_PURCHASED",
+            "ITEM_DESTROYED",
+            "ITEM_UNDO",
+            "ITEM_SOLD",
             "LEVEL_UP",
             "SKILL_LEVEL_UP",
             "CHAMPION_KILL",
@@ -33,6 +36,18 @@ class TimelineAnalysisService {
             "WARD_PLACED",
             "WARD_KILL"
         )
+
+        private val ROLE_QUEST_QUEUE_IDS = setOf(400, 420, 440, 700)
+        private val STARTER_ROLE_QUEST_IDS = setOf(1200, 1201, 1202, 1203, 1204, 1222)
+        private val COMPLETED_ROLE_QUEST_REWARD_IDS = setOf(1205, 1206, 1207, 1208, 1209, 1210, 1211, 1220, 1221)
+        private val VERIFIED_BOT_QUEST_BOOT_IDS = setOf(
+            1001, 2422,
+            3006, 3009, 3010, 3013, 3020, 3047, 3111, 3117, 3158,
+            3170, 3171, 3172, 3173, 3174, 3175, 3176
+        )
+
+        internal fun isUndefinedWardType(wardType: String?): Boolean =
+            wardType != null && wardType.trim().equals("UNDEFINED", ignoreCase = true)
     }
 
     /**
@@ -102,11 +117,13 @@ class TimelineAnalysisService {
                     val type = ev.type ?: return@filter false
                     if (type !in RELEVANT_TIMELINE_EVENT_TYPES) return@filter false
                     when (type) {
-                        "ITEM_PURCHASED", "LEVEL_UP", "SKILL_LEVEL_UP" ->
+                        "ITEM_PURCHASED", "ITEM_DESTROYED", "ITEM_UNDO", "ITEM_SOLD", "LEVEL_UP", "SKILL_LEVEL_UP" ->
                             ev.participantId != null && ev.participantId in keptParticipantIds
                         "WARD_PLACED" ->
-                            (ev.creatorId != null && ev.creatorId in keptParticipantIds) ||
-                                (ev.participantId != null && ev.participantId in keptParticipantIds)
+                            !isUndefinedWardType(ev.wardType) && (
+                                (ev.creatorId != null && ev.creatorId in keptParticipantIds) ||
+                                    (ev.participantId != null && ev.participantId in keptParticipantIds)
+                            )
                         "WARD_KILL" ->
                             (ev.killerId != null && ev.killerId in keptParticipantIds) ||
                                 (ev.participantId != null && ev.participantId in keptParticipantIds)
@@ -161,12 +178,14 @@ class TimelineAnalysisService {
         val buildOrders = mutableListOf<BuildOrderDto>()
         val skillOrders = mutableListOf<SkillOrderDto>()
         val eventTimelines = mutableListOf<MatchEventTimelineDto>()
+        val roleQuestTimings = mutableListOf<MatchRoleQuestTimingDto>()
 
         var totalFirstDeathMinute = 0.0
         var gamesWithDeath = 0
         var totalGoldLeadAt10 = 0.0
         var totalGoldLeadAt15 = 0.0
-        var gamesWithGoldData = 0
+        var gamesWithGold10 = 0
+        var gamesWithGold15 = 0
         var totalWards = 0
         var wardsPre10 = 0
         var wardsMin10To20 = 0
@@ -178,6 +197,14 @@ class TimelineAnalysisService {
         var totalDeathsNearObjectives = 0
         var totalKills = 0
         var totalAssists = 0
+
+        var roleQuestEligibleGames = 0
+        var roleQuestCompletedGames = 0
+        var roleQuestAmbiguousGames = 0
+        var roleQuestOpponentAmbiguousOnCompleted = 0
+        var sumRoleQuestCompletionMinute = 0.0
+        var sumRoleQuestDeltaSeconds = 0.0
+        var roleQuestDeltaCount = 0
 
         for ((matchId, timeline, matchDto) in timelines) {
             val info = timeline.info ?: continue
@@ -192,6 +219,7 @@ class TimelineAnalysisService {
             val playerChampion = playerMatchParticipant.championName ?: "Unknown"
             val playerTeamId = playerMatchParticipant.teamId ?: 100
             val playerWin = playerMatchParticipant.win ?: false
+            val normalizedPlayerRole = normalizeRole(playerMatchParticipant.teamPosition ?: playerMatchParticipant.individualPosition)
 
             // Find lane opponent
             val opponentMatchParticipant = matchInfo.participants.find { p ->
@@ -232,19 +260,21 @@ class TimelineAnalysisService {
                 }
             }
 
-            // Track gold lead at 10/15
-            val minuteFrame10 = frames.getOrNull(10)
-            val minuteFrame15 = frames.getOrNull(15)
+            // Track gold lead at 10/15 using actual frame timestamps (falling back to index only if all timestamps are null)
+            val hasTimestampedFrames = frames.any { it.timestamp != null }
+            val minuteFrame10 = if (hasTimestampedFrames) findCheckpointFrame(frames, 10) else frames.getOrNull(10)
+            val minuteFrame15 = if (hasTimestampedFrames) findCheckpointFrame(frames, 15) else frames.getOrNull(15)
             if (minuteFrame10 != null && opponentParticipantId != null) {
                 val pg10 = minuteFrame10.participantFrames?.get(playerParticipantId.toString())?.totalGold ?: 0
                 val og10 = minuteFrame10.participantFrames?.get(opponentParticipantId.toString())?.totalGold ?: 0
                 totalGoldLeadAt10 += (pg10 - og10)
-                gamesWithGoldData++
+                gamesWithGold10++
             }
             if (minuteFrame15 != null && opponentParticipantId != null) {
                 val pg15 = minuteFrame15.participantFrames?.get(playerParticipantId.toString())?.totalGold ?: 0
                 val og15 = minuteFrame15.participantFrames?.get(opponentParticipantId.toString())?.totalGold ?: 0
                 totalGoldLeadAt15 += (pg15 - og15)
+                gamesWithGold15++
             }
 
             // ── Events: build all structures in one pass ──
@@ -254,17 +284,29 @@ class TimelineAnalysisService {
                 .map { (it.timestamp ?: 0L) / 60000.0 }
             val buyItems = mutableListOf<BuildItem>()
             val skillLevelUps = mutableListOf<SkillUp>()
+            val seenSkillSlotTimestampPairs = HashSet<Pair<Int, Long>>()
             val matchEvents = mutableListOf<MatchEventEntry>()
             var playerCurrentLevel = 1
 
             for (event in allEvents) {
-                val minute = ((event.timestamp ?: 0) / 60000).toInt()
-                val second = (((event.timestamp ?: 0) / 1000) % 60).toInt()
+                val ts = event.timestamp ?: 0L
+                val minute = (ts / 60000L).toInt()
+                val second = ((ts / 1000L) % 60L).toInt()
 
                 when (event.type) {
                     "ITEM_PURCHASED" -> {
-                        if (event.participantId == playerParticipantId && event.itemId != null) {
-                            buyItems.add(BuildItem(event.itemId, event.timestamp ?: 0, minute))
+                        if (event.participantId == playerParticipantId && event.itemId != null && event.itemId > 0) {
+                            buyItems.add(BuildItem(event.itemId, ts, minute))
+                        }
+                    }
+                    "ITEM_UNDO" -> {
+                        val undoneItemId = event.beforeId
+                        // Reconcile shop undo when beforeId > 0; safely ignore #1174 Tier 3 boot undo where beforeId == 0
+                        if (event.participantId == playerParticipantId && undoneItemId != null && undoneItemId > 0) {
+                            val lastIdx = buyItems.indexOfLast { it.itemId == undoneItemId }
+                            if (lastIdx >= 0) {
+                                buyItems.removeAt(lastIdx)
+                            }
                         }
                     }
                     "LEVEL_UP" -> {
@@ -273,8 +315,15 @@ class TimelineAnalysisService {
                         }
                     }
                     "SKILL_LEVEL_UP" -> {
-                        if (event.participantId == playerParticipantId && event.skillSlot != null) {
-                            skillLevelUps.add(SkillUp(event.skillSlot, playerCurrentLevel, minute))
+                        // Accept NORMAL (or legacy null) skill-ups only (excluding EVOLVE) and deduplicate
+                        // identical (skillSlot, timestamp) bursts (#1100) without imposing an 18-point hard cap
+                        // that would truncate Udyr, transformation champions, or Season 2026 Top Quest Lv19-20.
+                        val isNormalLevelUp = event.levelUpType == null || event.levelUpType.equals("NORMAL", ignoreCase = true)
+                        if (event.participantId == playerParticipantId && event.skillSlot != null && isNormalLevelUp) {
+                            val dedupKey = event.skillSlot to ts
+                            if (event.timestamp == null || seenSkillSlotTimestampPairs.add(dedupKey)) {
+                                skillLevelUps.add(SkillUp(event.skillSlot, playerCurrentLevel, minute))
+                            }
                         }
                     }
                     "CHAMPION_KILL" -> {
@@ -401,38 +450,41 @@ class TimelineAnalysisService {
                         }
                     }
                     "WARD_PLACED" -> {
-                        val isPlayerWard = event.creatorId == playerParticipantId || event.participantId == playerParticipantId
-                        val isOpponentWard = opponentParticipantId != null &&
-                                (event.creatorId == opponentParticipantId || event.participantId == opponentParticipantId)
+                        // Exclude WARD_PLACED events with wardType == "UNDEFINED" (which include Season 2026
+                        // Faelight vision interactions and non-ward entities/traps, without assuming all UNDEFINED are Faelights).
+                        if (!isUndefinedWardType(event.wardType)) {
+                            val isPlayerWard = event.creatorId == playerParticipantId || event.participantId == playerParticipantId
+                            val isOpponentWard = opponentParticipantId != null &&
+                                    (event.creatorId == opponentParticipantId || event.participantId == opponentParticipantId)
 
-                        if (isPlayerWard || isOpponentWard) {
-                            matchEvents.add(MatchEventEntry(
-                                type = "WARD_PLACED",
-                                minuteMark = minute,
-                                secondMark = second,
-                                actor = if (isPlayerWard) playerChampion else opponentChampion,
-                                target = event.wardType ?: "WARD",
-                                isPlayer = isPlayerWard,
-                                isOpponent = isOpponentWard,
-                                laneType = null,
-                                monsterType = null,
-                                position = null,
-                                wardType = event.wardType
-                            ))
-                        }
-
-                        if (isPlayerWard) {
-                            totalWards++
-                            when {
-                                minute < 10 -> wardsPre10++
-                                minute < 20 -> wardsMin10To20++
-                                else -> wardsPost20++
+                            if (isPlayerWard || isOpponentWard) {
+                                matchEvents.add(MatchEventEntry(
+                                    type = "WARD_PLACED",
+                                    minuteMark = minute,
+                                    secondMark = second,
+                                    actor = if (isPlayerWard) playerChampion else opponentChampion,
+                                    target = event.wardType ?: "WARD",
+                                    isPlayer = isPlayerWard,
+                                    isOpponent = isOpponentWard,
+                                    laneType = null,
+                                    monsterType = null,
+                                    position = null,
+                                    wardType = event.wardType
+                                ))
                             }
-                            val timestamp = event.timestamp ?: 0L
-                            val closestMinute = if (timestamp % 60000 >= 30000) minute + 1 else minute
-                            val pos = event.position ?: frames.getOrNull(closestMinute)?.participantFrames?.get(playerParticipantId.toString())?.position
-                            if (pos?.x != null && pos.y != null) {
-                                wards.add(HeatmapPoint(pos.x, pos.y, matchId, minute))
+
+                            if (isPlayerWard) {
+                                totalWards++
+                                when {
+                                    minute < 10 -> wardsPre10++
+                                    minute < 20 -> wardsMin10To20++
+                                    else -> wardsPost20++
+                                }
+                                val nearestFrame = findNearestFrame(frames, ts)
+                                val pos = event.position ?: nearestFrame?.participantFrames?.get(playerParticipantId.toString())?.position
+                                if (pos?.x != null && pos.y != null) {
+                                    wards.add(HeatmapPoint(pos.x, pos.y, matchId, minute))
+                                }
                             }
                         }
                     }
@@ -457,6 +509,34 @@ class TimelineAnalysisService {
                                 wardType = event.wardType
                             ))
                         }
+                    }
+                }
+            }
+
+            // Compute conservative Season 2026 Role Quest timing (null whenever legacy/0/unknown/uncompleted/ambiguous)
+            val questEval = evaluateMatchRoleQuestTiming(
+                matchId = matchId,
+                matchInfo = matchInfo,
+                playerParticipant = playerMatchParticipant,
+                playerParticipantId = playerParticipantId,
+                playerRole = normalizedPlayerRole,
+                opponentParticipant = opponentMatchParticipant,
+                opponentParticipantId = opponentParticipantId,
+                allEvents = allEvents
+            )
+            roleQuestTimings.add(questEval.dto)
+            if (questEval.isSeasonQuestEligible) {
+                roleQuestEligibleGames++
+                if (questEval.isPlayerAmbiguous) {
+                    roleQuestAmbiguousGames++
+                } else if (questEval.dto.playerQuestCompleted == true && questEval.dto.playerCompletionMinute != null) {
+                    roleQuestCompletedGames++
+                    sumRoleQuestCompletionMinute += questEval.dto.playerCompletionMinute
+                    if (questEval.isOpponentAmbiguous) {
+                        roleQuestOpponentAmbiguousOnCompleted++
+                    } else if (questEval.dto.completionDeltaSeconds != null) {
+                        sumRoleQuestDeltaSeconds += questEval.dto.completionDeltaSeconds
+                        roleQuestDeltaCount++
                     }
                 }
             }
@@ -489,8 +569,21 @@ class TimelineAnalysisService {
         // ── Aggregate summary ──
         val deathZone = computeMostDangerousZone(deaths)
         val avgFirstDeath = if (gamesWithDeath > 0) totalFirstDeathMinute / gamesWithDeath else 0.0
-        val avgGold10 = if (gamesWithGoldData > 0) totalGoldLeadAt10 / gamesWithGoldData else 0.0
-        val avgGold15 = if (gamesWithGoldData > 0) totalGoldLeadAt15 / gamesWithGoldData else 0.0
+        val avgGold10 = if (gamesWithGold10 > 0) totalGoldLeadAt10 / gamesWithGold10 else 0.0
+        val avgGold15 = if (gamesWithGold15 > 0) totalGoldLeadAt15 / gamesWithGold15 else 0.0
+
+        // Never compute whole-sample Role Quest timing averages when any eligible match in the sample is ambiguous/unknown
+        val avgQuestMin = if (roleQuestEligibleGames > 0 && roleQuestAmbiguousGames == 0 && roleQuestCompletedGames > 0) {
+            round1(sumRoleQuestCompletionMinute / roleQuestCompletedGames)
+        } else null
+        val avgQuestDeltaSec = if (
+            roleQuestEligibleGames > 0 &&
+            roleQuestAmbiguousGames == 0 &&
+            roleQuestOpponentAmbiguousOnCompleted == 0 &&
+            roleQuestDeltaCount > 0
+        ) {
+            round1(sumRoleQuestDeltaSeconds / roleQuestDeltaCount)
+        } else null
 
         val improvementStats = computeImprovementStats(timelines, puuid, allMatches)
 
@@ -522,9 +615,15 @@ class TimelineAnalysisService {
                     pre10 = wardsPre10,
                     min10To20 = wardsMin10To20,
                     post20 = wardsPost20
-                )
+                ),
+                roleQuestEligibleGames = if (roleQuestEligibleGames > 0) roleQuestEligibleGames else null,
+                roleQuestCompletedGames = if (roleQuestEligibleGames > 0 && roleQuestAmbiguousGames == 0) roleQuestCompletedGames else null,
+                roleQuestAmbiguousGames = if (roleQuestEligibleGames > 0) roleQuestAmbiguousGames else null,
+                avgRoleQuestCompletionMinute = avgQuestMin,
+                avgRoleQuestDeltaSeconds = avgQuestDeltaSec
             ),
-            improvementStats = improvementStats
+            improvementStats = improvementStats,
+            roleQuestTimings = roleQuestTimings
         )
     }
 
@@ -670,6 +769,170 @@ class TimelineAnalysisService {
         return frames
             .filter { it.timestamp != null && abs(it.timestamp - targetMs) <= 30_000L }
             .minByOrNull { abs((it.timestamp ?: 0L) - targetMs) }
+    }
+
+    private fun findNearestFrame(frames: List<TimelineFrameDto>, timestampMs: Long): TimelineFrameDto? {
+        val timestamped = frames.filter { it.timestamp != null }
+        if (timestamped.isEmpty()) {
+            val approxIndex = ((timestampMs + 30_000L) / 60_000L).toInt()
+            return frames.getOrNull(approxIndex)
+        }
+        return timestamped.minByOrNull { abs((it.timestamp ?: 0L) - timestampMs) }
+    }
+
+    private fun reconcileParticipantPurchaseEvents(
+        frames: List<TimelineFrameDto>,
+        participantId: Int
+    ): List<TimelineEventDto> {
+        val kept = mutableListOf<TimelineEventDto>()
+        for (frame in frames) {
+            for (ev in frame.events.orEmpty()) {
+                if (ev.participantId != participantId) continue
+                when (ev.type) {
+                    "ITEM_PURCHASED" -> {
+                        if (ev.itemId != null && ev.itemId > 0 && ev.timestamp != null) {
+                            kept.add(ev)
+                        }
+                    }
+                    "ITEM_UNDO" -> {
+                        val undoneId = ev.beforeId
+                        if (undoneId != null && undoneId > 0) {
+                            val lastIdx = kept.indexOfLast { it.itemId == undoneId }
+                            if (lastIdx >= 0) {
+                                kept.removeAt(lastIdx)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return kept.sortedBy { it.timestamp ?: 0L }
+    }
+
+    private data class SingleParticipantQuestEval(
+        val questCompleted: Boolean?,
+        val completionTimestampMs: Long?,
+        val completionMinute: Double?,
+        val isAmbiguous: Boolean
+    )
+
+    private data class RoleQuestMatchEvaluation(
+        val dto: MatchRoleQuestTimingDto,
+        val isSeasonQuestEligible: Boolean,
+        val isPlayerAmbiguous: Boolean,
+        val isOpponentAmbiguous: Boolean
+    )
+
+    private fun evaluateSingleParticipantRoleQuest(
+        participant: ParticipantDto?,
+        participantId: Int?,
+        normalizedRole: String,
+        allEvents: List<TimelineEventDto>
+    ): SingleParticipantQuestEval {
+        if (participant == null || participantId == null) {
+            return SingleParticipantQuestEval(null, null, null, isAmbiguous = true)
+        }
+        val rbi = participant.roleBoundItem
+            ?: return SingleParticipantQuestEval(null, null, null, isAmbiguous = true) // legacy unknown
+        if (rbi <= 0 || rbi in STARTER_ROLE_QUEST_IDS) {
+            return SingleParticipantQuestEval(false, null, null, isAmbiguous = false)
+        }
+        val isVerifiedCompleted = rbi in COMPLETED_ROLE_QUEST_REWARD_IDS ||
+            (normalizedRole == "BOTTOM" && rbi in VERIFIED_BOT_QUEST_BOOT_IDS)
+        if (!isVerifiedCompleted) {
+            // Unseen/unknown positive item ID: preserve ID on DTO, never claim quest completion
+            return SingleParticipantQuestEval(null, null, null, isAmbiguous = true)
+        }
+
+        val starterDestroys = allEvents.filter { ev ->
+            ev.type == "ITEM_DESTROYED" &&
+                ev.participantId == participantId &&
+                ev.itemId in STARTER_ROLE_QUEST_IDS &&
+                (ev.timestamp ?: 0L) > 60_000L
+        }
+        if (starterDestroys.size != 1) {
+            return SingleParticipantQuestEval(true, null, null, isAmbiguous = true)
+        }
+        val destroyTs = starterDestroys.first().timestamp ?: return SingleParticipantQuestEval(true, null, null, isAmbiguous = true)
+        val hasLaterStarterPurchase = allEvents.any { ev ->
+            ev.type == "ITEM_PURCHASED" &&
+                ev.participantId == participantId &&
+                ev.itemId in STARTER_ROLE_QUEST_IDS &&
+                (ev.timestamp ?: 0L) > destroyTs
+        }
+        if (hasLaterStarterPurchase) {
+            return SingleParticipantQuestEval(true, null, null, isAmbiguous = true)
+        }
+        return SingleParticipantQuestEval(
+            questCompleted = true,
+            completionTimestampMs = destroyTs,
+            completionMinute = round1(destroyTs / 60_000.0),
+            isAmbiguous = false
+        )
+    }
+
+    private fun evaluateMatchRoleQuestTiming(
+        matchId: String,
+        matchInfo: MatchInfo,
+        playerParticipant: ParticipantDto,
+        playerParticipantId: Int,
+        playerRole: String,
+        opponentParticipant: ParticipantDto?,
+        opponentParticipantId: Int?,
+        allEvents: List<TimelineEventDto>
+    ): RoleQuestMatchEvaluation {
+        val majorPatch = matchInfo.gameVersion?.trim()?.substringBefore('.')?.toIntOrNull()
+        val isEligible = (majorPatch != null && majorPatch >= 16) &&
+            (matchInfo.queueId == null || matchInfo.queueId in ROLE_QUEST_QUEUE_IDS) &&
+            (matchInfo.gameDuration ?: 0L) >= 180L &&
+            playerParticipant.gameEndedInEarlySurrender != true
+
+        if (!isEligible) {
+            return RoleQuestMatchEvaluation(
+                dto = MatchRoleQuestTimingDto(
+                    matchId = matchId,
+                    role = playerRole,
+                    playerRoleBoundItem = playerParticipant.roleBoundItem,
+                    opponentRoleBoundItem = opponentParticipant?.roleBoundItem
+                ),
+                isSeasonQuestEligible = false,
+                isPlayerAmbiguous = false,
+                isOpponentAmbiguous = false
+            )
+        }
+
+        val playerEval = evaluateSingleParticipantRoleQuest(playerParticipant, playerParticipantId, playerRole, allEvents)
+        val oppRole = normalizeRole(opponentParticipant?.teamPosition ?: opponentParticipant?.individualPosition).let {
+            if (it == "UNKNOWN") playerRole else it
+        }
+        val oppEval = if (opponentParticipant != null && opponentParticipantId != null) {
+            evaluateSingleParticipantRoleQuest(opponentParticipant, opponentParticipantId, oppRole, allEvents)
+        } else {
+            SingleParticipantQuestEval(null, null, null, isAmbiguous = false)
+        }
+
+        val deltaSeconds = if (playerEval.completionTimestampMs != null && oppEval.completionTimestampMs != null) {
+            round1((playerEval.completionTimestampMs - oppEval.completionTimestampMs) / 1000.0)
+        } else null
+
+        return RoleQuestMatchEvaluation(
+            dto = MatchRoleQuestTimingDto(
+                matchId = matchId,
+                role = playerRole,
+                playerRoleBoundItem = playerParticipant.roleBoundItem,
+                opponentRoleBoundItem = opponentParticipant?.roleBoundItem,
+                playerQuestCompleted = playerEval.questCompleted,
+                opponentQuestCompleted = oppEval.questCompleted,
+                playerCompletionTimestampMs = playerEval.completionTimestampMs,
+                playerCompletionMinute = playerEval.completionMinute,
+                opponentCompletionTimestampMs = oppEval.completionTimestampMs,
+                opponentCompletionMinute = oppEval.completionMinute,
+                completionDeltaSeconds = deltaSeconds
+            ),
+            isSeasonQuestEligible = true,
+            isPlayerAmbiguous = playerEval.isAmbiguous,
+            isOpponentAmbiguous = opponentParticipant != null && oppEval.isAmbiguous
+        )
     }
 
     private fun buildImprovementSlice(
@@ -1447,10 +1710,7 @@ class TimelineAnalysisService {
             }
 
             eligibleGames++
-            val playerPurchases = frames
-                .flatMap { it.events ?: emptyList() }
-                .filter { it.type == "ITEM_PURCHASED" && it.participantId == playerPid && it.timestamp != null }
-                .sortedBy { it.timestamp ?: 0L }
+            val playerPurchases = reconcileParticipantPurchaseEvents(frames, playerPid)
 
             var matchHighCount = 0
             var matchHighBeforePurchaseCount = 0
@@ -1742,27 +2002,36 @@ class TimelineAnalysisService {
     ): List<PowerSpikePoint> {
         val playerItems = mutableListOf<Int>()
         val opponentItems = mutableListOf<Int>()
-        // We collect items from ITEM_PURCHASED events grouped by minute
-        val playerItemsByMinute = mutableMapOf<Int, MutableList<Int>>()
-        val opponentItemsByMinute = mutableMapOf<Int, MutableList<Int>>()
-
-        for (frame in frames) {
-            val minute = ((frame.timestamp ?: 0) / 60000).toInt()
-            frame.events?.forEach { event ->
-                if (event.type == "ITEM_PURCHASED") {
-                    if (event.participantId == playerParticipantId && event.itemId != null) {
-                        playerItemsByMinute.getOrPut(minute) { mutableListOf() }.add(event.itemId)
-                    }
-                    if (opponentParticipantId != null && event.participantId == opponentParticipantId && event.itemId != null) {
-                        opponentItemsByMinute.getOrPut(minute) { mutableListOf() }.add(event.itemId)
-                    }
-                }
-            }
-        }
 
         val points = mutableListOf<PowerSpikePoint>()
         for (frame in frames) {
             val minute = ((frame.timestamp ?: 0) / 60000).toInt()
+            frame.events?.forEach { event ->
+                when (event.type) {
+                    "ITEM_PURCHASED" -> {
+                        if (event.participantId == playerParticipantId && event.itemId != null && event.itemId > 0) {
+                            playerItems.add(event.itemId)
+                        }
+                        if (opponentParticipantId != null && event.participantId == opponentParticipantId && event.itemId != null && event.itemId > 0) {
+                            opponentItems.add(event.itemId)
+                        }
+                    }
+                    "ITEM_UNDO" -> {
+                        val undoneId = event.beforeId
+                        if (undoneId != null && undoneId > 0) {
+                            if (event.participantId == playerParticipantId) {
+                                val lastIdx = playerItems.indexOfLast { it == undoneId }
+                                if (lastIdx >= 0) playerItems.removeAt(lastIdx)
+                            }
+                            if (opponentParticipantId != null && event.participantId == opponentParticipantId) {
+                                val lastIdx = opponentItems.indexOfLast { it == undoneId }
+                                if (lastIdx >= 0) opponentItems.removeAt(lastIdx)
+                            }
+                        }
+                    }
+                }
+            }
+
             val playerFrame = frame.participantFrames?.get(playerParticipantId.toString()) ?: continue
             val pg = playerFrame.totalGold ?: 0
             val pxp = playerFrame.xp ?: 0
@@ -1774,10 +2043,6 @@ class TimelineAnalysisService {
             val oFrame = if (opponentParticipantId != null) frame.participantFrames?.get(opponentParticipantId.toString()) else null
             val oxp = oFrame?.xp ?: 0
             val ocs = (oFrame?.minionsKilled ?: 0) + (oFrame?.jungleMinionsKilled ?: 0)
-
-            // Accumulate items up to this minute
-            playerItemsByMinute[minute]?.let { playerItems.addAll(it) }
-            opponentItemsByMinute[minute]?.let { opponentItems.addAll(it) }
 
             // Events occurring in this minute
             val eventsThisMinute = matchEvents.filter {
