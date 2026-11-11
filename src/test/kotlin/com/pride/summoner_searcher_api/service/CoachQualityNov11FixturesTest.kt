@@ -81,9 +81,12 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
         val exemplarClean = normalFixture["exemplarCleanResponse"] as String
         @Suppress("UNCHECKED_CAST")
         val historicalBad = normalFixture["historicalBadResponses"] as List<String>
+        @Suppress("UNCHECKED_CAST")
+        val liveProviderSchemaLeaks = normalFixture["liveProviderSchemaLeakResponses"] as List<String>
+        val bloated271WordDefault = normalFixture["bloated271WordDefaultResponse"] as String
 
         When("constructing prompts for default short vs explicitly expanded coaching requests") {
-            Then("it enforces 3-sample separation, verified abilities, team-objective non-attribution, 114/120 theoreticalMax ceilings (including FE Map roleBreakdown and <10m/Jungle null fail-closed), timeline association limits, and <=16KB budget") {
+            Then("it enforces concise ~80-130w default, human sample labels, 3-sample separation, verified abilities + own-ready vs enemy-unavailable polarity, team-objective non-attribution, 114/120 theoreticalMax ceilings, timeline association limits, and <=16KB budget") {
                 clearMocks(exampleRepository, patternRepository)
                 every {
                     exampleRepository.findByIsActiveTrueAndQuestionCategoryOrderByQualityScoreDesc(any(), any())
@@ -105,11 +108,14 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 val defaultPrompt = buildPrompt(context, userMessage)
                 val expandedPrompt = buildPrompt(context, expandedUserMessage)
 
-                // 1. Short default + <=2 controllable actions vs expand on request
+                // 1. Short default (~80-130 words) + <=2 observable actions vs expand on request
                 AiAnalysisService.requestsExpandedAnswer(userMessage) shouldBe false
                 AiAnalysisService.requestsExpandedAnswer(expandedUserMessage) shouldBe true
-                defaultPrompt shouldContain "Default to a **short, high-signal answer**"
+                defaultPrompt shouldContain "Default to a **short, high-signal answer** (3–5 crisp sentences, ~80–130 words total"
                 defaultPrompt shouldContain "at most two controllable next-game actions"
+                defaultPrompt shouldContain "concrete, observable in-game habits"
+                defaultPrompt shouldContain "NEVER output literal `rankedRecord`, `savedHistory`, `recentMatchSample`"
+                defaultPrompt shouldContain "never write literal `rankedRecord`/`savedHistory`/`recentMatchSample` or \"single-enemy kill credit\""
                 expandedPrompt shouldContain "The player explicitly asked for an expanded breakdown"
 
                 // 2. Separate rankedRecord / savedHistory / recentMatchSample (recent 20, NOT totalGamesAnalyzed=883)
@@ -123,8 +129,9 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 defaultPrompt shouldContain "NEVER \"lifetime\", \"all-time\", or \"career\" games, and Riot exposes **no hidden MMR**"
                 defaultPrompt shouldContain "NEVER invent \"better synergy\", \"tighter macro\", or \"cleaner execution\" as causes"
 
-                // 3. Verified champion abilities only (no "Aegis of Zealous" in learned examples or output)
-                defaultPrompt shouldContain "Verified Champion Abilities Only"
+                // 3. Verified champion abilities + own-ready vs enemy-unavailable polarity (no "Aegis of Zealous" in learned examples or output)
+                defaultPrompt shouldContain "Verified Champion Abilities Only & Own-Ready vs. Enemy-Unavailable Polarity"
+                defaultPrompt shouldContain "Keep **your own passive/stacks/spells READY** strictly separate from **enemy mobility/defensive cooldowns DOWN/used**"
                 defaultPrompt shouldNotContain "shows low-percentage fights with Aegis of Zealous"
                 defaultPrompt shouldContain "Team first-Voidgrub rate is a 5-player team stat"
 
@@ -144,9 +151,10 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 defaultPrompt shouldContain "Game 1 (Oldest Match in Context): L on Pantheon vs EnemyJg1 (LeeSin)"
                 defaultPrompt shouldContain "laneCs@10=8, cs10.theoreticalMax=null"
 
-                // 5. Team objectives & timeline associations != proven causes
+                // 5. Team objectives & aggregate/timeline associations != proven causes
                 defaultPrompt shouldContain "**5-player team outcomes**—NEVER praise or blame them as personal player performance or weakness"
                 defaultPrompt shouldContain "Causality boundary: Timeline diffs, zones, and objective-window death counts are temporal/spatial associations only"
+                defaultPrompt shouldContain "aggregate stats (KDA, avg deaths, CS/min, time dead, win rates) and `topStrengths`/`topWeaknesses` (beat/trail counts) support **hypotheses only, NEVER causal micro diagnoses**"
                 defaultPrompt shouldContain "topStrengths (beat-opp freq, NOT causal proof)"
                 defaultPrompt shouldContain "topWeaknesses (trail-opp freq, NOT causal proof)"
 
@@ -156,10 +164,12 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 fallbackPrompt shouldContain "Game Count (4)"
                 fallbackPrompt shouldNotContain "your last 883 detailed matches"
 
-                // 7. Budget & exemplar / historical regression checks
+                // 7. Budget & exemplar / historical + live-QA regression checks
                 (AiAnalysisService.utf8ByteSize(defaultPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
                 (AiAnalysisService.utf8ByteSize(expandedPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
 
+                val exemplarWords = AiAnalysisService.stripSuggestionsBlock(exemplarClean).split(Regex("\\s+")).count { it.isNotBlank() }
+                (exemplarWords in 80..135) shouldBe true
                 AiAnalysisService.containsInternalSchemaLeak(exemplarClean) shouldBe false
                 AiAnalysisService.containsCs10TheoreticalMaxMislabeling(exemplarClean) shouldBe false
                 AiAnalysisService.containsEvidenceBoundaryViolation(exemplarClean) shouldBe false
@@ -169,6 +179,14 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                     AiAnalysisService.containsEvidenceBoundaryViolation(bad) shouldBe true
                     AiAnalysisService.isEligibleCuratedExample(userMessage, bad) shouldBe false
                 }
+                liveProviderSchemaLeaks.forEach { leaky ->
+                    AiAnalysisService.containsInternalSchemaLeak(leaky) shouldBe true
+                    AiAnalysisService.isEligibleCuratedExample(userMessage, leaky) shouldBe false
+                }
+                val bloatedWords = AiAnalysisService.stripSuggestionsBlock(bloated271WordDefault).split(Regex("\\s+")).count { it.isNotBlank() }
+                (bloatedWords >= 250) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample(userMessage, bloated271WordDefault) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample(expandedUserMessage, bloated271WordDefault) shouldBe true
             }
         }
     }
@@ -311,13 +329,17 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
         val userMessage = roastFixture["userMessage"] as String
         val exemplarClean = roastFixture["exemplarCleanResponse"] as String
         val badRoast = roastFixture["badRoastWithTeamObjectiveBlame"] as String
+        @Suppress("UNCHECKED_CAST")
+        val liveProviderRegressions = roastFixture["liveProviderRegressionBadResponses"] as List<String>
 
         When("constructing the prompt when the player explicitly asks to be roasted during a 1W-4L slump") {
-            Then("it preserves invited playful bluntness instead of forcing extra-supportive streak tone, anchors banter to personal stats, and forbids roasting team objective rates") {
+            Then("it preserves invited playful bluntness, anchors banter to personal stats as hypotheses, enforces own-ready vs enemy-unavailable polarity, and rejects all live-QA roast regressions") {
                 AiAnalysisService.invitesBluntnessOrRoast(userMessage) shouldBe true
 
                 val prompt = buildPrompt(context, userMessage)
                 prompt shouldContain "Player explicitly invited bluntness or a playful roast"
+                prompt shouldContain "keep your own passive/spell READY separate from enemy cooldowns being DOWN"
+                prompt shouldContain "never claim aggregate KDA/deaths prove over-forcing trades or bad spacing"
                 prompt shouldNotContain "Use extra supportive tone and focus on small, achievable improvements"
                 prompt shouldContain "Invited Bluntness & Playful Roasts"
                 prompt shouldContain "NEVER roast or blame the player personally for 5-player team objective rates"
@@ -325,12 +347,58 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 prompt shouldNotContain "refuse to roast"
                 (AiAnalysisService.utf8ByteSize(prompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
 
+                val roastExemplarWords = AiAnalysisService.stripSuggestionsBlock(exemplarClean).split(Regex("\\s+")).count { it.isNotBlank() }
+                (roastExemplarWords in 80..135) shouldBe true
                 AiAnalysisService.containsInternalSchemaLeak(exemplarClean) shouldBe false
                 AiAnalysisService.containsEvidenceBoundaryViolation(exemplarClean) shouldBe false
                 AiAnalysisService.isEligibleCuratedExample(userMessage, exemplarClean) shouldBe true
 
                 AiAnalysisService.containsEvidenceBoundaryViolation(badRoast) shouldBe true
                 AiAnalysisService.isEligibleCuratedExample(userMessage, badRoast) shouldBe false
+
+                // Exact live-provider QA blocking outputs from deployed b9911bf must be deterministically rejected
+                liveProviderRegressions.forEach { badLiveOutput ->
+                    AiAnalysisService.containsEvidenceBoundaryViolation(badLiveOutput) shouldBe true
+                    AiAnalysisService.isEligibleCuratedExample(userMessage, badLiveOutput) shouldBe false
+                }
+                AiAnalysisService.containsInternalSchemaLeak(liveProviderRegressions[2]) shouldBe true
+
+                // Poisoned assistant history containing any of those exact live-QA outputs is stripped at read time
+                val historyWithLiveQaRegressions = liveProviderRegressions.flatMapIndexed { idx, badText ->
+                    listOf(
+                        mapOf("role" to "user", "content" to "Prior question $idx"),
+                        mapOf("role" to "assistant", "content" to badText)
+                    )
+                }
+                val promptWithSanitizedHistory = buildPrompt(context, userMessage, historyWithLiveQaRegressions)
+                promptWithSanitizedHistory shouldNotContain "empowered passive and enemy core mobility cooldowns are down"
+                promptWithSanitizedHistory shouldNotContain "point to a persistent issue with over-forcing trades"
+                promptWithSanitizedHistory shouldNotContain "eliminate unassisted single-enemy kill credit deaths"
+                promptWithSanitizedHistory shouldContain "user: Prior question 0"
+            }
+        }
+    }
+
+    Given("Fixture 7 (live-QA b9911bf regressions): Exact deployed live-provider blocking sentences vs grounded own-ready/enemy-down and hypothesis controls") {
+        When("evaluating the 5 live-provider QA findings (reversed passive polarity, aggregate causal trade claim, telemetry jargon habit, camelCase sample leak, and 271-word unexpanded bloat)") {
+            Then("every offending live sentence is caught while grounded Pantheon own-ready vs enemy-down polarity, hypothesis wording, and negated disclaimers pass cleanly") {
+                val reversedPolarity = "Sequentially verify that your empowered passive and enemy core mobility cooldowns are down before stepping across the wave threshold."
+                val aggregateCausal = "Your saved-history 2.21 KDA and 4.9 deaths point to a persistent issue with over-forcing trades when your spacing and cooldown windows don't support the engage."
+                val jargonHabit = "Focus on two habits next game: eliminate unassisted single-enemy kill credit deaths and ward earlier."
+                val camelCaseLeak = "Across recentMatchSample (11W-9L) you improved slightly over savedHistory (52.3%) and rankedRecord (53.6%)."
+
+                AiAnalysisService.containsEvidenceBoundaryViolation(reversedPolarity) shouldBe true
+                AiAnalysisService.containsEvidenceBoundaryViolation(aggregateCausal) shouldBe true
+                AiAnalysisService.containsEvidenceBoundaryViolation(jargonHabit) shouldBe true
+                AiAnalysisService.containsInternalSchemaLeak(jargonHabit) shouldBe true
+                AiAnalysisService.containsInternalSchemaLeak(camelCaseLeak) shouldBe true
+
+                // Grounded Pantheon own-ready vs enemy-unavailable advice + conditional hypothesis wording must NOT false-positive
+                val cleanPolarityAndHypothesis =
+                    "Across your 883 saved matches (52.3% win rate), a 2.21 KDA and 4.9 average deaths only raise a hypothesis—summary stats do not point to a persistent issue with over-forcing trades when behind. Next game: (1) check that your empowered Mortal Will passive is stacked and E (Aegis Assault) is ready while the enemy's dash cooldown is down before W-engaging, and (2) crash your top wave before channeling R (Grand Starfall)."
+                AiAnalysisService.containsInternalSchemaLeak(cleanPolarityAndHypothesis) shouldBe false
+                AiAnalysisService.containsEvidenceBoundaryViolation(cleanPolarityAndHypothesis) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample("Roast my Pantheon stats and give me two habits.", cleanPolarityAndHypothesis) shouldBe true
             }
         }
     }

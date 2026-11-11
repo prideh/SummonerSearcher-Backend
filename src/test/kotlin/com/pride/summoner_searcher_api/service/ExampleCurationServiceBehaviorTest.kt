@@ -158,11 +158,23 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                 )
                 val bloatedNonExpanded = mkCandidate(
                     "Quick check on my CS?",
-                    ("Across your last 20 detailed matches (55.0% win rate), you averaged 7.1 CS/min and 76.2 lane CS at 10:00. Focus on crashing the wave before resetting so you do not lose farm during river rotations. ").repeat(8)
+                    ("Across your last 20 detailed matches (55.0% win rate), you averaged 7.1 CS/min and 76.2 lane CS at 10:00. Focus on crashing the wave before resetting so you do not lose farm during river rotations. ").repeat(6)
+                )
+                val badReversedPassivePolarity = mkCandidate(
+                    "Roast my Pantheon laning!",
+                    "Sequentially verify that your empowered passive and enemy core mobility cooldowns are down before stepping across the wave threshold.\n---SUGGESTIONS--- [\"Check trades\", \"Review resets\", \"Compare matchups\"]"
+                )
+                val badAggregateCausalDiagnosis = mkCandidate(
+                    "Roast my Pantheon stats!",
+                    "Across your 883 saved matches, your 2.21 KDA and 4.9 deaths point to a persistent issue with over-forcing trades when your spacing and cooldown windows don't support the engage. Next game, eliminate unassisted single-enemy kill credit deaths.\n---SUGGESTIONS--- [\"Check deaths\", \"Review trades\", \"Compare side splits\"]"
+                )
+                val badRawSchemaIdentifierLeak = mkCandidate(
+                    "How is my win rate looking?",
+                    "Across recentMatchSample you went 11W-9L (55.0%), compared with savedHistory (52.3%) and rankedRecord (53.6%). Next game, track your pre-6 wave crash.\n---SUGGESTIONS--- [\"Check builds\", \"Review matchups\", \"Compare sides\"]"
                 )
                 val cleanShortDefault = mkCandidate(
                     "How is my early Pantheon farming?",
-                    "Across **your last 20 detailed matches** (11W–9L, **55.0%** win rate), you average **76.2 lane CS at 10:00** (with **114** as the Patch 26.1+ theoretical maximum passive wave spawn—a ceiling, not a target) and **7.1 CS/min** across **883 saved matches** (**52.3%** win rate). Match summary stats don't show wave states at recall, so next game: (1) **check whether early R roams happen before crashing the wave**, and (2) **track one pre-6 reset on a cannon wave**.\n---SUGGESTIONS--- [\"How do my mid-game CS numbers hold up?\", \"When should Pantheon Ult from top?\", \"Compare my Blue and Red side stats\"]"
+                    "Across **your last 20 detailed matches** (11W–9L, **55.0%** win rate), you average **76.2 lane CS at 10:00** (with **114** as the Patch 26.1+ theoretical maximum passive wave spawn—a ceiling, not a target) and **7.1 CS/min** across **your 883 saved matches** (**52.3%** win rate). Summary stats only support hypotheses about recall states, so next game: (1) **check whether early R roams happen before crashing the wave**, and (2) **track one pre-6 reset on a cannon wave**.\n---SUGGESTIONS--- [\"How do my mid-game CS numbers hold up?\", \"When should Pantheon Ult from top?\", \"Compare my Blue and Red side stats\"]"
                 )
 
                 val legacyPoisonedHighScore = AiLearnedExample(
@@ -186,6 +198,9 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                     badCs10Target,
                     badVoidgrubAndAbility,
                     bloatedNonExpanded,
+                    badReversedPassivePolarity,
+                    badAggregateCausalDiagnosis,
+                    badRawSchemaIdentifierLeak,
                     cleanShortDefault
                 )
                 every { exampleRepository.countByQuestionCategoryAndIsActive("cs_farming", true) } returns 10L
@@ -198,7 +213,12 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                 val savedRun = slot<CurationRun>()
                 every { curationRunRepository.save(capture(savedRun)) } answers { firstArg<CurationRun>() }
                 every { promptVersionRepository.findByIsActiveTrueAndIsChallengerTrue() } returns emptyList()
-                every { feedbackRepository.findNegativeRateByCategory(any(), any()) } returns emptyList()
+                every { feedbackRepository.findNegativeRateByCategory(any(), any()) } returns listOf(
+                    arrayOf<Any>("trading_laning", 15L, 21L)
+                )
+                every { promptVersionRepository.findByIsActiveTrueAndCategoryScope("trading_laning") } returns emptyList()
+                val savedTradingChallenger = slot<PromptVersion>()
+                every { promptVersionRepository.save(capture(savedTradingChallenger)) } answers { firstArg<PromptVersion>() }
 
                 curationService.curateNewExamples()
 
@@ -208,6 +228,8 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                 legacyPoisonedHighScore.isActive shouldBe false
                 existingCleanLowerScore.isActive shouldBe true
                 savedExamples.any { it.userQuestion == "How is my early Pantheon farming?" && it.isActive } shouldBe true
+                savedTradingChallenger.captured.categoryScope shouldBe "trading_laning"
+                AiAnalysisService.isEligiblePromptVersionDirective(savedTradingChallenger.captured.promptTemplate) shouldBe true
             }
         }
     }

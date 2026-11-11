@@ -227,11 +227,11 @@ class ExampleCurationService(
 
     private fun buildCategoryChallengerDirective(category: String): String =
         when (category) {
-            "itemization_builds" -> "Answer concisely using items grounded in context and their functional purpose against the enemy composition (never cite Mythic-era items or unverified patch numbers), then give at most two practical build or reset checks."
-            "matchups" -> "Answer concisely by citing the player's scoped matchup record with game counts and Q/W/E/R cooldown or spacing windows (use official ability names only when certain; frame unrecorded execution as hypotheses), plus at most two controllable next-game habits."
-            "cs_farming" -> "Answer concisely with sample-scoped CS/min and 10:00 lane CS numbers (frame 114 Top/Bot and 120 Mid on Patch 26.1+ strictly as the theoretical maximum passive wave spawn by 10:00—not a target or benchmark, and never a missed-CS baseline), plus at most two controllable wave-reset or recall checks."
-            "vision_warding" -> "Answer concisely using ward counts, ward types, and timing buckets only (never claim specific bush or map coordinates), and give at most two practical objective-timer warding habits."
-            else -> "Answer the user's question concisely with key sample-scoped evidence, honest uncertainty, and at most two controllable next-game actions (expand only when explicitly asked)."
+            "itemization_builds" -> "Answer concisely (~80–130 words unless expanded) in plain player labels using items grounded in context and their functional role against the enemy composition (never cite Mythic-era items or unverified patch numbers), then give two observable build or reset habits."
+            "matchups", "trading_laning", "positional_spacing" -> "Answer concisely (~80–130 words unless expanded) in plain player labels by citing the scoped matchup record with game counts, treating aggregate KDA/deaths strictly as hypotheses rather than proof of over-forcing trades or bad spacing, keeping your own passive/spell READY separate from enemy mobility/defensive cooldowns being DOWN (use official ability names only when 100% certain), and giving two observable next-game habits."
+            "cs_farming" -> "Answer concisely (~80–130 words unless expanded) in plain player labels with sample-scoped CS/min and 10:00 lane CS numbers (frame 114 Top/Bot and 120 Mid on Patch 26.1+ strictly as the theoretical maximum passive wave spawn by 10:00—not a target or benchmark, and never a missed-CS baseline), plus two observable wave-crash or recall habits."
+            "vision_warding" -> "Answer concisely (~80–130 words unless expanded) in plain player labels using ward counts, ward types, and timing buckets only (never claim specific bush or map coordinates), and give two observable objective-timer warding habits."
+            else -> "Answer concisely (~80–130 words unless expanded) using plain human sample labels, treat aggregate stats as hypotheses rather than causal micro diagnoses, keep own ability readiness separate from enemy cooldowns being down, and finish with at most two concrete, observable next-game habits."
         }
     
     /**
@@ -258,21 +258,21 @@ class ExampleCurationService(
             else -> score += 5.0
         }
         
-        // Factor 3: Coaching body length (15 points) - Short by default; fuller when expansion was requested
+        // Factor 3: Coaching body length (15 points) - Concise ~80-130w by default; fuller when expansion was requested
         val coachingBody = AiAnalysisService.stripSuggestionsBlock(interaction.aiResponse)
         val wordCount = coachingBody.split(Regex("\\s+")).count { it.isNotBlank() }
         val expandedRequested = AiAnalysisService.requestsExpandedAnswer(interaction.userQuestion)
         if (expandedRequested) {
             when {
                 wordCount in 120..420 -> score += 15.0
-                wordCount in 80..500 -> score += 10.0
-                else -> score += 5.0
+                wordCount in 80..450 -> score += 10.0
+                else -> score += 0.0
             }
         } else {
             when {
-                wordCount in 35..180 -> score += 15.0 // Ideal short default answer
-                wordCount in 20..220 -> score += 10.0
-                else -> score += 5.0
+                wordCount in 35..140 -> score += 15.0 // Ideal concise default answer
+                wordCount in 20..165 -> score += 10.0
+                else -> score += 0.0
             }
         }
         
