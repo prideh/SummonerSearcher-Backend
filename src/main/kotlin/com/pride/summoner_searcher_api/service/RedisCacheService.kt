@@ -82,6 +82,20 @@ class RedisCacheService(
     }
 
     /**
+     * Returns the remaining positive TTL of [key] in Redis, or `null` when missing, persistent (`-1`),
+     * unstubbed in mocks, or unavailable. Used by targeted cache updates to preserve remaining TTL
+     * rather than resetting expiration back to full 60d/14d windows.
+     */
+    fun getRemainingTtl(key: String): Duration? {
+        return try {
+            val remainingMs = redisTemplate.getExpire(key, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (remainingMs != null && remainingMs > 0L) Duration.ofMillis(remainingMs) else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
      * Bounded cursor-based key scan matching [pattern] (e.g., `match:euw1:*` or `player:profile:euw1:*`).
      * Enforces [maxKeys] (capped at [HARD_MAX_SCAN_KEYS]) so Redis scans are never unbounded.
      * Falls back to `redisTemplate.keys(pattern)` only when `scan` is unstubbed (returns null/throws) in unit tests.

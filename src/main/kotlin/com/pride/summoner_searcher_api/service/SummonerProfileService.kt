@@ -61,7 +61,7 @@ class SummonerProfileService(
         
         val pageMatchIds = allMatchIds.subList(start, minOf(end, allMatchIds.size))
         
-        // Use the bulk fetch method in PlayerCacheService
-        return playerCacheService.getMatchesByIds(pageMatchIds, region)
+        // Use the bulk fetch method in PlayerCacheService (passing puuid so any opt-in legacy refresh syncs profile recentMatches safely)
+        return playerCacheService.getMatchesByIds(pageMatchIds, region, ownerPuuid = puuid)
     }
 }
