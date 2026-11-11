@@ -98,8 +98,10 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
         private val failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>?
     ) : java.io.InputStream() {
         private var totalBytesRead = 0
+        private var initialHeadroomChecked = false
+        private var nextHeadroomCheckAtBytes = 1_024
 
-        private fun checkGuardsOrThrow() {
+        private fun checkFastGuardsOrThrow() {
             if (cancellationHandle?.isCancelled() == true ||
                 Thread.currentThread().isInterrupted ||
                 (deadlineAtMs != null && timeProvider.now() >= deadlineAtMs)
@@ -108,11 +110,6 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
                 abortResponseBody(response, delegate)
                 throw BoundedLeagueStreamAbortedException("DEADLINE_EXCEEDED")
             }
-            if (headroomGuard != null && !headroomGuard.invoke()) {
-                failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
-                abortResponseBody(response, delegate)
-                throw BoundedLeagueStreamAbortedException("MEMORY_HEADROOM_STOP")
-            }
             if (totalBytesRead > maxResponseBytes) {
                 failureReasonHolder?.set("RESPONSE_TOO_LARGE")
                 abortResponseBody(response, delegate)
@@ -120,25 +117,43 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
             }
         }
 
+        private fun checkHeadroomIfDueOrThrow(force: Boolean = false) {
+            if (headroomGuard != null && (force || !initialHeadroomChecked || totalBytesRead >= nextHeadroomCheckAtBytes)) {
+                initialHeadroomChecked = true
+                while (nextHeadroomCheckAtBytes <= totalBytesRead) {
+                    nextHeadroomCheckAtBytes += 1_024
+                }
+                if (!headroomGuard.invoke()) {
+                    failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
+                    abortResponseBody(response, delegate)
+                    throw BoundedLeagueStreamAbortedException("MEMORY_HEADROOM_STOP")
+                }
+            }
+        }
+
         override fun read(): Int {
-            checkGuardsOrThrow()
+            checkFastGuardsOrThrow()
+            checkHeadroomIfDueOrThrow()
             val b = delegate.read()
             if (b != -1) {
                 totalBytesRead++
             }
-            checkGuardsOrThrow()
+            checkFastGuardsOrThrow()
+            checkHeadroomIfDueOrThrow()
             return b
         }
 
         override fun read(b: ByteArray, off: Int, len: Int): Int {
             if (len <= 0) return 0
-            checkGuardsOrThrow()
+            checkFastGuardsOrThrow()
+            checkHeadroomIfDueOrThrow()
             val boundedLen = len.coerceAtMost(1_024)
             val n = delegate.read(b, off, boundedLen)
             if (n > 0) {
                 totalBytesRead += n
             }
-            checkGuardsOrThrow()
+            checkFastGuardsOrThrow()
+            checkHeadroomIfDueOrThrow(force = n in 1 until boundedLen)
             return n
         }
 
