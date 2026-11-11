@@ -15,9 +15,11 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import java.time.Duration
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
@@ -779,7 +781,7 @@ class PlayerCacheService(
         if (joinedDeferred != null) {
             legacyRoleQuestBackfillSingleflightJoinsCounter.incrementAndGet()
             val joinedResult = joinedDeferred!!.await()
-            kotlinx.coroutines.ensureActive(kotlin.coroutines.coroutineContext)
+            kotlin.coroutines.coroutineContext.ensureActive()
             return if (joinedResult != null) {
                 SingleLegacyBackfillOutcome(SingleLegacyBackfillStatus.JOINED_SINGLEFLIGHT_UPDATED, joinedResult)
             } else {
@@ -788,7 +790,7 @@ class PlayerCacheService(
         }
 
         try {
-            kotlinx.coroutines.ensureActive(kotlin.coroutines.coroutineContext)
+            kotlin.coroutines.coroutineContext.ensureActive()
 
             // Check whether another node/caller already upgraded `match:{region}:{matchId}` in Redis
             val latestCached = redisCacheService.get(matchCacheKey, MatchDto::class.java)
@@ -830,7 +832,7 @@ class PlayerCacheService(
 
             val failureReason = java.util.concurrent.atomic.AtomicReference<String?>(null)
             val fetched = globalLegacyBackfillSemaphore.withPermit {
-                kotlinx.coroutines.ensureActive(kotlin.coroutines.coroutineContext)
+                kotlin.coroutines.coroutineContext.ensureActive()
                 try {
                     riotApiService.getMatchByIdLowPriority(
                         matchId = matchId,
@@ -845,7 +847,7 @@ class PlayerCacheService(
                 }
             }
 
-            kotlinx.coroutines.ensureActive(kotlin.coroutines.coroutineContext)
+            kotlin.coroutines.coroutineContext.ensureActive()
 
             if (fetched?.info != null &&
                 fetched.info.participants.isNotEmpty() &&
@@ -895,7 +897,7 @@ class PlayerCacheService(
         excludedIds: Set<String> = emptySet(),
         maxBackfills: Int = MAX_LEGACY_ROLE_QUEST_BACKFILLS_PER_CALL
     ): Pair<List<MatchDto>, Int> {
-        kotlinx.coroutines.ensureActive(kotlin.coroutines.coroutineContext)
+        kotlin.coroutines.coroutineContext.ensureActive()
         if (!legacyRoleQuestBackfillEnabled || matches.isEmpty() || maxBackfills <= 0) {
             return matches to 0
         }
@@ -917,7 +919,7 @@ class PlayerCacheService(
         var updatedCount = 0
 
         for ((pos, matchIdx) in eligibleIndices.withIndex()) {
-            kotlinx.coroutines.ensureActive(kotlin.coroutines.coroutineContext)
+            kotlin.coroutines.coroutineContext.ensureActive()
             if (callBudgetConsumed >= maxBackfills) {
                 legacyRoleQuestBackfillSkippedBudgetCounter.addAndGet((eligibleIndices.size - pos).toLong())
                 break
@@ -991,7 +993,7 @@ class PlayerCacheService(
     ) {
         if (refreshedById.isEmpty()) return
         val normalizedRegion = region.trim().lowercase()
-        val lockKey = getProfileLockKey(puuid, normalizedRegion)
+        val lockKey = getLockKey(puuid, normalizedRegion)
         if (!redisCacheService.setIfAbsent(lockKey, "locked", Duration.ofSeconds(10))) {
             return
         }
