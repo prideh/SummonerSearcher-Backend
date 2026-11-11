@@ -71,7 +71,11 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
         skillSlot: Int? = null,
         levelUpType: String? = null,
         wardType: String? = null,
+        buildingType: String? = null,
+        laneType: String? = null,
         monsterType: String? = null,
+        monsterSubType: String? = null,
+        position: TimelinePositionDto? = null,
         killerTeamId: Int? = null,
         bounty: Int? = null,
         shutdownBounty: Int? = null
@@ -90,14 +94,14 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
         wardType = wardType,
         creatorId = creatorId,
         level = null,
-        buildingType = null,
-        laneType = null,
+        buildingType = buildingType,
+        laneType = laneType,
         towerType = null,
         teamId = null,
         killerTeamId = killerTeamId,
         monsterType = monsterType,
-        monsterSubType = null,
-        position = null,
+        monsterSubType = monsterSubType,
+        position = position,
         bounty = bounty,
         shutdownBounty = shutdownBounty,
         goldGain = null
@@ -985,6 +989,230 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 mixedAnalysis.aggregateSummary.roleQuestAmbiguousGames shouldBe 1
                 mixedAnalysis.aggregateSummary.avgRoleQuestCompletionMinute.shouldBeNull()
                 mixedAnalysis.aggregateSummary.avgRoleQuestDeltaSeconds.shouldBeNull()
+            }
+        }
+    }
+
+    Given("Plain League language output mapping & human missing-vs-zero labels (Owner 19:08)") {
+        When("TimelineAnalysisService formats event targets, missing champion fallbacks, dangerous zones, and Role Quest status labels") {
+            Then("never exposes raw schema/enum/variable names or participant indices, and distinguishes missing/unrecorded from zero in human words") {
+                val forbiddenTokens = listOf(
+                    "roleBoundItem",
+                    "dtoSchemaVersion",
+                    "BARON_NASHOR",
+                    "RIFTHERALD",
+                    "HORDE",
+                    "TOP_LANE",
+                    "MID_LANE",
+                    "BOT_LANE",
+                    "YELLOW_TRINKET",
+                    "CONTROL_WARD",
+                    "BLUE_TRINKET",
+                    "SIGHT_WARD",
+                    "UNDEFINED",
+                    "UNKNOWN",
+                    "OBJECTIVE",
+                    "Participant "
+                )
+
+                // 0 analyzed timelines -> "Not available" (missing/no sample), NOT "Unknown" or "No deaths recorded"
+                val emptyAnalysis = timelineAnalysisService.analyze(emptyList(), "puuid-3")
+                emptyAnalysis.aggregateSummary.mostDangerousZone shouldBe "Not available"
+
+                // Build a match where assisting jungler (participant 2) has null championName, player (pid 3) has 0 deaths,
+                // player Role Quest is completed (1206), and opponent (pid 8) has explicit 0 Role Quest item
+                val baseMatch = buildMatchDto("EUW1_HUMAN_1") { pid ->
+                    when (pid) {
+                        3 -> 1206
+                        8 -> 0
+                        else -> 1208
+                    }
+                }
+                val matchWithMissingChamp = baseMatch.copy(
+                    info = baseMatch.info!!.copy(
+                        participants = baseMatch.info!!.participants.map { p ->
+                            if (p.participantId == 2) p.copy(championName = null) else p
+                        }
+                    )
+                )
+
+                val richEventsFrame = TimelineFrameDto(
+                    timestamp = 840_000L, // 14:00
+                    participantFrames = mapOf(
+                        "3" to tlPFrame(participantId = 3, totalGold = 5200, position = TimelinePositionDto(7500, 7500)),
+                        "8" to tlPFrame(participantId = 8, totalGold = 4800, position = TimelinePositionDto(7600, 7600))
+                    ),
+                    events = listOf(
+                        tlEvent(
+                            type = "CHAMPION_KILL",
+                            timestamp = 845_000L,
+                            killerId = 3,
+                            victimId = 8,
+                            assistingParticipantIds = listOf(2),
+                            position = TimelinePositionDto(7550, 7550)
+                        ),
+                        tlEvent(
+                            type = "TURRET_PLATE_DESTROYED",
+                            timestamp = 780_000L,
+                            killerId = 3,
+                            laneType = "TOP_LANE",
+                            assistingParticipantIds = listOf(2)
+                        ),
+                        tlEvent(
+                            type = "BUILDING_KILL",
+                            timestamp = 850_000L,
+                            killerId = 3,
+                            laneType = null,
+                            buildingType = "TOWER_BUILDING"
+                        ),
+                        tlEvent(
+                            type = "ELITE_MONSTER_KILL",
+                            timestamp = 855_000L,
+                            killerId = 3,
+                            monsterType = "HORDE"
+                        ),
+                        tlEvent(
+                            type = "ELITE_MONSTER_KILL",
+                            timestamp = 860_000L,
+                            killerId = 3,
+                            monsterType = "RIFTHERALD"
+                        ),
+                        tlEvent(
+                            type = "ELITE_MONSTER_KILL",
+                            timestamp = 865_000L,
+                            killerId = 3,
+                            monsterType = "BARON_NASHOR"
+                        ),
+                        tlEvent(
+                            type = "ELITE_MONSTER_KILL",
+                            timestamp = 870_000L,
+                            killerId = 3,
+                            monsterType = "DRAGON",
+                            monsterSubType = "FIRE_DRAGON"
+                        ),
+                        tlEvent(
+                            type = "ELITE_MONSTER_KILL",
+                            timestamp = 875_000L,
+                            killerId = 3,
+                            monsterType = null
+                        ),
+                        tlEvent(
+                            type = "WARD_PLACED",
+                            timestamp = 880_000L,
+                            creatorId = 3,
+                            wardType = "YELLOW_TRINKET"
+                        ),
+                        tlEvent(
+                            type = "WARD_KILL",
+                            timestamp = 885_000L,
+                            killerId = 3,
+                            wardType = "CONTROL_WARD"
+                        ),
+                        tlEvent(
+                            type = "ITEM_DESTROYED",
+                            timestamp = 780_000L, // 13:00
+                            participantId = 3,
+                            itemId = 1201
+                        )
+                    )
+                )
+
+                val tl = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata(matchId = "EUW1_HUMAN_1", participants = null),
+                    info = MatchTimelineInfo(
+                        frameInterval = 60_000L,
+                        frames = listOf(richEventsFrame),
+                        participants = listOf(TimelineParticipantDto(3, "puuid-3"), TimelineParticipantDto(8, "puuid-8"))
+                    )
+                )
+
+                val analyzed = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_HUMAN_1", tl, matchWithMissingChamp)),
+                    "puuid-3"
+                )
+
+                // >=1 analyzed game with 0 player deaths -> "No deaths recorded" (explicit zero, distinct from "Not available")
+                analyzed.aggregateSummary.mostDangerousZone shouldBe "No deaths recorded"
+
+                val evs = analyzed.eventTimelines.first().events
+                evs.first { it.type == "KILL" }.assistants shouldBe listOf("Unknown Champion")
+
+                val plateTargets = evs.filter { it.type == "PLATE" }.map { it.target }
+                plateTargets shouldBe listOf("Top Lane Turret Plate", "Enemy Turret")
+
+                val objTargets = evs.filter { it.type == "OBJECTIVE" }.map { it.target }
+                objTargets shouldBe listOf("Void Grubs", "Rift Herald", "Baron Nashor", "Infernal Drake", "Epic Monster")
+
+                evs.first { it.type == "WARD_PLACED" }.target shouldBe "Stealth Ward"
+                evs.first { it.type == "WARD_PLACED" }.wardType shouldBe "YELLOW_TRINKET"
+                evs.first { it.type == "WARD_KILLED" }.target shouldBe "Control Ward"
+                evs.first { it.type == "WARD_KILLED" }.wardType shouldBe "CONTROL_WARD"
+
+                // Quest human labels distinguish completed (with timestamp), zero (0 completed), missing (not recorded), starter, ambiguous, and unseen ID
+                val qt1 = analyzed.roleQuestTimings.first()
+                qt1.playerQuestStatusLabel shouldBe "Mid Lane Quest Reward completed at 13:00"
+                qt1.opponentQuestStatusLabel shouldBe "No Role Quest item (0 completed)"
+
+                val legacyNullMatch = buildMatchDto("EUW1_HUMAN_NULL") { null }
+                val starterAndUnseenMatch = buildMatchDto("EUW1_HUMAN_STARTER") { pid ->
+                    when (pid) {
+                        3 -> 1201 // Mid starter in progress
+                        8 -> 9999 // Unseen positive ID
+                        else -> 0
+                    }
+                }
+                val ambiguousCompletedMatch = buildMatchDto("EUW1_HUMAN_AMBIG") { 1206 } // No ITEM_DESTROYED 1201 in empty timeline
+                val emptyFrameTl = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata(matchId = "EUW1_EMPTY", participants = null),
+                    info = MatchTimelineInfo(
+                        frameInterval = 60_000L,
+                        frames = listOf(
+                            TimelineFrameDto(
+                                timestamp = 60_000L,
+                                participantFrames = mapOf(
+                                    "3" to tlPFrame(participantId = 3, totalGold = 500),
+                                    "8" to tlPFrame(participantId = 8, totalGold = 500)
+                                ),
+                                events = emptyList()
+                            )
+                        ),
+                        participants = listOf(TimelineParticipantDto(3, "puuid-3"), TimelineParticipantDto(8, "puuid-8"))
+                    )
+                )
+
+                val multiStates = timelineAnalysisService.analyze(
+                    listOf(
+                        Triple("EUW1_HUMAN_NULL", emptyFrameTl, legacyNullMatch),
+                        Triple("EUW1_HUMAN_STARTER", emptyFrameTl, starterAndUnseenMatch),
+                        Triple("EUW1_HUMAN_AMBIG", emptyFrameTl, ambiguousCompletedMatch)
+                    ),
+                    "puuid-3"
+                )
+
+                multiStates.roleQuestTimings[0].playerQuestStatusLabel shouldBe "Role Quest data not recorded for this match"
+                multiStates.roleQuestTimings[1].playerQuestStatusLabel shouldBe "Mid Lane Quest in progress (not completed)"
+                multiStates.roleQuestTimings[1].opponentQuestStatusLabel shouldBe "Unrecognized Role Quest slot item (completion unverified)"
+                multiStates.roleQuestTimings[2].playerQuestStatusLabel shouldBe "Mid Lane Quest Reward completed (exact time unavailable)"
+
+                // Sweep every human-facing target, assistant, zone, and quest status label for forbidden raw identifiers
+                val allHumanStrings = buildList {
+                    add(emptyAnalysis.aggregateSummary.mostDangerousZone)
+                    add(analyzed.aggregateSummary.mostDangerousZone)
+                    evs.forEach { e ->
+                        e.target?.let { add(it) }
+                        e.actor?.let { add(it) }
+                        e.assistants?.forEach { add(it) }
+                    }
+                    (analyzed.roleQuestTimings + multiStates.roleQuestTimings).forEach { q ->
+                        q.playerQuestStatusLabel?.let { add(it) }
+                        q.opponentQuestStatusLabel?.let { add(it) }
+                    }
+                }
+                for (s in allHumanStrings) {
+                    for (forbidden in forbiddenTokens) {
+                        (s.contains(forbidden)) shouldBe false
+                    }
+                }
             }
         }
     }
