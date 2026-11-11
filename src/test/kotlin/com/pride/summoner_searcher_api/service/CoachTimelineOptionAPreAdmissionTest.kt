@@ -117,10 +117,11 @@ class CoachTimelineOptionAPreAdmissionTest {
     )
 
     private fun buildProfile(): SummonerProfileDto {
-        val matches = matchIds.map { matchId ->
+        val matches = matchIds.mapIndexed { idx, matchId ->
             MatchDto(
                 metadata = MatchMetadata(matchId = matchId, participants = listOf(playerPuuid, oppPuuid)),
                 info = MatchInfo(
+                    gameId = 7_698_000_000L + idx,
                     gameCreation = 1_700_000_000_000L,
                     gameDuration = 1_800L,
                     gameMode = "CLASSIC",
@@ -132,17 +133,15 @@ class CoachTimelineOptionAPreAdmissionTest {
                 )
             )
         }
-        return objectMapper.convertValue(
-            mapOf(
-                "puuid" to playerPuuid,
-                "gameName" to gameName,
-                "tagLine" to tagLine,
-                "profileIconId" to 1,
-                "summonerLevel" to 412L,
-                "recentMatches" to matches,
-                "allMatchIds" to matchIds
-            ),
-            SummonerProfileDto::class.java
+        return SummonerProfileDto(
+            puuid = playerPuuid,
+            gameName = gameName,
+            tagLine = tagLine,
+            summonerLevel = 412L,
+            profileIconId = 1,
+            soloQueueRank = null,
+            recentMatches = matches,
+            allMatchIds = matchIds
         )
     }
 
@@ -620,4 +619,350 @@ class CoachTimelineOptionAPreAdmissionTest {
         assertEquals("MEMORY_HEADROOM_STOP", midstreamReady.result.stopReason)
         assertEquals(0, midstreamGcCalls.get(), "Midstream MEMORY_HEADROOM_STOP must NEVER trigger GC")
     }
+
+    @DisplayName("negative, zero, or lower positive config overrides cannot weaken 24 MiB unused-committed or 30s cooldown floors")
+    @Test
+    fun configFloorOverridesCannotWeaken24MiBUnusedOr30sCooldownMinima() = runBlocking {
+        val (riotApi, redisCache) = newMockedTimelineDeps()
+
+        // 1. Unused-committed floor (24 MiB): 20 MiB actual unused MUST skip GC even with -1, 0, 1 KiB, or 16 MiB overrides
+        for (overrideBytes in listOf(-1L, 0L, 1_024L, 16L * 1024L * 1024L)) {
+            val clock = MutableClock(20_000L)
+            val gcCalls = AtomicInteger(0)
+            val summaries = Collections.synchronizedList(mutableListOf<String>())
+            val service = TimelineService(
+                riotApiService = riotApi,
+                redisCacheService = redisCache,
+                timeProvider = clock,
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = buildSample(
+                        cgroupCurrentBytes = 372_162_560L,
+                        heapUsedBytes = 160L * 1024L * 1024L,
+                        heapCommittedBytes = 180L * 1024L * 1024L // 20 MiB unused (< 24 MiB floor)
+                    )
+                },
+                preAdmissionGcEnabled = true,
+                preAdmissionGcMinUnusedCommittedBytes = overrideBytes
+            )
+            service.preAdmissionGcRunner = { gcCalls.incrementAndGet() }
+            service.stageSummaryObserver = { summaries.add(it) }
+
+            val outcome = service.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            val ready = outcome as TimelineService.PlayerPreparationOutcome.Ready
+            assertEquals("BLOCKED", ready.result.status)
+            assertEquals(0, gcCalls.get(), "Override $overrideBytes must not weaken 24 MiB floor")
+            assertTrue(summaries.single().contains("gcStatus=SKIPPED_LOW_UNUSED_COMMITTED"))
+            assertZeroPlayerPayloadLeakage(summaries.single())
+        }
+
+        // At exact 24 MiB unused committed, a lower override clamps to 24 MiB and permits single attempt;
+        // a stricter override (48 MiB) still enforces 48 MiB.
+        run {
+            val gcCallsAt24MiB = AtomicInteger(0)
+            val serviceAt24MiB = TimelineService(
+                riotApiService = riotApi,
+                redisCacheService = redisCache,
+                timeProvider = MutableClock(25_000L),
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = buildSample(
+                        cgroupCurrentBytes = 372_162_560L,
+                        heapUsedBytes = 156L * 1024L * 1024L,
+                        heapCommittedBytes = 180L * 1024L * 1024L // exact 24 MiB unused
+                    )
+                },
+                preAdmissionGcEnabled = true,
+                preAdmissionGcMinUnusedCommittedBytes = 0L
+            )
+            serviceAt24MiB.preAdmissionGcRunner = { gcCallsAt24MiB.incrementAndGet() }
+            serviceAt24MiB.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            assertEquals(1, gcCallsAt24MiB.get(), "Exact 24 MiB unused should satisfy clamped 24 MiB floor")
+
+            val gcCallsStricter = AtomicInteger(0)
+            val stricterService = TimelineService(
+                riotApiService = riotApi,
+                redisCacheService = redisCache,
+                timeProvider = MutableClock(26_000L),
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = buildSample(
+                        cgroupCurrentBytes = 372_162_560L,
+                        heapUsedBytes = 148L * 1024L * 1024L,
+                        heapCommittedBytes = 180L * 1024L * 1024L // 32 MiB unused (< 48 MiB stricter override)
+                    )
+                },
+                preAdmissionGcEnabled = true,
+                preAdmissionGcMinUnusedCommittedBytes = 48L * 1024L * 1024L
+            )
+            stricterService.preAdmissionGcRunner = { gcCallsStricter.incrementAndGet() }
+            stricterService.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            assertEquals(0, gcCallsStricter.get(), "Stricter >24 MiB override must remain respected")
+        }
+
+        // 2. Cooldown floor (30_000 ms): -5_000, 0, 1, and 5_000 ms overrides MUST still enforce 30_000 ms cooldown
+        for (overrideCooldownMs in listOf(-5_000L, 0L, 1L, 5_000L)) {
+            val clock = MutableClock(50_000L)
+            val gcCalls = AtomicInteger(0)
+            val summaries = Collections.synchronizedList(mutableListOf<String>())
+            val service = TimelineService(
+                riotApiService = riotApi,
+                redisCacheService = redisCache,
+                timeProvider = clock,
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = buildSample(
+                        cgroupCurrentBytes = 372_162_560L,
+                        heapUsedBytes = 90L * 1024L * 1024L,
+                        heapCommittedBytes = 180L * 1024L * 1024L
+                    )
+                },
+                preAdmissionGcEnabled = true,
+                preAdmissionGcCooldownMs = overrideCooldownMs
+            )
+            service.preAdmissionGcRunner = { gcCalls.incrementAndGet() }
+            service.stageSummaryObserver = { summaries.add(it) }
+
+            service.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            assertEquals(1, gcCalls.get())
+
+            // Immediate retry (+0 ms), +5,000 ms, and +29,999 ms must ALL be blocked by the 30s floor
+            summaries.clear()
+            service.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            assertEquals(1, gcCalls.get(), "Override $overrideCooldownMs must not allow immediate retry")
+            assertTrue(summaries.single().contains("gcStatus=SKIPPED_COOLDOWN"))
+
+            clock.advanceBy(5_000L)
+            summaries.clear()
+            service.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            assertEquals(1, gcCalls.get(), "Override $overrideCooldownMs must not allow +5s retry")
+            assertTrue(summaries.single().contains("gcStatus=SKIPPED_COOLDOWN"))
+
+            clock.advanceBy(24_999L) // total +29,999 ms
+            summaries.clear()
+            service.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            assertEquals(1, gcCalls.get(), "Override $overrideCooldownMs must not allow +29,999ms retry")
+            assertTrue(summaries.single().contains("gcStatus=SKIPPED_COOLDOWN"))
+
+            clock.advanceBy(1L) // total +30,000 ms
+            summaries.clear()
+            service.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            assertEquals(2, gcCalls.get(), "Clamped 30s cooldown permits single attempt at +30,000ms")
+            assertTrue(summaries.single().contains("gcStatus=STILL_BLOCKED_AFTER_GC"))
+        }
+    }
+
+    @DisplayName("invalid samples, sampler exceptions, and GC runner exceptions fail closed without unsafe GC or spin loops")
+    @Test
+    fun invalidSamplesSamplerExceptionsAndGcRunnerExceptionsFailClosedWithoutUnsafeGc() = runBlocking {
+        val (riotApi, redisCache) = newMockedTimelineDeps()
+
+        // 1. Invalid initial samples MUST fail closed BEFORE GC eligibility (zero GC calls),
+        // including negative heapUsed with positive heapCommitted (must NOT coerce used to 0 and compute >24 MiB unused!)
+        val invalidInitialSamples = listOf(
+            "negative_heap_used_positive_committed" to RawMemorySample(
+                jvmHeapUsedBytes = -1L,
+                jvmHeapCommittedBytes = 180L * 1024L * 1024L,
+                jvmHeapMaxBytes = 214_748_364L,
+                cgroupMemoryCurrentBytes = 372_162_560L,
+                cgroupMemoryMaxBytes = 536_870_912L
+            ),
+            "zero_heap_max" to RawMemorySample(
+                jvmHeapUsedBytes = 0L,
+                jvmHeapCommittedBytes = 180L * 1024L * 1024L,
+                jvmHeapMaxBytes = 0L,
+                cgroupMemoryCurrentBytes = 372_162_560L,
+                cgroupMemoryMaxBytes = 536_870_912L
+            ),
+            "committed_below_used" to RawMemorySample(
+                jvmHeapUsedBytes = 170L * 1024L * 1024L,
+                jvmHeapCommittedBytes = 120L * 1024L * 1024L,
+                jvmHeapMaxBytes = 214_748_364L,
+                cgroupMemoryCurrentBytes = 372_162_560L,
+                cgroupMemoryMaxBytes = 536_870_912L
+            ),
+            "missing_cgroup_current_in_bounded_container" to RawMemorySample(
+                jvmHeapUsedBytes = 85L * 1024L * 1024L,
+                jvmHeapCommittedBytes = 180L * 1024L * 1024L,
+                jvmHeapMaxBytes = 214_748_364L,
+                cgroupMemoryCurrentBytes = null,
+                cgroupMemoryMaxBytes = 536_870_912L
+            ),
+            "zero_cgroup_current_in_bounded_container" to RawMemorySample(
+                jvmHeapUsedBytes = 85L * 1024L * 1024L,
+                jvmHeapCommittedBytes = 180L * 1024L * 1024L,
+                jvmHeapMaxBytes = 214_748_364L,
+                cgroupMemoryCurrentBytes = 0L,
+                cgroupMemoryMaxBytes = 536_870_912L
+            )
+        )
+
+        for ((caseLabel, badSample) in invalidInitialSamples) {
+            val gcCalls = AtomicInteger(0)
+            val summaries = Collections.synchronizedList(mutableListOf<String>())
+            val service = TimelineService(
+                riotApiService = riotApi,
+                redisCacheService = redisCache,
+                timeProvider = MutableClock(80_000L),
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = badSample
+                },
+                preAdmissionGcEnabled = true
+            )
+            service.preAdmissionGcRunner = { gcCalls.incrementAndGet() }
+            service.stageSummaryObserver = { summaries.add(it) }
+
+            val outcome = service.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            val ready = outcome as TimelineService.PlayerPreparationOutcome.Ready
+            assertEquals("BLOCKED", ready.result.status, "Case $caseLabel must block")
+            assertEquals("MEMORY_HEADROOM_ADMISSION_BLOCKED", ready.result.stopReason)
+            assertEquals(0, gcCalls.get(), "Case $caseLabel must NEVER invoke GC on invalid sample")
+            val line = summaries.single()
+            assertZeroPlayerPayloadLeakage(line)
+            assertTrue(line.contains("gcAttempted=false gcStatus=INVALID_INITIAL_SAMPLE"), "Unexpected summary for $caseLabel: $line")
+            if (caseLabel == "negative_heap_used_positive_committed") {
+                assertTrue(line.contains("heapUsed=-1,heapComm=${180L * 1024L * 1024L},heapUnusedComm=-1,"))
+            }
+        }
+
+        // 2. Initial sample() throwing exception -> BLOCKED, INITIAL_SAMPLE_ERROR, 0 GC calls
+        run {
+            val gcCalls = AtomicInteger(0)
+            val summaries = Collections.synchronizedList(mutableListOf<String>())
+            val service = TimelineService(
+                riotApiService = riotApi,
+                redisCacheService = redisCache,
+                timeProvider = MutableClock(90_000L),
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample {
+                        throw IllegalStateException("simulated cgroupfs read failure")
+                    }
+                },
+                preAdmissionGcEnabled = true
+            )
+            service.preAdmissionGcRunner = { gcCalls.incrementAndGet() }
+            service.stageSummaryObserver = { summaries.add(it) }
+
+            val outcome = service.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            val ready = outcome as TimelineService.PlayerPreparationOutcome.Ready
+            assertEquals("BLOCKED", ready.result.status)
+            assertEquals("MEMORY_HEADROOM_ADMISSION_BLOCKED", ready.result.stopReason)
+            assertEquals(0, gcCalls.get())
+            val line = summaries.single()
+            assertZeroPlayerPayloadLeakage(line)
+            assertTrue(line.contains("gcAttempted=false gcStatus=INITIAL_SAMPLE_ERROR"))
+            assertTrue(line.contains("memPre={unavailable}"))
+        }
+
+        // 3. preAdmissionGcRunner throwing exception -> BLOCKED, GC_RUNNER_ERROR, lock released + 30s cooldown armed
+        run {
+            val clock = MutableClock(100_000L)
+            val gcCalls = AtomicInteger(0)
+            val summaries = Collections.synchronizedList(mutableListOf<String>())
+            val service = TimelineService(
+                riotApiService = riotApi,
+                redisCacheService = redisCache,
+                timeProvider = clock,
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample = buildSample(
+                        cgroupCurrentBytes = 372_162_560L,
+                        heapUsedBytes = 90L * 1024L * 1024L,
+                        heapCommittedBytes = 180L * 1024L * 1024L
+                    )
+                },
+                preAdmissionGcEnabled = true
+            )
+            service.preAdmissionGcRunner = {
+                gcCalls.incrementAndGet()
+                clock.advanceBy(7L)
+                throw RuntimeException("synthetic gc runner failure")
+            }
+            service.stageSummaryObserver = { summaries.add(it) }
+
+            val firstOutcome = service.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            val firstReady = firstOutcome as TimelineService.PlayerPreparationOutcome.Ready
+            assertEquals("BLOCKED", firstReady.result.status)
+            assertEquals("MEMORY_HEADROOM_ADMISSION_BLOCKED", firstReady.result.stopReason)
+            assertEquals(1, gcCalls.get())
+            assertTrue(summaries.single().contains("gcAttempted=true gcStatus=GC_RUNNER_ERROR gcMs=7"))
+            assertZeroPlayerPayloadLeakage(summaries.single())
+
+            // Immediate follow-up within 30s must hit SKIPPED_COOLDOWN (not stuck in SKIPPED_CONCURRENT_GC and not retrying GC)
+            summaries.clear()
+            clock.advanceBy(1_000L)
+            val secondOutcome = service.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            assertEquals("BLOCKED", (secondOutcome as TimelineService.PlayerPreparationOutcome.Ready).result.status)
+            assertEquals(1, gcCalls.get(), "Failed GC attempt must still arm 30s cooldown to prevent retry loops")
+            assertTrue(summaries.single().contains("gcAttempted=false gcStatus=SKIPPED_COOLDOWN"))
+        }
+
+        // 4. Post-GC sample() exception and invalid post-GC sample both fail closed
+        run {
+            val gcCalls = AtomicInteger(0)
+            val sampleCalls = AtomicInteger(0)
+            val summaries = Collections.synchronizedList(mutableListOf<String>())
+            val service = TimelineService(
+                riotApiService = riotApi,
+                redisCacheService = redisCache,
+                timeProvider = MutableClock(120_000L),
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample {
+                        if (sampleCalls.incrementAndGet() == 1) {
+                            return buildSample(
+                                cgroupCurrentBytes = 372_162_560L,
+                                heapUsedBytes = 90L * 1024L * 1024L,
+                                heapCommittedBytes = 180L * 1024L * 1024L
+                            )
+                        }
+                        throw IllegalStateException("post-gc sample read failed")
+                    }
+                },
+                preAdmissionGcEnabled = true
+            )
+            service.preAdmissionGcRunner = { gcCalls.incrementAndGet() }
+            service.stageSummaryObserver = { summaries.add(it) }
+
+            val outcome = service.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            assertEquals("BLOCKED", (outcome as TimelineService.PlayerPreparationOutcome.Ready).result.status)
+            assertEquals(1, gcCalls.get())
+            assertTrue(summaries.single().contains("gcAttempted=true gcStatus=POST_GC_SAMPLE_ERROR"))
+            assertZeroPlayerPayloadLeakage(summaries.single())
+        }
+
+        run {
+            val gcCalls = AtomicInteger(0)
+            val sampleCalls = AtomicInteger(0)
+            val summaries = Collections.synchronizedList(mutableListOf<String>())
+            val service = TimelineService(
+                riotApiService = riotApi,
+                redisCacheService = redisCache,
+                timeProvider = MutableClock(140_000L),
+                memoryStatsProvider = object : MemoryStatsProvider {
+                    override fun sample(): RawMemorySample {
+                        return if (sampleCalls.incrementAndGet() == 1) {
+                            buildSample(
+                                cgroupCurrentBytes = 372_162_560L,
+                                heapUsedBytes = 90L * 1024L * 1024L,
+                                heapCommittedBytes = 180L * 1024L * 1024L
+                            )
+                        } else {
+                            RawMemorySample(
+                                jvmHeapUsedBytes = -5L,
+                                jvmHeapCommittedBytes = 120L * 1024L * 1024L,
+                                jvmHeapMaxBytes = 214_748_364L,
+                                cgroupMemoryCurrentBytes = 340_000_000L,
+                                cgroupMemoryMaxBytes = 536_870_912L
+                            )
+                        }
+                    }
+                },
+                preAdmissionGcEnabled = true
+            )
+            service.preAdmissionGcRunner = { gcCalls.incrementAndGet() }
+            service.stageSummaryObserver = { summaries.add(it) }
+
+            val outcome = service.prepareCoachTimelinesForPlayer("euw1", playerPuuid, matchIds) { buildProfile() }
+            assertEquals("BLOCKED", (outcome as TimelineService.PlayerPreparationOutcome.Ready).result.status)
+            assertEquals(1, gcCalls.get())
+            assertTrue(summaries.single().contains("gcAttempted=true gcStatus=INVALID_POST_GC_SAMPLE"))
+            assertZeroPlayerPayloadLeakage(summaries.single())
+        }
+    }
 }
+

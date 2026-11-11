@@ -124,17 +124,20 @@ class TimelineService @Autowired constructor(
 
         internal fun formatPayloadFreeMemorySample(sample: RawMemorySample?): String {
             if (sample == null) return "unavailable"
-            val safeHeapUsed = sample.jvmHeapUsedBytes.coerceAtLeast(0L)
-            val safeHeapComm = sample.jvmHeapCommittedBytes.coerceAtLeast(safeHeapUsed)
-            val unusedComm = safeHeapComm - safeHeapUsed
+            val validHeap = sample.jvmHeapMaxBytes > 0L &&
+                sample.jvmHeapUsedBytes >= 0L &&
+                sample.jvmHeapCommittedBytes > 0L &&
+                sample.jvmHeapCommittedBytes >= sample.jvmHeapUsedBytes &&
+                sample.jvmHeapCommittedBytes <= sample.jvmHeapMaxBytes
+            val unusedComm = if (validHeap) sample.jvmHeapCommittedBytes - sample.jvmHeapUsedBytes else -1L
             return "cgroupCur=${sample.cgroupMemoryCurrentBytes ?: -1}," +
                 "cgroupMax=${sample.cgroupMemoryMaxBytes ?: -1}," +
                 "cgroupPeak=${sample.cgroupMemoryPeakBytes ?: -1}," +
                 "anon=${sample.cgroupAnonBytes ?: -1}," +
                 "file=${sample.cgroupFileCacheBytes ?: -1}," +
                 "inactiveFile=${sample.cgroupInactiveFileBytes ?: -1}," +
-                "heapUsed=$safeHeapUsed," +
-                "heapComm=$safeHeapComm," +
+                "heapUsed=${sample.jvmHeapUsedBytes}," +
+                "heapComm=${sample.jvmHeapCommittedBytes}," +
                 "heapUnusedComm=$unusedComm," +
                 "heapMax=${sample.jvmHeapMaxBytes}," +
                 "nonHeapUsed=${sample.jvmNonHeapUsedBytes}," +
@@ -399,13 +402,35 @@ class TimelineService @Autowired constructor(
         return true
     }
 
+    internal fun isValidSampleForGcEligibility(raw: RawMemorySample): Boolean {
+        if (raw.jvmHeapMaxBytes <= 0L) return false
+        if (raw.jvmHeapUsedBytes < 0L || raw.jvmHeapUsedBytes > raw.jvmHeapMaxBytes) return false
+        if (raw.jvmHeapCommittedBytes <= 0L ||
+            raw.jvmHeapCommittedBytes < raw.jvmHeapUsedBytes ||
+            raw.jvmHeapCommittedBytes > raw.jvmHeapMaxBytes
+        ) {
+            return false
+        }
+        val hasBoundedContainerCgroupLimit = raw.cgroupMemoryMaxBytes != null &&
+            raw.cgroupMemoryMaxBytes in 1L..2_147_483_648L
+        if (hasBoundedContainerCgroupLimit) {
+            if (configuredContainerLimitBytes <= 0L) return false
+            val cgroupCurrent = raw.cgroupMemoryCurrentBytes
+            if (cgroupCurrent == null || cgroupCurrent <= 0L) return false
+        }
+        return true
+    }
+
     /**
      * Pre-admission-only check preserving raw 350/360/78%/64 MiB/512 MiB criteria:
      * - Never runs GC when initial admission already succeeds (`NOT_NEEDED`).
      * - Never runs GC when `coach.timeline.pre-admission-gc-enabled` is false (`DISABLED_BY_CONFIG`).
-     * - Never runs GC when measured `unusedCommitted < preAdmissionGcMinUnusedCommittedBytes` (24 MiB default).
-     * - Concurrency-safe: at most ONE thread enters GC, enforcing `preAdmissionGcCooldownMs` (30s default),
-     *   followed by ONE post-GC sample recheck with zero retry loops.
+     * - Fails closed (`INVALID_INITIAL_SAMPLE`, zero GC) before any GC check if heap or bounded-cgroup
+     *   sample fields are negative, zero, inverted (`committed < used`), or missing.
+     * - Enforces hard safety floors: `minUnusedBytes >= 24 MiB` and `cooldownMs >= 30_000 ms`
+     *   (negative, zero, or lower config overrides cannot weaken either floor).
+     * - Concurrency-safe: at most ONE thread enters GC, enforcing `cooldownMs`, followed by ONE
+     *   validated post-GC sample recheck with zero retry loops.
      */
     internal fun evaluatePreAdmissionHeadroom(): PreAdmissionCheckResult {
         val initialSample = try {
@@ -416,6 +441,14 @@ class TimelineService @Autowired constructor(
                 admitted = false,
                 initialSample = null,
                 gcStatus = "INITIAL_SAMPLE_ERROR"
+            )
+        }
+
+        if (!isValidSampleForGcEligibility(initialSample)) {
+            return PreAdmissionCheckResult(
+                admitted = false,
+                initialSample = initialSample,
+                gcStatus = "INVALID_INITIAL_SAMPLE"
             )
         }
 
@@ -435,10 +468,9 @@ class TimelineService @Autowired constructor(
             )
         }
 
-        val safeHeapUsed = initialSample.jvmHeapUsedBytes.coerceAtLeast(0L)
-        val safeHeapComm = initialSample.jvmHeapCommittedBytes.coerceAtLeast(safeHeapUsed)
-        val unusedCommitted = safeHeapComm - safeHeapUsed
-        val minUnusedBytes = preAdmissionGcMinUnusedCommittedBytes.coerceAtLeast(1L)
+        val unusedCommitted = initialSample.jvmHeapCommittedBytes - initialSample.jvmHeapUsedBytes
+        val minUnusedBytes = preAdmissionGcMinUnusedCommittedBytes
+            .coerceAtLeast(DEFAULT_PRE_ADMISSION_GC_MIN_UNUSED_COMMITTED_BYTES)
         if (unusedCommitted < minUnusedBytes) {
             return PreAdmissionCheckResult(
                 admitted = false,
@@ -447,7 +479,8 @@ class TimelineService @Autowired constructor(
             )
         }
 
-        val cooldownMs = preAdmissionGcCooldownMs.coerceAtLeast(0L)
+        val cooldownMs = preAdmissionGcCooldownMs
+            .coerceAtLeast(DEFAULT_PRE_ADMISSION_GC_COOLDOWN_MS)
         val nowMs = timeProvider.now()
         val skipReason = synchronized(preAdmissionGcLock) {
             when {
@@ -496,6 +529,17 @@ class TimelineService @Autowired constructor(
                     initialSample = initialSample,
                     gcAttempted = true,
                     gcStatus = "POST_GC_SAMPLE_ERROR",
+                    gcDurationMs = gcDurationMs
+                )
+            }
+
+            if (!isValidSampleForGcEligibility(postGcSample)) {
+                return PreAdmissionCheckResult(
+                    admitted = false,
+                    initialSample = initialSample,
+                    postGcSample = postGcSample,
+                    gcAttempted = true,
+                    gcStatus = "INVALID_POST_GC_SAMPLE",
                     gcDurationMs = gcDurationMs
                 )
             }
