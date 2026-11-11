@@ -284,15 +284,33 @@ class TimelineAnalysisService {
         var sumRoleQuestDeltaSeconds = 0.0
         var roleQuestDeltaCount = 0
 
+        var validAnalyzedGames = 0
+        var gamesWithEventCoverage = 0
+
         for ((matchId, timeline, matchDto) in timelines) {
             val info = timeline.info ?: continue
             val matchInfo = matchDto.info ?: continue
 
             // Resolve the tracked player's participantId within the timeline
             val playerMatchParticipant = matchInfo.participants.find { it.puuid == puuid } ?: continue
-            val playerParticipantId = info.participants?.find { it.puuid == puuid }?.participantId
-                ?: playerMatchParticipant.participantId
+            val playerParticipantId = (info.participants?.find { it.puuid == puuid }?.participantId
+                ?: playerMatchParticipant.participantId)
+                ?.takeIf { it in 1..10 }
                 ?: continue
+
+            val frames = info.frames?.takeIf { it.isNotEmpty() } ?: continue
+            val hasPlayerFrames = frames.any { it.participantFrames?.containsKey(playerParticipantId.toString()) == true }
+            val hasEventCoverage = frames.any { it.events != null }
+            val hasTimelinePlayerEvidence = hasPlayerFrames || (
+                info.participants?.any { it.puuid == puuid || it.participantId == playerParticipantId } == true &&
+                    hasEventCoverage
+            )
+            if (!hasTimelinePlayerEvidence) continue
+
+            validAnalyzedGames++
+            if (hasEventCoverage) {
+                gamesWithEventCoverage++
+            }
 
             val playerChampion = playerMatchParticipant.championName?.takeIf { it.isNotBlank() } ?: "Unknown Champion"
             val playerTeamId = playerMatchParticipant.teamId ?: 100
@@ -326,8 +344,6 @@ class TimelineAnalysisService {
                     participantToChampion[pid] = champ
                 }
             }
-
-            val frames = info.frames ?: continue
 
             // ── Heatmap: collect player positions per frame ──
             for (frame in frames) {
@@ -442,12 +458,20 @@ class TimelineAnalysisService {
                                 assistants = assistingChamps
                             ))
 
+                            val posX = event.position?.x
+                            val posY = event.position?.y
+                            val hasValidPosition = posX != null && posY != null
+
                             if (isPlayerKiller) {
-                                kills.add(HeatmapPoint(event.position?.x ?: 0, event.position?.y ?: 0, matchId, minute))
+                                if (hasValidPosition) {
+                                    kills.add(HeatmapPoint(posX!!, posY!!, matchId, minute))
+                                }
                                 totalKills++
                             }
                             if (isPlayerVictim) {
-                                deaths.add(HeatmapPoint(event.position?.x ?: 0, event.position?.y ?: 0, matchId, minute))
+                                if (hasValidPosition) {
+                                    deaths.add(HeatmapPoint(posX!!, posY!!, matchId, minute))
+                                }
                                 totalDeaths++
                                 if (minute < 10) {
                                     totalDeathsBefore10++
@@ -463,7 +487,9 @@ class TimelineAnalysisService {
                                 }
                             }
                             if (isPlayerAssist) {
-                                assists.add(HeatmapPoint(event.position?.x ?: 0, event.position?.y ?: 0, matchId, minute))
+                                if (hasValidPosition) {
+                                    assists.add(HeatmapPoint(posX!!, posY!!, matchId, minute))
+                                }
                                 totalAssists++
                             }
                         }
@@ -619,11 +645,12 @@ class TimelineAnalysisService {
                 }
             }
 
-            // Compute first death minute for summary
-            val firstDeath = allEvents.filter { it.type == "CHAMPION_KILL" && it.victimId == playerParticipantId }
-                .minByOrNull { it.timestamp ?: Long.MAX_VALUE }
+            // Compute first death minute for summary (requiring non-null timestamp)
+            val firstDeath = allEvents.filter {
+                it.type == "CHAMPION_KILL" && it.victimId == playerParticipantId && it.timestamp != null
+            }.minByOrNull { it.timestamp!! }
             if (firstDeath != null) {
-                totalFirstDeathMinute += ((firstDeath.timestamp ?: 0) / 60000.0)
+                totalFirstDeathMinute += (firstDeath.timestamp!! / 60000.0)
                 gamesWithDeath++
             }
 
@@ -645,7 +672,7 @@ class TimelineAnalysisService {
         }
 
         // ── Aggregate summary ──
-        val deathZone = computeMostDangerousZone(deaths, timelines.size)
+        val deathZone = computeMostDangerousZone(deaths, gamesWithEventCoverage, totalDeaths)
         val avgFirstDeath = if (gamesWithDeath > 0) totalFirstDeathMinute / gamesWithDeath else 0.0
         val avgGold10 = if (gamesWithGold10 > 0) totalGoldLeadAt10 / gamesWithGold10 else 0.0
         val avgGold15 = if (gamesWithGold15 > 0) totalGoldLeadAt15 / gamesWithGold15 else 0.0
@@ -684,16 +711,18 @@ class TimelineAnalysisService {
                 deathsTotal = totalDeaths,
                 killsTotal = totalKills,
                 assistsTotal = totalAssists,
-                gamesAnalyzed = timelines.size,
-                deathsBefore10 = totalDeathsBefore10,
-                assistedDeaths = totalAssistedDeaths,
-                unassistedDeaths = totalUnassistedDeaths,
-                deathsNearObjectiveWindows = totalDeathsNearObjectives,
-                wardsByTimeBucket = WardTimeBucketsDto(
-                    pre10 = wardsPre10,
-                    min10To20 = wardsMin10To20,
-                    post20 = wardsPost20
-                ),
+                gamesAnalyzed = validAnalyzedGames,
+                deathsBefore10 = if (gamesWithEventCoverage > 0) totalDeathsBefore10 else null,
+                assistedDeaths = if (gamesWithEventCoverage > 0) totalAssistedDeaths else null,
+                unassistedDeaths = if (gamesWithEventCoverage > 0) totalUnassistedDeaths else null,
+                deathsNearObjectiveWindows = if (gamesWithEventCoverage > 0) totalDeathsNearObjectives else null,
+                wardsByTimeBucket = if (gamesWithEventCoverage > 0) {
+                    WardTimeBucketsDto(
+                        pre10 = wardsPre10,
+                        min10To20 = wardsMin10To20,
+                        post20 = wardsPost20
+                    )
+                } else null,
                 roleQuestEligibleGames = if (roleQuestEligibleGames > 0) roleQuestEligibleGames else null,
                 roleQuestCompletedGames = if (roleQuestEligibleGames > 0 && roleQuestAmbiguousGames == 0) roleQuestCompletedGames else null,
                 roleQuestAmbiguousGames = if (roleQuestEligibleGames > 0) roleQuestAmbiguousGames else null,
@@ -2210,11 +2239,17 @@ class TimelineAnalysisService {
     /**
      * Determines which map quadrant (named) had the most deaths.
      * Map is divided into 4 quadrants based on the 15000x15000 coordinate space.
-     * Distinguishes missing/empty timeline samples ("Not available") from zero deaths ("No deaths recorded").
+     * Distinguishes missing/skipped event coverage or unpositioned deaths ("Not available")
+     * from verified zero deaths ("No deaths recorded").
      */
-    private fun computeMostDangerousZone(deathPositions: List<HeatmapPoint>, gamesAnalyzed: Int): String {
-        if (gamesAnalyzed <= 0) return "Not available"
-        if (deathPositions.isEmpty()) return "No deaths recorded"
+    private fun computeMostDangerousZone(
+        deathPositions: List<HeatmapPoint>,
+        gamesWithEventCoverage: Int,
+        totalDeaths: Int
+    ): String {
+        if (gamesWithEventCoverage <= 0) return "Not available"
+        if (totalDeaths <= 0) return "No deaths recorded"
+        if (deathPositions.isEmpty()) return "Not available"
 
         val half = MAP_SIZE / 2
         val zones = mapOf(

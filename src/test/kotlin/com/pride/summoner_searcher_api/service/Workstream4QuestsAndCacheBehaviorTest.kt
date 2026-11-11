@@ -1215,5 +1215,149 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 }
             }
         }
+
+        When("analyzing non-empty invalid/skipped timelines (missing info, frames, player, or event arrays) and deaths with absent/partial coordinates") {
+            Then("reports Not available instead of No deaths recorded when coverage is missing, never invents (0, 0) coordinates, and preserves actual death counts separately") {
+                val validMatch = buildMatchDto("EUW1_BASE")
+                val matchMissingInfo = MatchDto(metadata = MatchMetadata("EUW1_NO_MINFO", emptyList()), info = null)
+                val matchMissingPlayer = validMatch.copy(
+                    info = validMatch.info!!.copy(
+                        participants = validMatch.info!!.participants.filter { it.puuid != "puuid-3" }
+                    )
+                )
+
+                val tlMissingInfo = MatchTimelineDto(metadata = MatchTimelineMetadata("EUW1_NO_TINFO", null), info = null)
+                val tlNullFrames = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata("EUW1_NULL_FRAMES", null),
+                    info = MatchTimelineInfo(frameInterval = 60_000L, frames = null, participants = listOf(TimelineParticipantDto(3, "puuid-3")))
+                )
+                val tlEmptyFrames = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata("EUW1_EMPTY_FRAMES", null),
+                    info = MatchTimelineInfo(frameInterval = 60_000L, frames = emptyList(), participants = listOf(TimelineParticipantDto(3, "puuid-3")))
+                )
+                val tlWrongPlayerOnly = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata("EUW1_WRONG_PLAYER", null),
+                    info = MatchTimelineInfo(
+                        frameInterval = 60_000L,
+                        frames = listOf(
+                            TimelineFrameDto(
+                                timestamp = 60_000L,
+                                participantFrames = mapOf("1" to tlPFrame(participantId = 1, totalGold = 500)),
+                                events = emptyList()
+                            )
+                        ),
+                        participants = listOf(TimelineParticipantDto(1, "puuid-1"))
+                    )
+                )
+
+                // 1. Non-empty timelines list where ALL entries are invalid/skipped -> unknown ("Not available"), NEVER "No deaths recorded"!
+                val skippedSample = timelineAnalysisService.analyze(
+                    listOf(
+                        Triple("EUW1_NO_TINFO", tlMissingInfo, validMatch),
+                        Triple("EUW1_NO_MINFO", tlWrongPlayerOnly, matchMissingInfo),
+                        Triple("EUW1_NULL_FRAMES", tlNullFrames, validMatch),
+                        Triple("EUW1_EMPTY_FRAMES", tlEmptyFrames, validMatch),
+                        Triple("EUW1_NO_MPLAYER", tlWrongPlayerOnly, matchMissingPlayer),
+                        Triple("EUW1_NO_TPLAYER", tlWrongPlayerOnly, validMatch)
+                    ),
+                    "puuid-3"
+                )
+                skippedSample.aggregateSummary.gamesAnalyzed shouldBe 0
+                skippedSample.aggregateSummary.mostDangerousZone shouldBe "Not available"
+                skippedSample.aggregateSummary.deathsBefore10.shouldBeNull()
+                skippedSample.aggregateSummary.wardsByTimeBucket.shouldBeNull()
+
+                // 2. Valid player frames present (gamesAnalyzed == 1), but events == null on every frame -> event coverage missing ("Not available")
+                val tlNullEvents = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata("EUW1_NULL_EVENTS", null),
+                    info = MatchTimelineInfo(
+                        frameInterval = 60_000L,
+                        frames = listOf(
+                            TimelineFrameDto(
+                                timestamp = 60_000L,
+                                participantFrames = mapOf("3" to tlPFrame(participantId = 3, totalGold = 500)),
+                                events = null
+                            )
+                        ),
+                        participants = listOf(TimelineParticipantDto(3, "puuid-3"))
+                    )
+                )
+                val missingEventsAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_NULL_EVENTS", tlNullEvents, validMatch)),
+                    "puuid-3"
+                )
+                missingEventsAnalysis.aggregateSummary.gamesAnalyzed shouldBe 1
+                missingEventsAnalysis.aggregateSummary.mostDangerousZone shouldBe "Not available"
+                missingEventsAnalysis.aggregateSummary.deathsBefore10.shouldBeNull()
+
+                // 3. Deaths (and kill/assist) with absent or partial coordinates -> preserve actual counts, emit 0 HeatmapPoints, zone = "Not available"
+                val tlUnpositionedDeaths = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata("EUW1_UNPOS_DEATHS", null),
+                    info = MatchTimelineInfo(
+                        frameInterval = 60_000L,
+                        frames = listOf(
+                            TimelineFrameDto(
+                                timestamp = 300_000L,
+                                participantFrames = mapOf(
+                                    "3" to tlPFrame(participantId = 3, totalGold = 1800),
+                                    "8" to tlPFrame(participantId = 8, totalGold = 1900)
+                                ),
+                                events = listOf(
+                                    tlEvent(type = "CHAMPION_KILL", timestamp = 240_000L, killerId = 8, victimId = 3, position = null),
+                                    tlEvent(type = "CHAMPION_KILL", timestamp = 300_000L, killerId = 8, victimId = 3, position = TimelinePositionDto(x = null, y = 9000)),
+                                    tlEvent(type = "CHAMPION_KILL", timestamp = 360_000L, killerId = 8, victimId = 3, position = TimelinePositionDto(x = 9000, y = null)),
+                                    tlEvent(type = "CHAMPION_KILL", timestamp = 390_000L, killerId = 3, victimId = 8, position = null),
+                                    tlEvent(type = "CHAMPION_KILL", timestamp = 410_000L, killerId = 1, victimId = 8, assistingParticipantIds = listOf(3), position = null)
+                                )
+                            )
+                        ),
+                        participants = listOf(TimelineParticipantDto(3, "puuid-3"), TimelineParticipantDto(8, "puuid-8"))
+                    )
+                )
+                val unpositionedAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_UNPOS_DEATHS", tlUnpositionedDeaths, validMatch)),
+                    "puuid-3"
+                )
+                unpositionedAnalysis.aggregateSummary.gamesAnalyzed shouldBe 1
+                unpositionedAnalysis.aggregateSummary.deathsTotal shouldBe 3
+                unpositionedAnalysis.aggregateSummary.deathsBefore10 shouldBe 3
+                unpositionedAnalysis.aggregateSummary.killsTotal shouldBe 1
+                unpositionedAnalysis.aggregateSummary.assistsTotal shouldBe 1
+                unpositionedAnalysis.deathPositions.size shouldBe 0
+                unpositionedAnalysis.killPositions.size shouldBe 0
+                unpositionedAnalysis.assistPositions.size shouldBe 0
+                unpositionedAnalysis.aggregateSummary.mostDangerousZone shouldBe "Not available"
+
+                // 4. Mixed deaths: 2 missing-position deaths + 1 valid Red Side Jungle death -> deathsTotal = 3, Red Side Jungle wins (no (0, 0) Blue bias!)
+                val tlMixedPos = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata("EUW1_MIXED_POS", null),
+                    info = MatchTimelineInfo(
+                        frameInterval = 60_000L,
+                        frames = listOf(
+                            TimelineFrameDto(
+                                timestamp = 300_000L,
+                                participantFrames = mapOf(
+                                    "3" to tlPFrame(participantId = 3, totalGold = 1800),
+                                    "8" to tlPFrame(participantId = 8, totalGold = 1900)
+                                ),
+                                events = listOf(
+                                    tlEvent(type = "CHAMPION_KILL", timestamp = 240_000L, killerId = 8, victimId = 3, position = null),
+                                    tlEvent(type = "CHAMPION_KILL", timestamp = 300_000L, killerId = 8, victimId = 3, position = null),
+                                    tlEvent(type = "CHAMPION_KILL", timestamp = 420_000L, killerId = 8, victimId = 3, position = TimelinePositionDto(x = 12000, y = 12000))
+                                )
+                            )
+                        ),
+                        participants = listOf(TimelineParticipantDto(3, "puuid-3"), TimelineParticipantDto(8, "puuid-8"))
+                    )
+                )
+                val mixedPosAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_MIXED_POS", tlMixedPos, validMatch)),
+                    "puuid-3"
+                )
+                mixedPosAnalysis.aggregateSummary.deathsTotal shouldBe 3
+                mixedPosAnalysis.deathPositions shouldBe listOf(HeatmapPoint(x = 12000, y = 12000, matchId = "EUW1_MIXED_POS", minute = 7))
+                mixedPosAnalysis.aggregateSummary.mostDangerousZone shouldBe "Red Side Jungle"
+            }
+        }
     }
 })
