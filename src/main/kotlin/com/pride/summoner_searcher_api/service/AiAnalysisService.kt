@@ -351,6 +351,7 @@ class AiAnalysisService(
         val naturalTimelineState = when {
             timelineStatus.equals("ANALYZED", ignoreCase = true) -> "timeline analyzed"
             timelineStatus.equals("PARTIAL", ignoreCase = true) -> "partial timeline analyzed"
+            timelineStatus.equals("BLOCKED", ignoreCase = true) -> "timeline temporarily unavailable"
             else -> "timeline not analyzed yet"
         }
         
@@ -624,7 +625,7 @@ class AiAnalysisService(
         const val MAX_PROMPT_VERSION_DIRECTIVE_CHARS: Int = 1_200
 
         private val INTERNAL_SCHEMA_LEAK_REGEX = Regex(
-            """\b(?:savedHistorySideSplits|missingLaneCsAt10Matches|theoreticalMaxMatchCount|savedHistoryAverages|omittedMatchesRollup|visionDataPrecision|recentMatchSummary|totalGamesAnalyzed|recentMatchSample|championMatchups|timelineInsights|improvementStats|timelineInvolved|personalTakedowns|eligibleTimeDeadGames|avgTheoreticalMax|wardsByTimeBucket|challengeSummary|personalLastHits|targetMatchCount|opponentDetails|timelineStatus|damageSplitPct|teamObjectives|avgLaneCsAt10|recentMatches|opponentStats|roleBreakdown|skillMaxOrder|topWeaknesses|leadRetention|rankedRecord|savedHistory|topChampions|topStrengths|phaseFarming|unspentGold|NOT_ANALYZED|WARD_PLACED|itemSpikes|deathCost|firstRate|avgTarget|cs_farming|vision_warding|wave_management|trading_laning|itemization_builds|macro_rotations|objective_control|jungle_pathing|back_timing|win_conditions|champion_pool|champion_mechanics|power_spikes|positional_spacing|resource_management|mental_state_tilt|review_methodology|full_analysis|opponent_specific)\b|\b[a-z]+(?:SideSplits|Averages|MatchSample|MatchSummary|MatchesRollup|DataPrecision|TimeBucket|SplitPct|MaxOrder|LastHits)\b|\b(?:horde|tower|dragon|baron|riftHerald)\.firstRate\b|\bcs10\.(?:theoreticalMax(?:Label)?|target(?:Label)?|spawnedSupply|supplyLabel)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`"""
+            """\b(?:savedHistorySideSplits|missingLaneCsAt10Matches|theoreticalMaxMatchCount|savedHistoryAverages|omittedMatchesRollup|visionDataPrecision|recentMatchSummary|totalGamesAnalyzed|recentMatchSample|championMatchups|timelineCoverage|timelineInsights|improvementStats|timelineInvolved|personalTakedowns|eligibleTimeDeadGames|avgTheoreticalMax|wardsByTimeBucket|challengeSummary|personalLastHits|targetMatchCount|opponentDetails|timelineStatus|damageSplitPct|teamObjectives|avgLaneCsAt10|recentMatches|opponentStats|roleBreakdown|skillMaxOrder|topWeaknesses|leadRetention|rankedRecord|savedHistory|topChampions|topStrengths|phaseFarming|unspentGold|NOT_ANALYZED|WARD_PLACED|itemSpikes|deathCost|firstRate|avgTarget|cs_farming|vision_warding|wave_management|trading_laning|itemization_builds|macro_rotations|objective_control|jungle_pathing|back_timing|win_conditions|champion_pool|champion_mechanics|power_spikes|positional_spacing|resource_management|mental_state_tilt|review_methodology|full_analysis|opponent_specific)\b|\b[a-z]+(?:SideSplits|Averages|MatchSample|MatchSummary|MatchesRollup|DataPrecision|TimeBucket|SplitPct|MaxOrder|LastHits)\b|\b(?:horde|tower|dragon|baron|riftHerald)\.firstRate\b|\bcs10\.(?:theoreticalMax(?:Label)?|target(?:Label)?|spawnedSupply|supplyLabel)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`"""
         )
 
         /**
@@ -1003,12 +1004,20 @@ class AiAnalysisService(
 
             out = Regex("""`?\btimelineStatus\b`?\s*(?:is|=|:)\s*`?\bNOT_ANALYZED\b`?""", RegexOption.IGNORE_CASE)
                 .replace(out, "match timelines are not analyzed yet")
+            out = Regex("""`?\btimelineStatus\b`?\s*(?:is|=|:)\s*`?\bPARTIAL\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out, "match timelines are partially analyzed")
+            out = Regex("""`?\btimelineStatus\b`?\s*(?:is|=|:)\s*`?\bBLOCKED\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out, "match timelines are temporarily unavailable")
             out = Regex("""`?\btimelineStatus\b`?\s*(?:is|=|:)\s*`?\bANALYZED\b`?""", RegexOption.IGNORE_CASE)
                 .replace(out, "match timelines are analyzed")
             out = Regex("""\b(your|the|my)\s+`?\btimelineStatus\b`?""", RegexOption.IGNORE_CASE)
                 .replace(out) { "${it.groupValues[1]} match timeline analysis" }
             out = Regex("""`?\btimelineStatus\b`?""")
                 .replace(out, "match timeline analysis")
+            out = Regex("""\b(your|the|my)\s+`?\btimelineCoverage\b`?""", RegexOption.IGNORE_CASE)
+                .replace(out) { "${it.groupValues[1]} match timeline coverage" }
+            out = Regex("""`?\btimelineCoverage\b`?""")
+                .replace(out, "match timeline coverage")
 
             out = Regex("""\b(your|the|my)\s+`?\brecentMatches\b`?""", RegexOption.IGNORE_CASE)
                 .replace(out) { mr ->
@@ -2127,6 +2136,10 @@ class AiAnalysisService(
         if (rawTimelineStatus != null) {
             val naturalTimelineStatus = when {
                 rawTimelineStatus.equals("ANALYZED", ignoreCase = true) -> "analyzed"
+                rawTimelineStatus.equals("PARTIAL", ignoreCase = true) ->
+                    "partially analyzed (minute-by-minute timeline subset only; see timeline coverage below)"
+                rawTimelineStatus.equals("BLOCKED", ignoreCase = true) ->
+                    "temporarily unavailable (end-of-game summary and challenge stats only)"
                 rawTimelineStatus.equals("NOT_ANALYZED", ignoreCase = true) ->
                     "not analyzed yet (end-of-game summary and challenge stats only)"
                 else -> rewriteInternalSchemaTokens(rawTimelineStatus.take(160), context)
@@ -2137,12 +2150,22 @@ class AiAnalysisService(
             headerLines.add("  Vision telemetry scope: ${rewriteInternalSchemaTokens(it.toString().take(160), context)}")
         }
         (context["timelineCoverage"] as? Map<*, *>)?.let { cov ->
-            val covStatus = (cov["status"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: "UNKNOWN").take(24)
+            val rawCovStatus = cov["status"]?.toString()?.trim()?.takeIf { it.isNotBlank() } ?: "UNKNOWN"
+            val naturalCovStatus = when {
+                rawCovStatus.equals("COMPLETE", ignoreCase = true) || rawCovStatus.equals("ANALYZED", ignoreCase = true) -> "complete"
+                rawCovStatus.equals("PARTIAL", ignoreCase = true) -> "partial"
+                rawCovStatus.equals("BLOCKED", ignoreCase = true) -> "blocked"
+                else -> rewriteInternalSchemaTokens(rawCovStatus.lowercase().replace('_', ' ').take(32), context)
+            }
             val covCount = cov["covered"] ?: cov["coveredCount"] ?: cov["coveredMatches"] ?: 0
             val reqCount = cov["requested"] ?: cov["requestedCount"] ?: cov["requestedMatches"] ?: 0
-            val stopReason = cov["stopReason"]?.toString()?.trim()?.takeIf { it.isNotBlank() }?.take(48)
-            val stopSuffix = if (stopReason != null) ", stopReason=$stopReason" else ""
-            headerLines.add("  timelineCoverage: {status=$covStatus, covered=${covCount}/${reqCount} games$stopSuffix}")
+            val stopReason = cov["stopReason"]?.toString()?.trim()?.takeIf { it.isNotBlank() }
+                ?.lowercase()
+                ?.replace('_', ' ')
+                ?.replace(Regex("""\s+"""), " ")
+                ?.take(64)
+            val stopSuffix = if (stopReason != null) ", stop reason=$stopReason" else ""
+            headerLines.add("  Timeline coverage: status=$naturalCovStatus, covered=${covCount}/${reqCount} games$stopSuffix")
         }
 
         // 3. Saved-history per-game averages & side splits (explicitly scoped to saved matches; omitted if structured savedHistory is invalid/null)
@@ -2927,7 +2950,7 @@ class AiAnalysisService(
         if (coverage != null || rawStatus == "PARTIAL" || rawStatus == "BLOCKED") {
             lines.add(
                 "\n**⏱️ TIMELINE COVERAGE BOUNDARY:** " +
-                    "When `timelineStatus` is `PARTIAL`, cite the exact `covered`/`requested` timeline denominator from `timelineCoverage` in plain player language (for example, \"minute-by-minute timeline data is available for X of your last Y games\"), anchor minute-by-minute claims strictly to those covered games without extrapolating to missing games, and when `timelineStatus` is `BLOCKED` or `covered` is 0, state plainly that minute-by-minute timeline data is temporarily unavailable and rely only on match summary stats. Never echo internal schema keys or status codes (`timelineCoverage`, `timelineStatus`, `stopReason`, `PARTIAL`, `BLOCKED`, `NOT_ANALYZED`)."
+                    "When match timeline analysis is partial, cite the exact covered/requested game denominator from Timeline coverage in plain player language (for example, \"minute-by-minute timeline data is available for X of your last Y games\"), anchor minute-by-minute claims strictly to those covered games without extrapolating to missing games, and when match timeline analysis is blocked or temporarily unavailable (or covered games is 0), state plainly that minute-by-minute timeline data is temporarily unavailable and rely only on match summary stats. Never echo internal schema keys, status codes, or backticks."
             )
         }
 

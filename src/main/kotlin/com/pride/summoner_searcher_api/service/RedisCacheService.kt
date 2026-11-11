@@ -130,6 +130,18 @@ class RedisCacheService(
         return bos.toString(java.nio.charset.StandardCharsets.ISO_8859_1)
     }
 
+    /**
+     * Deserializes [rawValue] without allocating whole-payload UTF-8, substring, or ISO-8859-1 copies.
+     *
+     * Note on boundaries & intentional fail-closed tradeoff:
+     * - [redisTemplate] (`StringRedisTemplate`) already materializes [rawValue] as a JVM `String` before
+     *   entering [deserializeValue]; these bounds prevent additional whole-payload conversions/copies here.
+     * - Compressed caps ([maxCompressedBytesForInflatedCap] / [maxBase64CharsForInflatedCap]) cover single-member
+     *   `GZIPOutputStream` payloads written by [serializeAndCompress] (including incompressible stored blocks),
+     *   and intentionally fail closed (`RESPONSE_TOO_LARGE` -> `null`) on pathological GZIP shapes (such as
+     *   concatenated multi-member streams or oversized `FEXTRA`/`FNAME`/`FCOMMENT` headers) that exceed the
+     *   compressed/Base64 cap even if inflated output would remain within `effectiveMaxBytes`.
+     */
     private fun <T> deserializeValue(rawValue: String, type: Class<T>): T? {
         val ctx = currentThreadInflateContext.get()
         val effectiveMaxBytes = (ctx?.maxInflatedBytes ?: DEFAULT_MAX_INFLATED_CACHE_BYTES)
