@@ -763,20 +763,20 @@ class TimelineService @Autowired constructor(
 
         // 1. Pre-decode 350 MiB admission guard
         if (!hasCoachAdmissionHeadroom()) {
-            logger.warn(
-                "Coach timeline preparation blocked at pre-decode admission (350 MiB guard) for puuid={} region={}",
-                trimmedPuuid,
-                normalizedRegion
+            val blocked = buildBlockedResult(
+                normalizedRegion = normalizedRegion,
+                puuid = trimmedPuuid,
+                orderedMatchIds = sanitizedRequestedIds,
+                stopReason = "MEMORY_HEADROOM_ADMISSION_BLOCKED",
+                analyzerVersion = analyzerVersion
             )
-            return PlayerPreparationOutcome.Ready(
-                buildBlockedResult(
-                    normalizedRegion = normalizedRegion,
-                    puuid = trimmedPuuid,
-                    orderedMatchIds = sanitizedRequestedIds,
-                    stopReason = "MEMORY_HEADROOM_ADMISSION_BLOCKED",
-                    analyzerVersion = analyzerVersion
-                )
+            logCoachPrepStageSummary(
+                normalizedRegion = normalizedRegion,
+                stage = "pre_admission",
+                result = blocked,
+                totalMs = (timeProvider.now() - startMs).coerceAtLeast(0L)
             )
+            return PlayerPreparationOutcome.Ready(blocked)
         }
 
         val playerCacheKey = buildPlayerPreparationCacheKey(
@@ -792,15 +792,20 @@ class TimelineService @Autowired constructor(
             map = inFlightPlayerPreparations,
             callerDeadlineMs = callerDeadlineMs,
             onCallerDeadlineExceeded = {
-                PlayerPreparationOutcome.Ready(
-                    buildBlockedResult(
-                        normalizedRegion = normalizedRegion,
-                        puuid = trimmedPuuid,
-                        orderedMatchIds = sanitizedRequestedIds,
-                        stopReason = "DEADLINE_EXCEEDED",
-                        analyzerVersion = analyzerVersion
-                    )
+                val blocked = buildBlockedResult(
+                    normalizedRegion = normalizedRegion,
+                    puuid = trimmedPuuid,
+                    orderedMatchIds = sanitizedRequestedIds,
+                    stopReason = "DEADLINE_EXCEEDED",
+                    analyzerVersion = analyzerVersion
                 )
+                logCoachPrepStageSummary(
+                    normalizedRegion = normalizedRegion,
+                    stage = "singleflight_caller_deadline",
+                    result = blocked,
+                    totalMs = (timeProvider.now() - startMs).coerceAtLeast(0L)
+                )
+                PlayerPreparationOutcome.Ready(blocked)
             }
         ) {
             executeSlotGuardedPlayerPreparation(
@@ -811,6 +816,50 @@ class TimelineService @Autowired constructor(
                 playerCacheKey = playerCacheKey,
                 includeEmptyFallbackAnalysisForLegacyRoute = includeEmptyFallbackAnalysisForLegacyRoute,
                 profileLoader = profileLoader
+            )
+        }
+    }
+
+    private fun logCoachPrepStageSummary(
+        normalizedRegion: String,
+        stage: String,
+        result: CoachTimelinePreparationResultDto,
+        totalMs: Long,
+        warmLookupMs: Long = 0L,
+        profileDecodeMs: Long = 0L,
+        riotLoopMs: Long = 0L,
+        httpAttempts: Int = 0
+    ) {
+        if (result.status == "COMPLETE") {
+            logger.info(
+                "coachTimelinePrep summary region={} status={} stage={} covered={}/{} cacheHit={} totalMs={} warmLookupMs={} profileDecodeMs={} riotLoopMs={} httpAttempts={}",
+                normalizedRegion,
+                result.status,
+                stage,
+                result.coveredMatchIds.size,
+                result.requestedMatchIds.size,
+                result.cacheHit,
+                totalMs,
+                warmLookupMs,
+                profileDecodeMs,
+                riotLoopMs,
+                httpAttempts
+            )
+        } else {
+            logger.warn(
+                "coachTimelinePrep summary region={} status={} stopReason={} stage={} covered={}/{} cacheHit={} totalMs={} warmLookupMs={} profileDecodeMs={} riotLoopMs={} httpAttempts={}",
+                normalizedRegion,
+                result.status,
+                result.stopReason ?: "NONE",
+                stage,
+                result.coveredMatchIds.size,
+                result.requestedMatchIds.size,
+                result.cacheHit,
+                totalMs,
+                warmLookupMs,
+                profileDecodeMs,
+                riotLoopMs,
+                httpAttempts
             )
         }
     }
@@ -829,62 +878,100 @@ class TimelineService @Autowired constructor(
 
         // Re-check 350 MiB admission headroom before slot & before any decode
         if (!hasCoachAdmissionHeadroom()) {
-            return PlayerPreparationOutcome.Ready(
-                buildBlockedResult(
+            val blocked = buildBlockedResult(
+                normalizedRegion = normalizedRegion,
+                puuid = puuid,
+                orderedMatchIds = sanitizedRequestedIds,
+                stopReason = "MEMORY_HEADROOM_ADMISSION_BLOCKED",
+                analyzerVersion = analyzerVersion
+            )
+            logCoachPrepStageSummary(
+                normalizedRegion = normalizedRegion,
+                stage = "slot_admission",
+                result = blocked,
+                totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L)
+            )
+            return PlayerPreparationOutcome.Ready(blocked)
+        }
+
+        // 3. Acquire global concurrency slot BEFORE warm-cache inflate or profile decode
+        val safeMaxConcurrent = maxConcurrentPreparations.coerceAtLeast(1)
+        if (!tryAcquireGlobalSlot(safeMaxConcurrent)) {
+            val blocked = buildBlockedResult(
+                normalizedRegion = normalizedRegion,
+                puuid = puuid,
+                orderedMatchIds = sanitizedRequestedIds,
+                stopReason = "CONCURRENCY_LIMIT_REACHED",
+                analyzerVersion = analyzerVersion
+            )
+            logCoachPrepStageSummary(
+                normalizedRegion = normalizedRegion,
+                stage = "concurrency_slot",
+                result = blocked,
+                totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L)
+            )
+            return PlayerPreparationOutcome.Ready(blocked)
+        }
+
+        val lingeringWorkers = Collections.synchronizedList(mutableListOf<RiotApiService.LingeringWorkerHandle>())
+        var warmLookupMs = 0L
+        var profileDecodeMs = 0L
+        try {
+            if (!hasCoachAdmissionHeadroom()) {
+                val blocked = buildBlockedResult(
                     normalizedRegion = normalizedRegion,
                     puuid = puuid,
                     orderedMatchIds = sanitizedRequestedIds,
                     stopReason = "MEMORY_HEADROOM_ADMISSION_BLOCKED",
                     analyzerVersion = analyzerVersion
                 )
-            )
-        }
-
-        // 3. Acquire global concurrency slot BEFORE warm-cache inflate or profile decode
-        val safeMaxConcurrent = maxConcurrentPreparations.coerceAtLeast(1)
-        if (!tryAcquireGlobalSlot(safeMaxConcurrent)) {
-            return PlayerPreparationOutcome.Ready(
-                buildBlockedResult(
+                logCoachPrepStageSummary(
                     normalizedRegion = normalizedRegion,
-                    puuid = puuid,
-                    orderedMatchIds = sanitizedRequestedIds,
-                    stopReason = "CONCURRENCY_LIMIT_REACHED",
-                    analyzerVersion = analyzerVersion
+                    stage = "post_slot_admission",
+                    result = blocked,
+                    totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L)
                 )
-            )
-        }
-
-        val lingeringWorkers = Collections.synchronizedList(mutableListOf<RiotApiService.LingeringWorkerHandle>())
-        try {
-            if (!hasCoachAdmissionHeadroom()) {
-                return PlayerPreparationOutcome.Ready(
-                    buildBlockedResult(
-                        normalizedRegion = normalizedRegion,
-                        puuid = puuid,
-                        orderedMatchIds = sanitizedRequestedIds,
-                        stopReason = "MEMORY_HEADROOM_ADMISSION_BLOCKED",
-                        analyzerVersion = analyzerVersion
-                    )
-                )
+                return PlayerPreparationOutcome.Ready(blocked)
             }
 
             // 4. Bounded warm cache lookup inside the global slot BEFORE SummonerProfileDto decode
-            when (val warmPlayerLookup = readCachedPreparationBounded(playerCacheKey, ownerDeadlineMs, lingeringWorkers)) {
-                is CachedPreparationLookup.Hit -> return PlayerPreparationOutcome.Ready(warmPlayerLookup.result)
-                is CachedPreparationLookup.Aborted -> return PlayerPreparationOutcome.Ready(
-                    buildBlockedResult(
+            val warmStartMs = timeProvider.now()
+            val warmPlayerLookup = readCachedPreparationBounded(playerCacheKey, ownerDeadlineMs, lingeringWorkers)
+            warmLookupMs += (timeProvider.now() - warmStartMs).coerceAtLeast(0L)
+            when (warmPlayerLookup) {
+                is CachedPreparationLookup.Hit -> {
+                    logCoachPrepStageSummary(
+                        normalizedRegion = normalizedRegion,
+                        stage = "player_warm_cache",
+                        result = warmPlayerLookup.result,
+                        totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
+                        warmLookupMs = warmLookupMs
+                    )
+                    return PlayerPreparationOutcome.Ready(warmPlayerLookup.result)
+                }
+                is CachedPreparationLookup.Aborted -> {
+                    val blocked = buildBlockedResult(
                         normalizedRegion = normalizedRegion,
                         puuid = puuid,
                         orderedMatchIds = sanitizedRequestedIds,
                         stopReason = warmPlayerLookup.stopReason,
                         analyzerVersion = analyzerVersion
                     )
-                )
+                    logCoachPrepStageSummary(
+                        normalizedRegion = normalizedRegion,
+                        stage = "player_warm_cache",
+                        result = blocked,
+                        totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
+                        warmLookupMs = warmLookupMs
+                    )
+                    return PlayerPreparationOutcome.Ready(blocked)
+                }
                 CachedPreparationLookup.Miss -> Unit
             }
 
             // 5. Bounded profile decode + immediate slice to <= 20 recent match IDs/DTOs (releasing 883-ID profile immediately)
             val profileFailure = AtomicReference<String?>(null)
+            val profileStartMs = timeProvider.now()
             val slicedProfile = extractBoundedProfileSlice(
                 sanitizedRequestedIds = sanitizedRequestedIds,
                 deadlineAtMs = ownerDeadlineMs,
@@ -892,6 +979,7 @@ class TimelineService @Autowired constructor(
                 lingeringWorkers = lingeringWorkers,
                 profileLoader = profileLoader
             )
+            profileDecodeMs = (timeProvider.now() - profileStartMs).coerceAtLeast(0L)
             val profileAbortReason = profileFailure.get()
             if (profileAbortReason != null) {
                 val mappedReason = when (profileAbortReason) {
@@ -900,38 +988,59 @@ class TimelineService @Autowired constructor(
                     "HTTP_EXECUTOR_SATURATED" -> "HTTP_EXECUTOR_SATURATED"
                     else -> "TIMELINE_UNAVAILABLE"
                 }
-                return PlayerPreparationOutcome.Ready(
-                    buildBlockedResult(
-                        normalizedRegion = normalizedRegion,
-                        puuid = puuid,
-                        orderedMatchIds = sanitizedRequestedIds,
-                        stopReason = mappedReason,
-                        analyzerVersion = analyzerVersion
-                    )
+                val blocked = buildBlockedResult(
+                    normalizedRegion = normalizedRegion,
+                    puuid = puuid,
+                    orderedMatchIds = sanitizedRequestedIds,
+                    stopReason = mappedReason,
+                    analyzerVersion = analyzerVersion
                 )
+                logCoachPrepStageSummary(
+                    normalizedRegion = normalizedRegion,
+                    stage = "profile_decode",
+                    result = blocked,
+                    totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
+                    warmLookupMs = warmLookupMs,
+                    profileDecodeMs = profileDecodeMs
+                )
+                return PlayerPreparationOutcome.Ready(blocked)
             }
             if (slicedProfile == null) {
+                logger.info(
+                    "coachTimelinePrep summary region={} status=PROFILE_NOT_FOUND stage=profile_decode totalMs={} warmLookupMs={} profileDecodeMs={}",
+                    normalizedRegion,
+                    (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
+                    warmLookupMs,
+                    profileDecodeMs
+                )
                 return PlayerPreparationOutcome.ProfileNotFound
             }
 
             val orderedMatchIds = slicedProfile.effectiveMatchIds
             val orderedMatchDtos = slicedProfile.orderedMatchDtos
             if (orderedMatchIds.isEmpty()) {
-                return PlayerPreparationOutcome.Ready(
-                    CoachTimelinePreparationResultDto(
-                        status = "BLOCKED",
-                        region = normalizedRegion,
-                        puuid = puuid,
-                        analyzerVersion = analyzerVersion,
-                        requestedMatchIds = emptyList(),
-                        coveredMatchIds = emptyList(),
-                        missingMatches = emptyList(),
-                        stopReason = "NO_MATCHES_AVAILABLE",
-                        cacheHit = false,
-                        peakRetainedRawTimelines = 0,
-                        analysis = null
-                    )
+                val blocked = CoachTimelinePreparationResultDto(
+                    status = "BLOCKED",
+                    region = normalizedRegion,
+                    puuid = puuid,
+                    analyzerVersion = analyzerVersion,
+                    requestedMatchIds = emptyList(),
+                    coveredMatchIds = emptyList(),
+                    missingMatches = emptyList(),
+                    stopReason = "NO_MATCHES_AVAILABLE",
+                    cacheHit = false,
+                    peakRetainedRawTimelines = 0,
+                    analysis = null
                 )
+                logCoachPrepStageSummary(
+                    normalizedRegion = normalizedRegion,
+                    stage = "no_matches",
+                    result = blocked,
+                    totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
+                    warmLookupMs = warmLookupMs,
+                    profileDecodeMs = profileDecodeMs
+                )
+                return PlayerPreparationOutcome.Ready(blocked)
             }
 
             val directCacheKey = buildDirectPreparationCacheKey(
@@ -940,21 +1049,45 @@ class TimelineService @Autowired constructor(
                 orderedMatchIds = orderedMatchIds,
                 analyzerVersion = analyzerVersion
             )
-            when (val warmDirectLookup = readCachedPreparationBounded(directCacheKey, ownerDeadlineMs, lingeringWorkers)) {
-                is CachedPreparationLookup.Hit -> return PlayerPreparationOutcome.Ready(warmDirectLookup.result)
-                is CachedPreparationLookup.Aborted -> return PlayerPreparationOutcome.Ready(
-                    buildBlockedResult(
+            val directWarmStartMs = timeProvider.now()
+            val warmDirectLookup = readCachedPreparationBounded(directCacheKey, ownerDeadlineMs, lingeringWorkers)
+            warmLookupMs += (timeProvider.now() - directWarmStartMs).coerceAtLeast(0L)
+            when (warmDirectLookup) {
+                is CachedPreparationLookup.Hit -> {
+                    logCoachPrepStageSummary(
+                        normalizedRegion = normalizedRegion,
+                        stage = "direct_warm_cache",
+                        result = warmDirectLookup.result,
+                        totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
+                        warmLookupMs = warmLookupMs,
+                        profileDecodeMs = profileDecodeMs
+                    )
+                    return PlayerPreparationOutcome.Ready(warmDirectLookup.result)
+                }
+                is CachedPreparationLookup.Aborted -> {
+                    val blocked = buildBlockedResult(
                         normalizedRegion = normalizedRegion,
                         puuid = puuid,
                         orderedMatchIds = orderedMatchIds,
                         stopReason = warmDirectLookup.stopReason,
                         analyzerVersion = analyzerVersion
                     )
-                )
+                    logCoachPrepStageSummary(
+                        normalizedRegion = normalizedRegion,
+                        stage = "direct_warm_cache",
+                        result = blocked,
+                        totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
+                        warmLookupMs = warmLookupMs,
+                        profileDecodeMs = profileDecodeMs
+                    )
+                    return PlayerPreparationOutcome.Ready(blocked)
+                }
                 CachedPreparationLookup.Miss -> Unit
             }
 
             val playerScopeKey = "$normalizedRegion:$puuid"
+            val httpAttempts = AtomicInteger(0)
+            val riotLoopStartMs = timeProvider.now()
             val result = RiotApiService.withLingeringWorkerHook({ handle -> lingeringWorkers.add(handle) }) {
                 executeCoreTimelinePreparation(
                     normalizedRegion = normalizedRegion,
@@ -965,9 +1098,21 @@ class TimelineService @Autowired constructor(
                     cacheKeysToPopulate = listOf(directCacheKey, playerCacheKey),
                     playerScopeKey = playerScopeKey,
                     deadlineAtMs = ownerDeadlineMs,
-                    lingeringWorkers = lingeringWorkers
+                    lingeringWorkers = lingeringWorkers,
+                    httpAttemptCounter = httpAttempts
                 )
             }
+            val riotLoopMs = (timeProvider.now() - riotLoopStartMs).coerceAtLeast(0L)
+            logCoachPrepStageSummary(
+                normalizedRegion = normalizedRegion,
+                stage = "timeline_loop",
+                result = result,
+                totalMs = (timeProvider.now() - ownerStartMs).coerceAtLeast(0L),
+                warmLookupMs = warmLookupMs,
+                profileDecodeMs = profileDecodeMs,
+                riotLoopMs = riotLoopMs,
+                httpAttempts = httpAttempts.get()
+            )
 
             val nonTransientEmptyAnalysis = if (
                 includeEmptyFallbackAnalysisForLegacyRoute &&
@@ -1189,7 +1334,8 @@ class TimelineService @Autowired constructor(
         cacheKeysToPopulate: List<String>,
         playerScopeKey: String,
         deadlineAtMs: Long,
-        lingeringWorkers: MutableList<RiotApiService.LingeringWorkerHandle>
+        lingeringWorkers: MutableList<RiotApiService.LingeringWorkerHandle>,
+        httpAttemptCounter: AtomicInteger? = null
     ): CoachTimelinePreparationResultDto {
         val matchDtosById = matchDtos.mapNotNull { dto ->
             val mid = dto.metadata?.matchId?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
@@ -1267,7 +1413,7 @@ class TimelineService @Autowired constructor(
                             region = normalizedRegion,
                             priority = ApiPriority.LOW,
                             maxRetries = 0,
-                            httpAttemptCounter = null,
+                            httpAttemptCounter = httpAttemptCounter,
                             failureReasonHolder = failureReason,
                             maxTotalDurationMs = remainingMs,
                             headroomGuard = ::hasCoachContinueHeadroom
