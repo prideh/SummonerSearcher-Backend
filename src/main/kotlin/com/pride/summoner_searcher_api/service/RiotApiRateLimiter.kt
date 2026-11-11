@@ -62,6 +62,23 @@ class RiotApiRateLimiter(
     }
 
     /**
+     * Attempts to acquire a permit within [maxWaitMs].
+     * Enforces [LOW_PRIORITY_CAP_RATIO] and foreground user-request yield clearance when [priority] is [ApiPriority.LOW],
+     * never updating [RegionRateLimiter.lastHighPriorityAtMs] for low-priority callers, and returns `false`
+     * without sleeping past the budget if Retry-After, foreground yield, or bucket waits exceed [maxWaitMs].
+     */
+    suspend fun tryAcquirePermit(
+        region: String,
+        priority: ApiPriority,
+        endpointKey: String? = null,
+        maxWaitMs: Long
+    ): Boolean {
+        val normalizedRegion = region.lowercase()
+        return limiters.computeIfAbsent(normalizedRegion) { RegionRateLimiter(it) }
+            .tryAcquire(priority, endpointKey, maxWaitMs)
+    }
+
+    /**
      * Updates the rate limits for a region based on Riot API response headers.
      */
     suspend fun updateLimits(
@@ -70,15 +87,67 @@ class RiotApiRateLimiter(
         countHeader: String?,
         endpointKey: String? = null,
         methodLimitHeader: String? = null,
-        methodCountHeader: String? = null
+        methodCountHeader: String? = null,
+        deadlineAtMs: Long? = null
     ) {
         val normalizedRegion = region.lowercase()
         val regionLimiter = limiters.computeIfAbsent(normalizedRegion) { RegionRateLimiter(it) }
         if (limitHeader != null && countHeader != null) {
-            regionLimiter.updateBuckets(limitHeader, countHeader)
+            regionLimiter.updateBuckets(limitHeader, countHeader, deadlineAtMs)
         }
         if (!endpointKey.isNullOrBlank() && methodLimitHeader != null && methodCountHeader != null) {
-            regionLimiter.updateMethodBuckets(endpointKey, methodLimitHeader, methodCountHeader)
+            regionLimiter.updateMethodBuckets(endpointKey, methodLimitHeader, methodCountHeader, deadlineAtMs)
+        }
+    }
+
+    internal suspend fun <T> withRegionAppBucketLockForTest(
+        region: String,
+        windowSeconds: Int,
+        block: suspend () -> T
+    ): T {
+        val normalizedRegion = region.lowercase()
+        val regionLimiter = limiters.computeIfAbsent(normalizedRegion) { RegionRateLimiter(it) }
+        return regionLimiter.withAppBucketLockForTest(windowSeconds, block)
+    }
+
+    private suspend fun tryLockWithDeadline(mutex: Mutex, deadlineAtMs: Long): Boolean {
+        val now = timeProvider.now()
+        val remainingMs = deadlineAtMs - now
+        if (remainingMs < 0L) {
+            return false
+        }
+        if (mutex.tryLock()) {
+            if (timeProvider.now() > deadlineAtMs) {
+                mutex.unlock()
+                return false
+            }
+            return true
+        }
+        if (remainingMs == 0L) {
+            return false
+        }
+        var locked = false
+        return try {
+            val acquired = kotlinx.coroutines.withTimeoutOrNull(remainingMs) {
+                mutex.lock()
+                locked = true
+                true
+            } ?: false
+            if (!acquired && locked) {
+                mutex.unlock()
+                locked = false
+            }
+            if (locked && timeProvider.now() > deadlineAtMs) {
+                mutex.unlock()
+                locked = false
+                return false
+            }
+            locked
+        } catch (t: Throwable) {
+            if (locked) {
+                mutex.unlock()
+            }
+            throw t
         }
     }
 
@@ -118,6 +187,15 @@ class RiotApiRateLimiter(
         val normalizedRegion = region.lowercase()
         limiters.computeIfAbsent(normalizedRegion) { RegionRateLimiter(it) }
             .awaitLowPriorityClearance()
+    }
+
+    /**
+     * Returns the remaining active regional `429 Retry-After` or `service` backoff wait time in milliseconds,
+     * or `0L` if no cooldown is currently active.
+     */
+    fun getActiveRetryAfterWaitMs(region: String): Long {
+        val normalizedRegion = region.lowercase()
+        return limiters[normalizedRegion]?.getActiveRetryAfterWaitMs() ?: 0L
     }
 
     /**
@@ -203,6 +281,11 @@ class RiotApiRateLimiter(
             }
         }
 
+        fun getActiveRetryAfterWaitMs(): Long {
+            val now = timeProvider.now()
+            return (maxOf(retryAfterUntilMs, serviceRateLimitUntilMs) - now).coerceAtLeast(0L)
+        }
+
         private fun isForegroundYieldActive(now: Long): Boolean {
             if (activeUserRequests.get() > 0) return true
             val lastHigh = lastHighPriorityAtMs ?: return false
@@ -254,84 +337,197 @@ class RiotApiRateLimiter(
             }
         }
 
-        suspend fun updateBuckets(limitHeader: String, countHeader: String) {
-            bucketsMutex.withLock {
-                try {
-                    val limits = parseHeader(limitHeader)
-                    val counts = parseHeader(countHeader)
+        suspend fun tryAcquire(priority: ApiPriority, endpointKey: String? = null, maxWaitMs: Long): Boolean {
+            val safeMaxWaitMs = maxWaitMs.coerceAtLeast(0L)
+            val startMs = timeProvider.now()
+            val deadlineAtMs = startMs + safeMaxWaitMs
+            if (priority == ApiPriority.HIGH) {
+                lastHighPriorityAtMs = startMs
+            }
 
-                    if (limits.size != counts.size || limits.isEmpty()) {
-                        logger.warn("[{}] Mismatch in limit/count headers: {} vs {}", regionName, limitHeader, countHeader)
-                        return
+            while (true) {
+                val now = timeProvider.now()
+                val remainingMs = deadlineAtMs - now
+                if (remainingMs < 0L) {
+                    return false
+                }
+                val retryWait = maxOf(retryAfterUntilMs, serviceRateLimitUntilMs) - now
+                if (retryWait > 0L) {
+                    val sleepMs = retryWait + 10L
+                    if (sleepMs > remainingMs) {
+                        return false
                     }
+                    delay(sleepMs)
+                    if (timeProvider.now() <= now) {
+                        return false
+                    }
+                    continue
+                }
+                if (priority == ApiPriority.LOW) {
+                    if (activeUserRequests.get() > 0) {
+                        val sleepMs = 50L
+                        if (sleepMs > remainingMs) {
+                            return false
+                        }
+                        delay(sleepMs)
+                        if (timeProvider.now() <= now) {
+                            return false
+                        }
+                        continue
+                    }
+                    val lastHigh = lastHighPriorityAtMs
+                    if (lastHigh != null && (now - lastHigh) in 0 until USER_REQUEST_YIELD_WINDOW_MS) {
+                        val yieldWait = (USER_REQUEST_YIELD_WINDOW_MS - (now - lastHigh)).coerceAtLeast(25L)
+                        if (yieldWait > remainingMs) {
+                            return false
+                        }
+                        delay(yieldWait)
+                        if (timeProvider.now() <= now) {
+                            return false
+                        }
+                        continue
+                    }
+                }
+                break
+            }
 
-                    lastAppLimitHeader = limitHeader
-                    lastAppCountHeader = countHeader
-                    appLimitsVerifiedFromHeaders = true
+            val nowBeforeBuckets = timeProvider.now()
+            val remainingBeforeBuckets = deadlineAtMs - nowBeforeBuckets
+            if (remainingBeforeBuckets < 0L) {
+                return false
+            }
 
-                    val newBuckets = mutableListOf<SlidingWindowBucket>()
-                    var changed = false
+            val currentBuckets = buckets
+            val methodBuckets = if (!endpointKey.isNullOrBlank()) {
+                methodEndpoints[endpointKey]?.buckets ?: emptyList()
+            } else {
+                emptyList()
+            }
+            val maxBucketWait = (currentBuckets + methodBuckets)
+                .maxOfOrNull { it.requiredWaitMs(priority, nowBeforeBuckets) } ?: 0L
+            if (maxBucketWait > 0L && maxBucketWait + 10L > remainingBeforeBuckets) {
+                return false
+            }
 
-                    limits.forEachIndexed { index, (capacity, seconds) ->
-                        val count = counts[index].first
-                        val window = Duration.ofSeconds(seconds.toLong())
+            for (bucket in currentBuckets) {
+                if (timeProvider.now() > deadlineAtMs || !bucket.tryAcquire(priority, deadlineAtMs)) {
+                    return false
+                }
+            }
+            for (bucket in methodBuckets) {
+                if (timeProvider.now() > deadlineAtMs || !bucket.tryAcquire(priority, deadlineAtMs)) {
+                    return false
+                }
+            }
+            return true
+        }
 
-                        val existingBucket = buckets.find { it.windowSeconds == seconds }
+        internal suspend fun <T> withAppBucketLockForTest(
+            windowSeconds: Int,
+            block: suspend () -> T
+        ): T {
+            val bucket = buckets.find { it.windowSeconds == windowSeconds }
+                ?: error("No app bucket with windowSeconds=$windowSeconds in region=$regionName")
+            return bucket.withBucketLockForTest(block)
+        }
 
-                        if (existingBucket != null) {
-                            if (existingBucket.updateConfig(capacity, count)) {
-                                changed = true
-                            }
-                            newBuckets.add(existingBucket)
-                        } else {
-                            logger.info("[{}] Discovered new rate limit: {} req / {}s", regionName, capacity, seconds)
-                            val newBucket = SlidingWindowBucket(capacity, window, "$regionName-${seconds}s")
-                            newBucket.syncCount(count)
-                            newBuckets.add(newBucket)
+        suspend fun updateBuckets(limitHeader: String, countHeader: String, deadlineAtMs: Long? = null) {
+            if (deadlineAtMs != null) {
+                if (!tryLockWithDeadline(bucketsMutex, deadlineAtMs)) {
+                    return
+                }
+            } else {
+                bucketsMutex.lock()
+            }
+            try {
+                val limits = parseHeader(limitHeader)
+                val counts = parseHeader(countHeader)
+
+                if (limits.size != counts.size || limits.isEmpty()) {
+                    logger.warn("[{}] Mismatch in limit/count headers: {} vs {}", regionName, limitHeader, countHeader)
+                    return
+                }
+
+                lastAppLimitHeader = limitHeader
+                lastAppCountHeader = countHeader
+                appLimitsVerifiedFromHeaders = true
+
+                val newBuckets = mutableListOf<SlidingWindowBucket>()
+                var changed = false
+
+                limits.forEachIndexed { index, (capacity, seconds) ->
+                    val count = counts[index].first
+                    val window = Duration.ofSeconds(seconds.toLong())
+
+                    val existingBucket = buckets.find { it.windowSeconds == seconds }
+
+                    if (existingBucket != null) {
+                        if (existingBucket.updateConfig(capacity, count, deadlineAtMs)) {
                             changed = true
                         }
+                        newBuckets.add(existingBucket)
+                    } else {
+                        logger.info("[{}] Discovered new rate limit: {} req / {}s", regionName, capacity, seconds)
+                        val newBucket = SlidingWindowBucket(capacity, window, "$regionName-${seconds}s")
+                        newBucket.syncCount(count, deadlineAtMs)
+                        newBuckets.add(newBucket)
+                        changed = true
                     }
-
-                    if (changed || newBuckets.size != buckets.size) {
-                        buckets = newBuckets
-                        logger.debug("[{}] Buckets updated. Active limits: {}", regionName, buckets.map { "${it.capacity}/${it.windowSeconds}s" })
-                    }
-                } catch (e: Exception) {
-                    logger.error("[{}] Failed to parse rate limit headers: {} / {}", regionName, limitHeader, countHeader, e)
                 }
+
+                if (changed || newBuckets.size != buckets.size) {
+                    buckets = newBuckets
+                    logger.debug("[{}] Buckets updated. Active limits: {}", regionName, buckets.map { "${it.capacity}/${it.windowSeconds}s" })
+                }
+            } catch (e: Exception) {
+                logger.error("[{}] Failed to parse rate limit headers: {} / {}", regionName, limitHeader, countHeader, e)
+            } finally {
+                bucketsMutex.unlock()
             }
         }
 
-        suspend fun updateMethodBuckets(endpointKey: String, methodLimitHeader: String, methodCountHeader: String) {
+        suspend fun updateMethodBuckets(
+            endpointKey: String,
+            methodLimitHeader: String,
+            methodCountHeader: String,
+            deadlineAtMs: Long? = null
+        ) {
             val state = methodEndpoints.computeIfAbsent(endpointKey) { MethodEndpointState(it) }
-            state.mutex.withLock {
-                try {
-                    val limits = parseHeader(methodLimitHeader)
-                    val counts = parseHeader(methodCountHeader)
-                    if (limits.size != counts.size || limits.isEmpty()) return
-
-                    state.lastLimitHeader = methodLimitHeader
-                    state.lastCountHeader = methodCountHeader
-                    state.lastUpdatedAtMs = timeProvider.now()
-
-                    val newBuckets = mutableListOf<SlidingWindowBucket>()
-                    limits.forEachIndexed { index, (capacity, seconds) ->
-                        val count = counts[index].first
-                        val window = Duration.ofSeconds(seconds.toLong())
-                        val existing = state.buckets.find { it.windowSeconds == seconds }
-                        if (existing != null) {
-                            existing.updateConfig(capacity, count)
-                            newBuckets.add(existing)
-                        } else {
-                            val b = SlidingWindowBucket(capacity, window, "$regionName-$endpointKey-${seconds}s")
-                            b.syncCount(count)
-                            newBuckets.add(b)
-                        }
-                    }
-                    state.buckets = newBuckets
-                } catch (e: Exception) {
-                    logger.debug("[{}:{}] Failed to parse method rate limit headers: {} / {}", regionName, endpointKey, methodLimitHeader, methodCountHeader)
+            if (deadlineAtMs != null) {
+                if (!tryLockWithDeadline(state.mutex, deadlineAtMs)) {
+                    return
                 }
+            } else {
+                state.mutex.lock()
+            }
+            try {
+                val limits = parseHeader(methodLimitHeader)
+                val counts = parseHeader(methodCountHeader)
+                if (limits.size != counts.size || limits.isEmpty()) return
+
+                state.lastLimitHeader = methodLimitHeader
+                state.lastCountHeader = methodCountHeader
+                state.lastUpdatedAtMs = timeProvider.now()
+
+                val newBuckets = mutableListOf<SlidingWindowBucket>()
+                limits.forEachIndexed { index, (capacity, seconds) ->
+                    val count = counts[index].first
+                    val window = Duration.ofSeconds(seconds.toLong())
+                    val existing = state.buckets.find { it.windowSeconds == seconds }
+                    if (existing != null) {
+                        existing.updateConfig(capacity, count, deadlineAtMs)
+                        newBuckets.add(existing)
+                    } else {
+                        val b = SlidingWindowBucket(capacity, window, "$regionName-$endpointKey-${seconds}s")
+                        b.syncCount(count, deadlineAtMs)
+                        newBuckets.add(b)
+                    }
+                }
+                state.buckets = newBuckets
+            } catch (e: Exception) {
+                logger.debug("[{}:{}] Failed to parse method rate limit headers: {} / {}", regionName, endpointKey, methodLimitHeader, methodCountHeader)
+            } finally {
+                state.mutex.unlock()
             }
         }
 
@@ -421,12 +617,19 @@ class RiotApiRateLimiter(
         private val name: String
     ) {
         private val timestamps = ArrayDeque<Long>()
+        private val timestampsLock = Any()
         private val mutex = Mutex()
         val windowSeconds = window.seconds.toInt()
         private val windowMs = window.toMillis()
 
+        internal suspend fun <T> withBucketLockForTest(block: suspend () -> T): T {
+            return mutex.withLock { block() }
+        }
+
         fun currentUsage(now: Long): Int {
-            return timestamps.count { now - it < windowMs }
+            return synchronized(timestampsLock) {
+                timestamps.count { now - it < windowMs }
+            }
         }
 
         fun hasHeadroomForLowPriority(now: Long): Boolean {
@@ -434,7 +637,21 @@ class RiotApiRateLimiter(
             return currentUsage(now) < lowCap
         }
 
-        suspend fun updateConfig(newCapacity: Int, remoteCount: Int): Boolean {
+        fun requiredWaitMs(priority: ApiPriority, now: Long): Long {
+            val effectiveCapacity = when (priority) {
+                ApiPriority.HIGH -> capacity
+                ApiPriority.LOW -> (capacity * LOW_PRIORITY_CAP_RATIO).toInt().coerceAtLeast(1)
+            }
+            return synchronized(timestampsLock) {
+                val active = timestamps.filter { now - it < windowMs }
+                if (active.size < effectiveCapacity) return@synchronized 0L
+                val targetIndex = (active.size - effectiveCapacity).coerceIn(0, active.size - 1)
+                val expiryTime = active[targetIndex] + windowMs
+                (expiryTime - now).coerceAtLeast(0L)
+            }
+        }
+
+        suspend fun updateConfig(newCapacity: Int, remoteCount: Int, deadlineAtMs: Long? = null): Boolean {
             var changed = false
             if (capacity != newCapacity) {
                 logger.info("[{}] Capacity changed: {} -> {}", name, capacity, newCapacity)
@@ -442,23 +659,34 @@ class RiotApiRateLimiter(
                 changed = true
             }
 
-            syncCount(remoteCount)
+            syncCount(remoteCount, deadlineAtMs)
             return changed
         }
 
-        suspend fun syncCount(remoteCount: Int) {
-            mutex.withLock {
+        suspend fun syncCount(remoteCount: Int, deadlineAtMs: Long? = null) {
+            if (deadlineAtMs != null) {
+                if (!tryLockWithDeadline(mutex, deadlineAtMs)) {
+                    return
+                }
+            } else {
+                mutex.lock()
+            }
+            try {
                 val now = timeProvider.now()
-                cleanUp(now)
+                synchronized(timestampsLock) {
+                    cleanUp(now)
 
-                val localCount = timestamps.size
-                if (remoteCount > localCount) {
-                    val diff = remoteCount - localCount
-                    logger.trace("[{}] Syncing count: Local {} < Remote {}. Adding {} fake entries.", name, localCount, remoteCount, diff)
-                    repeat(diff) {
-                        timestamps.addLast(now)
+                    val localCount = timestamps.size
+                    if (remoteCount > localCount) {
+                        val diff = remoteCount - localCount
+                        logger.trace("[{}] Syncing count: Local {} < Remote {}. Adding {} fake entries.", name, localCount, remoteCount, diff)
+                        repeat(diff) {
+                            timestamps.addLast(now)
+                        }
                     }
                 }
+            } finally {
+                mutex.unlock()
             }
         }
 
@@ -466,26 +694,33 @@ class RiotApiRateLimiter(
             mutex.withLock {
                 while (true) {
                     val now = timeProvider.now()
-                    cleanUp(now)
-
-                    // Reserve 20% headroom for HIGH priority requests by capping LOW priority at 80% capacity
                     val effectiveCapacity = when (priority) {
                         ApiPriority.HIGH -> capacity
                         ApiPriority.LOW -> (capacity * LOW_PRIORITY_CAP_RATIO).toInt().coerceAtLeast(1)
                     }
 
-                    if (timestamps.size < effectiveCapacity) {
-                        timestamps.addLast(timeProvider.now())
+                    var acquired = false
+                    var waitTime = 0L
+                    var currentSize = 0
+                    synchronized(timestampsLock) {
+                        cleanUp(now)
+                        if (timestamps.size < effectiveCapacity) {
+                            timestamps.addLast(timeProvider.now())
+                            acquired = true
+                        } else {
+                            currentSize = timestamps.size
+                            val targetIndex = (timestamps.size - effectiveCapacity).coerceIn(0, timestamps.size - 1)
+                            val targetTimestamp = timestamps[targetIndex]
+                            val expiryTime = targetTimestamp + windowMs
+                            waitTime = expiryTime - now
+                        }
+                    }
+                    if (acquired) {
                         return
                     }
 
-                    val targetIndex = (timestamps.size - effectiveCapacity).coerceIn(0, timestamps.size - 1)
-                    val targetTimestamp = timestamps[targetIndex]
-                    val expiryTime = targetTimestamp + windowMs
-                    val waitTime = expiryTime - now
-
                     if (waitTime > 0) {
-                        logger.debug("[{}] Limit reached for {} ({}/{}). Waiting {}ms...", name, priority, timestamps.size, effectiveCapacity, waitTime)
+                        logger.debug("[{}] Limit reached for {} ({}/{}). Waiting {}ms...", name, priority, currentSize, effectiveCapacity, waitTime)
                         mutex.unlock()
                         try {
                             delay(waitTime + 10)
@@ -493,6 +728,79 @@ class RiotApiRateLimiter(
                             mutex.lock()
                         }
                     }
+                }
+            }
+        }
+
+        suspend fun tryAcquire(priority: ApiPriority, deadlineAtMs: Long): Boolean {
+            if (!tryLockWithDeadline(mutex, deadlineAtMs)) {
+                return false
+            }
+            var holdsLock = true
+            try {
+                while (true) {
+                    val now = timeProvider.now()
+                    val effectiveCapacity = when (priority) {
+                        ApiPriority.HIGH -> capacity
+                        ApiPriority.LOW -> (capacity * LOW_PRIORITY_CAP_RATIO).toInt().coerceAtLeast(1)
+                    }
+
+                    var acquired = false
+                    var deadlineAlreadyPast = false
+                    var waitTime = 0L
+                    var currentSize = 0
+                    synchronized(timestampsLock) {
+                        cleanUp(now)
+                        if (timestamps.size < effectiveCapacity) {
+                            if (now > deadlineAtMs) {
+                                deadlineAlreadyPast = true
+                            } else {
+                                timestamps.addLast(now)
+                                acquired = true
+                            }
+                        } else {
+                            currentSize = timestamps.size
+                            val targetIndex = (timestamps.size - effectiveCapacity).coerceIn(0, timestamps.size - 1)
+                            val targetTimestamp = timestamps[targetIndex]
+                            val expiryTime = targetTimestamp + windowMs
+                            waitTime = expiryTime - now
+                        }
+                    }
+                    if (deadlineAlreadyPast) {
+                        return false
+                    }
+                    if (acquired) {
+                        return true
+                    }
+
+                    val sleepMs = (waitTime + 10L).coerceAtLeast(1L)
+                    val remainingMs = deadlineAtMs - now
+
+                    if (waitTime > 0L) {
+                        if (sleepMs > remainingMs) {
+                            logger.debug(
+                                "[{}] Limit reached for {} ({}/{}). Required wait {}ms exceeds remaining budget {}ms.",
+                                name, priority, currentSize, effectiveCapacity, sleepMs, remainingMs
+                            )
+                            return false
+                        }
+                        mutex.unlock()
+                        holdsLock = false
+                        delay(sleepMs)
+                        if (timeProvider.now() <= now) {
+                            return false
+                        }
+                        if (!tryLockWithDeadline(mutex, deadlineAtMs)) {
+                            return false
+                        }
+                        holdsLock = true
+                    } else if (now > deadlineAtMs) {
+                        return false
+                    }
+                }
+            } finally {
+                if (holdsLock) {
+                    mutex.unlock()
                 }
             }
         }

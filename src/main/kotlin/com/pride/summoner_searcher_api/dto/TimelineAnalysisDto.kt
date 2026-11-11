@@ -100,7 +100,9 @@ data class MatchEventEntry(
     val secondMark: Int,       // full seconds within the minute
     val actor: String?,        // champion name of the actor
     val target: String?,       // champion name of the target, or objective name
+    @param:com.fasterxml.jackson.annotation.JsonAlias("player", "isPlayer")
     val isPlayer: Boolean,     // true if the tracked player is the actor
+    @param:com.fasterxml.jackson.annotation.JsonAlias("opponent", "isOpponent")
     val isOpponent: Boolean,   // true if the tracked opponent is the actor
     val laneType: String?,
     val monsterType: String?,
@@ -132,3 +134,28 @@ data class TimelineAggregateSummary(
     val deathsNearObjectiveWindows: Int? = null,
     val wardsByTimeBucket: WardTimeBucketsDto? = null
 )
+
+data class CoachTimelinePreparationRequestDto(
+    val matchIds: List<String?>? = null
+)
+
+data class MissingMatchTimelineDto(
+    val matchId: String,
+    val reason: String
+)
+
+data class CoachTimelinePreparationResultDto(
+    /** "COMPLETE", "PARTIAL", or "BLOCKED" */
+    val status: String,
+    val region: String,
+    val puuid: String,
+    val analyzerVersion: String,
+    val requestedMatchIds: List<String>,
+    val coveredMatchIds: List<String>,
+    val missingMatches: List<MissingMatchTimelineDto>,
+    val stopReason: String? = null,
+    val cacheHit: Boolean = false,
+    val peakRetainedRawTimelines: Int = 0,
+    val analysis: TimelineAnalysisDto? = null
+)
+
