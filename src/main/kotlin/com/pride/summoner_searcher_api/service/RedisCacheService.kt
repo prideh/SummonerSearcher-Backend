@@ -68,20 +68,32 @@ class RedisCacheService(
 
     private val lastSetAllPeakSubBatchBytes = java.util.concurrent.atomic.AtomicLong(0L)
     private val maxObservedSetAllSubBatchBytes = java.util.concurrent.atomic.AtomicLong(0L)
+    private val lastSetAllPeakWhilePriorBatchHeldBytes = java.util.concurrent.atomic.AtomicLong(0L)
+    private val lastSetAllPeakTransientBufferedBytes = java.util.concurrent.atomic.AtomicLong(0L)
+    private val maxObservedOversizedEntryBytes = java.util.concurrent.atomic.AtomicLong(0L)
     private val pipelineSubBatchFlushes = java.util.concurrent.atomic.AtomicLong(0L)
+    private val oversizedDirectWrites = java.util.concurrent.atomic.AtomicLong(0L)
     private val pipelineFallbackWrites = java.util.concurrent.atomic.AtomicLong(0L)
 
     internal data class PipelineWriteTelemetry(
         val lastCallPeakSubBatchBytes: Long,
         val maxObservedSubBatchBytes: Long,
+        val lastCallPeakWhilePriorBatchHeldBytes: Long = 0L,
+        val lastCallPeakTransientBufferedBytes: Long = 0L,
+        val maxObservedOversizedEntryBytes: Long = 0L,
         val pipelineFlushes: Long,
+        val oversizedDirectWrites: Long = 0L,
         val fallbackWrites: Long
     )
 
     internal fun getPipelineWriteTelemetry(): PipelineWriteTelemetry = PipelineWriteTelemetry(
         lastCallPeakSubBatchBytes = lastSetAllPeakSubBatchBytes.get(),
         maxObservedSubBatchBytes = maxObservedSetAllSubBatchBytes.get(),
+        lastCallPeakWhilePriorBatchHeldBytes = lastSetAllPeakWhilePriorBatchHeldBytes.get(),
+        lastCallPeakTransientBufferedBytes = lastSetAllPeakTransientBufferedBytes.get(),
+        maxObservedOversizedEntryBytes = maxObservedOversizedEntryBytes.get(),
         pipelineFlushes = pipelineSubBatchFlushes.get(),
+        oversizedDirectWrites = oversizedDirectWrites.get(),
         fallbackWrites = pipelineFallbackWrites.get()
     )
 
@@ -101,10 +113,121 @@ class RedisCacheService(
     }
 
     /**
-     * Streams [entries] through bounded GZIP+Base64 sub-batches (`<= 25` entries and `<= 256 KiB` buffered bytes
-     * per pipeline flush) so whole-chunk pre-compression never spikes live heap on a 512 MiB container.
-     * Preserves identical payload encoding and [expiration] TTL semantics as [set], falling back cleanly to
-     * per-key [ValueOperations.set] if pipelining is unavailable or throws.
+     * Slabbed (`2 KiB` initial, `8 KiB` max slab) ASCII output buffer for `setAll` compression that:
+     * 1. Eliminates `ByteArrayOutputStream` power-of-two doubling (`256 KiB -> 512 KiB`) and intermediate `String` copies.
+     * 2. Flushes and clears any non-empty `priorBatch` **before** allocating a new slab or contiguous `ByteArray`
+     *    whenever `priorSubBatchBytes + keyBytesLength + allocatedSlabBytes + extraBytes > 256 KiB`, guaranteeing
+     *    that `priorBatch` is never held concurrently once combined buffered bytes would cross `256 KiB`.
+     */
+    private class BudgetAwareSlabOutputStream(
+        private val keyBytesLength: Int,
+        private val currentSubBatchBytes: () -> Long,
+        private val flushPriorSubBatchIfNonEmpty: () -> Unit
+    ) : java.io.OutputStream() {
+        private val slabs = ArrayList<ByteArray>(8)
+        private var completedSlabsBytes = 0L
+        private var activeSlab = ByteArray(INITIAL_SLAB_BYTES)
+        private var activeOffset = 0
+        private var totalSize = 0
+        var peakWhilePriorHeldBytes: Long = 0L
+            private set
+        var peakTransientBytes: Long = 0L
+            private set
+
+        init {
+            recordPeak(0L)
+        }
+
+        private fun recordPeak(extraContiguousBytes: Long) {
+            val subBytes = currentSubBatchBytes()
+            val slabBytes = completedSlabsBytes + activeSlab.size.toLong()
+            val combined = subBytes + keyBytesLength.toLong() + slabBytes + extraContiguousBytes
+            if (subBytes > 0L && combined > peakWhilePriorHeldBytes) {
+                peakWhilePriorHeldBytes = combined
+            }
+            if (combined > peakTransientBytes) {
+                peakTransientBytes = combined
+            }
+        }
+
+        private fun rollSlabWithBudgetGuard() {
+            val subBytes = currentSubBatchBytes()
+            val nextSlabBytes = completedSlabsBytes + activeSlab.size.toLong() + MAX_SLAB_BYTES.toLong()
+            if (subBytes > 0L &&
+                subBytes + keyBytesLength.toLong() + nextSlabBytes > MAX_PIPELINE_SUBBATCH_UTF8_BYTES
+            ) {
+                flushPriorSubBatchIfNonEmpty()
+            }
+            slabs.add(activeSlab)
+            completedSlabsBytes += activeSlab.size.toLong()
+            activeSlab = ByteArray(MAX_SLAB_BYTES)
+            activeOffset = 0
+            recordPeak(0L)
+        }
+
+        override fun write(b: Int) {
+            if (activeOffset >= activeSlab.size) {
+                rollSlabWithBudgetGuard()
+            }
+            activeSlab[activeOffset++] = b.toByte()
+            totalSize++
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            if (off < 0 || len < 0 || len > b.size - off) {
+                throw IndexOutOfBoundsException()
+            }
+            var remaining = len
+            var srcPos = off
+            while (remaining > 0) {
+                if (activeOffset >= activeSlab.size) {
+                    rollSlabWithBudgetGuard()
+                }
+                val toCopy = minOf(remaining, activeSlab.size - activeOffset)
+                System.arraycopy(b, srcPos, activeSlab, activeOffset, toCopy)
+                activeOffset += toCopy
+                srcPos += toCopy
+                remaining -= toCopy
+                totalSize += toCopy
+            }
+        }
+
+        fun toByteArrayAndReleaseSlabs(): ByteArray {
+            val subBytes = currentSubBatchBytes()
+            val slabBytes = completedSlabsBytes + activeSlab.size.toLong()
+            if (subBytes > 0L &&
+                subBytes + keyBytesLength.toLong() + slabBytes + totalSize.toLong() > MAX_PIPELINE_SUBBATCH_UTF8_BYTES
+            ) {
+                flushPriorSubBatchIfNonEmpty()
+            }
+            val out = ByteArray(totalSize)
+            recordPeak(totalSize.toLong())
+            var dstPos = 0
+            for (i in slabs.indices) {
+                val slab = slabs[i]
+                System.arraycopy(slab, 0, out, dstPos, slab.size)
+                dstPos += slab.size
+                slabs[i] = EMPTY_BYTES
+            }
+            slabs.clear()
+            completedSlabsBytes = 0L
+            if (activeOffset > 0) {
+                System.arraycopy(activeSlab, 0, out, dstPos, activeOffset)
+            }
+            activeSlab = EMPTY_BYTES
+            activeOffset = 0
+            return out
+        }
+    }
+
+    /**
+     * Streams [entries] with strict sub-batching and bounded transient compression buffers:
+     * - **Queued `subBatch` invariant**: `subBatch.size <= 25` and `subBatchBytes <= 256 KiB` (`262,144` bytes) strictly.
+     * - **Prior-batch non-overlap**: while `subBatch` is non-empty, `subBatchBytes + keyBytes + slabs + copy <= 256 KiB`;
+     *   before any slab roll or contiguous `ByteArray` materialization would cross `256 KiB`, `subBatch` is flushed and cleared first.
+     * - **Oversized single entries (`entryBytes > 256 KiB`)**: never added to `subBatch` and never batched via `executePipelined`;
+     *   written immediately as an unbatched single-key write preserving `"GZIP_B64:"` encoding, [expiration] TTL, and
+     *   [ValueOperations.set] fallback, then released (`2 * entryValueBytes + <= 8 KiB` slab transient peak during assembly).
      */
     fun <T> setAll(entries: Map<String, T>, expiration: Duration) {
         if (entries.isEmpty()) return
@@ -117,12 +240,17 @@ class RedisCacheService(
 
         val subBatch = ArrayList<PreparedPipelineEntry>(minOf(entries.size, MAX_PIPELINE_SUBBATCH_ENTRIES))
         var subBatchBytes = 0L
-        var callPeakBytes = 0L
+        var callPeakSubBatchBytes = 0L
+        var callPeakWhilePriorHeldBytes = 0L
+        var callPeakTransientBytes = 0L
 
         fun flushSubBatch() {
             if (subBatch.isEmpty()) return
-            if (subBatchBytes > callPeakBytes) {
-                callPeakBytes = subBatchBytes
+            if (subBatchBytes > callPeakSubBatchBytes) {
+                callPeakSubBatchBytes = subBatchBytes
+            }
+            if (subBatchBytes > callPeakTransientBytes) {
+                callPeakTransientBytes = subBatchBytes
             }
             maxObservedSetAllSubBatchBytes.accumulateAndGet(subBatchBytes, ::maxOf)
             val pipelinedSucceeded = try {
@@ -151,7 +279,7 @@ class RedisCacheService(
             if (!pipelinedSucceeded) {
                 val valueOps = redisTemplate.opsForValue()
                 for (item in subBatch) {
-                    val compressed = String(item.valueBytes, java.nio.charset.StandardCharsets.UTF_8)
+                    val compressed = String(item.valueBytes, java.nio.charset.StandardCharsets.ISO_8859_1)
                     if (hasPositiveTtl) {
                         valueOps.set(item.key, compressed, expiration)
                     } else {
@@ -164,11 +292,79 @@ class RedisCacheService(
             subBatchBytes = 0L
         }
 
+        fun writeDirectOversizedEntry(item: PreparedPipelineEntry) {
+            val directRawSucceeded = try {
+                if (redisTemplate.connectionFactory == null) {
+                    false
+                } else {
+                    redisTemplate.execute(
+                        org.springframework.data.redis.core.RedisCallback<Boolean> { connection ->
+                            connection.stringCommands().set(
+                                item.keyBytes,
+                                item.valueBytes,
+                                redisExpiration,
+                                org.springframework.data.redis.connection.RedisStringCommands.SetOption.UPSERT
+                            )
+                        }
+                    ) == true
+                }
+            } catch (_: Exception) {
+                false
+            }
+            oversizedDirectWrites.incrementAndGet()
+            if (!directRawSucceeded) {
+                val valueOps = redisTemplate.opsForValue()
+                val compressed = String(item.valueBytes, java.nio.charset.StandardCharsets.ISO_8859_1)
+                if (hasPositiveTtl) {
+                    valueOps.set(item.key, compressed, expiration)
+                } else {
+                    valueOps.set(item.key, compressed)
+                }
+                pipelineFallbackWrites.incrementAndGet()
+            }
+        }
+
         for ((key, value) in entries) {
             val keyBytes = key.toByteArray(java.nio.charset.StandardCharsets.UTF_8)
-            val valueBytes = serializeAndCompress(value).toByteArray(java.nio.charset.StandardCharsets.UTF_8)
+            if (subBatch.isNotEmpty() &&
+                (subBatch.size >= MAX_PIPELINE_SUBBATCH_ENTRIES ||
+                    subBatchBytes + keyBytes.size.toLong() + INITIAL_SLAB_BYTES.toLong() > MAX_PIPELINE_SUBBATCH_UTF8_BYTES)
+            ) {
+                flushSubBatch()
+            }
+
+            val slabOut = BudgetAwareSlabOutputStream(
+                keyBytesLength = keyBytes.size,
+                currentSubBatchBytes = { subBatchBytes },
+                flushPriorSubBatchIfNonEmpty = ::flushSubBatch
+            )
+            slabOut.write(COMPRESSION_PREFIX_ASCII_BYTES, 0, COMPRESSION_PREFIX_ASCII_BYTES.size)
+            java.util.Base64.getEncoder().wrap(slabOut).use { b64Out ->
+                java.util.zip.GZIPOutputStream(b64Out, GZIP_BUFFER_SIZE).use { gzipOut ->
+                    objectMapper.writeValue(gzipOut, value)
+                }
+            }
+            val valueBytes = slabOut.toByteArrayAndReleaseSlabs()
+            if (slabOut.peakWhilePriorHeldBytes > callPeakWhilePriorHeldBytes) {
+                callPeakWhilePriorHeldBytes = slabOut.peakWhilePriorHeldBytes
+            }
+            if (slabOut.peakTransientBytes > callPeakTransientBytes) {
+                callPeakTransientBytes = slabOut.peakTransientBytes
+            }
+
             val prepared = PreparedPipelineEntry(key, keyBytes, valueBytes)
             val entryBytes = prepared.totalBufferedBytes
+            if (entryBytes > MAX_PIPELINE_SUBBATCH_UTF8_BYTES) {
+                // Never admit an oversized (> 256 KiB) entry into `subBatch` or `executePipelined`.
+                flushSubBatch()
+                maxObservedOversizedEntryBytes.accumulateAndGet(entryBytes, ::maxOf)
+                if (entryBytes > callPeakTransientBytes) {
+                    callPeakTransientBytes = entryBytes
+                }
+                writeDirectOversizedEntry(prepared)
+                continue
+            }
+
             if (subBatch.isNotEmpty() &&
                 (subBatch.size >= MAX_PIPELINE_SUBBATCH_ENTRIES ||
                     subBatchBytes + entryBytes > MAX_PIPELINE_SUBBATCH_UTF8_BYTES)
@@ -177,9 +373,19 @@ class RedisCacheService(
             }
             subBatch.add(prepared)
             subBatchBytes += entryBytes
+            if (subBatchBytes > callPeakTransientBytes) {
+                callPeakTransientBytes = subBatchBytes
+            }
+            if (subBatch.size >= MAX_PIPELINE_SUBBATCH_ENTRIES ||
+                subBatchBytes >= MAX_PIPELINE_SUBBATCH_UTF8_BYTES
+            ) {
+                flushSubBatch()
+            }
         }
         flushSubBatch()
-        lastSetAllPeakSubBatchBytes.set(callPeakBytes)
+        lastSetAllPeakSubBatchBytes.set(callPeakSubBatchBytes)
+        lastSetAllPeakWhilePriorBatchHeldBytes.set(callPeakWhilePriorHeldBytes)
+        lastSetAllPeakTransientBufferedBytes.set(callPeakTransientBytes)
     }
 
     /**
@@ -772,6 +978,11 @@ class RedisCacheService(
 
     companion object {
         private const val COMPRESSION_PREFIX = "GZIP_B64:"
+        private val COMPRESSION_PREFIX_ASCII_BYTES =
+            COMPRESSION_PREFIX.toByteArray(java.nio.charset.StandardCharsets.ISO_8859_1)
+        private val EMPTY_BYTES = ByteArray(0)
+        private const val INITIAL_SLAB_BYTES = 2_048
+        private const val MAX_SLAB_BYTES = 8_192
         private const val GZIP_BUFFER_SIZE = 2048
         internal const val HEADROOM_CHECK_STRIDE_BYTES = 1_024
         private const val BASE64_PAD = -2

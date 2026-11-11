@@ -1552,6 +1552,7 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
         val directNonPipelinedSets = AtomicInteger(0)
         val pipelineBatchSizes = java.util.concurrent.CopyOnWriteArrayList<Int>()
         val failPipeline = AtomicBoolean(false)
+        val remainingDirectSetFailures = AtomicInteger(0)
 
         val connectionFactory = object : RedisConnectionFactory {
             override fun getConnection(): RedisConnection {
@@ -1593,6 +1594,12 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
                                 if (inserted) recordedTtlMs[k] = ttl
                                 if (inPipeline.get()) null else inserted
                             } else {
+                                if (!inPipeline.get() && remainingDirectSetFailures.getAndUpdate { if (it > 0) it - 1 else 0 } > 0) {
+                                    throw org.springframework.data.redis.RedisSystemException(
+                                        "ERR simulated direct 4-arg SET failure",
+                                        RuntimeException("simulated-direct-set")
+                                    )
+                                }
                                 rawRedisBytes[k] = v
                                 recordedTtlMs[k] = ttl
                                 if (opt != null) recordedSetOptions[k] = opt
@@ -1734,6 +1741,108 @@ class ProfileSpeedWorkstreamBenchmarkTest : FunSpec({
         realRedisService.getPipelineWriteTelemetry().fallbackWrites shouldBe 6L
         recordedTtlMs["match:euw1:FB_6"] shouldBe Duration.ofDays(60).toMillis()
         realRedisService.multiGet(fallbackEntries.keys.toList(), MatchDto::class.java)["match:euw1:FB_6"]?.metadata?.matchId shouldBe "FB_6"
+
+        // D. Real random/incompressible > 256 KiB entry contract:
+        //    - Prior sub-batch (~200 KiB across 4 incompressible entries) is flushed BEFORE combined bytes cross 256 KiB.
+        //    - Oversized (> 256 KiB wire bytes) incompressible entry is NEVER added to `subBatch` or `executePipelined`;
+        //      written directly (unbatched) preserving `"GZIP_B64:"` + GZIP magic + exact 60d TTL + ValueOperations.set fallback.
+        val oversizedRng = java.util.Random(0x5EED_2026L)
+        val mixedOversizedEntries = LinkedHashMap<String, Map<String, String>>()
+        for (i in 1..4) {
+            val preBytes = ByteArray(38_000).also { oversizedRng.nextBytes(it) }
+            mixedOversizedEntries["blob:over:pre:$i"] = mapOf(
+                "payload" to java.util.Base64.getEncoder().encodeToString(preBytes)
+            )
+        }
+        val hugeRandomRaw = ByteArray(240 * 1024).also { oversizedRng.nextBytes(it) } // 240 KiB true uniform random entropy
+        val hugeRandomB64 = java.util.Base64.getEncoder().encodeToString(hugeRandomRaw)
+        mixedOversizedEntries["blob:over:huge"] = mapOf("payload" to hugeRandomB64)
+        for (i in 1..3) {
+            val postBytes = ByteArray(38_000).also { oversizedRng.nextBytes(it) }
+            mixedOversizedEntries["blob:over:post:$i"] = mapOf(
+                "payload" to java.util.Base64.getEncoder().encodeToString(postBytes)
+            )
+        }
+
+        openPipelineCalls.set(0)
+        closePipelineCalls.set(0)
+        directNonPipelinedSets.set(0)
+        pipelineBatchSizes.clear()
+        realRedisService.setAll(mixedOversizedEntries, Duration.ofDays(60))
+
+        val hugeWireBytes = rawRedisBytes["blob:over:huge"]!!
+        val hugeKeyUtf8Len = "blob:over:huge".toByteArray(StandardCharsets.UTF_8).size
+        val hugeTotalEntryBytes = hugeKeyUtf8Len.toLong() + hugeWireBytes.size.toLong()
+        (hugeWireBytes.size > 256 * 1024) shouldBe true // Proves genuinely incompressible > 256 KiB wire entry!
+
+        // Prior 4 normal entries flushed in <=256 KiB sub-batches ([3, 1] due to transient copy guard),
+        // huge (>256 KiB) entry written directly (unbatched! sum of pipelined = 7 of 8), trailing 3 entries in final sub-batch ([3])
+        pipelineBatchSizes.sum() shouldBe 7
+        pipelineBatchSizes.toList() shouldBe listOf(3, 1, 3)
+        openPipelineCalls.get() shouldBe 3
+        directNonPipelinedSets.get() shouldBe 1
+
+        val overTel = realRedisService.getPipelineWriteTelemetry()
+        overTel.lastCallPeakSubBatchBytes shouldBeLessThanOrEqualTo (256L * 1024L)
+        overTel.maxObservedSubBatchBytes shouldBeLessThanOrEqualTo (256L * 1024L)
+        overTel.lastCallPeakWhilePriorBatchHeldBytes shouldBeLessThanOrEqualTo (256L * 1024L)
+        overTel.oversizedDirectWrites shouldBe 1L
+        overTel.maxObservedOversizedEntryBytes shouldBe hugeTotalEntryBytes
+        // Quantified single-entry transient assembly bound (`2 * valueBytes + keyBytes + <= 8 KiB` slab slack, zero priorBatch overlap)
+        overTel.lastCallPeakTransientBufferedBytes shouldBeLessThanOrEqualTo (hugeKeyUtf8Len.toLong() + 2L * hugeWireBytes.size.toLong() + 8_192L)
+
+        // Encoding, TTL, UPSERT option, and round-trip integrity on the > 256 KiB random entry
+        val hugeWireStr = String(hugeWireBytes, StandardCharsets.ISO_8859_1)
+        hugeWireStr.startsWith("GZIP_B64:") shouldBe true
+        val hugeCompressed = java.util.Base64.getDecoder().decode(hugeWireStr.removePrefix("GZIP_B64:"))
+        (hugeCompressed[0].toInt() and 0xFF) shouldBe 0x1F
+        (hugeCompressed[1].toInt() and 0xFF) shouldBe 0x8B
+        recordedTtlMs["blob:over:huge"] shouldBe Duration.ofDays(60).toMillis()
+        recordedSetOptions["blob:over:huge"] shouldBe RedisStringCommands.SetOption.UPSERT
+
+        @Suppress("UNCHECKED_CAST")
+        val roundTrippedHuge = realRedisService.get("blob:over:huge", Map::class.java as Class<Map<String, String>>)
+        roundTrippedHuge?.get("payload") shouldBe hugeRandomB64
+        @Suppress("UNCHECKED_CAST")
+        val multiRoundTripped = realRedisService.multiGet(
+            mixedOversizedEntries.keys.toList(),
+            Map::class.java as Class<Map<String, String>>
+        )
+        multiRoundTripped["blob:over:pre:4"]?.get("payload") shouldBe mixedOversizedEntries["blob:over:pre:4"]!!["payload"]
+        multiRoundTripped["blob:over:huge"]?.get("payload") shouldBe hugeRandomB64
+        multiRoundTripped["blob:over:post:3"]?.get("payload") shouldBe mixedOversizedEntries["blob:over:post:3"]!!["payload"]
+
+        // Oversized fallback parity: when pipeline is disabled AND raw direct RedisCallback SET fails,
+        // oversized entry still avoids pipelining and falls back cleanly to ValueOperations.set with exact 60d TTL + encoding
+        failPipeline.set(true)
+        remainingDirectSetFailures.set(1)
+        openPipelineCalls.set(0)
+        directNonPipelinedSets.set(0)
+        val fallbackHugeRaw = ByteArray(240 * 1024).also { oversizedRng.nextBytes(it) }
+        val fallbackHugeB64 = java.util.Base64.getEncoder().encodeToString(fallbackHugeRaw)
+        realRedisService.setAll(mapOf("blob:over:huge:fb" to mapOf("payload" to fallbackHugeB64)), Duration.ofDays(60))
+        failPipeline.set(false)
+        remainingDirectSetFailures.set(0)
+
+        openPipelineCalls.get() shouldBe 0
+        directNonPipelinedSets.get() shouldBe 1
+        val fbOverTel = realRedisService.getPipelineWriteTelemetry()
+        fbOverTel.oversizedDirectWrites shouldBe 2L
+        fbOverTel.fallbackWrites shouldBe 7L // 6 from section C + 1 oversized fallback
+        fbOverTel.maxObservedSubBatchBytes shouldBeLessThanOrEqualTo (256L * 1024L)
+        recordedTtlMs["blob:over:huge:fb"] shouldBe Duration.ofDays(60).toMillis()
+        @Suppress("UNCHECKED_CAST")
+        realRedisService.get("blob:over:huge:fb", Map::class.java as Class<Map<String, String>>)?.get("payload") shouldBe fallbackHugeB64
+
+        println(
+            """
+            [SETALL_OVERSIZED_AND_TRANSIENT_SUMMARY]
+              Oversized random wire bytes=${hugeWireBytes.size} (> 262144), totalEntryBytes=$hugeTotalEntryBytes, pipelineBatchSizes=${pipelineBatchSizes.toList()}
+              Strict subBatch peak=${overTel.lastCallPeakSubBatchBytes} (<= 262144), maxObservedSubBatch=${fbOverTel.maxObservedSubBatchBytes} (<= 262144)
+              Peak while priorBatch held=${overTel.lastCallPeakWhilePriorBatchHeldBytes} (<= 262144; priorBatch flushed before crossing cap)
+              Single-entry transient slab+copy peak=${overTel.lastCallPeakTransientBufferedBytes} (bounded by 2*entryBytes + 8KiB slab slack)
+            """.trimIndent()
+        )
 
         // 2. Real loopback TCP HTTP server (`HttpServer` on 127.0.0.1:0) + real Spring `RestClient` + real `RedisCacheService` end-to-end profile flow
         val tcpPuuid = "tcp-http-puuid-001"
