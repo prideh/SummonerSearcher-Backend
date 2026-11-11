@@ -41,7 +41,9 @@ data class MatchRoleQuestTimingDto(
     val playerCompletionMinute: Double? = null,
     val opponentCompletionTimestampMs: Long? = null,
     val opponentCompletionMinute: Double? = null,
-    val completionDeltaSeconds: Double? = null
+    val completionDeltaSeconds: Double? = null,
+    val playerQuestStatusLabel: String? = null,
+    val opponentQuestStatusLabel: String? = null
 )
 
 data class HeatmapPoint(
