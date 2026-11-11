@@ -137,8 +137,11 @@ class AiAnalysisService(
 
     class PromptBudgetExceededException(message: String) : IllegalArgumentException(message)
 
-    private fun buildSafeBudgetRefusal(reason: String?): String =
-        "I cannot process this request because the input exceeds the safe coaching context budget (${reason ?: "prompt limit exceeded"}). Please ask a shorter, focused coaching question.\n---SUGGESTIONS--- [\"Review my recent match performance\", \"How can I reduce early deaths?\", \"Check my itemization\"]"
+    private fun buildSafeBudgetRefusal(reason: String?, context: Map<String, Any> = emptyMap()): String =
+        sanitizePlayerFacingOutput(
+            "I cannot process this request because the input exceeds the safe coaching context budget (${reason ?: "prompt limit exceeded"}). Please ask a shorter, focused coaching question.\n---SUGGESTIONS--- [\"Review my recent match performance\", \"How can I reduce early deaths?\", \"Check my itemization\"]",
+            context
+        )
 
     fun analyze(context: Map<String, Any>, messages: List<Map<String, String>>, userMessage: String, sessionId: String? = null): Mono<AiAnalysisResult> {
         val detectedIntent = detectIntent(userMessage, messages)
@@ -151,7 +154,7 @@ class AiAnalysisService(
             logger.warn("Refusing oversized coaching request before Gemini call: ${e.message}")
             return Mono.just(
                 AiAnalysisResult(
-                    buildSafeBudgetRefusal(e.message),
+                    buildSafeBudgetRefusal(e.message, context),
                     temperature,
                     detectedIntent.category,
                     versionName
@@ -189,7 +192,7 @@ class AiAnalysisService(
                     .onRetryExhaustedThrow { _, signal -> signal.failure() }
             )
             .map { response ->
-                val generatedText = extractContent(response)
+                val generatedText = sanitizePlayerFacingOutput(extractContent(response), context)
                 AiAnalysisResult(generatedText, temperature, detectedIntent.category, versionName)
             }
     }
@@ -209,7 +212,7 @@ class AiAnalysisService(
         } catch (e: PromptBudgetExceededException) {
             logger.warn("Refusing oversized streaming coaching request before Gemini call: ${e.message}")
             return AiStreamContext(
-                reactor.core.publisher.Flux.just(buildSafeBudgetRefusal(e.message)),
+                reactor.core.publisher.Flux.just(buildSafeBudgetRefusal(e.message, context)),
                 temperature,
                 detectedIntent.category,
                 versionName
@@ -228,7 +231,7 @@ class AiAnalysisService(
         )
 
         val sseType = object : ParameterizedTypeReference<ServerSentEvent<String>>() {}
-        val chunks = webClient.post()
+        val rawChunks = webClient.post()
             .uri("models/{model}:streamGenerateContent?alt=sse&key={key}", geminiModel, apiKey)
             .bodyValue(requestBody)
             .retrieve()
@@ -249,7 +252,8 @@ class AiAnalysisService(
             .mapNotNull { event -> event.data()?.let { extractStreamDelta(it) } }
             .filter { it.isNotEmpty() }
 
-        return AiStreamContext(chunks, temperature, detectedIntent.category, versionName)
+        val sanitizedChunks = sanitizePlayerFacingStream(rawChunks, context)
+        return AiStreamContext(sanitizedChunks, temperature, detectedIntent.category, versionName)
     }
 
     private fun constructPrompt(
@@ -558,9 +562,626 @@ class AiAnalysisService(
         fun heuristicTokenEstimate(text: String): Int = (utf8ByteSize(text) + 3) / 4
         fun estimateTokens(text: String): Int = heuristicTokenEstimate(text)
 
+        private val SHARED_OBJECT_MAPPER = com.fasterxml.jackson.databind.ObjectMapper()
+
         private val INTERNAL_SCHEMA_LEAK_REGEX = Regex(
-            """\b(?:rankedRecord|savedHistory|recentMatchSample|savedHistoryAverages|savedHistorySideSplits|recentMatchSummary|omittedMatchesRollup|timelineStatus|timelineCoverage|timelineInsights|improvementStats|visionDataPrecision|avgLaneCsAt10|missingLaneCsAt10Matches|firstRate|avgTarget|targetMatchCount|avgTheoreticalMax|theoreticalMaxMatchCount|mostDangerousZone|deathsNearObjectiveWindows|NOT_ANALYZED)\b|\bcs10\.(?:target|targetLabel|theoreticalMax|theoreticalMaxLabel)\b|\bsingle[- ]enemy\s+kill\s+credit\b|\bmulti[- ]enemy\s+(?:kill\s+participation|involvement)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`(?:topChampions|opponentStats|championMatchups|topStrengths|topWeaknesses|phaseFarming|leadRetention|deathCost|unspentGold|teamObjectives|ANALYZED|PARTIAL|BLOCKED)`"""
+            """\b(?:rankedRecord|savedHistory|recentMatchSample|savedHistoryAverages|savedHistorySideSplits|recentMatchSummary|omittedMatchesRollup|timelineStatus|timelineCoverage|timelineInsights|timelineAt10|timelineAt15|improvementStats|visionDataPrecision|avgLaneCsAt10|laneCsAt10|missingLaneCsAt10Matches|laneMinionsFirst10Minutes|jungleCsBefore10Minutes|firstRate|firstCount|avgTarget|targetMatchCount|avgTheoreticalMax|theoreticalMaxMatchCount|avgSupportedActual|mostDangerousZone|deathsNearObjectiveWindows|phaseFarming|leadRetention|deathCost|deathContext|unspentGold|teamObjectives|topChampions|opponentStats|opponentDetails|championMatchups|topStrengths|topWeaknesses|damageSplitPct|itemSpikes|skillMaxOrder|MonkeyKing|FiddleSticks|null|NOT_ANALYZED|NOT_RUN|TIMELINE_UNAVAILABLE|NO_MATCHES_AVAILABLE|WARD_PLACED|WARD_KILLED|WARD_KILL|YELLOW_TRINKET|CONTROL_WARD|BLUE_TRINKET|ELITE_MONSTER_KILL|BUILDING_KILL|TURRET_PLATE_DESTROYED|BARON_NASHOR|RIFTHERALD|RIFT_HERALD|HORDE|ALLY_TEAM|ENEMY_TEAM|UTILITY|MEMORY_HEADROOM_ADMISSION_BLOCKED|MEMORY_HEADROOM_STOP|DEADLINE_EXCEEDED|CONCURRENCY_LIMIT_REACHED|RATE_LIMIT_COOLDOWN)\b|\b(?:laneCs|jungleCs)@10\b|\bcs10\.(?:target|targetLabel|theoreticalMax|theoreticalMaxLabel)\b|\bsingle[- ]enemy\s+kill\s+credit\b|\bmulti[- ]enemy\s+(?:kill\s+participation|involvement)\b|\[sample:|Solo/Duo Queue Counter|Saved Match History|Detailed Match List|`(?:ANALYZED|PARTIAL|BLOCKED|MIDDLE|BOTTOM|[A-Za-z][A-Za-z0-9_.]*)`|\b(?!(?:iPhone|iPad|iOS|macOS|eSports)\b)(?<![#@])[a-z]{2,}(?:[A-Z][a-z0-9]*)+\b(?!#)|\b[a-z]{2,}(?:_[a-z0-9]{2,})+\b"""
         )
+
+        private val SUGGESTIONS_BLOCK_REGEX = Regex("""---SUGGESTIONS---\s*(\[[\s\S]*])""")
+        private val SAMPLE_BRACKET_TAG_REGEX = Regex("""[ \t]*\[sample:\s*[^\]]*]""", RegexOption.IGNORE_CASE)
+        private val TIMELINE_STATUS_ASSIGNMENT_REGEX = Regex(
+            """\btimelineStatus\s*(?:=|:|\bis\b)\s*(NOT_ANALYZED|NOT_RUN|PARTIAL|BLOCKED|TIMELINE_UNAVAILABLE|ANALYZED)\b""",
+            RegexOption.IGNORE_CASE
+        )
+        private val ROLE_ASSIGNMENT_REGEX = Regex(
+            """\b(?:role|teamPosition|primaryRole)\s*(?:=|:)\s*(TOP|JUNGLE|MIDDLE|MID|BOTTOM|BOT|ADC|UTILITY|SUPPORT)\b""",
+            RegexOption.IGNORE_CASE
+        )
+        private val KEY_NULL_ASSIGNMENT_REGEX = Regex(
+            """\b([A-Za-z][A-Za-z0-9_.@]*)\s*(?:=|:)\s*null\b""",
+            RegexOption.IGNORE_CASE
+        )
+        private val COPULA_NULL_REGEX = Regex(
+            """\b(is|are|was|were)\s+null\b""",
+            RegexOption.IGNORE_CASE
+        )
+        private val PAREN_NULL_REGEX = Regex("""\(\s*null\s*\)""", RegexOption.IGNORE_CASE)
+        private val STANDALONE_NULL_REGEX = Regex("""\bnull\b""", RegexOption.IGNORE_CASE)
+        private val LEGACY_INCOMPLETE_CACHE_REGEX = Regex("""\bincomplete\s*\(\s*legacy\s+cache\s*\)""", RegexOption.IGNORE_CASE)
+
+        private data class DeterminerPhraseRule(
+            val regex: Regex,
+            val barePhrase: String,
+            val defaultDeterminer: String
+        )
+
+        private fun buildDeterminerRule(pattern: String, barePhrase: String, defaultDeterminer: String): DeterminerPhraseRule =
+            DeterminerPhraseRule(
+                regex = Regex(
+                    """\b(your|the|my|this|these|those|a|an|its|their|our)\s+(\*{0,2})(?:$pattern)(\*{0,2})\b|(\*{0,2})\b(?:$pattern)\b(\*{0,2})""",
+                    RegexOption.IGNORE_CASE
+                ),
+                barePhrase = barePhrase,
+                defaultDeterminer = defaultDeterminer
+            )
+
+        private val DETERMINER_SAMPLE_RULES: List<DeterminerPhraseRule> = listOf(
+            buildDeterminerRule("""rankedRecord|Solo/Duo\s+Queue\s+Counter""", "Solo/Duo ranked record", "your"),
+            buildDeterminerRule("""savedHistoryAverages""", "saved-match averages", "your"),
+            buildDeterminerRule("""savedHistorySideSplits""", "Blue and Red side record", "your"),
+            buildDeterminerRule("""savedHistory|Saved\s+Match\s+History""", "saved match history", "your"),
+            buildDeterminerRule("""recentMatchSummary""", "recent match summary", "your"),
+            buildDeterminerRule("""recentMatchSample|Detailed\s+Match\s+List""", "recent matches", "your"),
+            buildDeterminerRule("""omittedMatchesRollup""", "other recent matches", "your"),
+            buildDeterminerRule("""cs10\.(?:theoreticalMaxLabel|targetLabel)|theoreticalMaxLabel|targetLabel""", "10-minute wave spawn ceiling note", "the"),
+            buildDeterminerRule("""cs10\.(?:theoreticalMax|target)|avgTheoreticalMax|theoreticalMax|avgTarget""", "10-minute wave spawn ceiling", "the")
+        )
+
+        private val RIOT_INTERNAL_CHAMPION_RULES: List<Pair<Regex, String>> = listOf(
+            Regex("""\bMonkeyKing\b""") to "Wukong",
+            Regex("""\bFiddleSticks\b""") to "Fiddlesticks",
+            Regex("""\bAurelionSol\b""") to "Aurelion Sol",
+            Regex("""\bBelVeth\b""") to "Bel'Veth",
+            Regex("""\b(?:ChoGath|Chogath)\b""") to "Cho'Gath",
+            Regex("""\bDrMundo\b""") to "Dr. Mundo",
+            Regex("""\bJarvanIV\b""") to "Jarvan IV",
+            Regex("""\bKaiSa\b""") to "Kai'Sa",
+            Regex("""\b(?:KhaZix|Khazix)\b""") to "Kha'Zix",
+            Regex("""\bKogMaw\b""") to "Kog'Maw",
+            Regex("""\bKSante\b""") to "K'Sante",
+            Regex("""\bLeeSin\b""") to "Lee Sin",
+            Regex("""\bMasterYi\b""") to "Master Yi",
+            Regex("""\bMissFortune\b""") to "Miss Fortune",
+            Regex("""\bRekSai\b""") to "Rek'Sai",
+            Regex("""\bTahmKench\b""") to "Tahm Kench",
+            Regex("""\bTwistedFate\b""") to "Twisted Fate",
+            Regex("""\b(?:VelKoz|Velkoz)\b""") to "Vel'Koz",
+            Regex("""\bXinZhao\b""") to "Xin Zhao"
+        )
+
+        private val TELEMETRY_JARGON_RULES: List<Pair<Regex, String>> = listOf(
+            Regex("""\bunassisted\s+single[- ]enemy\s+kill\s+credit\s+deaths\b""", RegexOption.IGNORE_CASE) to "unassisted deaths",
+            Regex("""\bsingle[- ]enemy\s+kill\s+credit\b""", RegexOption.IGNORE_CASE) to "unassisted death",
+            Regex("""\bmulti[- ]enemy\s+(?:kill\s+participation|involvement)\b""", RegexOption.IGNORE_CASE) to "multi-enemy collapse"
+        )
+
+        private val EXACT_SCHEMA_FIELD_RULES: List<Pair<Regex, String>> = listOf(
+            Regex("""\b(?:laneCs@10|avgLaneCsAt10|laneCsAt10|laneMinionsFirst10Minutes)\b""") to "10-minute lane CS",
+            Regex("""\b(?:jungleCs@10|jungleCsBefore10Minutes)\b""") to "10-minute jungle CS",
+            Regex("""\bmissingLaneCsAt10Matches\b""") to "unrecorded 10-minute lane CS game count",
+            Regex("""\b(?:theoreticalMaxMatchCount|targetMatchCount)\b""") to "eligible Patch 26.1+ game count",
+            Regex("""\b(?:avgSupportedActual|supportedActual)\b""") to "Patch 26.1+ average 10-minute lane CS",
+            Regex("""\btimelineStatus\b""") to "timeline data",
+            Regex("""\btimelineCoverage\b""") to "timeline coverage",
+            Regex("""\btimelineInsights\b""") to "timeline summary",
+            Regex("""\bhasTimelineAnalysis\b""") to "timeline status",
+            Regex("""\btimelineAt10\b""") to "10-minute stats",
+            Regex("""\btimelineAt15\b""") to "15-minute stats",
+            Regex("""\bimprovementStats\b""") to "improvement summary",
+            Regex("""\bphaseFarming\b""") to "mid-to-late game farming",
+            Regex("""\bmin10To20\b""") to "10–20 minute window",
+            Regex("""\bmin20ToEnd\b""") to "20+ minute window",
+            Regex("""\bavgTotalCsPerMin\b""") to "average CS per minute",
+            Regex("""\b(?:avgLaneCsPerMin|laneCsPerMin)\b""") to "lane CS per minute",
+            Regex("""\b(?:avgJungleCsPerMin|jungleCsPerMin)\b""") to "jungle CS per minute",
+            Regex("""\bavgLaneCsGained\b""") to "average lane CS gained",
+            Regex("""\bavgJungleCsGained\b""") to "average jungle CS gained",
+            Regex("""\b(?:avgCsPerMin|csPerMin)\b""") to "CS per minute",
+            Regex("""\bleadRetention\b""") to "early lead conversion",
+            Regex("""\bavgGoldLeadAt10\b""") to "average gold lead at 10 minutes",
+            Regex("""\bavgGoldLeadAt15\b""") to "average gold lead at 15 minutes",
+            Regex("""\bavgGoldLeadAt20\b""") to "average gold lead at 20 minutes",
+            Regex("""\bavgXpLeadAt10\b""") to "average XP lead at 10 minutes",
+            Regex("""\bavgXpLeadAt20\b""") to "average XP lead at 20 minutes",
+            Regex("""\bgoldLeadRetentionRate\b""") to "gold lead retention rate",
+            Regex("""\bxpLeadRetentionRate\b""") to "XP lead retention rate",
+            Regex("""\beligibleGamesAt10\b""") to "games reaching 10 minutes",
+            Regex("""\beligibleGamesAt20\b""") to "games reaching 20 minutes",
+            Regex("""\b(?:gamesAheadInGoldAt10|gamesAheadGoldAt10|aheadGold10)\b""") to "games ahead in gold at 10 minutes",
+            Regex("""\b(?:gamesRetainedGoldLeadAt20|retainedGold20)\b""") to "games holding that gold lead at 20 minutes",
+            Regex("""\bvisionDataPrecision\b""") to "ward timing data",
+            Regex("""\bwardsByTimeBucket\b""") to "wards by game phase",
+            Regex("""\b(?:wardsPlacedTotal|wardsPlaced)\b""") to "wards placed",
+            Regex("""\bwardsKilled\b""") to "wards cleared",
+            Regex("""\b(?:controlWardsPlaced|controlWards)\b""") to "control wards placed",
+            Regex("""\b(?:visionScoreAdvantageLaneOpponent|visionAdvantage)\b""") to "vision score lead over your lane opponent",
+            Regex("""\b(?:avgVisionScore|visionScore)\b""") to "vision score",
+            Regex("""\bdeathCost\b""") to "death time and bounty cost",
+            Regex("""\bdeathContext\b""") to "death breakdown",
+            Regex("""\beligibleTimeDeadGames\b""") to "games with death-timer data",
+            Regex("""\b(?:excludedMissingTimeSpentDeadGames|excludedMissingTimeDeadGames|missingTimeDeadGames)\b""") to "games missing death-timer data",
+            Regex("""\b(?:totalTimeSpentDeadSeconds|totalTimeSpentDead)\b""") to "total time spent dead",
+            Regex("""\bavgTimeSpentDeadSeconds\b""") to "average time spent dead",
+            Regex("""\b(?:avgDeadTimeGameSharePct|overallDeadTimeGameSharePct|deadTimeGameSharePct|avgDeadTimeGameShare)\b""") to "share of game time spent dead",
+            Regex("""\bbountyOnPlayerDeaths\b""") to "bounty gold given up on deaths",
+            Regex("""\b(?:totalBaseKillBountyGold|baseKillBountyGold)\b""") to "base kill gold given up",
+            Regex("""\b(?:totalShutdownBountyGold|shutdownBountyGold)\b""") to "shutdown gold given up",
+            Regex("""\b(?:totalCombinedBountyGold|combinedBountyGold)\b""") to "total kill and shutdown gold given up",
+            Regex("""\bavgCombinedBountyPerDeath\b""") to "average gold given up per death",
+            Regex("""\bmostDangerousZone\b""") to "most frequent death area",
+            Regex("""\bavgFirstDeathMinute\b""") to "average first-death time",
+            Regex("""\bdeathsBefore10\b""") to "deaths before 10 minutes",
+            Regex("""\bdeathsNearObjectiveWindows\b""") to "deaths near objective spawns",
+            Regex("""\bunassistedDeaths\b""") to "unassisted deaths",
+            Regex("""\bassistedDeaths\b""") to "multi-enemy deaths",
+            Regex("""\bunspentGold\b""") to "unspent gold",
+            Regex("""\b(?:currentGoldAtSample|currentGold)\b""") to "gold in hand",
+            Regex("""\bmedianCurrentGold\b""") to "median gold in hand",
+            Regex("""\bavgCurrentGold\b""") to "average gold in hand",
+            Regex("""\bmaxCurrentGold\b""") to "peak gold in hand",
+            Regex("""\bhighBalanceThresholdGold\b""") to "high-gold checkpoint threshold",
+            Regex("""\b(?:highBalanceSampleCount|highBalanceBeforePurchaseSampleCount|highBalancePrePurchaseCount)\b""") to "high-gold 1-minute snapshots",
+            Regex("""\b(?:prePurchaseSamples|highBalanceBeforePurchaseSamples)\b""") to "high-gold snapshots before item buys",
+            Regex("""\bsampleCount\b""") to "snapshot count",
+            Regex("""\bteamObjectives\b""") to "team objective control",
+            Regex("""\beligibleTeamObjectiveGames\b""") to "games with team objective data",
+            Regex("""\b(?:excludedMissingTeamsDataGames|excludedMissingTeamsGames|missingTeamsGames)\b""") to "games missing team objective data",
+            Regex("""\b(?:firstRate|teamFirstRate|firstObjectiveRate)\b""") to "first-objective rate",
+            Regex("""\b(?:firstCount|teamFirstCount|firstObjectiveGames)\b""") to "first-objective count",
+            Regex("""\b(?:teamTotalKills|totalTeamKills|teamKills)\b""") to "team objective kills",
+            Regex("""\b(?:teamAvgKills|avgTeamKillsPerGame|teamAvg)\b""") to "team average kills",
+            Regex("""\b(?:enemyTeamAvgKills|avgEnemyKillsPerGame|enemyAvg)\b""") to "enemy team average kills",
+            Regex("""\b(?:personalTotalLastHits|totalPersonalLastHits|personalLastHits|personalLh)\b""") to "personal objective last-hits",
+            Regex("""\b(?:personalTotalTakedowns|totalPersonalTakedowns|personalTakedowns|personalTd)\b""") to "personal objective takedowns",
+            Regex("""\b(?:timelinePersonalInvolvements|timelineObjectivesInvolved|timelineInvolved)\b""") to "timeline objective takedowns",
+            Regex("""\briftHerald\b""") to "Rift Herald",
+            Regex("""\bvoidMonsterKill\b""") to "Voidgrub takedowns",
+            Regex("""\b(?:turretPlatesTaken|turretPlates|avgTurretPlates)\b""") to "turret plates",
+            Regex("""\bdamageDealtToObjectives\b""") to "objective damage",
+            Regex("""\bdamageDealtToTurrets\b""") to "turret damage",
+            Regex("""\b(?:damagePerMinute|damagePerMin|avgDamagePerMin)\b""") to "damage per minute",
+            Regex("""\b(?:goldPerMinute|goldPerMin|avgGoldPerMin)\b""") to "gold per minute",
+            Regex("""\b(?:killParticipation|avgKillParticipation)\b""") to "kill participation",
+            Regex("""\b(?:soloKills|avgSoloKills)\b""") to "solo kills",
+            Regex("""\b(?:earlyLaningPhaseGoldExpAdvantage|earlyLaningAdvantage)\b""") to "early laning gold and XP lead",
+            Regex("""\b(?:laningPhaseGoldExpAdvantage)\b""") to "laning gold and XP lead",
+            Regex("""\b(?:maxCsAdvantageOnLaneOpponent|csAdvantage)\b""") to "CS lead over your lane opponent",
+            Regex("""\btimeCCingOthers\b""") to "crowd-control score",
+            Regex("""\btotalDamageShieldedOnTeammates\b""") to "ally shielding",
+            Regex("""\btotalHealsOnTeammates\b""") to "ally healing",
+            Regex("""\bdamageSplitPct\b""") to "damage type split",
+            Regex("""\bitemSpikes\b""") to "item completion timings",
+            Regex("""\bskillMaxOrder\b""") to "ability max order",
+            Regex("""\bsummonerSpells\b""") to "summoner spells",
+            Regex("""\bsubStyle\b""") to "secondary rune tree",
+            Regex("""\btopChampions\b""") to "most-played champions",
+            Regex("""\b(?:opponentStats|opponentDetails)\b""") to "lane opponent stats",
+            Regex("""\bchampionMatchups\b""") to "champion matchups",
+            Regex("""\btopStrengths\b""") to "consistent strengths",
+            Regex("""\btopWeaknesses\b""") to "recurring weak spots",
+            Regex("""\b(?:primaryRole|teamPosition|individualPosition)\b""") to "main role",
+            Regex("""\bgameDuration\b""") to "game length",
+            Regex("""\bgameEndedInEarlySurrender\b""") to "early remake or surrender",
+            Regex("""\bblueSideWinRate\b""") to "Blue side win rate",
+            Regex("""\bredSideWinRate\b""") to "Red side win rate",
+            Regex("""\bblueSide\b""") to "Blue side",
+            Regex("""\bredSide\b""") to "Red side",
+            Regex("""\b(?:totalGamesAnalyzed|totalGamesConsidered)\b""") to "games analyzed",
+            Regex("""\bexcludedInvalidDurationGames\b""") to "excluded invalid-length games",
+            Regex("""\bexcludedMissingTimelineGames\b""") to "games without timeline data",
+            Regex("""\bdeathsFromMatchDto\b""") to "deaths",
+            Regex("""\bwinRate\b""") to "win rate",
+            Regex("""\bavgKda\b""") to "average KDA",
+            Regex("""\b(?:avgKillsPerGame|avgKills)\b""") to "average kills",
+            Regex("""\b(?:avgDeathsPerGame|avgDeaths)\b""") to "average deaths",
+            Regex("""\b(?:avgAssistsPerGame|avgAssists)\b""") to "average assists"
+        )
+
+        // Case-sensitive raw uppercase enum / status constants so lowercase English words remain untouched
+        private val UPPERCASE_ENUM_RULES: List<Pair<Regex, String>> = listOf(
+            Regex("""\b(?:NOT_ANALYZED|NOT_RUN)\b""") to "not analyzed yet",
+            Regex("""\b(?:TIMELINE_UNAVAILABLE|MEMORY_HEADROOM_ADMISSION_BLOCKED|MEMORY_HEADROOM_STOP|DEADLINE_EXCEEDED|CONCURRENCY_LIMIT_REACHED|RATE_LIMIT_COOLDOWN)\b""") to "temporarily unavailable",
+            Regex("""\bNO_MATCHES_AVAILABLE\b""") to "no matches loaded yet",
+            Regex("""\b(?:BATCH_BUDGET_REACHED_RESUMABLE|PAUSED_MEMORY_HEADROOM)\b""") to "paused",
+            Regex("""\bWARD_PLACED\b""") to "ward placement",
+            Regex("""\b(?:WARD_KILLED|WARD_KILL)\b""") to "ward clear",
+            Regex("""\bYELLOW_TRINKET\b""") to "Stealth Ward",
+            Regex("""\bCONTROL_WARD\b""") to "Control Ward",
+            Regex("""\bBLUE_TRINKET\b""") to "Farsight Ward",
+            Regex("""\bELITE_MONSTER_KILL\b""") to "epic monster take",
+            Regex("""\bBUILDING_KILL\b""") to "structure takedown",
+            Regex("""\bTURRET_PLATE_DESTROYED\b""") to "turret plate",
+            Regex("""\bBARON_NASHOR\b""") to "Baron Nashor",
+            Regex("""\b(?:RIFTHERALD|RIFT_HERALD)\b""") to "Rift Herald",
+            Regex("""\bHORDE\b""") to "Voidgrubs",
+            Regex("""\bALLY_TEAM\b""") to "your team",
+            Regex("""\bENEMY_TEAM\b""") to "the enemy team",
+            Regex("""\bTOP_LANE\b""") to "Top lane",
+            Regex("""\bMID_LANE\b""") to "Mid lane",
+            Regex("""\bBOT_LANE\b""") to "Bot lane",
+            Regex("""\bOUTER_TURRET\b""") to "outer turret",
+            Regex("""\bINNER_TURRET\b""") to "inner turret",
+            Regex("""\bBASE_TURRET\b""") to "base turret",
+            Regex("""\bNEXUS_TURRET\b""") to "Nexus turret",
+            Regex("""\bUTILITY\b""") to "Support",
+            Regex("""\bMIDDLE\b""") to "Mid",
+            Regex("""\bBOTTOM\b""") to "Bot",
+            Regex("""\bPARTIAL\b""") to "partially loaded",
+            Regex("""\bBLOCKED\b""") to "temporarily unavailable",
+            Regex("""\bANALYZED\b""") to "analyzed"
+        )
+
+        private val GENERIC_CAMEL_CASE_REGEX = Regex(
+            """\b(?!(?:iPhone|iPad|iOS|macOS|eSports)\b)(?<![#@])[a-z]{2,}(?:[A-Z][a-z0-9]*)+\b(?!#)"""
+        )
+        private val GENERIC_SNAKE_CASE_REGEX = Regex(
+            """\b(?![A-Za-z]{2,5}\d?_\d{3,}\b)[a-zA-Z]{2,}(?:_[a-zA-Z0-9]+)+\b"""
+        )
+        private val MID_PROSE_SENTENCE_CAPITAL_REGEX = Regex("""([.!?]\s+\*{0,2})([a-z])""")
+        private val LEADING_SENTENCE_CAPITAL_REGEX = Regex("""^(\s*\*{0,2})([a-z])""")
+
+        private val STREAM_HOLD_TAIL_REGEX = Regex(
+            """(?:\b(?:your|the|my|this|these|those|a|an|its|their|our)\b|\b[A-Za-z][A-Za-z0-9_.@]*\s+(?:is|are|was|were)\b|\b(?:is|are|was|were)\b|(?:\b[A-Za-z][A-Za-z0-9_.@]*\s*)?[=:]|\btimelineStatus(?:\s*(?:=|:|\bis\b))?|\bincomplete(?:\s*\((?:legacy)?)?|\bsolo(?:/duo(?:\s+queue)?)?\b|\bsaved(?:\s+match)?\b|\bdetailed(?:\s+match)?\b|\b(?:unassisted(?:\s+single(?:[- ]enemy(?:\s+kill(?:\s+credit)?)?)?)?|single(?:[- ]enemy(?:\s+kill(?:\s+credit)?)?)?|multi(?:[- ]enemy(?:\s+kill)?)?)\b)\s+$""",
+            RegexOption.IGNORE_CASE
+        )
+
+        private fun humanizeIdentifierWords(rawToken: String): String {
+            val cleaned = rawToken
+                .replace(Regex("""(?:FromMatchDto|SummaryDto|StatsDto|Dto)$"""), "")
+                .replace('_', ' ')
+                .replace(Regex("""([a-z0-9])([A-Z])"""), "$1 $2")
+                .replace(Regex("""([A-Z]+)([A-Z][a-z])"""), "$1 $2")
+            return cleaned
+                .split(Regex("""\s+"""))
+                .filter { it.isNotBlank() }
+                .joinToString(" ") { part ->
+                    when (part.lowercase()) {
+                        "avg" -> "average"
+                        "pct" -> "percentage"
+                        "cs" -> "CS"
+                        "xp" -> "XP"
+                        "kda" -> "KDA"
+                        "kp" -> "kill participation"
+                        "wr" -> "win rate"
+                        "cc" -> "CC"
+                        "cd" -> "cooldown"
+                        "opp" -> "opponent"
+                        "jg" -> "jungle"
+                        "min" -> "minute"
+                        "sec" -> "seconds"
+                        "dmg" -> "damage"
+                        "obj" -> "objective"
+                        "lh" -> "last-hits"
+                        "td" -> "takedowns"
+                        "tl" -> "timeline"
+                        "elig" -> "eligible"
+                        else -> part.lowercase()
+                    }
+                }
+        }
+
+        private fun humanizeRoleValue(rawRole: String): String =
+            when (rawRole.uppercase()) {
+                "UTILITY", "SUPPORT" -> "Support"
+                "MIDDLE", "MID" -> "Mid"
+                "BOTTOM", "BOT" -> "Bot"
+                "ADC" -> "ADC"
+                "JUNGLE" -> "Jungle"
+                "TOP" -> "Top"
+                else -> rawRole
+            }
+
+        private fun sanitizePlayerFacingProse(
+            rawText: String,
+            @Suppress("UNUSED_PARAMETER") context: Map<String, Any?> = emptyMap(),
+            capitalizeLeadingSentence: Boolean = true
+        ): String {
+            if (rawText.isEmpty()) return rawText
+            var result = rawText
+
+            // 1. Strip internal [sample: ...] tags and inline code backticks
+            result = SAMPLE_BRACKET_TAG_REGEX.replace(result, "")
+            result = result.replace("`", "")
+
+            // 2. Preserve unknown/missing vs zero in plain human language before identifier replacement
+            result = TIMELINE_STATUS_ASSIGNMENT_REGEX.replace(result) { match ->
+                val statePhrase = when (match.groupValues[1].uppercase()) {
+                    "PARTIAL" -> "partially loaded"
+                    "BLOCKED", "TIMELINE_UNAVAILABLE" -> "temporarily unavailable"
+                    "ANALYZED" -> "analyzed"
+                    else -> "not analyzed yet"
+                }
+                "timeline data is $statePhrase"
+            }
+            result = ROLE_ASSIGNMENT_REGEX.replace(result) { match ->
+                "${humanizeRoleValue(match.groupValues[1])} role"
+            }
+            result = KEY_NULL_ASSIGNMENT_REGEX.replace(result) { match ->
+                "${match.groupValues[1]} is unavailable"
+            }
+            result = COPULA_NULL_REGEX.replace(result) { match ->
+                "${match.groupValues[1]} unavailable"
+            }
+            result = PAREN_NULL_REGEX.replace(result, "(unavailable)")
+            result = STANDALONE_NULL_REGEX.replace(result, "unavailable")
+            result = LEGACY_INCOMPLETE_CACHE_REGEX.replace(result, "unavailable in older match data")
+
+            // 3. Determiner-aware sample and CS@10 ceiling labels (prevents "your your" / "the the")
+            for (rule in DETERMINER_SAMPLE_RULES) {
+                result = rule.regex.replace(result) { match ->
+                    val existingDet = match.groupValues[1]
+                    if (existingDet.isNotEmpty()) {
+                        val openStars = match.groupValues[2]
+                        val closeStars = match.groupValues[3]
+                        "$existingDet $openStars${rule.barePhrase}$closeStars"
+                    } else {
+                        val openStars = match.groupValues[4]
+                        val closeStars = match.groupValues[5]
+                        "$openStars${rule.defaultDeterminer} ${rule.barePhrase}$closeStars"
+                    }
+                }
+            }
+
+            // 4. Official Riot internal champion IDs -> player-facing League champion names
+            for ((regex, replacement) in RIOT_INTERNAL_CHAMPION_RULES) {
+                result = regex.replace(result, replacement)
+            }
+
+            // 5. Internal telemetry jargon -> plain League terms
+            for ((regex, replacement) in TELEMETRY_JARGON_RULES) {
+                result = regex.replace(result, replacement)
+            }
+
+            // 6. Exact schema / DTO / challenge field names -> plain League terms
+            for ((regex, replacement) in EXACT_SCHEMA_FIELD_RULES) {
+                result = regex.replace(result, replacement)
+            }
+
+            // 7. Case-sensitive uppercase status & Riot event enums -> plain League terms
+            for ((regex, replacement) in UPPERCASE_ENUM_RULES) {
+                result = regex.replace(result, replacement)
+            }
+
+            // 8. Generic fallback for any remaining camelCase or snake_case schema/challenge identifiers
+            result = GENERIC_CAMEL_CASE_REGEX.replace(result) { match ->
+                humanizeIdentifierWords(match.value)
+            }
+            result = GENERIC_SNAKE_CASE_REGEX.replace(result) { match ->
+                humanizeIdentifierWords(match.value)
+            }
+
+            // 9. Clean up spacing around stripped tags and restore sentence-initial capitalization
+            result = result.replace(Regex("""[ \t]{2,}"""), " ")
+            result = result.replace(Regex(""" +([,.;:!?])"""), "$1")
+            result = MID_PROSE_SENTENCE_CAPITAL_REGEX.replace(result) { match ->
+                "${match.groupValues[1]}${match.groupValues[2].uppercase()}"
+            }
+            if (capitalizeLeadingSentence) {
+                result = LEADING_SENTENCE_CAPITAL_REGEX.replace(result) { match ->
+                    "${match.groupValues[1]}${match.groupValues[2].uppercase()}"
+                }
+            }
+            return result
+        }
+
+        /**
+         * Deterministically rewrites raw variable names, schema keys, bracketed `[sample: ...]` tags,
+         * enum constants, and internal telemetry identifiers into plain League of Legends language across both
+         * coaching prose and `---SUGGESTIONS---` items, while preserving missing/unavailable vs. zero.
+         */
+        fun sanitizePlayerFacingOutput(
+            rawText: String,
+            context: Map<String, Any?> = emptyMap(),
+            capitalizeLeadingSentence: Boolean = true
+        ): String {
+            if (rawText.isBlank() || rawText == "No content generated.") return rawText
+            val suggestionsMatch = SUGGESTIONS_BLOCK_REGEX.find(rawText)
+            if (suggestionsMatch == null) {
+                return sanitizePlayerFacingProse(rawText, context, capitalizeLeadingSentence)
+            }
+
+            val rawBody = rawText.substring(0, suggestionsMatch.range.first)
+            val hasBody = rawBody.isNotBlank()
+            val sanitizedBody = if (hasBody) {
+                sanitizePlayerFacingProse(rawBody.trimEnd(), context, capitalizeLeadingSentence)
+            } else {
+                ""
+            }
+
+            val rawJsonArray = suggestionsMatch.groupValues[1].replace(Regex(""",\s*]"""), "]")
+            val sanitizedSuggestionsJson = try {
+                val parsed = SHARED_OBJECT_MAPPER.readValue(rawJsonArray, List::class.java)
+                val cleanedItems = parsed.mapNotNull { item ->
+                    item?.toString()
+                        ?.let { sanitizePlayerFacingProse(it, context, capitalizeLeadingSentence = true) }
+                        ?.replace("**", "")
+                        ?.trim()
+                        ?.takeIf { it.isNotEmpty() }
+                }
+                cleanedItems.joinToString(", ", "[", "]") { SHARED_OBJECT_MAPPER.writeValueAsString(it) }
+            } catch (_: Exception) {
+                val quoted = Regex(""""([^"]+)"""").findAll(rawJsonArray).map { m ->
+                    sanitizePlayerFacingProse(m.groupValues[1], context, capitalizeLeadingSentence = true)
+                        .replace("**", "")
+                        .trim()
+                }.filter { it.isNotEmpty() }.toList()
+                if (quoted.isNotEmpty()) {
+                    quoted.joinToString(", ", "[", "]") { SHARED_OBJECT_MAPPER.writeValueAsString(it) }
+                } else {
+                    sanitizePlayerFacingProse(rawJsonArray, context, capitalizeLeadingSentence = false)
+                }
+            }
+
+            val trailingAfterSuggestions = rawText.substring(suggestionsMatch.range.last + 1)
+                .takeIf { it.isNotBlank() }
+                ?.let { " " + sanitizePlayerFacingProse(it.trim(), context, capitalizeLeadingSentence = false) }
+                ?: ""
+
+            return if (hasBody) {
+                "$sanitizedBody\n---SUGGESTIONS--- $sanitizedSuggestionsJson$trailingAfterSuggestions"
+            } else {
+                "---SUGGESTIONS--- $sanitizedSuggestionsJson$trailingAfterSuggestions"
+            }
+        }
+
+        private fun findSafeStreamFlushCut(pending: CharSequence): Int {
+            if (pending.isEmpty()) return 0
+            var limit = pending.length
+
+            // Hold potential or active ---SUGGESTIONS--- block until stream completion so JSON parses atomically
+            val dashIdx = pending.indexOf("-")
+            if (dashIdx >= 0) {
+                var idx = dashIdx
+                while (idx >= 0) {
+                    val tailFromDash = pending.substring(idx)
+                    val trimmedTail = tailFromDash.trimStart()
+                    if ("---SUGGESTIONS---".startsWith(trimmedTail) || trimmedTail.startsWith("---SUGGESTIONS---")) {
+                        limit = minOf(limit, idx)
+                        break
+                    }
+                    idx = pending.indexOf("---", idx + 1)
+                }
+            }
+
+            // Hold short unclosed [sample: ...] brackets along with immediately preceding horizontal spaces
+            val lastOpenBracket = pending.lastIndexOf('[', limit - 1)
+            if (lastOpenBracket >= 0 && pending.indexOf(']', lastOpenBracket) < 0 && (limit - lastOpenBracket) < 128) {
+                var holdIdx = lastOpenBracket
+                while (holdIdx > 0 && (pending[holdIdx - 1] == ' ' || pending[holdIdx - 1] == '\t')) {
+                    holdIdx--
+                }
+                limit = minOf(limit, holdIdx)
+            }
+
+            // Hold short unclosed inline backtick spans
+            var backtickCount = 0
+            var lastBacktickIdx = -1
+            for (i in 0 until limit) {
+                if (pending[i] == '`') {
+                    backtickCount++
+                    lastBacktickIdx = i
+                }
+            }
+            if (backtickCount % 2 == 1 && lastBacktickIdx >= 0 && (limit - lastBacktickIdx) < 128) {
+                limit = minOf(limit, lastBacktickIdx)
+            }
+
+            if (limit <= 0) return 0
+            val bounded = pending.subSequence(0, limit)
+
+            // Require at least one trailing whitespace so partial identifiers split across SSE deltas are never cut mid-token
+            var lastWs = -1
+            for (i in bounded.length - 1 downTo 0) {
+                if (bounded[i].isWhitespace()) {
+                    lastWs = i
+                    break
+                }
+            }
+            if (lastWs < 0) return 0
+
+            val candidate = bounded.substring(0, lastWs + 1)
+            val holdMatch = STREAM_HOLD_TAIL_REGEX.find(candidate)
+            return holdMatch?.range?.first ?: candidate.length
+        }
+
+        private fun sanitizeStreamSegmentPreservingEdges(
+            segment: String,
+            context: Map<String, Any?>,
+            capitalizeLeadingSentence: Boolean
+        ): String {
+            if (segment.isEmpty()) return ""
+            val firstNonWs = segment.indexOfFirst { !it.isWhitespace() }
+            if (firstNonWs < 0) return segment
+            val lastNonWs = segment.indexOfLast { !it.isWhitespace() }
+            val leadingWs = segment.substring(0, firstNonWs)
+            val core = segment.substring(firstNonWs, lastNonWs + 1)
+            val trailingWs = segment.substring(lastNonWs + 1)
+            val sanitizedCore = sanitizePlayerFacingProse(core, context, capitalizeLeadingSentence).trim()
+            if (sanitizedCore.isEmpty()) return ""
+            return "$leadingWs$sanitizedCore$trailingWs"
+        }
+
+        private fun normalizeStreamBoundarySpacing(chunk: String, prevEndedWithHorizontalSpace: Boolean): String {
+            if (!prevEndedWithHorizontalSpace || chunk.isEmpty()) return chunk
+            var idx = 0
+            while (idx < chunk.length && (chunk[idx] == ' ' || chunk[idx] == '\t')) {
+                idx++
+            }
+            return if (idx > 0) chunk.substring(idx) else chunk
+        }
+
+        /**
+         * Stateful token-boundary SSE stream sanitizer that buffers only incomplete trailing tokens,
+         * multi-word lookahead prefixes, unclosed `[sample: ...]` / backtick spans, and the terminal
+         * `---SUGGESTIONS---` JSON array so split SSE deltas never leak raw identifiers.
+         */
+        fun sanitizePlayerFacingStream(
+            rawChunks: Flux<String>,
+            context: Map<String, Any?> = emptyMap()
+        ): Flux<String> = Flux.defer {
+            val pending = StringBuilder()
+            var atSentenceStart = true
+            var prevEndedWithHorizontalSpace = false
+
+            fun recordEmitted(emitted: String) {
+                if (emitted.isEmpty()) return
+                val lastCh = emitted.last()
+                prevEndedWithHorizontalSpace = lastCh == ' ' || lastCh == '\t'
+                if (emitted.contains('\n')) {
+                    val afterNewline = emitted.substringAfterLast('\n')
+                    if (afterNewline.isBlank()) {
+                        atSentenceStart = true
+                        return
+                    }
+                }
+                val lastVisible = emitted.trimEnd().lastOrNull() ?: return
+                atSentenceStart = lastVisible == '.' || lastVisible == '!' || lastVisible == '?'
+            }
+
+            rawChunks
+                .mapNotNull { chunk ->
+                    if (chunk.isEmpty()) return@mapNotNull null
+                    pending.append(chunk)
+                    val safeCut = findSafeStreamFlushCut(pending)
+                    if (safeCut <= 0) {
+                        null
+                    } else {
+                        val readySegment = pending.substring(0, safeCut)
+                        pending.delete(0, safeCut)
+                        val shouldCap = atSentenceStart || readySegment.startsWith("\n")
+                        val sanitized = normalizeStreamBoundarySpacing(
+                            sanitizeStreamSegmentPreservingEdges(readySegment, context, shouldCap),
+                            prevEndedWithHorizontalSpace
+                        )
+                        if (sanitized.isNotEmpty()) {
+                            recordEmitted(sanitized)
+                            sanitized
+                        } else {
+                            null
+                        }
+                    }
+                }
+                .concatWith(
+                    Mono.defer {
+                        if (pending.isEmpty()) {
+                            Mono.empty()
+                        } else {
+                            val tail = pending.toString()
+                            pending.setLength(0)
+                            val firstNonWs = tail.indexOfFirst { !it.isWhitespace() }
+                            if (firstNonWs < 0) {
+                                val normalizedWs = normalizeStreamBoundarySpacing(tail, prevEndedWithHorizontalSpace)
+                                if (normalizedWs.isEmpty()) Mono.empty() else Mono.just(normalizedWs)
+                            } else {
+                                val leadingWs = tail.substring(0, firstNonWs)
+                                val coreAndAfter = tail.substring(firstNonWs)
+                                val shouldCap = atSentenceStart || leadingWs.contains('\n')
+                                val sanitizedTail = sanitizePlayerFacingOutput(coreAndAfter, context, shouldCap)
+                                if (sanitizedTail.isEmpty()) {
+                                    Mono.empty()
+                                } else {
+                                    val combined = normalizeStreamBoundarySpacing(
+                                        "$leadingWs$sanitizedTail",
+                                        prevEndedWithHorizontalSpace
+                                    )
+                                    if (combined.isEmpty()) Mono.empty() else Mono.just(combined)
+                                }
+                            }
+                        }
+                    }
+                )
+        }
 
         private val EXPANDED_ANSWER_REGEX = Regex(
             """\b(?:in[- ]depth|detailed|full\s+(?:breakdown|review|analysis|guide)|step[- ]by[- ]step|comprehensive|thorough(?:ly)?|elaborate|expand(?:\s+on)?|walk\s+me\s+through|deep\s+dive|long\s+version|explain\s+in\s+detail)\b""",
@@ -1963,8 +2584,7 @@ class AiAnalysisService(
 
     private fun extractContent(jsonResponse: String): String {
         return try {
-            val mapper = com.fasterxml.jackson.databind.ObjectMapper()
-            val root = mapper.readTree(jsonResponse)
+            val root = SHARED_OBJECT_MAPPER.readTree(jsonResponse)
             val candidates = root.path("candidates")
             if (candidates.isArray && candidates.size() > 0) {
                 val candidate = candidates.get(0)
@@ -1989,7 +2609,8 @@ class AiAnalysisService(
             }
             "No content generated."
         } catch (e: Exception) {
-            "Error parsing AI response: ${e.message}"
+            logger.warn("Error parsing AI response JSON: {}", e.message)
+            "I couldn't read that coaching response clearly—please try asking again."
         }
     }
 
@@ -1997,8 +2618,7 @@ class AiAnalysisService(
         return try {
             val cleaned = jsonChunk.trim().removePrefix("data:").trim()
             if (cleaned.isEmpty() || cleaned == "[DONE]") return ""
-            val mapper = com.fasterxml.jackson.databind.ObjectMapper()
-            val root = mapper.readTree(cleaned)
+            val root = SHARED_OBJECT_MAPPER.readTree(cleaned)
             val candidates = root.path("candidates")
             if (candidates.isArray && candidates.size() > 0) {
                 val parts = candidates.get(0).path("content").path("parts")

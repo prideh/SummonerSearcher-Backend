@@ -402,4 +402,61 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
             }
         }
     }
+
+    Given("Fixture 8 (19:08 output-surface plain League terms): Deterministic rewriting of variable/schema/enum/field labels while preserving missing/unavailable vs zero") {
+        When("sanitizing leaked sample keys, 5-stat/challenge identifiers, Riot internal champion/enum names, null fields, and character-split SSE chunks") {
+            Then("zero internal variable/schema/enum names remain, missing/null stays unavailable rather than 0, substantive boundary gates remain intact, and clean exemplars stay unchanged") {
+                @Suppress("UNCHECKED_CAST")
+                val liveSchemaLeaks = (fixtures.getValue("normal")["liveProviderSchemaLeakResponses"] as List<String>)
+                liveSchemaLeaks.forEach { rawLeak ->
+                    val cleaned = AiAnalysisService.sanitizePlayerFacingOutput(rawLeak)
+                    AiAnalysisService.containsInternalSchemaLeak(cleaned) shouldBe false
+                    cleaned shouldNotContain "recentMatchSample"
+                    cleaned shouldNotContain "savedHistory"
+                    cleaned shouldNotContain "rankedRecord"
+                    cleaned shouldNotContain "[sample:"
+                }
+
+                // Missing / null / incomplete telemetry must stay human "unavailable" / "not analyzed yet", NEVER coerced to 0
+                val rawMissingOutput =
+                    "In `phaseFarming` and `leadRetention`, avgTotalCsPerMin is null and goldLeadRetentionRate=null because timelineStatus: TIMELINE_UNAVAILABLE. " +
+                        "In `deathCost` and `unspentGold`, totalCombinedBountyGold=null, medianCurrentGold is null, and wardsByTimeBucket is incomplete (legacy cache). " +
+                        "On KSante vs LeeSin and MonkeyKing (role=BOTTOM), RIFTHERALD and YELLOW_TRINKET / CONTROL_WARD timings were not recorded.\n" +
+                        "---SUGGESTIONS--- [\"Compare **recentMatchSample** to **rankedRecord**\", \"Why is `unspentGold` null?\", \"Review `teamObjectives` vs HORDE\"]"
+
+                val sanitizedMissing = AiAnalysisService.sanitizePlayerFacingOutput(rawMissingOutput)
+                AiAnalysisService.containsInternalSchemaLeak(sanitizedMissing) shouldBe false
+                sanitizedMissing shouldContain "In mid-to-late game farming and early lead conversion, average CS per minute is unavailable and gold lead retention rate is unavailable because timeline data is temporarily unavailable."
+                sanitizedMissing shouldContain "In death time and bounty cost and unspent gold, total kill and shutdown gold given up is unavailable, median gold in hand is unavailable, and wards by game phase is unavailable in older match data."
+                sanitizedMissing shouldContain "On K'Sante vs Lee Sin and Wukong (Bot role), Rift Herald and Stealth Ward / Control Ward timings were not recorded."
+                sanitizedMissing shouldContain "---SUGGESTIONS--- [\"Compare your recent matches to your Solo/Duo ranked record\", \"Why is unspent gold unavailable?\", \"Review team objective control vs Voidgrubs\"]"
+                sanitizedMissing shouldNotContain " 0"
+                sanitizedMissing shouldNotContain "=0"
+                sanitizedMissing shouldNotContain "null"
+
+                // Character-by-character SSE streaming produces the exact same output with zero leaked tokens in any intermediate chunk
+                val twoCharChunks = reactor.core.publisher.Flux.fromIterable(rawMissingOutput.chunked(3))
+                val streamedPieces = AiAnalysisService.sanitizePlayerFacingStream(twoCharChunks).collectList().block()!!
+                streamedPieces.forEach { piece ->
+                    AiAnalysisService.containsInternalSchemaLeak(piece) shouldBe false
+                }
+                streamedPieces.joinToString("") shouldBe sanitizedMissing
+
+                // Sanitizer translates telemetry jargon for players WITHOUT masking curation boundary violations
+                val sanitizedJargon = AiAnalysisService.sanitizePlayerFacingOutput(
+                    "Focus on two habits next game: eliminate unassisted single-enemy kill credit deaths and ward earlier."
+                )
+                AiAnalysisService.containsInternalSchemaLeak(sanitizedJargon) shouldBe false
+                sanitizedJargon shouldContain "eliminate unassisted deaths"
+                AiAnalysisService.containsEvidenceBoundaryViolation(sanitizedJargon) shouldBe true
+
+                // All clean exemplars across Fixtures 1, 2, 4, 5, and 6 remain byte-for-byte unchanged
+                listOf("normal", "offtopic", "adversarial", "angry", "roast").forEach { key ->
+                    val exemplar = fixtures.getValue(key)["exemplarCleanResponse"] as String
+                    AiAnalysisService.sanitizePlayerFacingOutput(exemplar) shouldBe exemplar
+                }
+            }
+        }
+    }
 })
+

@@ -1419,12 +1419,13 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
         }
 
         When("checking player-facing coaching prose and follow-up suggestions with containsInternalSchemaLeak") {
-            Then("it flags internal sample keys, schema markers, header labels, and NOT_ANALYZED while passing natural player-facing coaching and suggestions") {
+            Then("it flags internal sample keys, unbackticked 5-stat/challenge camelCase keys, Riot internal enums, and NOT_ANALYZED while passing natural player-facing coaching and suggestions") {
                 val leakyOutputs = listOf(
                     "Across your `recentMatchSample` of 20 games you have a 55.0% win rate.",
                     "Your savedHistory sits at 52.3% across 883 matches, while rankedRecord is 53.6%.",
                     "Your Pantheon averages 2.21 KDA [sample: savedHistory (883g)].",
                     "Because timelineStatus is NOT_ANALYZED, item spike minutes are unavailable.",
+                    "In phaseFarming and deathCost on MonkeyKing UTILITY, BARON_NASHOR and HORDE timings matter.",
                     "---SUGGESTIONS--- [\"Compare recentMatchSample to savedHistory\", \"Check `topChampions`\", \"Why is timeline NOT_ANALYZED?\"]"
                 )
                 leakyOutputs.forEach { sample ->
@@ -1437,7 +1438,134 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 )
                 cleanOutputs.forEach { sample ->
                     AiAnalysisService.containsInternalSchemaLeak(sample) shouldBe false
+                    AiAnalysisService.sanitizePlayerFacingOutput(sample) shouldBe sample
                 }
+            }
+        }
+
+        When("Gemini emits raw variable names, schema keys, Riot enums, and null fields across sync analyze() and split SSE analyzeStream() chunks") {
+            Then("both output surfaces deterministically translate identifiers to plain League terms, never emit raw variable names in any SSE chunk or suggestion, and preserve unavailable vs zero") {
+                val rawModelText =
+                    "Across your `recentMatchSample` (11W-9L) you improved over savedHistory (52.3%) [sample: savedHistory (883g)] and rankedRecord (53.6%). " +
+                        "Because timelineStatus = NOT_ANALYZED, avgGoldLeadAt10 is null, cs10.theoreticalMax=null on MonkeyKing role=UTILITY, and deathCost=null (missingLaneCsAt10Matches: null). " +
+                        "Watch BARON_NASHOR and HORDE timers after WARD_PLACED checks and controlWardTimeCoverageInRiverOrEnemyHalf in wave_management.\n" +
+                        "---SUGGESTIONS--- [\"Compare recentMatchSample to savedHistory\", \"Check `topChampions` and `phaseFarming`\", \"Why is timelineStatus NOT_ANALYZED?\"]"
+
+                val mapper = com.fasterxml.jackson.databind.ObjectMapper()
+                val syncGeminiPayload = mapper.writeValueAsString(
+                    mapOf(
+                        "candidates" to listOf(
+                            mapOf(
+                                "finishReason" to "STOP",
+                                "content" to mapOf("parts" to listOf(mapOf("text" to rawModelText)))
+                            )
+                        )
+                    )
+                )
+
+                // Deliberately split identifiers, brackets, backticks, enums, null assignments, and ---SUGGESTIONS--- across SSE frame boundaries
+                val splitDeltas = listOf(
+                    "Across your `recentMatch",
+                    "Sample` (11W-9L) you improved over saved",
+                    "History (52.3%) [sample: saved",
+                    "History (883g)] and ranked",
+                    "Record (53.6%). Because timelineStatus = ",
+                    "NOT_",
+                    "ANALYZED, avgGoldLead",
+                    "At10 is ",
+                    "null, cs10.theoretical",
+                    "Max=null on Monkey",
+                    "King role=UTIL",
+                    "ITY, and death",
+                    "Cost=null (missingLaneCsAt10",
+                    "Matches: null). Watch BARON_",
+                    "NASHOR and HOR",
+                    "DE timers after WARD_",
+                    "PLACED checks and controlWardTimeCoverage",
+                    "InRiverOrEnemyHalf in wave_",
+                    "management.\n---SUGG",
+                    "ESTIONS--- [\"Compare recentMatch",
+                    "Sample to savedHistory\", \"Check `top",
+                    "Champions` and `phaseFarming`\", \"Why is timeline",
+                    "Status NOT_ANALYZED?\"]"
+                )
+                splitDeltas.joinToString("") shouldBe rawModelText
+
+                val sseBody = splitDeltas.joinToString("\n\n") { delta ->
+                    val frameJson = mapper.writeValueAsString(
+                        mapOf(
+                            "candidates" to listOf(
+                                mapOf("content" to mapOf("parts" to listOf(mapOf("text" to delta))))
+                            )
+                        )
+                    )
+                    "data: $frameJson"
+                } + "\n\n"
+
+                val offlineWebClient = org.springframework.web.reactive.function.client.WebClient.builder()
+                    .baseUrl("https://generativelanguage.googleapis.com/v1beta/")
+                    .exchangeFunction { request ->
+                        val isStream = request.url().toString().contains("streamGenerateContent")
+                        val response = if (isStream) {
+                            org.springframework.web.reactive.function.client.ClientResponse
+                                .create(org.springframework.http.HttpStatus.OK)
+                                .header("Content-Type", "text/event-stream")
+                                .body(sseBody)
+                                .build()
+                        } else {
+                            org.springframework.web.reactive.function.client.ClientResponse
+                                .create(org.springframework.http.HttpStatus.OK)
+                                .header("Content-Type", "application/json")
+                                .body(syncGeminiPayload)
+                                .build()
+                        }
+                        reactor.core.publisher.Mono.just(response)
+                    }
+                    .build()
+
+                val testService = createService()
+                val webClientField = AiAnalysisService::class.java.getDeclaredField("webClient").apply {
+                    isAccessible = true
+                }
+                webClientField.set(testService, offlineWebClient)
+
+                val syncOut = testService.analyze(
+                    context = spearShotContext,
+                    messages = emptyList(),
+                    userMessage = "How is my recent win rate and timeline data?"
+                ).block()!!.response
+
+                val emittedChunks = testService.analyzeStream(
+                    context = spearShotContext,
+                    messages = emptyList(),
+                    userMessage = "How is my recent win rate and timeline data?"
+                ).chunks.collectList().block()!!
+                val streamOut = emittedChunks.joinToString("")
+
+                // Every individual SSE chunk must be free of raw variable/schema/enum identifiers
+                (emittedChunks.size >= 3) shouldBe true
+                emittedChunks.forEach { chunk ->
+                    AiAnalysisService.containsInternalSchemaLeak(chunk) shouldBe false
+                }
+
+                // Sync and streaming surfaces produce identical, plain League language output
+                streamOut shouldBe syncOut
+                AiAnalysisService.containsInternalSchemaLeak(syncOut) shouldBe false
+
+                syncOut shouldContain "Across your recent matches (11W-9L) you improved over your saved match history (52.3%) and your Solo/Duo ranked record (53.6%)."
+                syncOut shouldContain "Because timeline data is not analyzed yet"
+                syncOut shouldContain "average gold lead at 10 minutes is unavailable"
+                syncOut shouldContain "the 10-minute wave spawn ceiling is unavailable on Wukong Support role"
+                syncOut shouldContain "death time and bounty cost is unavailable (unrecorded 10-minute lane CS game count is unavailable)"
+                syncOut shouldContain "Baron Nashor and Voidgrubs timers after ward placement checks"
+                syncOut shouldContain "control ward time coverage in river or enemy half in wave management"
+                syncOut shouldContain "---SUGGESTIONS--- [\"Compare your recent matches to your saved match history\", \"Check most-played champions and mid-to-late game farming\", \"Why is timeline data not analyzed yet?\"]"
+
+                // Missing / null fields stay human unavailable—NEVER coerced to 0
+                syncOut shouldNotContain "= 0"
+                syncOut shouldNotContain "is 0"
+                syncOut shouldNotContain "null"
+                syncOut shouldNotContain "your your"
             }
         }
     }
