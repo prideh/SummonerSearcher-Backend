@@ -296,6 +296,8 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     "missingLaneCsAt10Matches" to 0,
                     "recentMatches" to listOf(
                         mapOf(
+                            "patch" to "16.1",
+                            "gameDuration" to 30.0,
                             "champion" to "Ahri",
                             "role" to "MIDDLE",
                             "win" to true,
@@ -304,7 +306,7 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                             "laneCsAt10" to mapOf(
                                 "actual" to 81,
                                 "target" to 120,
-                                "targetLabel" to "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
+                                "targetLabel" to "Mid lane target"
                             )
                         )
                     )
@@ -320,11 +322,11 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     null
                 ) as String
 
-                // 1. Softened 150-word rule -> concise-but-natural depth guidance
+                // 1. Short default + at most two controllable actions (expand on request)
                 prompt shouldNotContain "MUST be under 150 words"
                 prompt shouldNotContain "brutally efficient elevator pitch"
-                prompt shouldContain "Concise & Natural Depth"
-                prompt shouldContain "allow longer, fuller explanations when the question needs depth"
+                prompt shouldContain "Short Default, Expand on Request (& At Most Two Actions)"
+                prompt shouldContain "at most two controllable next-game actions"
 
                 // 2. Rank-appropriate persona instead of hardcoded Challenger persona
                 prompt shouldNotContain "Treat the player as a Challenger tier player"
@@ -337,13 +339,14 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "WARD_PLACED"
                 prompt shouldContain "never claim ward placement in specific bushes"
                 prompt shouldContain "assisted deaths are not necessarily jungle ganks"
-                prompt shouldContain "cs10.target"
-                prompt shouldContain "114 for Top/Bot, 120 for Mid on verified patch 26.1+ games only"
-                prompt shouldContain "NEVER subtract `actual` from `target` to claim exact \"missed CS\""
+                prompt shouldContain "cs10.theoreticalMax"
+                prompt shouldContain "114 for Top/Bot, 120 for Mid on verified patch 26.1+ games lasting `>=10:00` only"
+                prompt shouldContain "NEVER subtract `actual` from `theoreticalMax` to claim exact \"missed CS\""
                 prompt shouldContain "laneCs@10=81"
-                prompt shouldContain "cs10.target=120"
-                prompt shouldContain "avgLaneCsAt10: {avgActual=81.0 (matchCount=1), avgTarget=120.0 (targetMatchCount=1, avgSupportedActual=81.0)"
+                prompt shouldContain "cs10.theoreticalMax=120"
+                prompt shouldContain "avgLaneCsAt10: {avgActual=81.0 (matchCount=1), avgTheoreticalMax=120.0 (theoreticalMaxMatchCount=1, avgSupportedActual=81.0)"
                 prompt shouldContain "missingLaneCsAt10Matches: 0"
+                prompt shouldNotContain "cs10.target="
                 prompt shouldNotContain "cs10.spawnedSupply"
                 prompt shouldNotContain "cs10.supplyLabel"
 
@@ -782,10 +785,11 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "Game 20 (Most Recent Match):"
                 prompt shouldContain "opponentDetails={champion=Viktor"
 
-                // 4. Redundant earlyDeaths fields stripped & targetLabel emitted at most once
+                // 4. Redundant earlyDeaths fields stripped & theoreticalMaxLabel emitted at most once
                 prompt shouldNotContain "participants="
                 prompt shouldNotContain "assistantsCount="
-                Regex("cs10\\.targetLabel=").findAll(prompt).count() shouldBe 1
+                Regex("cs10\\.theoreticalMaxLabel=").findAll(prompt).count() shouldBe 1
+                prompt shouldNotContain "cs10.targetLabel="
                 prompt shouldNotContain "cs10.spawnedSupply"
                 prompt shouldNotContain "cs10.supplyLabel"
 
@@ -855,6 +859,7 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                         mapOf(
                             "matchId" to "NA1_5001",
                             "patch" to "16.2",
+                            "gameDuration" to 28.0,
                             "role" to "MIDDLE",
                             "champion" to "Orianna",
                             "win" to true,
@@ -863,12 +868,13 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                             "laneCsAt10" to mapOf(
                                 "actual" to 88,
                                 "target" to 120,
-                                "targetLabel" to "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
+                                "targetLabel" to "Mid lane target"
                             )
                         ),
                         mapOf(
                             "matchId" to "NA1_5002",
                             "patch" to "15.24",
+                            "gameDuration" to 31.0,
                             "role" to "TOP",
                             "champion" to "Gnar",
                             "win" to false,
@@ -993,13 +999,14 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     null
                 ) as String
 
-                // Reconciled laneCsAt10 contract
-                prompt shouldContain "avgLaneCsAt10: {avgActual=80.5 (matchCount=6), avgTarget=118.0 (targetMatchCount=4, avgSupportedActual=82.0)"
-                prompt shouldContain "roleBreakdown=[MIDDLE(actual=82.0 in 4g, target=120.0 in 3g, supportedActual=83.5); TOP(actual=77.5 in 2g, target=114.0 in 1g, supportedActual=79.0)]"
+                // Reconciled fail-closed laneCsAt10 theoreticalMax contract (mixed-patch matchCount=6 > supported=4 -> avgTheoreticalMax=null)
+                prompt shouldContain "avgLaneCsAt10: {avgActual=80.5 (matchCount=6), avgTheoreticalMax=null (theoreticalMaxMatchCount=4, avgSupportedActual=82.0)"
+                prompt shouldContain "roleBreakdown=[MIDDLE(actual=82.0 in 4g, theoreticalMax=null in 3g, supportedActual=83.5); TOP(actual=77.5 in 2g, theoreticalMax=null in 1g, supportedActual=79.0)]"
                 prompt shouldContain "missingLaneCsAt10Matches: 2"
-                prompt shouldContain "cs10.target=120"
-                prompt shouldContain "cs10.target=null"
-                prompt shouldContain "cs10.targetLabel=Patch 26.1+ passive wave spawn total by 10:00"
+                prompt shouldContain "cs10.theoreticalMax=120"
+                prompt shouldContain "cs10.theoreticalMax=null"
+                prompt shouldContain "cs10.theoreticalMaxLabel=Patch 26.1+ theoretical max passive lane minions spawned by 10:00"
+                prompt shouldNotContain "cs10.target="
                 prompt shouldNotContain "cs10.spawnedSupply"
 
                 // All 5 improvementStats groups + denominators + missingness
