@@ -21,6 +21,73 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
     val mapper: ObjectMapper = ObjectMapper().findAndRegisterModules()
     val timelineAnalysisService = TimelineAnalysisService()
 
+    fun memProvider(sample: RawMemorySample): MemoryStatsProvider = object : MemoryStatsProvider {
+        override fun sample(): RawMemorySample = sample
+    }
+
+    fun clockProvider(nowFn: () -> Long): TimeProvider = object : TimeProvider {
+        override fun now(): Long = nowFn()
+    }
+
+    fun tlPFrame(
+        participantId: Int,
+        totalGold: Int,
+        currentGold: Int = 500,
+        level: Int = 1,
+        xp: Int = 0,
+        minionsKilled: Int = 0,
+        jungleMinionsKilled: Int = 0,
+        position: TimelinePositionDto = TimelinePositionDto(7500, 7500)
+    ): ParticipantFrameDto = ParticipantFrameDto(
+        participantId = participantId,
+        totalGold = totalGold,
+        level = level,
+        xp = xp,
+        currentGold = currentGold,
+        minionsKilled = minionsKilled,
+        jungleMinionsKilled = jungleMinionsKilled,
+        position = position
+    )
+
+    fun tlEvent(
+        type: String,
+        timestamp: Long,
+        participantId: Int? = null,
+        creatorId: Int? = null,
+        itemId: Int? = null,
+        beforeId: Int? = null,
+        afterId: Int? = null,
+        skillSlot: Int? = null,
+        levelUpType: String? = null,
+        wardType: String? = null
+    ): TimelineEventDto = TimelineEventDto(
+        type = type,
+        timestamp = timestamp,
+        participantId = participantId,
+        killerId = null,
+        victimId = null,
+        assistingParticipantIds = null,
+        itemId = itemId,
+        afterId = afterId,
+        beforeId = beforeId,
+        skillSlot = skillSlot,
+        levelUpType = levelUpType,
+        wardType = wardType,
+        creatorId = creatorId,
+        level = null,
+        buildingType = null,
+        laneType = null,
+        towerType = null,
+        teamId = null,
+        killerTeamId = null,
+        monsterType = null,
+        monsterSubType = null,
+        position = null,
+        bounty = null,
+        shutdownBounty = null,
+        goldGain = null
+    )
+
     fun buildTenParticipants(roleBoundItemBySlot: (Int) -> Int? = { null }): List<ParticipantDto> {
         val roles = listOf("TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY")
         return (1..10).map { pid ->
@@ -176,9 +243,9 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 parts[4].gameEndedInIGNBSurrender shouldBe true
                 parts[4].teamIGNBSurrendered shouldBe true
                 val acc = MatchStatsAccumulator("p-ignb")
-                acc.processMatch(parsed) shouldBe true
+                acc.addMatchIfEligible(parsed) shouldBe true
                 val (_, overall) = acc.getResult()
-                overall.totalGames shouldBe 1
+                (overall.wins + overall.losses) shouldBe 1
                 overall.winRate shouldBe 0.0
             }
         }
@@ -202,7 +269,7 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                     redisCacheService = redis,
                     riotApiService = riot,
                     indexedPlayerRepository = indexRepo,
-                    memoryStatsProvider = MemoryStatsProvider { healthyMemory }
+                    memoryStatsProvider = memProvider(healthyMemory)
                 )
 
                 val legacyMatches = (1..5).map { buildMatchDto("EUW1_$it") }
@@ -210,7 +277,7 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
 
                 updated shouldBe 0
                 result shouldBe legacyMatches
-                coVerify(exactly = 0) { riot.getMatchByIdLowPriority(any(), any(), any(), any()) }
+                coVerify(exactly = 0) { riot.getMatchByIdLowPriority(any(), any(), any(), any(), any()) }
                 verify(exactly = 0) { redis.set(any(), any<MatchDto>(), any()) }
             }
         }
@@ -225,22 +292,23 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 every { redis.get(any(), MatchDto::class.java) } returns null
                 every { redis.getRemainingTtl("match:euw1:EUW1_1") } returns Duration.ofDays(19)
                 every { redis.getRemainingTtl("match:euw1:EUW1_2") } returns null
+                every { redis.getRemainingTtl("match:euw1:EUW1_3") } returns null
                 every { riot.getActiveRetryAfterWaitMs(any()) } returns 0L
 
                 val service = PlayerCacheService(
                     redisCacheService = redis,
                     riotApiService = riot,
                     indexedPlayerRepository = indexRepo,
-                    timeProvider = TimeProvider { nowMs },
-                    memoryStatsProvider = MemoryStatsProvider { healthyMemory },
+                    timeProvider = clockProvider { nowMs },
+                    memoryStatsProvider = memProvider(healthyMemory),
                     legacyRoleQuestBackfillEnabled = true
                 )
 
                 // Match 1 succeeds (preserves 19d TTL); Match 2 fails (null -> original retained, 30m cooldown); Match 3 succeeds; Match 4+5 skipped by per-call cap (3)
-                coEvery { riot.getMatchByIdLowPriority("EUW1_1", "euw1", 0, any()) } returns
+                coEvery { riot.getMatchByIdLowPriority("EUW1_1", "euw1", 0, any(), any()) } returns
                     buildMatchDto("EUW1_1", dtoSchemaVersion = 2) { 3006 }
-                coEvery { riot.getMatchByIdLowPriority("EUW1_2", "euw1", 0, any()) } returns null
-                coEvery { riot.getMatchByIdLowPriority("EUW1_3", "euw1", 0, any()) } returns
+                coEvery { riot.getMatchByIdLowPriority("EUW1_2", "euw1", 0, any(), any()) } returns null
+                coEvery { riot.getMatchByIdLowPriority("EUW1_3", "euw1", 0, any(), any()) } returns
                     buildMatchDto("EUW1_3", dtoSchemaVersion = 2) { 1206 }
 
                 val batch = (1..5).map { buildMatchDto("EUW1_$it") }
@@ -263,19 +331,19 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 telemetryAfterFirst["legacyRoleQuestBackfillSkippedBudget"] shouldBe 2L
 
                 // Repeated call within 30m: EUW1_2 is in failed-attempt cooldown -> 0 retry calls on EUW1_2!
-                coEvery { riot.getMatchByIdLowPriority("EUW1_4", "euw1", 0, any()) } returns
+                coEvery { riot.getMatchByIdLowPriority("EUW1_4", "euw1", 0, any(), any()) } returns
                     buildMatchDto("EUW1_4", dtoSchemaVersion = 2) { 1220 }
                 val (_, secondUpdated) = service.refreshLegacyRoleQuestMatchesBounded(
                     listOf(refreshed[1], refreshed[3]), // EUW1_2 (failed earlier) + EUW1_4
                     "euw1"
                 )
                 secondUpdated shouldBe 1
-                coVerify(exactly = 1) { riot.getMatchByIdLowPriority("EUW1_2", "euw1", 0, any()) }
+                coVerify(exactly = 1) { riot.getMatchByIdLowPriority("EUW1_2", "euw1", 0, any(), any()) }
                 service.getDiscoveryAndSeasonWriteTelemetry()["legacyRoleQuestBackfillSkippedMatchCooldown"] shouldBe 1L
 
                 // Singleflight test: two concurrent callers requesting EUW1_99 make strictly 1 Riot API call
                 val inflightCalls = AtomicInteger(0)
-                coEvery { riot.getMatchByIdLowPriority("EUW1_99", "euw1", 0, any()) } coAnswers {
+                coEvery { riot.getMatchByIdLowPriority("EUW1_99", "euw1", 0, any(), any()) } coAnswers {
                     inflightCalls.incrementAndGet()
                     delay(40)
                     buildMatchDto("EUW1_99", dtoSchemaVersion = 2) { 1208 }
@@ -291,7 +359,7 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
 
                 // Global window cap (10/min): we already consumed 5 attempts above; 5 more reach 10, 11th skips globally
                 for (k in 10..20) {
-                    coEvery { riot.getMatchByIdLowPriority("EUW1_G$k", "euw1", 0, any()) } returns
+                    coEvery { riot.getMatchByIdLowPriority("EUW1_G$k", "euw1", 0, any(), any()) } returns
                         buildMatchDto("EUW1_G$k", dtoSchemaVersion = 2) { 1206 }
                 }
                 service.refreshLegacyRoleQuestMatchesBounded((10..12).map { buildMatchDto("EUW1_G$it") }, "euw1")
@@ -318,7 +386,7 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                     redisCacheService = redis,
                     riotApiService = riot,
                     indexedPlayerRepository = indexRepo,
-                    memoryStatsProvider = MemoryStatsProvider { lowMemory },
+                    memoryStatsProvider = memProvider(lowMemory),
                     legacyRoleQuestBackfillEnabled = true
                 )
                 lowMemService.refreshLegacyRoleQuestMatchesBounded(listOf(buildMatchDto("EUW1_MEM")), "euw1").second shouldBe 0
@@ -327,12 +395,12 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 // CancellationException must propagate without writing to Redis
                 val cancelRiot = mockk<RiotApiService>(relaxed = true)
                 every { cancelRiot.getActiveRetryAfterWaitMs(any()) } returns 0L
-                coEvery { cancelRiot.getMatchByIdLowPriority("EUW1_CANCEL", "euw1", 0, any()) } throws CancellationException("cancelled")
+                coEvery { cancelRiot.getMatchByIdLowPriority("EUW1_CANCEL", "euw1", 0, any(), any()) } throws CancellationException("cancelled")
                 val cancelService = PlayerCacheService(
                     redisCacheService = redis,
                     riotApiService = cancelRiot,
                     indexedPlayerRepository = indexRepo,
-                    memoryStatsProvider = MemoryStatsProvider { healthyMemory },
+                    memoryStatsProvider = memProvider(healthyMemory),
                     legacyRoleQuestBackfillEnabled = true
                 )
                 shouldThrow<CancellationException> {
@@ -354,7 +422,7 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                     recentMatches = listOf(buildMatchDto("EUW1_SYNC")),
                     allMatchIds = listOf("EUW1_SYNC"),
                     championStats = emptyList(),
-                    overallStats = OverallStatsDto(1, 1, 0, 100.0, 6.0, 5.0, 2.0, 7.0, 6.5),
+                    overallStats = null,
                     improvementStats = null,
                     totalMatches = 1,
                     lastRefreshed = newerRefreshedAt
@@ -365,13 +433,13 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
 
                 val syncRiot = mockk<RiotApiService>(relaxed = true)
                 every { syncRiot.getActiveRetryAfterWaitMs(any()) } returns 0L
-                coEvery { syncRiot.getMatchByIdLowPriority("EUW1_SYNC", "euw1", 0, any()) } returns
+                coEvery { syncRiot.getMatchByIdLowPriority("EUW1_SYNC", "euw1", 0, any(), any()) } returns
                     buildMatchDto("EUW1_SYNC", dtoSchemaVersion = 2) { 3006 }
                 val syncService = PlayerCacheService(
                     redisCacheService = redis,
                     riotApiService = syncRiot,
                     indexedPlayerRepository = indexRepo,
-                    memoryStatsProvider = MemoryStatsProvider { healthyMemory },
+                    memoryStatsProvider = memProvider(healthyMemory),
                     legacyRoleQuestBackfillEnabled = true
                 )
                 val pageResult = syncService.getMatchesByIds(listOf("EUW1_SYNC"), "euw1", ownerPuuid = "puuid-1")
@@ -403,7 +471,7 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                         TimelineFrameDto(
                             timestamp = ts,
                             participantFrames = mapOf(
-                                "3" to ParticipantFrameDto(
+                                "3" to tlPFrame(
                                     participantId = 3,
                                     totalGold = if (m == 10) 3800 else if (m == 15) 5900 else 500 + m * 300,
                                     currentGold = 600,
@@ -413,7 +481,7 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                                     jungleMinionsKilled = 0,
                                     position = TimelinePositionDto(7500, 7500)
                                 ),
-                                "8" to ParticipantFrameDto(
+                                "8" to tlPFrame(
                                     participantId = 8,
                                     totalGold = if (m == 10) 3300 else if (m == 15) 5100 else 500 + m * 280,
                                     currentGold = 500,
@@ -427,19 +495,19 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                             events = if (m == 5) {
                                 listOf(
                                     // Valid ward vs UNDEFINED ward (must be excluded!)
-                                    TimelineEventDto(type = "WARD_PLACED", timestamp = 305_000L, creatorId = 3, wardType = "YELLOW_TRINKET"),
-                                    TimelineEventDto(type = "WARD_PLACED", timestamp = 310_000L, creatorId = 3, wardType = "UNDEFINED"),
+                                    tlEvent(type = "WARD_PLACED", timestamp = 305_000L, creatorId = 3, wardType = "YELLOW_TRINKET"),
+                                    tlEvent(type = "WARD_PLACED", timestamp = 310_000L, creatorId = 3, wardType = "UNDEFINED"),
                                     // Buy 1056 -> Buy 1082 -> Undo 1082 (beforeId=1082) -> #1174 Boot undo (beforeId=0, must NOT pop 1056!)
-                                    TimelineEventDto(type = "ITEM_PURCHASED", timestamp = 301_000L, participantId = 3, itemId = 1056),
-                                    TimelineEventDto(type = "ITEM_PURCHASED", timestamp = 302_000L, participantId = 3, itemId = 1082),
-                                    TimelineEventDto(type = "ITEM_UNDO", timestamp = 303_000L, participantId = 3, beforeId = 1082, afterId = 0),
-                                    TimelineEventDto(type = "ITEM_UNDO", timestamp = 304_000L, participantId = 3, beforeId = 0, afterId = 0),
+                                    tlEvent(type = "ITEM_PURCHASED", timestamp = 301_000L, participantId = 3, itemId = 1056),
+                                    tlEvent(type = "ITEM_PURCHASED", timestamp = 302_000L, participantId = 3, itemId = 1082),
+                                    tlEvent(type = "ITEM_UNDO", timestamp = 303_000L, participantId = 3, beforeId = 1082, afterId = 0),
+                                    tlEvent(type = "ITEM_UNDO", timestamp = 304_000L, participantId = 3, beforeId = 0, afterId = 0),
                                     // SKILL_LEVEL_UP: 19 valid NORMAL skill-ups (e.g. Udyr/Lv20 exception preserved!), 1 EVOLVE excluded, and 1 duplicate (#1100) deduplicated
-                                    TimelineEventDto(type = "SKILL_LEVEL_UP", timestamp = 315_000L, participantId = 3, skillSlot = 1, levelUpType = "EVOLVE"),
-                                    TimelineEventDto(type = "SKILL_LEVEL_UP", timestamp = 320_000L, participantId = 3, skillSlot = 1, levelUpType = "NORMAL"),
-                                    TimelineEventDto(type = "SKILL_LEVEL_UP", timestamp = 320_000L, participantId = 3, skillSlot = 1, levelUpType = "NORMAL")
+                                    tlEvent(type = "SKILL_LEVEL_UP", timestamp = 315_000L, participantId = 3, skillSlot = 1, levelUpType = "EVOLVE"),
+                                    tlEvent(type = "SKILL_LEVEL_UP", timestamp = 320_000L, participantId = 3, skillSlot = 1, levelUpType = "NORMAL"),
+                                    tlEvent(type = "SKILL_LEVEL_UP", timestamp = 320_000L, participantId = 3, skillSlot = 1, levelUpType = "NORMAL")
                                 ) + (1..18).map { idx ->
-                                    TimelineEventDto(
+                                    tlEvent(
                                         type = "SKILL_LEVEL_UP",
                                         timestamp = 321_000L + idx * 1000L,
                                         participantId = 3,
@@ -449,8 +517,8 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                                 }
                             } else if (m == 13) {
                                 listOf(
-                                    TimelineEventDto(type = "ITEM_DESTROYED", timestamp = 780_000L, participantId = 3, itemId = 1201), // 13.0m
-                                    TimelineEventDto(type = "ITEM_DESTROYED", timestamp = 810_000L, participantId = 8, itemId = 1201)  // 13.5m
+                                    tlEvent(type = "ITEM_DESTROYED", timestamp = 780_000L, participantId = 3, itemId = 1201), // 13.0m
+                                    tlEvent(type = "ITEM_DESTROYED", timestamp = 810_000L, participantId = 8, itemId = 1201)  // 13.5m
                                 )
                             } else emptyList()
                         )
@@ -461,8 +529,8 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                             TimelineFrameDto(
                                 timestamp = 95_000L,
                                 participantFrames = mapOf(
-                                    "3" to ParticipantFrameDto(participantId = 3, totalGold = 99999, position = TimelinePositionDto(7500, 7500)),
-                                    "8" to ParticipantFrameDto(participantId = 8, totalGold = 1000, position = TimelinePositionDto(7600, 7600))
+                                    "3" to tlPFrame(participantId = 3, totalGold = 99999, position = TimelinePositionDto(7500, 7500)),
+                                    "8" to tlPFrame(participantId = 8, totalGold = 1000, position = TimelinePositionDto(7600, 7600))
                                 ),
                                 events = emptyList()
                             )
@@ -475,7 +543,7 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                     info = MatchTimelineInfo(
                         frameInterval = 60_000L,
                         frames = frames,
-                        participants = listOf(TimelineParticipant(3, "puuid-3"), TimelineParticipant(8, "puuid-8"))
+                        participants = listOf(TimelineParticipantDto(3, "puuid-3"), TimelineParticipantDto(8, "puuid-8"))
                     )
                 )
 
