@@ -42,6 +42,7 @@ data class RawMemorySample(
     val cgroupMemoryPeakBytes: Long? = null,
     val cgroupAnonBytes: Long? = null,
     val cgroupFileCacheBytes: Long? = null,
+    val cgroupInactiveFileBytes: Long? = null,
     val oldGenGcCount: Long = 0L
 )
 
@@ -51,6 +52,12 @@ interface MemoryStatsProvider {
 
 @org.springframework.stereotype.Component
 class SystemMemoryStatsProvider : MemoryStatsProvider {
+    private data class CgroupStatBreakdown(
+        val anonBytes: Long?,
+        val fileBytes: Long?,
+        val inactiveFileBytes: Long?
+    )
+
     override fun sample(): RawMemorySample {
         val rt = Runtime.getRuntime()
         val committed = rt.totalMemory().coerceAtLeast(0L)
@@ -138,7 +145,7 @@ class SystemMemoryStatsProvider : MemoryStatsProvider {
             ?: readLongFromFile("/sys/fs/cgroup/memory/memory.limit_in_bytes")?.takeIf { it in 1L..68_719_476_736L }
         val cgroupPeak = readLongFromFile("/sys/fs/cgroup/memory.peak")
             ?: readLongFromFile("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")
-        val (cgroupAnon, cgroupFileCache) = readCgroupAnonAndFileBytes()
+        val cgroupStat = readCgroupStatBreakdown()
 
         return RawMemorySample(
             jvmHeapUsedBytes = used,
@@ -158,8 +165,9 @@ class SystemMemoryStatsProvider : MemoryStatsProvider {
             cgroupMemoryCurrentBytes = cgroupCurrent,
             cgroupMemoryMaxBytes = cgroupMax,
             cgroupMemoryPeakBytes = cgroupPeak,
-            cgroupAnonBytes = cgroupAnon,
-            cgroupFileCacheBytes = cgroupFileCache,
+            cgroupAnonBytes = cgroupStat.anonBytes,
+            cgroupFileCacheBytes = cgroupStat.fileBytes,
+            cgroupInactiveFileBytes = cgroupStat.inactiveFileBytes,
             oldGenGcCount = oldGenGcCount
         )
     }
@@ -176,17 +184,19 @@ class SystemMemoryStatsProvider : MemoryStatsProvider {
         }
     }
 
-    private fun readCgroupAnonAndFileBytes(): Pair<Long?, Long?> {
+    private fun readCgroupStatBreakdown(): CgroupStatBreakdown {
         val statFile = sequenceOf(
             java.io.File("/sys/fs/cgroup/memory.stat"),
             java.io.File("/sys/fs/cgroup/memory/memory.stat")
-        ).firstOrNull { it.exists() && it.canRead() } ?: return null to null
+        ).firstOrNull { it.exists() && it.canRead() } ?: return CgroupStatBreakdown(null, null, null)
 
         return try {
             var anon: Long? = null
             var fileCache: Long? = null
+            var inactiveFile: Long? = null
             var rssFallback: Long? = null
             var cacheFallback: Long? = null
+            var totalInactiveFileFallback: Long? = null
             statFile.forEachLine { line ->
                 val parts = line.trim().split(' ', '\t')
                 if (parts.size >= 2) {
@@ -196,15 +206,21 @@ class SystemMemoryStatsProvider : MemoryStatsProvider {
                         when (key) {
                             "anon" -> anon = value
                             "file" -> fileCache = value
+                            "inactive_file" -> inactiveFile = value
                             "rss" -> rssFallback = value
                             "cache" -> cacheFallback = value
+                            "total_inactive_file" -> totalInactiveFileFallback = value
                         }
                     }
                 }
             }
-            (anon ?: rssFallback) to (fileCache ?: cacheFallback)
+            CgroupStatBreakdown(
+                anonBytes = anon ?: rssFallback,
+                fileBytes = fileCache ?: cacheFallback,
+                inactiveFileBytes = inactiveFile ?: totalInactiveFileFallback
+            )
         } catch (_: Exception) {
-            null to null
+            CgroupStatBreakdown(null, null, null)
         }
     }
 }
