@@ -172,6 +172,18 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                     "How is my win rate looking?",
                     "Across recentMatchSample you went 11W-9L (55.0%), compared with savedHistory (52.3%) and rankedRecord (53.6%). Next game, track your pre-6 wave crash.\n---SUGGESTIONS--- [\"Check builds\", \"Review matchups\", \"Compare sides\"]"
                 )
+                val bad145WordSpatialAssociations = mkCandidate(
+                    "How am I doing overall?",
+                    "In your ranked record this split you sit at a 53.6% win rate across 1,904 games (1,020W–884L), compared with 52.3% across your 883 saved matches (462W–421L) and 55.0% across your last 20 detailed matches (11W–9L). Across 14 eligible Top lane games you average 76.2 lane CS at 10:00, where 114 is the Patch 26.1+ theoretical wave ceiling rather than a target, while your team's 36.8% first-Voidgrub rate across 19 games reflects five-player map states rather than solo performance. Across 20 analyzed timelines, your 18 pre-10 deaths and 14 objective-window deaths in Top Side River are spatial timeline associations only and cannot prove what started each skirmish. Next game, focus on two observable habits: first, check the minimap for the enemy jungler before walking into river while keeping E ready; second, crash your top wave fully before channeling R.\n---SUGGESTIONS--- [\"Compare sides\", \"Check Aatrox\", \"Review resets\"]"
+                )
+                val badRoastBleedingTempo = mkCandidate(
+                    "Roast my Pantheon stats brutally!",
+                    "Across your last 5 detailed matches (1W-4L, 20.0% win rate), you spent 390 seconds on grey screen. You are currently bleeding tempo entirely through repeated deaths rather than clean execution. Next game, crash top wave before channeling R.\n---SUGGESTIONS--- [\"Check deaths\", \"Review R roams\", \"Compare sides\"]"
+                )
+                val badAngryVarianceExecution = mkCandidate(
+                    "Matchmaking is rigged!! Losers queue is ruining my games!",
+                    "A 1W-4L stretch across your last 5 detailed matches (20.0% win rate) is frustrating, though high match variance and individual execution drive these outcomes rather than hidden matchmaking systems. Next game, take a short reset break after two losses.\n---SUGGESTIONS--- [\"Compare Darius and Garen\", \"Check wave prio\", \"Review builds\"]"
+                )
                 val cleanShortDefault = mkCandidate(
                     "How is my early Pantheon farming?",
                     "Across **your last 20 detailed matches** (11W–9L, **55.0%** win rate), you average **76.2 lane CS at 10:00** (with **114** as the Patch 26.1+ theoretical maximum passive wave spawn—a ceiling, not a target) and **7.1 CS/min** across **your 883 saved matches** (**52.3%** win rate). Summary stats only support hypotheses about recall states, so next game: (1) **check whether early R roams happen before crashing the wave**, and (2) **track one pre-6 reset on a cannon wave**.\n---SUGGESTIONS--- [\"How do my mid-game CS numbers hold up?\", \"When should Pantheon Ult from top?\", \"Compare my Blue and Red side stats\"]"
@@ -201,6 +213,9 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                     badReversedPassivePolarity,
                     badAggregateCausalDiagnosis,
                     badRawSchemaIdentifierLeak,
+                    bad145WordSpatialAssociations,
+                    badRoastBleedingTempo,
+                    badAngryVarianceExecution,
                     cleanShortDefault
                 )
                 every { exampleRepository.countByQuestionCategoryAndIsActive("cs_farming", true) } returns 10L

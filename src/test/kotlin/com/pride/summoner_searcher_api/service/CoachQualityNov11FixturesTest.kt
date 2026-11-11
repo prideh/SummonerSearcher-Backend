@@ -108,14 +108,15 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 val defaultPrompt = buildPrompt(context, userMessage)
                 val expandedPrompt = buildPrompt(context, expandedUserMessage)
 
-                // 1. Short default (~80-130 words) + <=2 observable actions vs expand on request
+                // 1. Short default (~65-105 words, max 115) + <=2 observable actions vs expand on request
                 AiAnalysisService.requestsExpandedAnswer(userMessage) shouldBe false
                 AiAnalysisService.requestsExpandedAnswer(expandedUserMessage) shouldBe true
-                defaultPrompt shouldContain "Default to a **short, high-signal answer** (3–5 crisp sentences, ~80–130 words total"
+                defaultPrompt shouldContain "Default to a **short, high-signal answer** (3–4 short sentences, ~65–105 words total, max 115 words"
                 defaultPrompt shouldContain "at most two controllable next-game actions"
                 defaultPrompt shouldContain "concrete, observable in-game habits"
                 defaultPrompt shouldContain "NEVER output literal `rankedRecord`, `savedHistory`, `recentMatchSample`"
                 defaultPrompt shouldContain "never write literal `rankedRecord`/`savedHistory`/`recentMatchSample` or \"single-enemy kill credit\""
+                defaultPrompt shouldContain "do not append a trailing follow-up question"
                 expandedPrompt shouldContain "The player explicitly asked for an expanded breakdown"
 
                 // 2. Separate rankedRecord / savedHistory / recentMatchSample (recent 20, NOT totalGamesAnalyzed=883)
@@ -151,10 +152,12 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 defaultPrompt shouldContain "Game 1 (Oldest Match in Context): L on Pantheon vs EnemyJg1 (LeeSin)"
                 defaultPrompt shouldContain "laneCs@10=8, cs10.theoreticalMax=null"
 
-                // 5. Team objectives & aggregate/timeline associations != proven causes
+                // 5. Team objectives & plain-language timeline/aggregate boundaries (zero "temporal/spatial associations" or "spatial timeline associations" priming)
                 defaultPrompt shouldContain "**5-player team outcomes**—NEVER praise or blame them as personal player performance or weakness"
-                defaultPrompt shouldContain "Causality boundary: Timeline diffs, zones, and objective-window death counts are temporal/spatial associations only"
-                defaultPrompt shouldContain "aggregate stats (KDA, avg deaths, CS/min, time dead, win rates) and `topStrengths`/`topWeaknesses` (beat/trail counts) support **hypotheses only, NEVER causal micro diagnoses**"
+                defaultPrompt shouldContain "Causality boundary: Timeline diffs, death areas, and objective-window death counts show when and where events happened only"
+                defaultPrompt shouldNotContain "temporal/spatial associations"
+                defaultPrompt shouldNotContain "spatial timeline associations"
+                defaultPrompt shouldContain "aggregate stats (KDA, avg deaths, CS/min, time dead, win rates) and `topStrengths`/`topWeaknesses` (beat/trail counts) support **hypotheses only, NEVER causal micro or macro diagnoses**"
                 defaultPrompt shouldContain "topStrengths (beat-opp freq, NOT causal proof)"
                 defaultPrompt shouldContain "topWeaknesses (trail-opp freq, NOT causal proof)"
 
@@ -169,7 +172,7 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 (AiAnalysisService.utf8ByteSize(expandedPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
 
                 val exemplarWords = AiAnalysisService.stripSuggestionsBlock(exemplarClean).split(Regex("\\s+")).count { it.isNotBlank() }
-                (exemplarWords in 80..135) shouldBe true
+                (exemplarWords in 75..115) shouldBe true
                 AiAnalysisService.containsInternalSchemaLeak(exemplarClean) shouldBe false
                 AiAnalysisService.containsCs10TheoreticalMaxMislabeling(exemplarClean) shouldBe false
                 AiAnalysisService.containsEvidenceBoundaryViolation(exemplarClean) shouldBe false
@@ -301,22 +304,29 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
         val context = angryFixture["context"] as Map<String, Any?>
         val userMessage = angryFixture["userMessage"] as String
         val exemplarClean = angryFixture["exemplarCleanResponse"] as String
+        val live4d1f487AngryRegression = angryFixture["live4d1f487CausalOverconfidenceResponse"] as String
 
         When("detecting intent and constructing the coaching prompt for a tilted rant") {
-            Then("it detects tilt, injects calm non-preachy de-escalation, forbids validating hidden MMR/losers queue or blaming teammates, and caps advice at <=2 controllable checks") {
+            Then("it detects tilt, injects calm non-preachy de-escalation, forbids BOTH validating hidden MMR/losers queue AND counter-diagnosing loss causes via variance/execution, and caps advice at <=2 controllable checks") {
                 AiAnalysisService.isAngryOrTiltedQuestion(userMessage) shouldBe true
+                AiAnalysisService.isAngryOrTiltedQuestion("I am tilted on a 4 game lose streak in elo hell") shouldBe true
                 val intent = service.detectIntent(userMessage)
                 intent.category shouldBe "mental_state_tilt"
 
                 val prompt = buildPrompt(context, userMessage)
                 prompt shouldContain "Player sounds frustrated or tilted. De-escalate calmly without lecturing"
                 prompt shouldContain "NEVER validate rigged matchmaking, \"losers queue\", or hidden MMR claims"
+                prompt shouldContain "never counter-diagnose why losses happened (never claim \"match variance\" or \"individual execution\" drives/causes these outcomes"
                 prompt shouldContain "at most two controllable checks"
                 (AiAnalysisService.utf8ByteSize(prompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
 
                 AiAnalysisService.containsInternalSchemaLeak(exemplarClean) shouldBe false
                 AiAnalysisService.containsEvidenceBoundaryViolation(exemplarClean) shouldBe false
                 AiAnalysisService.isEligibleCuratedExample("How do I reset after a 1W-4L Darius slump?", exemplarClean) shouldBe true
+
+                // Live 4d1f487 counter-diagnosis ("high match variance and individual execution drive these outcomes rather than hidden matchmaking systems") is deterministically rejected
+                AiAnalysisService.containsEvidenceBoundaryViolation(live4d1f487AngryRegression) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample(userMessage, live4d1f487AngryRegression) shouldBe false
             }
         }
     }
@@ -333,13 +343,14 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
         val liveProviderRegressions = roastFixture["liveProviderRegressionBadResponses"] as List<String>
 
         When("constructing the prompt when the player explicitly asks to be roasted during a 1W-4L slump") {
-            Then("it preserves invited playful bluntness, anchors banter to personal stats as hypotheses, enforces own-ready vs enemy-unavailable polarity, and rejects all live-QA roast regressions") {
+            Then("it preserves invited playful bluntness on observed personal numbers, forbids tempo-bleed/aggregate causal overconfidence, enforces own-ready vs enemy-unavailable polarity, and rejects all live-QA roast regressions") {
                 AiAnalysisService.invitesBluntnessOrRoast(userMessage) shouldBe true
 
                 val prompt = buildPrompt(context, userMessage)
                 prompt shouldContain "Player explicitly invited bluntness or a playful roast"
                 prompt shouldContain "keep your own passive/spell READY separate from enemy cooldowns being DOWN"
                 prompt shouldContain "never claim aggregate KDA/deaths prove over-forcing trades or bad spacing"
+                prompt shouldContain "never assert unhedged tempo-bleed or execution causes from deaths/KDA"
                 prompt shouldNotContain "Use extra supportive tone and focus on small, achievable improvements"
                 prompt shouldContain "Invited Bluntness & Playful Roasts"
                 prompt shouldContain "NEVER roast or blame the player personally for 5-player team objective rates"
@@ -348,7 +359,7 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 (AiAnalysisService.utf8ByteSize(prompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
 
                 val roastExemplarWords = AiAnalysisService.stripSuggestionsBlock(exemplarClean).split(Regex("\\s+")).count { it.isNotBlank() }
-                (roastExemplarWords in 80..135) shouldBe true
+                (roastExemplarWords in 75..115) shouldBe true
                 AiAnalysisService.containsInternalSchemaLeak(exemplarClean) shouldBe false
                 AiAnalysisService.containsEvidenceBoundaryViolation(exemplarClean) shouldBe false
                 AiAnalysisService.isEligibleCuratedExample(userMessage, exemplarClean) shouldBe true
@@ -356,7 +367,7 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 AiAnalysisService.containsEvidenceBoundaryViolation(badRoast) shouldBe true
                 AiAnalysisService.isEligibleCuratedExample(userMessage, badRoast) shouldBe false
 
-                // Exact live-provider QA blocking outputs from deployed b9911bf must be deterministically rejected
+                // Exact live-provider QA blocking outputs from deployed b9911bf and 4d1f487 must be deterministically rejected
                 liveProviderRegressions.forEach { badLiveOutput ->
                     AiAnalysisService.containsEvidenceBoundaryViolation(badLiveOutput) shouldBe true
                     AiAnalysisService.isEligibleCuratedExample(userMessage, badLiveOutput) shouldBe false
@@ -374,7 +385,8 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 promptWithSanitizedHistory shouldNotContain "empowered passive and enemy core mobility cooldowns are down"
                 promptWithSanitizedHistory shouldNotContain "point to a persistent issue with over-forcing trades"
                 promptWithSanitizedHistory shouldNotContain "eliminate unassisted single-enemy kill credit deaths"
-                promptWithSanitizedHistory shouldContain "user: Prior question 0"
+                promptWithSanitizedHistory shouldNotContain "bleeding tempo entirely through repeated deaths"
+                promptWithSanitizedHistory shouldContain "user: Prior question 3"
             }
         }
     }
@@ -455,6 +467,65 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                     val exemplar = fixtures.getValue(key)["exemplarCleanResponse"] as String
                     AiAnalysisService.sanitizePlayerFacingOutput(exemplar) shouldBe exemplar
                 }
+            }
+        }
+    }
+
+    Given("Fixture 9 (live-QA 4d1f487 regressions): ~145-word spatial timeline associations, roast tempo-bleed causal overconfidence, and angry variance/execution counter-diagnosis") {
+        When("evaluating the 3 exact live-provider 4d1f487 findings against generation prompts, sync/SSE sanitizers, history/example gates, and blunt/calm controls") {
+            Then("145-word unexpanded responses and spatial timeline associations are blocked/rewritten, both causal-overconfidence sentences are caught even with 'rather than' contrast clauses, and blunt tentative controls pass cleanly") {
+                val normalFixture = fixtures.getValue("normal")
+                val userMessage = normalFixture["userMessage"] as String
+                val expandedUserMessage = normalFixture["expandedUserMessage"] as String
+                val live145Spatial = normalFixture["live4d1f487VerboseTimelineAssociationResponse"] as String
+
+                // 1. ~145-word unexpanded normal response + "spatial timeline associations"
+                val live145Words = AiAnalysisService.stripSuggestionsBlock(live145Spatial).split(Regex("\\s+")).count { it.isNotBlank() }
+                (live145Words in 135..160) shouldBe true
+                AiAnalysisService.containsInternalSchemaLeak(live145Spatial) shouldBe true
+                AiAnalysisService.containsEvidenceBoundaryViolation(live145Spatial) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample(userMessage, live145Spatial) shouldBe false
+
+                // Even without academic jargon, a ~145-word unexpanded default response exceeds the tightened <=130-word cap
+                val cleanWorded145Default = AiAnalysisService.sanitizePlayerFacingOutput(live145Spatial)
+                AiAnalysisService.containsInternalSchemaLeak(cleanWorded145Default) shouldBe false
+                cleanWorded145Default shouldNotContain "spatial timeline associations"
+                cleanWorded145Default shouldContain "timeline timing and map patterns"
+                AiAnalysisService.isEligibleCuratedExample(userMessage, cleanWorded145Default) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample(expandedUserMessage, cleanWorded145Default) shouldBe true
+
+                // Split-chunk SSE stream rewrites "spatial timeline associations" identically to sync output
+                val splitSpatialStream = AiAnalysisService.sanitizePlayerFacingStream(
+                    reactor.core.publisher.Flux.fromIterable(live145Spatial.chunked(3))
+                ).collectList().block()!!
+                splitSpatialStream.forEach { piece ->
+                    AiAnalysisService.containsInternalSchemaLeak(piece) shouldBe false
+                }
+                splitSpatialStream.joinToString("") shouldBe cleanWorded145Default
+
+                // 2. Exact live 4d1f487 roast causal overconfidence ("bleeding tempo entirely through repeated deaths rather than clean execution")
+                val liveRoastTempoBleed = "You are currently bleeding tempo entirely through repeated deaths rather than clean execution."
+                AiAnalysisService.containsEvidenceBoundaryViolation(liveRoastTempoBleed) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample("Roast my Pantheon stats brutally!", liveRoastTempoBleed) shouldBe false
+
+                // Blunt personal-stat roast with tentative "may"/"if" framing and negated boundary disclaimer passes cleanly
+                val cleanBluntRoastControl =
+                    "Across **your last 5 detailed matches** (**1W–4L, 20.0%** win rate), **390 seconds** on a grey screen (**78.0s per game**) is basically a second queue timer, and **4.9 average deaths** across **your 883 saved matches** (**52.3%** win rate) may cost map pressure if deaths happen before wave crashes—though summary stats alone cannot prove you are bleeding tempo through repeated deaths. Next game: (1) **confirm empowered Mortal Will is stacked while enemy mobility is down before W-engaging**, and (2) **crash top wave before R**."
+                AiAnalysisService.containsInternalSchemaLeak(cleanBluntRoastControl) shouldBe false
+                AiAnalysisService.containsEvidenceBoundaryViolation(cleanBluntRoastControl) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample("Roast my Pantheon stats brutally!", cleanBluntRoastControl) shouldBe true
+
+                // 3. Exact live 4d1f487 angry counter-diagnosis ("high match variance and individual execution drive these outcomes rather than hidden matchmaking systems")
+                val liveAngryVarianceExecution = "High match variance and individual execution drive these outcomes rather than hidden matchmaking systems."
+                AiAnalysisService.containsEvidenceBoundaryViolation(liveAngryVarianceExecution) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample("Matchmaking is rigged!!", liveAngryVarianceExecution) shouldBe false
+
+                // Calm data-boundary + tentative hypothesis response passes cleanly
+                val cleanCalmAngryControl =
+                    "A **1W–4L** stretch across **your last 5 detailed matches** (**20.0%** win rate vs **48.9%** across **180 games** in **your ranked record**) is rough; Riot match data doesn't expose matchmaking systems, and summary stats do not prove that match variance and individual execution drive these outcomes, though **6–8 deaths** in those losses could snowball top lane. Next game: (1) **if you burn Flash early, hold wave near tower until it returns**, and (2) **take a 5-minute reset after two losses**."
+                AiAnalysisService.containsInternalSchemaLeak(cleanCalmAngryControl) shouldBe false
+                AiAnalysisService.containsEvidenceBoundaryViolation(cleanCalmAngryControl) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample("How do I reset after a 1W-4L slump?", cleanCalmAngryControl) shouldBe true
             }
         }
     }
