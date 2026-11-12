@@ -2053,14 +2053,54 @@ class CoachTimelinePreparationBehaviorTest {
             null,
             null
         ) as String
-        assertTrue(blockedPrompt.contains("Timeline (timeline temporarily unavailable)"))
+        assertTrue(blockedPrompt.contains("Timeline (timeline skipped while server busy)"))
+        assertFalse(blockedPrompt.contains("temporarily unavailable"))
         assertTrue(blockedPrompt.contains("Timeline coverage: status=blocked, covered=0/20 games, stop reason=memory headroom admission blocked"))
         assertTrue(blockedPrompt.contains("TIMELINE COVERAGE BOUNDARY"))
         assertTrue(
             blockedPrompt.contains(
-                "when match timeline analysis is blocked or covered games is 0, state plainly that minute-by-minute timeline data is temporarily unavailable and rely only on match summary stats"
+                "when match timeline analysis is blocked or covered games is 0, state the truthful stop reason plainly (timeline preparation timed out on timeouts, paused for rate-limit cooldown, skipped while server busy, or not loaded in this snapshot) and rely only on match summary stats"
             )
         )
+
+        val deadlineBlockedContext = mapOf<String, Any>(
+            "summonerName" to "TestPlayer#NA1",
+            "rank" to "GOLD IV",
+            "timelineStatus" to "BLOCKED",
+            "timelineCoverage" to mapOf(
+                "status" to "BLOCKED",
+                "requested" to 20,
+                "covered" to 0,
+                "stopReason" to "DEADLINE_EXCEEDED"
+            )
+        )
+        val deadlineBlockedPrompt = constructPromptMethod.invoke(
+            aiService,
+            deadlineBlockedContext,
+            emptyList<Map<String, String>>(),
+            "How is my early laning?",
+            null,
+            null
+        ) as String
+        assertTrue(deadlineBlockedPrompt.contains("Timeline (timeline preparation timed out)"))
+        assertFalse(deadlineBlockedPrompt.contains("temporarily unavailable"))
+
+        val notAnalyzedContext = mapOf<String, Any>(
+            "summonerName" to "TestPlayer#NA1",
+            "rank" to "GOLD IV",
+            "timelineStatus" to "NOT_ANALYZED"
+        )
+        val notAnalyzedPrompt = constructPromptMethod.invoke(
+            aiService,
+            notAnalyzedContext,
+            emptyList<Map<String, String>>(),
+            "How is my early laning?",
+            null,
+            null
+        ) as String
+        assertTrue(notAnalyzedPrompt.contains("Timeline (timeline not analyzed yet)"))
+        assertTrue(notAnalyzedPrompt.contains("timeline data is not included in this snapshot"))
+        assertFalse(notAnalyzedPrompt.contains("temporarily unavailable"))
 
         // Verify #38 schema-leak detector covers timelineStatus and timelineCoverage
         assertTrue(AiAnalysisService.containsInternalSchemaLeak("Your timelineStatus is NOT_ANALYZED"))

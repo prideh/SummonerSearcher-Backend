@@ -438,7 +438,8 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
 
                 val sanitizedMissing = AiAnalysisService.sanitizePlayerFacingOutput(rawMissingOutput)
                 AiAnalysisService.containsInternalSchemaLeak(sanitizedMissing) shouldBe false
-                sanitizedMissing shouldContain "In mid-to-late game farming and early lead conversion, average CS per minute is unavailable and gold lead retention rate is unavailable because timeline data is temporarily unavailable."
+                sanitizedMissing shouldContain "In mid-to-late game farming and early lead conversion, average CS per minute is unavailable and gold lead retention rate is unavailable because timeline data is not loaded in this snapshot."
+                sanitizedMissing shouldNotContain "temporarily unavailable"
                 sanitizedMissing shouldContain "In death time and bounty cost and unspent gold, total kill and shutdown gold given up is unavailable, median gold in hand is unavailable, and wards by game phase is unavailable in older match data."
                 sanitizedMissing shouldContain "On K'Sante vs Lee Sin and Wukong (Bot role), Rift Herald and Stealth Ward / Control Ward timings were not recorded."
                 sanitizedMissing shouldContain "---SUGGESTIONS--- [\"Compare your recent matches to your Solo/Duo ranked record\", \"Why is unspent gold unavailable?\", \"Review team objective control vs Voidgrubs\"]"
@@ -713,6 +714,279 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 val stoppedCoveragePrompt = buildPrompt(stoppedCoverageContext, question)
                 stoppedCoveragePrompt shouldContain "explain missing, partial, rate-limited, or unanalyzed fields as uncollected—never say playing more games will clarify them."
                 stoppedCoveragePrompt shouldContain "TIMELINE COVERAGE BOUNDARY"
+            }
+        }
+    }
+
+    Given("Fixture 12 (live-QA 9598428 regressions): Missing ---SUGGESTIONS--- output assembly on invited roast d175c9a6, witty roast framing, and unnatural League phrase cleanup") {
+        When("assembling sync analyze() and SSE analyzeStream() outputs when Gemini omits or partially formats ---SUGGESTIONS---, and checking roast wit + all 5 unnatural phrases") {
+            Then("every accepted advice/roast response preserves or deterministically generates 3 valid ---SUGGESTIONS--- across sync and SSE, roast prompts require League wit, and all 5 unnatural phrases are rewritten and gated") {
+                @Suppress("UNCHECKED_CAST")
+                val roastFixture = fixtures.getValue("roast")
+                @Suppress("UNCHECKED_CAST")
+                val roastContext = roastFixture["context"] as Map<String, Any>
+                val roastUserMessage = roastFixture["userMessage"] as String
+                val liveMissingSuggestionsRoast = roastFixture["live9598428MissingSuggestionsRoast"] as String
+
+                // 1. Exact live interaction d175c9a6-2bfb-4070-9f1f-246bd4ccf28b had NO ---SUGGESTIONS--- delimiter/list at EOF
+                liveMissingSuggestionsRoast shouldNotContain "---SUGGESTIONS---"
+
+                val syncPayload = mapper.writeValueAsString(
+                    mapOf(
+                        "candidates" to listOf(
+                            mapOf(
+                                "finishReason" to "STOP",
+                                "content" to mapOf("parts" to listOf(mapOf("text" to liveMissingSuggestionsRoast)))
+                            )
+                        )
+                    )
+                )
+                val splitRoastDeltas = liveMissingSuggestionsRoast.chunked(11)
+                val sseRoastBody = splitRoastDeltas.joinToString("\n\n") { delta ->
+                    val frame = mapper.writeValueAsString(
+                        mapOf("candidates" to listOf(mapOf("content" to mapOf("parts" to listOf(mapOf("text" to delta))))))
+                    )
+                    "data: $frame"
+                } + "\n\n"
+
+                val offlineRoastService = AiAnalysisService(
+                    apiKey = "offline-test-key",
+                    geminiModel = "gemini-3.5-flash-lite",
+                    geminiThinkingLevel = "low",
+                    exampleRepository = exampleRepository,
+                    interactionRepository = interactionRepository,
+                    patternRepository = patternRepository,
+                    promptVersionRepository = promptVersionRepository
+                )
+                val offlineWebClient = org.springframework.web.reactive.function.client.WebClient.builder()
+                    .baseUrl("https://generativelanguage.googleapis.com/v1beta/")
+                    .exchangeFunction { req ->
+                        val isStream = req.url().toString().contains("streamGenerateContent")
+                        val resp = org.springframework.web.reactive.function.client.ClientResponse
+                            .create(org.springframework.http.HttpStatus.OK)
+                            .header("Content-Type", if (isStream) "text/event-stream" else "application/json")
+                            .body(if (isStream) sseRoastBody else syncPayload)
+                            .build()
+                        reactor.core.publisher.Mono.just(resp)
+                    }
+                    .build()
+                AiAnalysisService::class.java.getDeclaredField("webClient").apply {
+                    isAccessible = true
+                    set(offlineRoastService, offlineWebClient)
+                }
+
+                val syncRoastOut = offlineRoastService.analyze(
+                    context = roastContext,
+                    messages = emptyList(),
+                    userMessage = roastUserMessage
+                ).block()!!.response
+
+                val streamRoastChunks = offlineRoastService.analyzeStream(
+                    context = roastContext,
+                    messages = emptyList(),
+                    userMessage = roastUserMessage
+                ).chunks.collectList().block()!!
+                val streamRoastOut = streamRoastChunks.joinToString("")
+
+                streamRoastOut shouldBe syncRoastOut
+                syncRoastOut shouldContain liveMissingSuggestionsRoast
+                syncRoastOut shouldContain "\n---SUGGESTIONS--- ["
+                val suggestionsJson = syncRoastOut.substringAfter("---SUGGESTIONS---").trim()
+                val parsedSuggestions: List<String> = mapper.readValue(suggestionsJson, object : TypeReference<List<String>>() {})
+                parsedSuggestions.size shouldBe 3
+                parsedSuggestions[0] shouldBe "Which Pantheon deaths gave up shutdown gold?"
+                parsedSuggestions.forEach { item ->
+                    AiAnalysisService.containsInternalSchemaLeak(item) shouldBe false
+                    AiAnalysisService.containsEvidenceBoundaryViolation(item) shouldBe false
+                }
+                AiAnalysisService.containsInternalSchemaLeak(syncRoastOut) shouldBe false
+                AiAnalysisService.containsEvidenceBoundaryViolation(syncRoastOut) shouldBe false
+
+                // Variant markdown/bullet/partial delimiters and trailing-space SSE chunks normalize cleanly to 1 ---SUGGESTIONS--- block of 3 items
+                val variantPartial =
+                    "Across your last 5 detailed matches (1W-4L, 20.0% win rate), keep Pantheon E ready.   **--- SUGGESTIONS ---**\n- Check Pantheon matchups\n"
+                val ensuredVariant = AiAnalysisService.ensureSuggestionsBlock(variantPartial, roastContext, roastUserMessage, "combat_trading")
+                Regex("---SUGGESTIONS---").findAll(ensuredVariant).count() shouldBe 1
+                val variantList: List<String> = mapper.readValue(
+                    ensuredVariant.substringAfter("---SUGGESTIONS---").trim(),
+                    object : TypeReference<List<String>>() {}
+                )
+                variantList.size shouldBe 3
+                variantList[0] shouldBe "Check Pantheon matchups"
+
+                val streamedVariant = AiAnalysisService.sanitizePlayerFacingStream(
+                    rawChunks = reactor.core.publisher.Flux.fromIterable(variantPartial.chunked(4)),
+                    context = roastContext,
+                    ensureSuggestions = true,
+                    userMessage = roastUserMessage,
+                    category = "combat_trading"
+                ).collectList().block()!!.joinToString("")
+                Regex("---SUGGESTIONS---").findAll(streamedVariant).count() shouldBe 1
+                streamedVariant shouldContain "---SUGGESTIONS--- [\"Check Pantheon matchups\""
+
+                // Existing valid 3-item ---SUGGESTIONS--- on exemplars stay byte-for-byte intact, and system error fallbacks stay clean
+                val roastExemplar = roastFixture["exemplarCleanResponse"] as String
+                AiAnalysisService.ensureSuggestionsBlock(roastExemplar, roastContext, roastUserMessage, "general") shouldBe roastExemplar
+                val errorFallback = "I couldn't read that coaching response clearly—please try asking again."
+                AiAnalysisService.ensureSuggestionsBlock(errorFallback, roastContext, roastUserMessage, "general") shouldBe errorFallback
+
+                // 2. Roast prompt explicitly requires League wit/banter and mandatory ---SUGGESTIONS--- (never ending at the 2 habits)
+                val roastPrompt = buildPrompt(roastContext, roastUserMessage)
+                roastPrompt shouldContain "open with genuinely funny, dry League banter on **observed personal numbers**"
+                roastPrompt shouldContain "open with witty, playful League banter roasting ONLY observed personal numbers"
+                roastPrompt shouldContain "never dry clinical prose"
+                roastPrompt shouldNotContain "finish with two concrete, observable next-game habits"
+                roastPrompt shouldContain "ALWAYS append `---SUGGESTIONS--- [\"Option 1\", \"Option 2\", \"Option 3\"]`"
+
+                // 3. All 5 unnatural League phrases from 9598428 live QA are absent from prompts, rewritten in sync + SSE, and gated in curation/history
+                @Suppress("UNCHECKED_CAST")
+                val normalFixture = fixtures.getValue("normal")
+                @Suppress("UNCHECKED_CAST")
+                val normalContext = normalFixture["context"] as Map<String, Any?>
+                val normalPrompt = buildPrompt(normalContext, normalFixture["userMessage"] as String)
+                @Suppress("UNCHECKED_CAST")
+                val angryFixture = fixtures.getValue("angry")
+                @Suppress("UNCHECKED_CAST")
+                val angryContext = angryFixture["context"] as Map<String, Any?>
+                val angryPrompt = buildPrompt(angryContext, angryFixture["userMessage"] as String)
+
+                normalPrompt shouldNotContain "wave crash/bounce timers, jungle tracking"
+                normalPrompt shouldContain "minimap jungler checks"
+                angryPrompt shouldContain "never synthetic phrases like \"early trading friction\", \"personal execution windows\", \"clear the bounce fully\""
+
+                val rawNormalUnnatural = normalFixture["live9598428UnnaturalPhrasesNormal"] as String
+                val rawAngryUnnatural = angryFixture["live9598428UnnaturalPhrasesAngry"] as String
+
+                AiAnalysisService.containsEvidenceBoundaryViolation(rawNormalUnnatural) shouldBe true
+                AiAnalysisService.containsEvidenceBoundaryViolation(rawAngryUnnatural) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample(normalFixture["userMessage"] as String, rawNormalUnnatural) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample(angryFixture["userMessage"] as String, rawAngryUnnatural) shouldBe false
+
+                val cleanNormal = AiAnalysisService.sanitizePlayerFacingOutput(rawNormalUnnatural, normalContext)
+                val streamNormal = AiAnalysisService.sanitizePlayerFacingStream(
+                    reactor.core.publisher.Flux.fromIterable(rawNormalUnnatural.chunked(3)),
+                    normalContext
+                ).collectList().block()!!.joinToString("")
+                streamNormal shouldBe cleanNormal
+                cleanNormal shouldNotContain "jungle tracking is absent"
+                cleanNormal shouldNotContain "early river camps"
+                cleanNormal shouldContain "enemy jungle vision is missing"
+                cleanNormal shouldContain "contesting early Scuttle Crab or Voidgrubs"
+                cleanNormal shouldContain "\"When should I contest early Scuttle Crab or Voidgrubs?\""
+                AiAnalysisService.containsEvidenceBoundaryViolation(cleanNormal) shouldBe false
+
+                val cleanAngry = AiAnalysisService.sanitizePlayerFacingOutput(rawAngryUnnatural, angryContext)
+                val streamAngry = AiAnalysisService.sanitizePlayerFacingStream(
+                    reactor.core.publisher.Flux.fromIterable(rawAngryUnnatural.chunked(3)),
+                    angryContext
+                ).collectList().block()!!.joinToString("")
+                streamAngry shouldBe cleanAngry
+                cleanAngry shouldNotContain "early trading friction"
+                cleanAngry shouldNotContain "personal execution windows"
+                cleanAngry shouldNotContain "clear the bounce fully"
+                cleanAngry shouldContain "rough early trading may snowball"
+                cleanAngry shouldContain "wait for your all-in cooldown windows"
+                cleanAngry shouldContain "crash the wave fully into tower before resetting"
+                cleanAngry shouldContain "\"When should I trade during all-in cooldown windows?\""
+                AiAnalysisService.containsEvidenceBoundaryViolation(cleanAngry) shouldBe false
+
+                // Poisoned conversation history containing those unnatural phrases is excluded from Previous: at read time
+                val historyPrompt = buildPrompt(
+                    angryContext,
+                    angryFixture["userMessage"] as String,
+                    listOf(
+                        mapOf("role" to "user", "content" to "Why did I lose top?"),
+                        mapOf("role" to "assistant", "content" to rawAngryUnnatural)
+                    )
+                )
+                val previousBlock = historyPrompt.substringAfter("\nPrevious:\n").substringBefore("\n\nUser:")
+                previousBlock shouldContain "user: Why did I lose top?"
+                previousBlock shouldNotContain "assistant:"
+                previousBlock shouldNotContain "early trading friction"
+                previousBlock shouldNotContain "personal execution windows"
+                previousBlock shouldNotContain "clear the bounce fully"
+            }
+        }
+    }
+
+    Given("Fixture 13 (live-QA 9598428 follow-up): Angry win-rate causal speculation ('might highlight early trading...') and stopReason-aware timeline wording without 'temporarily unavailable'") {
+        When("evaluating the exact angry win-rate speculation output and timeline absence/timeout contexts across prompt generation, sync/SSE sanitizers, and curation/history gates") {
+            Then("win-rate causal speculation is rejected both raw and post-sanitizer, clean summary-boundary angry responses pass with suggestions intact, and 'temporarily unavailable' is replaced with truthful stopReason-specific language") {
+                @Suppress("UNCHECKED_CAST")
+                val angryFixture = fixtures.getValue("angry")
+                @Suppress("UNCHECKED_CAST")
+                val angryContext = angryFixture["context"] as Map<String, Any?>
+                val angryUserMessage = angryFixture["userMessage"] as String
+                val angryPrompt = buildPrompt(angryContext, angryUserMessage)
+
+                // 1. Prompt boundary explicitly forbids win-rate -> gameplay-cause speculation even with "might"/"may"/"could" and never injects "temporarily unavailable"
+                angryPrompt shouldContain "never say a low win rate \"might highlight\" early trading, laning, or spacing issues"
+                angryPrompt shouldContain "match summaries/win rates cannot identify why those losses happened"
+                angryPrompt shouldContain "Timeline (timeline not analyzed yet)"
+                angryPrompt shouldContain "timeline data is not included in this snapshot"
+                angryPrompt shouldNotContain "temporarily unavailable"
+
+                // 2. Exact live 9598428 angry failure is rejected both raw AND after phrase sanitization ("might highlight rough early trading")
+                val rawWinRateSpeculation = angryFixture["live9598428WinRateSpeculationAngry"] as String
+                AiAnalysisService.containsEvidenceBoundaryViolation(rawWinRateSpeculation) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample(angryUserMessage, rawWinRateSpeculation) shouldBe false
+
+                val sanitizedSpeculation = AiAnalysisService.sanitizePlayerFacingOutput(rawWinRateSpeculation, angryContext)
+                sanitizedSpeculation shouldContain "might highlight rough early trading"
+                AiAnalysisService.containsEvidenceBoundaryViolation(sanitizedSpeculation) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample(angryUserMessage, sanitizedSpeculation) shouldBe false
+
+                // Clean angry response admitting summaries/win rate cannot identify why losses happened + two explicitly general controllable habits passes cleanly
+                val cleanSummaryBoundaryAngry =
+                    "Across **your last 5 detailed matches**, you went **1W–4L (20.0% win rate)** compared to **48.9% across 180 games** in **your ranked record**, with **6–8 deaths** in the four losses. Riot match data doesn't expose matchmaking systems, and because timeline data is not included in this snapshot, match summaries and win rates cannot identify why those losses happened. As two general habits you control next game: (1) **when looking to pull with Darius E, confirm the enemy's dash cooldown is down first**, and (2) **take a short reset break after two straight losses**.\n" +
+                        "---SUGGESTIONS--- [\"Compare my Darius and Garen games\", \"When should Darius concede early wave prio?\", \"Check my defensive item choices when behind\"]"
+                AiAnalysisService.containsInternalSchemaLeak(cleanSummaryBoundaryAngry) shouldBe false
+                AiAnalysisService.containsEvidenceBoundaryViolation(cleanSummaryBoundaryAngry) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample(angryUserMessage, cleanSummaryBoundaryAngry) shouldBe true
+                AiAnalysisService.ensureSuggestionsBlock(
+                    AiAnalysisService.sanitizePlayerFacingOutput(cleanSummaryBoundaryAngry, angryContext),
+                    angryContext,
+                    angryUserMessage,
+                    "general"
+                ) shouldBe cleanSummaryBoundaryAngry
+
+                // 3. Context-aware sync + SSE sanitization of LLM-generated "temporarily unavailable" claims
+                val llmTempUnavailable =
+                    "Minute-by-minute timeline data is temporarily unavailable here, so from your last 20 detailed matches you averaged 6.8 CS/min.\n" +
+                        "---SUGGESTIONS--- [\"Review my CS/min by champion\", \"Check my recent deaths\", \"Compare recent games to ranked record\"]"
+                AiAnalysisService.containsEvidenceBoundaryViolation(llmTempUnavailable) shouldBe true
+
+                // Fixture/uncollected context (NOT_ANALYZED) -> "not included in this snapshot"
+                val sanitizedNotAnalyzed = AiAnalysisService.sanitizePlayerFacingOutput(llmTempUnavailable, angryContext)
+                sanitizedNotAnalyzed shouldContain "Minute-by-minute timeline data is not included in this snapshot here"
+                sanitizedNotAnalyzed shouldNotContain "temporarily unavailable"
+                AiAnalysisService.containsEvidenceBoundaryViolation(sanitizedNotAnalyzed) shouldBe false
+                val streamNotAnalyzed = AiAnalysisService.sanitizePlayerFacingStream(
+                    reactor.core.publisher.Flux.fromIterable(llmTempUnavailable.chunked(4)),
+                    angryContext
+                ).collectList().block()!!.joinToString("")
+                streamNotAnalyzed shouldBe sanitizedNotAnalyzed
+
+                // Live timeout context (BLOCKED + DEADLINE_EXCEEDED) -> "unavailable because timeline preparation timed out"
+                val deadlineContext = mapOf<String, Any?>(
+                    "summonerName" to "Spear Shot#1111",
+                    "timelineStatus" to "BLOCKED",
+                    "timelineCoverage" to mapOf(
+                        "status" to "BLOCKED",
+                        "covered" to 0,
+                        "requested" to 20,
+                        "stopReason" to "DEADLINE_EXCEEDED"
+                    )
+                )
+                val sanitizedDeadline = AiAnalysisService.sanitizePlayerFacingOutput(llmTempUnavailable, deadlineContext)
+                sanitizedDeadline shouldContain "Minute-by-minute timeline data is unavailable because timeline preparation timed out here"
+                sanitizedDeadline shouldNotContain "temporarily unavailable"
+                AiAnalysisService.containsEvidenceBoundaryViolation(sanitizedDeadline) shouldBe false
+                val streamDeadline = AiAnalysisService.sanitizePlayerFacingStream(
+                    reactor.core.publisher.Flux.fromIterable(llmTempUnavailable.chunked(4)),
+                    deadlineContext
+                ).collectList().block()!!.joinToString("")
+                streamDeadline shouldBe sanitizedDeadline
             }
         }
     }
