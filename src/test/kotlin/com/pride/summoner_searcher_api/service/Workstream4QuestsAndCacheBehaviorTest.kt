@@ -581,8 +581,8 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 val legacyMatch = buildMatchDto(matchId)
                 val upgradedMatch = buildMatchDto(matchId, dtoSchemaVersion = 2) { 3006 }
 
-                // Build authoritative timeline frames (0..22m) with CS, leads, high unspent gold before purchase, death bounty, and dragon kill
-                val tlFrames = (0..22).map { m ->
+                // Build authoritative timeline frames (0..30m) with CS, leads, high unspent gold before purchase, death bounty, and dragon kill
+                val tlFrames = (0..30).map { m ->
                     val ts = m * 60_000L
                     TimelineFrameDto(
                         timestamp = ts,
@@ -853,12 +853,20 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
     Given("TimelineAnalysisService Season 2026 accuracy rules (#14)") {
         When("analyzing UNDEFINED wards, non-uniform timestamps, SKILL_LEVEL_UP EVOLVE/#1100 bursts, ITEM_UNDO (#1174), and Role Quest completion timings") {
             Then("excludes UNDEFINED wards, selects 10m/15m by timestamp, filters NORMAL+dedup without 18 cap, reconciles ITEM_UNDO safely, and keeps ambiguous quest timings/aggregates null") {
-                val matchComplete = buildMatchDto("EUW1_Q1") { pid ->
+                val matchComplete = buildMatchDto("EUW1_Q1", gameDuration = 960L) { pid ->
                     when (pid) {
                         3 -> 1206 // Player Mid completed quest
                         8 -> 1206 // Opponent Mid completed quest
                         else -> 1208
                     }
+                }.let { m ->
+                    m.copy(
+                        info = m.info!!.copy(
+                            participants = m.info!!.participants.map { p ->
+                                if (p.participantId == 3) p.copy(deaths = 0) else p
+                            }
+                        )
+                    )
                 }
                 // Insert an extra pause/sub-minute frame at index 2 so 10:00 (600_000ms) is at index 11 and 15:00 (900_000ms) is at index 16!
                 val frames = mutableListOf<TimelineFrameDto>()
@@ -1021,7 +1029,7 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
 
                 // Build a match where assisting jungler (participant 2) has null championName, player (pid 3) has 0 deaths,
                 // player Role Quest is completed (1206), and opponent (pid 8) has explicit 0 Role Quest item
-                val baseMatch = buildMatchDto("EUW1_HUMAN_1") { pid ->
+                val baseMatch = buildMatchDto("EUW1_HUMAN_1", gameDuration = 900L) { pid ->
                     when (pid) {
                         3 -> 1206
                         8 -> 0
@@ -1121,11 +1129,26 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                     )
                 )
 
+                val human1Frames = (0..15).map { minute ->
+                    if (minute == 14) {
+                        richEventsFrame
+                    } else {
+                        TimelineFrameDto(
+                            timestamp = minute * 60_000L,
+                            participantFrames = mapOf(
+                                "3" to tlPFrame(participantId = 3, totalGold = 500 + minute * 320),
+                                "8" to tlPFrame(participantId = 8, totalGold = 500 + minute * 300)
+                            ),
+                            events = emptyList()
+                        )
+                    }
+                }
+
                 val tl = MatchTimelineDto(
                     metadata = MatchTimelineMetadata(matchId = "EUW1_HUMAN_1", participants = null),
                     info = MatchTimelineInfo(
                         frameInterval = 60_000L,
-                        frames = listOf(richEventsFrame),
+                        frames = human1Frames,
                         participants = listOf(TimelineParticipantDto(3, "puuid-3"), TimelineParticipantDto(8, "puuid-8"))
                     )
                 )
@@ -1295,36 +1318,49 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 missingEventsAnalysis.aggregateSummary.deathsBefore10.shouldBeNull()
 
                 // 3. Deaths (and kill/assist) with absent or partial coordinates -> preserve actual counts, emit 0 HeatmapPoints, zone = "Not available"
+                val validThreeDeath7mMatch = buildMatchDto("EUW1_7M", gameDuration = 420L).let { m ->
+                    m.copy(
+                        info = m.info!!.copy(
+                            participants = m.info!!.participants.map { p ->
+                                if (p.participantId == 3) p.copy(deaths = 3) else p
+                            }
+                        )
+                    )
+                }
                 val tlUnpositionedDeaths = MatchTimelineDto(
                     metadata = MatchTimelineMetadata("EUW1_UNPOS_DEATHS", null),
                     info = MatchTimelineInfo(
                         frameInterval = 60_000L,
-                        frames = listOf(
+                        frames = (0..7).map { minute ->
                             TimelineFrameDto(
-                                timestamp = 300_000L,
+                                timestamp = minute * 60_000L,
                                 participantFrames = mapOf(
-                                    "3" to tlPFrame(participantId = 3, totalGold = 1800),
-                                    "8" to tlPFrame(participantId = 8, totalGold = 1900)
+                                    "3" to tlPFrame(participantId = 3, totalGold = 500 + minute * 260),
+                                    "8" to tlPFrame(participantId = 8, totalGold = 500 + minute * 280)
                                 ),
-                                events = listOf(
-                                    tlEvent(type = "CHAMPION_KILL", timestamp = 240_000L, killerId = 8, victimId = 3, position = null),
-                                    tlEvent(type = "CHAMPION_KILL", timestamp = 300_000L, killerId = 8, victimId = 3, position = TimelinePositionDto(x = null, y = 9000)),
-                                    tlEvent(type = "CHAMPION_KILL", timestamp = 360_000L, killerId = 8, victimId = 3, position = TimelinePositionDto(x = 9000, y = null)),
-                                    tlEvent(type = "CHAMPION_KILL", timestamp = 390_000L, killerId = 3, victimId = 8, position = null),
-                                    tlEvent(type = "CHAMPION_KILL", timestamp = 410_000L, killerId = 1, victimId = 8, assistingParticipantIds = listOf(3), position = null)
-                                )
+                                events = if (minute == 5) {
+                                    listOf(
+                                        tlEvent(type = "CHAMPION_KILL", timestamp = 240_000L, killerId = 8, victimId = 3, position = null),
+                                        tlEvent(type = "CHAMPION_KILL", timestamp = 300_000L, killerId = 8, victimId = 3, position = TimelinePositionDto(x = null, y = 9000)),
+                                        tlEvent(type = "CHAMPION_KILL", timestamp = 360_000L, killerId = 8, victimId = 3, position = TimelinePositionDto(x = 9000, y = null)),
+                                        tlEvent(type = "CHAMPION_KILL", timestamp = 390_000L, killerId = 3, victimId = 8, position = null),
+                                        tlEvent(type = "CHAMPION_KILL", timestamp = 410_000L, killerId = 1, victimId = 8, assistingParticipantIds = listOf(3), position = null)
+                                    )
+                                } else emptyList()
                             )
-                        ),
+                        },
                         participants = listOf(TimelineParticipantDto(3, "puuid-3"), TimelineParticipantDto(8, "puuid-8"))
                     )
                 )
                 val unpositionedAnalysis = timelineAnalysisService.analyze(
-                    listOf(Triple("EUW1_UNPOS_DEATHS", tlUnpositionedDeaths, validMatch)),
+                    listOf(Triple("EUW1_UNPOS_DEATHS", tlUnpositionedDeaths, validThreeDeath7mMatch)),
                     "puuid-3"
                 )
                 unpositionedAnalysis.aggregateSummary.gamesAnalyzed shouldBe 1
                 unpositionedAnalysis.aggregateSummary.deathsTotal shouldBe 3
                 unpositionedAnalysis.aggregateSummary.deathsBefore10 shouldBe 3
+                unpositionedAnalysis.aggregateSummary.assistedDeaths shouldBe 0
+                unpositionedAnalysis.aggregateSummary.unassistedDeaths shouldBe 3
                 unpositionedAnalysis.aggregateSummary.killsTotal shouldBe 1
                 unpositionedAnalysis.aggregateSummary.assistsTotal shouldBe 1
                 unpositionedAnalysis.deathPositions.size shouldBe 0
@@ -1337,36 +1373,39 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                     metadata = MatchTimelineMetadata("EUW1_MIXED_POS", null),
                     info = MatchTimelineInfo(
                         frameInterval = 60_000L,
-                        frames = listOf(
+                        frames = (0..7).map { minute ->
                             TimelineFrameDto(
-                                timestamp = 300_000L,
+                                timestamp = minute * 60_000L,
                                 participantFrames = mapOf(
-                                    "3" to tlPFrame(participantId = 3, totalGold = 1800),
-                                    "8" to tlPFrame(participantId = 8, totalGold = 1900)
+                                    "3" to tlPFrame(participantId = 3, totalGold = 500 + minute * 260),
+                                    "8" to tlPFrame(participantId = 8, totalGold = 500 + minute * 280)
                                 ),
-                                events = listOf(
-                                    tlEvent(type = "CHAMPION_KILL", timestamp = 240_000L, killerId = 8, victimId = 3, position = null),
-                                    tlEvent(type = "CHAMPION_KILL", timestamp = 300_000L, killerId = 8, victimId = 3, position = null),
-                                    tlEvent(type = "CHAMPION_KILL", timestamp = 420_000L, killerId = 8, victimId = 3, position = TimelinePositionDto(x = 12000, y = 12000))
-                                )
+                                events = if (minute == 5) {
+                                    listOf(
+                                        tlEvent(type = "CHAMPION_KILL", timestamp = 240_000L, killerId = 8, victimId = 3, position = null),
+                                        tlEvent(type = "CHAMPION_KILL", timestamp = 300_000L, killerId = 8, victimId = 3, position = null),
+                                        tlEvent(type = "CHAMPION_KILL", timestamp = 420_000L, killerId = 8, victimId = 3, position = TimelinePositionDto(x = 12000, y = 12000))
+                                    )
+                                } else emptyList()
                             )
-                        ),
+                        },
                         participants = listOf(TimelineParticipantDto(3, "puuid-3"), TimelineParticipantDto(8, "puuid-8"))
                     )
                 )
                 val mixedPosAnalysis = timelineAnalysisService.analyze(
-                    listOf(Triple("EUW1_MIXED_POS", tlMixedPos, validMatch)),
+                    listOf(Triple("EUW1_MIXED_POS", tlMixedPos, validThreeDeath7mMatch)),
                     "puuid-3"
                 )
                 mixedPosAnalysis.aggregateSummary.deathsTotal shouldBe 3
+                mixedPosAnalysis.aggregateSummary.deathsBefore10 shouldBe 3
                 mixedPosAnalysis.deathPositions shouldBe listOf(HeatmapPoint(x = 12000, y = 12000, matchId = "EUW1_MIXED_POS", minute = 7))
                 mixedPosAnalysis.aggregateSummary.mostDangerousZone shouldBe "Red Side Jungle"
             }
         }
 
-        When("analyzing timelines where only a subset of frames carry events arrays, mixed batches with malformed/skipped games, or truncated timelines missing MatchDto deaths") {
-            Then("never falsely promises complete game or sample coverage: missing arrays stay unknown (null / Not available) and malformed/skipped entries block whole-sample claims") {
-                val zeroDeathQuestMatch = buildMatchDto("EUW1_COMPLETE_ZERO") { pid ->
+        When("analyzing timelines where only a subset of frames carry events arrays, mixed batches with malformed/skipped games, or truncated timelines missing MatchDto deaths/duration/objectives/wards") {
+            Then("never falsely promises complete game or sample coverage: death/ward/objective/quest/improvement aggregates stay null when incomplete while preserving retained counts and position semantics") {
+                val zeroDeathQuestMatch = buildMatchDto("EUW1_COMPLETE_ZERO", gameDuration = 840L) { pid ->
                     when (pid) {
                         3 -> 1206
                         8 -> 1206
@@ -1376,46 +1415,55 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                     m.copy(
                         info = m.info!!.copy(
                             participants = m.info!!.participants.map { p ->
-                                if (p.participantId == 3) p.copy(deaths = 0, totalTimeSpentDead = 0) else p
+                                if (p.participantId == 3) p.copy(deaths = 0, wardsPlaced = 1, totalTimeSpentDead = 0) else p
                             },
                             teams = listOf(
                                 TeamDto(
                                     teamId = 100,
                                     win = true,
-                                    objectives = TeamObjectivesDto(dragon = ObjectiveStatsDto(first = true, kills = 2))
+                                    objectives = TeamObjectivesDto(dragon = ObjectiveStatsDto(first = true, kills = 1))
                                 )
                             )
                         )
                     )
                 }
 
-                // 1. Single game with 2 frames where frame 0 has an events array (starter destroy + high unspent gold)
-                //    and frame 1 has events = null (missing array) -> NOT full game coverage!
+                // 1. Single game with contiguous 0..14m frames where frame 14 has events = null (missing array) -> NOT full game coverage!
                 val tlPartialMissingEvents = MatchTimelineDto(
                     metadata = MatchTimelineMetadata("EUW1_PARTIAL_EVENTS", null),
                     info = MatchTimelineInfo(
                         frameInterval = 60_000L,
-                        frames = listOf(
-                            TimelineFrameDto(
-                                timestamp = 780_000L, // 13:00
-                                participantFrames = mapOf(
-                                    "3" to tlPFrame(participantId = 3, totalGold = 4900, currentGold = 1800),
-                                    "8" to tlPFrame(participantId = 8, totalGold = 4600, currentGold = 500)
-                                ),
-                                events = listOf(
-                                    tlEvent(type = "ITEM_DESTROYED", timestamp = 780_000L, participantId = 3, itemId = 1201),
-                                    tlEvent(type = "ITEM_DESTROYED", timestamp = 810_000L, participantId = 8, itemId = 1201)
+                        frames = (0..14).map { minute ->
+                            when (minute) {
+                                13 -> TimelineFrameDto(
+                                    timestamp = 780_000L, // 13:00
+                                    participantFrames = mapOf(
+                                        "3" to tlPFrame(participantId = 3, totalGold = 4900, currentGold = 1800),
+                                        "8" to tlPFrame(participantId = 8, totalGold = 4600, currentGold = 500)
+                                    ),
+                                    events = listOf(
+                                        tlEvent(type = "ITEM_DESTROYED", timestamp = 780_000L, participantId = 3, itemId = 1201),
+                                        tlEvent(type = "ITEM_DESTROYED", timestamp = 810_000L, participantId = 8, itemId = 1201)
+                                    )
                                 )
-                            ),
-                            TimelineFrameDto(
-                                timestamp = 840_000L, // 14:00 - missing events array!
-                                participantFrames = mapOf(
-                                    "3" to tlPFrame(participantId = 3, totalGold = 5300, currentGold = 400),
-                                    "8" to tlPFrame(participantId = 8, totalGold = 5000, currentGold = 400)
-                                ),
-                                events = null
-                            )
-                        ),
+                                14 -> TimelineFrameDto(
+                                    timestamp = 840_000L, // 14:00 - missing events array!
+                                    participantFrames = mapOf(
+                                        "3" to tlPFrame(participantId = 3, totalGold = 5300, currentGold = 400),
+                                        "8" to tlPFrame(participantId = 8, totalGold = 5000, currentGold = 400)
+                                    ),
+                                    events = null
+                                )
+                                else -> TimelineFrameDto(
+                                    timestamp = minute * 60_000L,
+                                    participantFrames = mapOf(
+                                        "3" to tlPFrame(participantId = 3, totalGold = 500 + minute * 320, currentGold = 450),
+                                        "8" to tlPFrame(participantId = 8, totalGold = 500 + minute * 300, currentGold = 400)
+                                    ),
+                                    events = emptyList()
+                                )
+                            }
+                        },
                         participants = listOf(TimelineParticipantDto(3, "puuid-3"), TimelineParticipantDto(8, "puuid-8"))
                     )
                 )
@@ -1454,7 +1502,7 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 partialImp.teamObjectives.dragon.timelineEligibleGames shouldBe 0
                 partialImp.teamObjectives.dragon.timelinePersonalInvolvements.shouldBeNull()
 
-                // Even if a partial frame has a positioned death, missing events on another frame blocks claiming a whole-game quadrant
+                // Even if a partial frame has a positioned death, missing events on another frame blocks claiming a whole-game quadrant or death breakdown
                 val matchWithOneDeath = zeroDeathQuestMatch.copy(
                     info = zeroDeathQuestMatch.info!!.copy(
                         participants = zeroDeathQuestMatch.info!!.participants.map { p ->
@@ -1464,20 +1512,21 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 )
                 val tlPartialWithPositionedDeath = tlPartialMissingEvents.copy(
                     info = tlPartialMissingEvents.info!!.copy(
-                        frames = listOf(
-                            tlPartialMissingEvents.info!!.frames!![0].copy(
-                                events = listOf(
-                                    tlEvent(
-                                        type = "CHAMPION_KILL",
-                                        timestamp = 420_000L,
-                                        killerId = 8,
-                                        victimId = 3,
-                                        position = TimelinePositionDto(12000, 12000)
+                        frames = tlPartialMissingEvents.info!!.frames!!.mapIndexed { idx, frame ->
+                            if (idx == 7) {
+                                frame.copy(
+                                    events = listOf(
+                                        tlEvent(
+                                            type = "CHAMPION_KILL",
+                                            timestamp = 420_000L,
+                                            killerId = 8,
+                                            victimId = 3,
+                                            position = TimelinePositionDto(12000, 12000)
+                                        )
                                     )
                                 )
-                            ),
-                            tlPartialMissingEvents.info!!.frames!![1] // events = null
-                        )
+                            } else frame
+                        }
                     )
                 )
                 val partialDeathAnalysis = timelineAnalysisService.analyze(
@@ -1487,29 +1536,61 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 partialDeathAnalysis.aggregateSummary.deathsTotal shouldBe 1
                 partialDeathAnalysis.aggregateSummary.mostDangerousZone shouldBe "Not available"
                 partialDeathAnalysis.aggregateSummary.deathsBefore10.shouldBeNull()
+                partialDeathAnalysis.aggregateSummary.assistedDeaths.shouldBeNull()
+                partialDeathAnalysis.aggregateSummary.unassistedDeaths.shouldBeNull()
+                partialDeathAnalysis.aggregateSummary.deathsNearObjectiveWindows.shouldBeNull()
 
-                // 2. Multi-game batch: 1 completely valid 0-death quest-completed game + 1 malformed/skipped game ->
-                //    gamesAnalyzed == 1, and whole-sample zone/breakdowns/quest averages stay unknown (Not available / null)
+                // Build a genuinely complete 14m (0..14m) timeline matching zeroDeathQuestMatch (0 deaths, 1 ward, 1 dragon, quest destroyed at 13:00/13:30)
                 val tlCompleteValid = MatchTimelineDto(
                     metadata = MatchTimelineMetadata("EUW1_COMPLETE_ZERO", null),
                     info = MatchTimelineInfo(
                         frameInterval = 60_000L,
-                        frames = listOf(
+                        frames = (0..14).map { minute ->
                             TimelineFrameDto(
-                                timestamp = 780_000L,
+                                timestamp = minute * 60_000L,
                                 participantFrames = mapOf(
-                                    "3" to tlPFrame(participantId = 3, totalGold = 4900),
-                                    "8" to tlPFrame(participantId = 8, totalGold = 4600)
+                                    "3" to tlPFrame(
+                                        participantId = 3,
+                                        totalGold = 500 + minute * 340,
+                                        currentGold = if (minute == 11) 1850 else 450
+                                    ),
+                                    "8" to tlPFrame(participantId = 8, totalGold = 500 + minute * 320, currentGold = 400)
                                 ),
-                                events = listOf(
-                                    tlEvent(type = "ITEM_DESTROYED", timestamp = 780_000L, participantId = 3, itemId = 1201),
-                                    tlEvent(type = "ITEM_DESTROYED", timestamp = 810_000L, participantId = 8, itemId = 1201)
-                                )
+                                events = when (minute) {
+                                    6 -> listOf(
+                                        tlEvent(type = "WARD_PLACED", timestamp = 365_000L, creatorId = 3, wardType = "YELLOW_TRINKET"),
+                                        tlEvent(type = "ELITE_MONSTER_KILL", timestamp = 390_000L, killerId = 3, killerTeamId = 100, monsterType = "DRAGON")
+                                    )
+                                    12 -> listOf(
+                                        tlEvent(type = "ITEM_PURCHASED", timestamp = 725_000L, participantId = 3, itemId = 3089)
+                                    )
+                                    13 -> listOf(
+                                        tlEvent(type = "ITEM_DESTROYED", timestamp = 780_000L, participantId = 3, itemId = 1201),
+                                        tlEvent(type = "ITEM_DESTROYED", timestamp = 810_000L, participantId = 8, itemId = 1201)
+                                    )
+                                    else -> emptyList()
+                                }
                             )
-                        ),
+                        },
                         participants = listOf(TimelineParticipantDto(3, "puuid-3"), TimelineParticipantDto(8, "puuid-8"))
                     )
                 )
+
+                // Sanity-check complete baseline produces non-null verified zero/positive aggregates
+                val verifiedCompleteBaseline = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_COMPLETE_ZERO", tlCompleteValid, zeroDeathQuestMatch)),
+                    "puuid-3"
+                )
+                verifiedCompleteBaseline.aggregateSummary.mostDangerousZone shouldBe "No deaths recorded"
+                verifiedCompleteBaseline.aggregateSummary.deathsBefore10 shouldBe 0
+                verifiedCompleteBaseline.aggregateSummary.assistedDeaths shouldBe 0
+                verifiedCompleteBaseline.aggregateSummary.unassistedDeaths shouldBe 0
+                verifiedCompleteBaseline.aggregateSummary.deathsNearObjectiveWindows shouldBe 0
+                verifiedCompleteBaseline.aggregateSummary.wardsByTimeBucket shouldBe WardTimeBucketsDto(pre10 = 1, min10To20 = 0, post20 = 0)
+                verifiedCompleteBaseline.aggregateSummary.avgRoleQuestCompletionMinute shouldBe 13.0
+
+                // 2. Multi-game batch: 1 completely valid 0-death quest-completed game + 1 malformed/skipped game ->
+                //    gamesAnalyzed == 1, and whole-sample zone/breakdowns/quest averages stay unknown (Not available / null)
                 val tlMalformedMissingInfo = MatchTimelineDto(
                     metadata = MatchTimelineMetadata("EUW1_MALFORMED_2", null),
                     info = null
@@ -1525,6 +1606,9 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 mixedValidAndMalformed.aggregateSummary.gamesAnalyzed shouldBe 1
                 mixedValidAndMalformed.aggregateSummary.mostDangerousZone shouldBe "Not available"
                 mixedValidAndMalformed.aggregateSummary.deathsBefore10.shouldBeNull()
+                mixedValidAndMalformed.aggregateSummary.assistedDeaths.shouldBeNull()
+                mixedValidAndMalformed.aggregateSummary.unassistedDeaths.shouldBeNull()
+                mixedValidAndMalformed.aggregateSummary.deathsNearObjectiveWindows.shouldBeNull()
                 mixedValidAndMalformed.aggregateSummary.wardsByTimeBucket.shouldBeNull()
                 mixedValidAndMalformed.aggregateSummary.roleQuestCompletedGames.shouldBeNull()
                 mixedValidAndMalformed.aggregateSummary.avgRoleQuestCompletionMinute.shouldBeNull()
@@ -1542,19 +1626,244 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 mixedValidAndPartial.aggregateSummary.gamesAnalyzed shouldBe 2
                 mixedValidAndPartial.aggregateSummary.mostDangerousZone shouldBe "Not available"
                 mixedValidAndPartial.aggregateSummary.deathsBefore10.shouldBeNull()
+                mixedValidAndPartial.aggregateSummary.assistedDeaths.shouldBeNull()
+                mixedValidAndPartial.aggregateSummary.unassistedDeaths.shouldBeNull()
+                mixedValidAndPartial.aggregateSummary.deathsNearObjectiveWindows.shouldBeNull()
                 mixedValidAndPartial.aggregateSummary.wardsByTimeBucket.shouldBeNull()
                 mixedValidAndPartial.aggregateSummary.roleQuestCompletedGames.shouldBeNull()
                 mixedValidAndPartial.aggregateSummary.avgRoleQuestCompletionMinute.shouldBeNull()
 
-                // 4. Truncated timeline where all present frames have non-null empty events (0 timeline deaths),
-                //    yet MatchDto proves player died (deaths = 2) -> NEVER claims "No deaths recorded"!
-                val matchTwoDeaths = buildMatchDto("EUW1_TRUNCATED_TL") // buildTenParticipants defaults deaths = 2
+                // 4a. Truncated timeline (0..14m frames on 30m 1800s match, all events arrays non-null) where MatchDto deaths (2) > 0 retained events ->
+                //     zone AND all death-derived whole-sample breakdowns MUST be null (never 0!), alongside ward/quest/improvement event totals
+                val matchTwoDeaths = buildMatchDto("EUW1_TRUNCATED_TL") // gameDuration = 1800L, deaths = 2
                 val truncatedAnalysis = timelineAnalysisService.analyze(
                     listOf(Triple("EUW1_TRUNCATED_TL", tlCompleteValid, matchTwoDeaths)),
                     "puuid-3"
                 )
                 truncatedAnalysis.aggregateSummary.deathsTotal shouldBe 0
                 truncatedAnalysis.aggregateSummary.mostDangerousZone shouldBe "Not available"
+                truncatedAnalysis.aggregateSummary.deathsBefore10.shouldBeNull()
+                truncatedAnalysis.aggregateSummary.assistedDeaths.shouldBeNull()
+                truncatedAnalysis.aggregateSummary.unassistedDeaths.shouldBeNull()
+                truncatedAnalysis.aggregateSummary.deathsNearObjectiveWindows.shouldBeNull()
+                truncatedAnalysis.aggregateSummary.wardsByTimeBucket.shouldBeNull()
+
+                // 4b. Even when frames span full 0..14m (840s) AND all events arrays are non-null, if MatchDto deaths (3) exceed
+                //     retained timeline deaths (2: 1 positioned pre-10 assisted near dragon + 1 unpositioned), all death-derived
+                //     breakdowns (deathsBefore10, assistedDeaths, unassistedDeaths, deathsNearObjectiveWindows) MUST be null,
+                //     while preserving retained deathsTotal = 2 and single valid HeatmapPoint (without inventing (0, 0))!
+                val matchThreeDeathsFull14m = zeroDeathQuestMatch.copy(
+                    info = zeroDeathQuestMatch.info!!.copy(
+                        participants = zeroDeathQuestMatch.info!!.participants.map { p ->
+                            if (p.participantId == 3) p.copy(deaths = 3) else p
+                        }
+                    )
+                )
+                val tlTwoRetainedDeathsOn14m = tlCompleteValid.copy(
+                    info = tlCompleteValid.info!!.copy(
+                        frames = tlCompleteValid.info!!.frames!!.map { frame ->
+                            if (frame.timestamp == 360_000L) {
+                                frame.copy(
+                                    events = frame.events.orEmpty() + listOf(
+                                        tlEvent(
+                                            type = "CHAMPION_KILL",
+                                            timestamp = 380_000L,
+                                            killerId = 8,
+                                            victimId = 3,
+                                            assistingParticipantIds = listOf(7),
+                                            position = TimelinePositionDto(12000, 12000)
+                                        ),
+                                        tlEvent(
+                                            type = "CHAMPION_KILL",
+                                            timestamp = 400_000L,
+                                            killerId = 8,
+                                            victimId = 3,
+                                            assistingParticipantIds = emptyList(),
+                                            position = null
+                                        )
+                                    )
+                                )
+                            } else frame
+                        }
+                    )
+                )
+                val missingThirdDeathAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_MISSING_DEATH_EVENT", tlTwoRetainedDeathsOn14m, matchThreeDeathsFull14m)),
+                    "puuid-3"
+                )
+                missingThirdDeathAnalysis.aggregateSummary.deathsTotal shouldBe 2
+                missingThirdDeathAnalysis.deathPositions shouldBe listOf(
+                    HeatmapPoint(x = 12000, y = 12000, matchId = "EUW1_MISSING_DEATH_EVENT", minute = 6)
+                )
+                missingThirdDeathAnalysis.aggregateSummary.mostDangerousZone shouldBe "Not available"
+                missingThirdDeathAnalysis.aggregateSummary.deathsBefore10.shouldBeNull()
+                missingThirdDeathAnalysis.aggregateSummary.assistedDeaths.shouldBeNull()
+                missingThirdDeathAnalysis.aggregateSummary.unassistedDeaths.shouldBeNull()
+                missingThirdDeathAnalysis.aggregateSummary.deathsNearObjectiveWindows.shouldBeNull()
+                // Ward & quest coverage on full 0..14m game remain unaffected when only a death event was unrecorded
+                missingThirdDeathAnalysis.aggregateSummary.wardsByTimeBucket shouldBe WardTimeBucketsDto(pre10 = 1, min10To20 = 0, post20 = 0)
+                missingThirdDeathAnalysis.aggregateSummary.avgRoleQuestCompletionMinute shouldBe 13.0
+
+                // 5. Duration-truncated timeline (0..14m frames on a 30m 1800s match) where MatchDto.deaths == 0 AND all frame
+                //    events arrays are non-null -> non-null event arrays alone NEVER prove full-game duration!
+                val match30mZeroDeaths = zeroDeathQuestMatch.copy(
+                    info = zeroDeathQuestMatch.info!!.copy(gameDuration = 1800L)
+                )
+                val durationTruncatedZeroDeath = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_TRUNC_30M_ZERO_DEATH", tlCompleteValid, match30mZeroDeaths)),
+                    "puuid-3"
+                )
+                durationTruncatedZeroDeath.aggregateSummary.gamesAnalyzed shouldBe 1
+                durationTruncatedZeroDeath.aggregateSummary.wardsPlacedTotal shouldBe 1
+                durationTruncatedZeroDeath.aggregateSummary.mostDangerousZone shouldBe "Not available"
+                durationTruncatedZeroDeath.aggregateSummary.deathsBefore10.shouldBeNull()
+                durationTruncatedZeroDeath.aggregateSummary.assistedDeaths.shouldBeNull()
+                durationTruncatedZeroDeath.aggregateSummary.unassistedDeaths.shouldBeNull()
+                durationTruncatedZeroDeath.aggregateSummary.deathsNearObjectiveWindows.shouldBeNull()
+                durationTruncatedZeroDeath.aggregateSummary.wardsByTimeBucket.shouldBeNull()
+                durationTruncatedZeroDeath.roleQuestTimings.first().playerQuestCompleted shouldBe true
+                durationTruncatedZeroDeath.roleQuestTimings.first().playerCompletionMinute.shouldBeNull()
+                durationTruncatedZeroDeath.aggregateSummary.avgRoleQuestCompletionMinute.shouldBeNull()
+                durationTruncatedZeroDeath.aggregateSummary.avgRoleQuestDeltaSeconds.shouldBeNull()
+                val truncImp = durationTruncatedZeroDeath.improvementStats.shouldNotBeNull()
+                truncImp.deathCost.perMatch.first().hasTimeline shouldBe false
+                truncImp.deathCost.perMatch.first().recordedDeathsCount.shouldBeNull()
+                truncImp.deathCost.bountyOnPlayerDeaths.totalRecordedDeaths.shouldBeNull()
+                truncImp.unspentGold.highBalanceSampleCount shouldBe 1
+                truncImp.unspentGold.highBalanceBeforePurchaseSampleCount.shouldBeNull()
+                truncImp.teamObjectives.dragon.timelineEligibleGames shouldBe 0
+                truncImp.teamObjectives.dragon.timelinePersonalInvolvements.shouldBeNull()
+
+                // 6. Dropped interior frames ([0m, 14m] skipping 1m..13m) or missing gameDuration -> fail closed even with non-null events arrays
+                val tlDroppedInterior = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata("EUW1_DROPPED_INTERIOR", null),
+                    info = MatchTimelineInfo(
+                        frameInterval = 60_000L,
+                        frames = listOf(
+                            tlCompleteValid.info!!.frames!!.first(),
+                            tlCompleteValid.info!!.frames!!.last()
+                        ),
+                        participants = tlCompleteValid.info!!.participants
+                    )
+                )
+                val droppedInteriorAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_DROPPED_INTERIOR", tlDroppedInterior, zeroDeathQuestMatch)),
+                    "puuid-3"
+                )
+                droppedInteriorAnalysis.aggregateSummary.mostDangerousZone shouldBe "Not available"
+                droppedInteriorAnalysis.aggregateSummary.deathsBefore10.shouldBeNull()
+                droppedInteriorAnalysis.aggregateSummary.assistedDeaths.shouldBeNull()
+                droppedInteriorAnalysis.aggregateSummary.unassistedDeaths.shouldBeNull()
+                droppedInteriorAnalysis.aggregateSummary.deathsNearObjectiveWindows.shouldBeNull()
+                droppedInteriorAnalysis.aggregateSummary.wardsByTimeBucket.shouldBeNull()
+                droppedInteriorAnalysis.aggregateSummary.avgRoleQuestCompletionMinute.shouldBeNull()
+
+                val matchMissingDuration = zeroDeathQuestMatch.copy(
+                    info = zeroDeathQuestMatch.info!!.copy(gameDuration = null)
+                )
+                val missingDurationAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_NO_DURATION", tlCompleteValid, matchMissingDuration)),
+                    "puuid-3"
+                )
+                missingDurationAnalysis.aggregateSummary.mostDangerousZone shouldBe "Not available"
+                missingDurationAnalysis.aggregateSummary.deathsBefore10.shouldBeNull()
+                missingDurationAnalysis.aggregateSummary.wardsByTimeBucket.shouldBeNull()
+
+                // 7. Analogous MatchDto ward & epic-monster counter reconciliation + FiddleSticks Effigy exception + Patch 16.1 #1129 drift
+                val matchUnrecordedWards = zeroDeathQuestMatch.copy(
+                    info = zeroDeathQuestMatch.info!!.copy(
+                        participants = zeroDeathQuestMatch.info!!.participants.map { p ->
+                            if (p.participantId == 3) p.copy(wardsPlaced = 5) else p
+                        }
+                    )
+                )
+                val unrecordedWardsAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_MISSING_WARDS", tlCompleteValid, matchUnrecordedWards)),
+                    "puuid-3"
+                )
+                unrecordedWardsAnalysis.aggregateSummary.wardsPlacedTotal shouldBe 1
+                unrecordedWardsAnalysis.aggregateSummary.wardsByTimeBucket.shouldBeNull()
+                unrecordedWardsAnalysis.aggregateSummary.deathsBefore10 shouldBe 0
+
+                val matchFiddlesticksEffigies = zeroDeathQuestMatch.copy(
+                    info = zeroDeathQuestMatch.info!!.copy(
+                        participants = zeroDeathQuestMatch.info!!.participants.map { p ->
+                            if (p.participantId == 3) p.copy(championName = "FiddleSticks", wardsPlaced = 5) else p
+                        }
+                    )
+                )
+                val fiddlesticksAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_FIDDLE_EFFIGY", tlCompleteValid, matchFiddlesticksEffigies)),
+                    "puuid-3"
+                )
+                fiddlesticksAnalysis.aggregateSummary.wardsByTimeBucket shouldBe WardTimeBucketsDto(pre10 = 1, min10To20 = 0, post20 = 0)
+
+                val matchUnrecordedDragon = zeroDeathQuestMatch.copy(
+                    info = zeroDeathQuestMatch.info!!.copy(
+                        teams = listOf(
+                            TeamDto(
+                                teamId = 100,
+                                win = true,
+                                objectives = TeamObjectivesDto(dragon = ObjectiveStatsDto(first = true, kills = 2))
+                            )
+                        )
+                    )
+                )
+                val unrecordedDragonAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_MISSING_DRAGON", tlCompleteValid, matchUnrecordedDragon)),
+                    "puuid-3"
+                )
+                unrecordedDragonAnalysis.aggregateSummary.deathsNearObjectiveWindows.shouldBeNull()
+                unrecordedDragonAnalysis.aggregateSummary.deathsBefore10 shouldBe 0
+                unrecordedDragonAnalysis.aggregateSummary.assistedDeaths shouldBe 0
+                unrecordedDragonAnalysis.aggregateSummary.unassistedDeaths shouldBe 0
+
+                // Patch 16.1 #1129 frame-interval drift (~65s-71.3s frame spacing) reaching gameDuration stays valid
+                val driftedTimestamps = buildList {
+                    var ts = 0L
+                    add(ts)
+                    val gaps = listOf(
+                        65_000L, 71_300L, 62_000L, 68_500L, 60_500L, 70_200L,
+                        64_000L, 66_500L, 69_000L, 61_000L, 71_000L, 63_000L, 60_000L
+                    ) // sum = 852_000ms >= 840_000ms, every gap <= 80_000ms
+                    for (g in gaps) {
+                        ts += g
+                        add(ts)
+                    }
+                }
+                val tlPatch161Drift = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata("EUW1_1129_DRIFT", null),
+                    info = MatchTimelineInfo(
+                        frameInterval = 60_000L,
+                        frames = driftedTimestamps.mapIndexed { idx, ts ->
+                            TimelineFrameDto(
+                                timestamp = ts,
+                                participantFrames = mapOf(
+                                    "3" to tlPFrame(participantId = 3, totalGold = 500 + idx * 350),
+                                    "8" to tlPFrame(participantId = 8, totalGold = 500 + idx * 330)
+                                ),
+                                events = if (idx == 6) {
+                                    listOf(
+                                        tlEvent(type = "WARD_PLACED", timestamp = ts + 1000L, creatorId = 3, wardType = "YELLOW_TRINKET"),
+                                        tlEvent(type = "ELITE_MONSTER_KILL", timestamp = ts + 2000L, killerId = 3, killerTeamId = 100, monsterType = "DRAGON"),
+                                        tlEvent(type = "ITEM_DESTROYED", timestamp = 780_000L, participantId = 3, itemId = 1201),
+                                        tlEvent(type = "ITEM_DESTROYED", timestamp = 810_000L, participantId = 8, itemId = 1201)
+                                    )
+                                } else emptyList()
+                            )
+                        },
+                        participants = tlCompleteValid.info!!.participants
+                    )
+                )
+                val driftAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_1129_DRIFT", tlPatch161Drift, zeroDeathQuestMatch)),
+                    "puuid-3"
+                )
+                driftAnalysis.aggregateSummary.mostDangerousZone shouldBe "No deaths recorded"
+                driftAnalysis.aggregateSummary.deathsBefore10 shouldBe 0
+                driftAnalysis.aggregateSummary.deathsNearObjectiveWindows shouldBe 0
+                driftAnalysis.aggregateSummary.wardsByTimeBucket shouldBe WardTimeBucketsDto(pre10 = 1, min10To20 = 0, post20 = 0)
+                driftAnalysis.aggregateSummary.avgRoleQuestCompletionMinute shouldBe 13.0
             }
         }
     }
