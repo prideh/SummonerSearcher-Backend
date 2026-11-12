@@ -28,18 +28,47 @@ class SummonerProfileService(
         tagLine: String,
         explicitRefresh: Boolean = false
     ): SummonerProfileDto? {
-        // Step 1: Get the global account PUUID from the Riot ID. This call is not cached.
+        // Fast-path: serve ready fresh/stale/cooldown-guarded cached profiles without a blocking Account-V1 RTT.
+        val immediate = playerCacheService.resolveImmediateCachedProfileByRiotId(
+            region = region,
+            summonerName = summonerName,
+            tagLine = tagLine,
+            explicitRefresh = explicitRefresh
+        )
+        if (immediate.served) {
+            return immediate.profile?.let { profile ->
+                profile.copy(recentMatches = profile.recentMatches?.take(20))
+            }
+        }
+
+        // Step 1: Get the global account PUUID from the Riot ID when cold, refreshing past cooldown, or past 30m owner-auth window.
         val accountDto = riotApiService.getAccountByRiotId(summonerName, tagLine, region)
-        val puuid = accountDto?.puuid?.takeIf { it.isNotBlank() } ?: return null
+        val puuid = accountDto?.puuid?.takeIf { it.isNotBlank() } ?: run {
+            playerCacheService.evictRiotIdMapping(region, summonerName, tagLine)
+            return null
+        }
+        playerCacheService.reconcileVerifiedRiotIdOwner(region, summonerName, tagLine, puuid)
+        val effectiveName = accountDto.gameName?.takeIf { it.isNotBlank() } ?: summonerName
+        val effectiveTag = accountDto.tagLine?.takeIf { it.isNotBlank() } ?: tagLine
 
         // Step 2: Get full profile from cache (or refresh if missing / explicitly requested)
         val fullProfile = playerCacheService.getPlayerProfile(
             puuid = puuid,
             region = region,
-            summonerName = summonerName,
-            tagLine = tagLine,
+            summonerName = effectiveName,
+            tagLine = effectiveTag,
             explicitRefresh = explicitRefresh
         ) ?: return null
+
+        // Only Account-V1-authenticated lookups record/advance ownerVerifiedAtMs (never unauthenticated cache hits).
+        playerCacheService.recordVerifiedRiotIdOwner(
+            region = region,
+            queriedName = summonerName,
+            queriedTag = tagLine,
+            canonicalName = effectiveName,
+            canonicalTag = effectiveTag,
+            verifiedPuuid = puuid
+        )
 
         // Step 3: Return profile with only the first page of matches (e.g., 20)
         // We keep the stats as they are calculated from the full history.
