@@ -1734,7 +1734,7 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 truncImp.teamObjectives.dragon.timelineEligibleGames shouldBe 0
                 truncImp.teamObjectives.dragon.timelinePersonalInvolvements.shouldBeNull()
 
-                // 6. Dropped interior frames ([0m, 14m] skipping 1m..13m) or missing gameDuration -> fail closed even with non-null events arrays
+                // 6a. Dropped interior frames ([0m, 14m] skipping 1m..13m) -> fail closed even with non-null events arrays
                 val tlDroppedInterior = MatchTimelineDto(
                     metadata = MatchTimelineMetadata("EUW1_DROPPED_INTERIOR", null),
                     info = MatchTimelineInfo(
@@ -1757,6 +1757,88 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 droppedInteriorAnalysis.aggregateSummary.deathsNearObjectiveWindows.shouldBeNull()
                 droppedInteriorAnalysis.aggregateSummary.wardsByTimeBucket.shouldBeNull()
                 droppedInteriorAnalysis.aggregateSummary.avgRoleQuestCompletionMinute.shouldBeNull()
+                val droppedInteriorImp = droppedInteriorAnalysis.improvementStats.shouldNotBeNull()
+                droppedInteriorImp.deathCost.perMatch.first().hasTimeline shouldBe false
+                droppedInteriorImp.deathCost.perMatch.first().recordedDeathsCount.shouldBeNull()
+                droppedInteriorImp.deathCost.bountyOnPlayerDeaths.totalRecordedDeaths.shouldBeNull()
+                droppedInteriorImp.unspentGold.highBalanceBeforePurchaseSampleCount.shouldBeNull()
+                droppedInteriorImp.teamObjectives.dragon.timelineEligibleGames shouldBe 0
+                droppedInteriorImp.teamObjectives.dragon.timelinePersonalInvolvements.shouldBeNull()
+
+                // 6b. Single missing interior frame (0..14m retaining start, 6m death+dragon+ward, 10m checkpoint, 11m 1850g sample,
+                //     12m ITEM_PURCHASED, 13m quest destroy, and 14m end frame, but missing minute 7) ->
+                //     EVERY whole-game event-derived consumer in BOTH aggregateSummary and improvementStats (deathCost, unspentGold,
+                //     teamObjectives) MUST fail closed rather than passing via start/end timestamps alone, while preserving legitimate
+                //     partial/checkpoint counters (10m gold lead, unspentGold sampleCount=14 & highBalanceSampleCount=1, retained
+                //     deathsTotal=1) and authoritative MatchDto fields (totalTimeSpentDeadSeconds, teamTotalKills)!
+                val matchOneDeath14m = zeroDeathQuestMatch.copy(
+                    info = zeroDeathQuestMatch.info!!.copy(
+                        participants = zeroDeathQuestMatch.info!!.participants.map { p ->
+                            if (p.participantId == 3) p.copy(deaths = 1, totalTimeSpentDead = 22) else p
+                        }
+                    )
+                )
+                val tlMissingMinute7 = tlCompleteValid.copy(
+                    metadata = MatchTimelineMetadata("EUW1_MISSING_MIN7", null),
+                    info = tlCompleteValid.info!!.copy(
+                        frames = tlCompleteValid.info!!.frames!!
+                            .filter { it.timestamp != 420_000L } // drop interior minute 7 only (retains 0..6m and 8..14m)
+                            .map { frame ->
+                                if (frame.timestamp == 360_000L) {
+                                    frame.copy(
+                                        events = frame.events.orEmpty() + listOf(
+                                            tlEvent(
+                                                type = "CHAMPION_KILL",
+                                                timestamp = 385_000L,
+                                                killerId = 8,
+                                                victimId = 3,
+                                                bounty = 300,
+                                                shutdownBounty = 150,
+                                                position = TimelinePositionDto(12000, 12000)
+                                            )
+                                        )
+                                    )
+                                } else frame
+                            }
+                    )
+                )
+                val singleMissingInteriorAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_MISSING_MIN7", tlMissingMinute7, matchOneDeath14m)),
+                    "puuid-3"
+                )
+                // Whole-game event-derived aggregateSummary fields fail closed
+                singleMissingInteriorAnalysis.aggregateSummary.mostDangerousZone shouldBe "Not available"
+                singleMissingInteriorAnalysis.aggregateSummary.deathsBefore10.shouldBeNull()
+                singleMissingInteriorAnalysis.aggregateSummary.assistedDeaths.shouldBeNull()
+                singleMissingInteriorAnalysis.aggregateSummary.unassistedDeaths.shouldBeNull()
+                singleMissingInteriorAnalysis.aggregateSummary.deathsNearObjectiveWindows.shouldBeNull()
+                singleMissingInteriorAnalysis.aggregateSummary.wardsByTimeBucket.shouldBeNull()
+                singleMissingInteriorAnalysis.aggregateSummary.avgRoleQuestCompletionMinute.shouldBeNull()
+                singleMissingInteriorAnalysis.aggregateSummary.avgRoleQuestDeltaSeconds.shouldBeNull()
+                singleMissingInteriorAnalysis.roleQuestTimings.first().playerQuestCompleted shouldBe true
+                singleMissingInteriorAnalysis.roleQuestTimings.first().playerCompletionMinute.shouldBeNull()
+                // Whole-game event-derived improvementStats fields fail closed (never claiming complete event totals)
+                val singleMissingImp = singleMissingInteriorAnalysis.improvementStats.shouldNotBeNull()
+                singleMissingImp.deathCost.perMatch.first().hasTimeline shouldBe false
+                singleMissingImp.deathCost.perMatch.first().recordedDeathsCount.shouldBeNull()
+                singleMissingImp.deathCost.perMatch.first().totalCombinedBountyGold.shouldBeNull()
+                singleMissingImp.deathCost.bountyOnPlayerDeaths.eligibleTimelineGames shouldBe 0
+                singleMissingImp.deathCost.bountyOnPlayerDeaths.totalRecordedDeaths.shouldBeNull()
+                singleMissingImp.deathCost.bountyOnPlayerDeaths.totalCombinedBountyGold.shouldBeNull()
+                singleMissingImp.unspentGold.perMatch.first().highBalanceBeforePurchaseSampleCount.shouldBeNull()
+                singleMissingImp.unspentGold.highBalanceBeforePurchaseSampleCount.shouldBeNull()
+                singleMissingImp.unspentGold.highBalanceBeforePurchaseSamples shouldBe emptyList()
+                singleMissingImp.teamObjectives.dragon.timelineEligibleGames shouldBe 0
+                singleMissingImp.teamObjectives.dragon.timelinePersonalInvolvements.shouldBeNull()
+                // Legitimate partial/checkpoint counters and MatchDto-sourced fields remain preserved
+                singleMissingInteriorAnalysis.aggregateSummary.deathsTotal shouldBe 1
+                singleMissingInteriorAnalysis.aggregateSummary.avgGoldLeadAt10 shouldBe 200.0
+                singleMissingImp.leadRetention.eligibleGamesAt10 shouldBe 1
+                singleMissingImp.leadRetention.avgGoldLeadAt10 shouldBe 200.0
+                singleMissingImp.unspentGold.sampleCount shouldBe 14
+                singleMissingImp.unspentGold.highBalanceSampleCount shouldBe 1
+                singleMissingImp.deathCost.totalTimeSpentDeadSeconds shouldBe 22
+                singleMissingImp.teamObjectives.dragon.teamTotalKills shouldBe 1
 
                 val matchMissingDuration = zeroDeathQuestMatch.copy(
                     info = zeroDeathQuestMatch.info!!.copy(gameDuration = null)
