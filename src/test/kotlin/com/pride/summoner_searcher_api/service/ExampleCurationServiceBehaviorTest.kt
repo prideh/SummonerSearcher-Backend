@@ -184,9 +184,17 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                     "Matchmaking is rigged!! Losers queue is ruining my games!",
                     "A 1W-4L stretch across your last 5 detailed matches (20.0% win rate) is frustrating, though high match variance and individual execution drive these outcomes rather than hidden matchmaking systems. Next game, take a short reset break after two losses.\n---SUGGESTIONS--- [\"Compare Darius and Garen\", \"Check wave prio\", \"Review builds\"]"
                 )
+                val badMissingPlayMoreGames = mkCandidate(
+                    "What were my exact grey-screen seconds and high-gold checkpoints?",
+                    "Your grey-screen time and high-gold checkpoints are currently unavailable across your last 4 detailed matches, though playing more games may clarify those numbers soon.\n---SUGGESTIONS--- [\"Review 10-minute CS\", \"Check Top builds\", \"Analyze last 4 games\"]"
+                )
+                val badBroadWaveManipulation = mkCandidate(
+                    "How do I stop losing top lane?",
+                    "Across your last 5 detailed matches (1W-4L, 20.0% win rate), focus on wave manipulation and stay calm when behind.\n---SUGGESTIONS--- [\"Compare Darius and Garen\", \"Check builds\", \"Review resets\"]"
+                )
                 val cleanShortDefault = mkCandidate(
                     "How is my early Pantheon farming?",
-                    "Across **your last 20 detailed matches** (11W–9L, **55.0%** win rate), you average **76.2 lane CS at 10:00** (with **114** as the Patch 26.1+ theoretical maximum passive wave spawn—a ceiling, not a target) and **7.1 CS/min** across **your 883 saved matches** (**52.3%** win rate). Summary stats only support hypotheses about recall states, so next game: (1) **check whether early R roams happen before crashing the wave**, and (2) **track one pre-6 reset on a cannon wave**.\n---SUGGESTIONS--- [\"How do my mid-game CS numbers hold up?\", \"When should Pantheon Ult from top?\", \"Compare my Blue and Red side stats\"]"
+                    "Across **your last 20 detailed matches** (11W–9L, **55.0%** win rate), you average **76.2 lane CS at 10:00** across **14 Top games** (with **114** as the Patch 26.1+ theoretical maximum passive wave spawn—a ceiling, not a target) and **7.1 CS/min** across **your 883 saved matches** (**52.3%** win rate). Summary stats only support hypotheses about recall states, so next game: (1) **check whether early R roams happen before crashing the wave**, and (2) **track one pre-6 reset on a cannon wave**.\n---SUGGESTIONS--- [\"How do my mid-game CS numbers hold up?\", \"When should Pantheon Ult from top?\", \"Compare my Blue and Red side stats\"]"
                 )
 
                 val legacyPoisonedHighScore = AiLearnedExample(
@@ -216,6 +224,8 @@ class ExampleCurationServiceBehaviorTest : BehaviorSpec({
                     bad145WordSpatialAssociations,
                     badRoastBleedingTempo,
                     badAngryVarianceExecution,
+                    badMissingPlayMoreGames,
+                    badBroadWaveManipulation,
                     cleanShortDefault
                 )
                 every { exampleRepository.countByQuestionCategoryAndIsActive("cs_farming", true) } returns 10L
