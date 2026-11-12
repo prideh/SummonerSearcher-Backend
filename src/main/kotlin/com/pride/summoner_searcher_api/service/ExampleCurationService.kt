@@ -52,6 +52,10 @@ class ExampleCurationService(
         val qualityScores = mutableListOf<Double>()
         
         candidates.forEach { interaction ->
+            if (!AiAnalysisService.isEligibleCuratedExample(interaction.userQuestion, interaction.aiResponse)) {
+                return@forEach
+            }
+
             val qualityScore = calculateQualityScore(interaction)
             
             // Only add high-quality examples (score > 80)
@@ -77,14 +81,20 @@ class ExampleCurationService(
                     qualityScores.add(qualityScore.toDouble())
                     logger.info("Added new example - Category: $category, Score: $qualityScore")
                 } else {
-                    // Replace lowest-scoring example if this one is better
-                    val lowestExample = exampleRepository
+                    // Evict any legacy active example that fails current schema/CS10/boundary/brevity rules first;
+                    // otherwise replace the lowest-scoring active example if this candidate scores higher.
+                    val activeExamples = exampleRepository
                         .findByQuestionCategoryAndIsActiveTrueOrderByQualityScoreAsc(category)
-                        .firstOrNull()
+                    val legacyIneligible = activeExamples.firstOrNull {
+                        !AiAnalysisService.isEligibleCuratedExample(it.userQuestion, it.aiResponse)
+                    }
+                    val targetToReplace = legacyIneligible ?: activeExamples.firstOrNull()?.takeIf {
+                        qualityScore > (it.qualityScore ?: BigDecimal.ZERO)
+                    }
                     
-                    if (lowestExample != null && qualityScore > lowestExample.qualityScore!!) {
-                        lowestExample.isActive = false
-                        exampleRepository.save(lowestExample)
+                    if (targetToReplace != null) {
+                        targetToReplace.isActive = false
+                        exampleRepository.save(targetToReplace)
                         
                         val newExample = AiLearnedExample(
                             sourceInteraction = interaction,
@@ -97,7 +107,7 @@ class ExampleCurationService(
                         exampleRepository.save(newExample)
                         replacedCount++
                         qualityScores.add(qualityScore.toDouble())
-                        logger.info("Replaced example - Category: $category, Old: ${lowestExample.qualityScore}, New: $qualityScore")
+                        logger.info("Replaced example - Category: $category, Old: ${targetToReplace.qualityScore}, New: $qualityScore")
                     }
                 }
             }
@@ -217,16 +227,16 @@ class ExampleCurationService(
 
     private fun buildCategoryChallengerDirective(category: String): String =
         when (category) {
-            "itemization_builds" -> "When answering item or build questions, name the exact items, explain their passive/stat synergy with the player's champion, and specify when to buy them based on enemy team composition."
-            "matchups" -> "When answering matchup questions, identify the key ability interaction or cooldown window that decides trades at levels 1-3 and level 6, and cite the player's actual win/loss record in that matchup if present."
-            "cs_farming" -> "When answering farming questions, connect CS/min to wave state around objective spawns and recall timings rather than generic last-hitting reminders."
-            "vision_warding" -> "When answering vision questions, specify exact warding timings and locations relative to upcoming dragon/baron timers and lane priority."
-            else -> "Focus strictly on the user's '$category' question with concrete, step-by-step in-game execution tailored to their champion and role, avoiding generic filler."
+            "itemization_builds" -> "Answer concisely (~65–105 words, max 115 words unless expanded) in plain player labels with explicit game counts using items grounded in context and their functional role against the enemy composition (never cite Mythic-era items or unverified patch numbers), then give two concrete, observable build or reset checks."
+            "matchups", "trading_laning", "positional_spacing" -> "Answer concisely (~65–105 words, max 115 words unless expanded) in plain player labels by citing scoped matchup and timeline numbers with explicit game counts, linking aggregate KDA/deaths to play tentatively with may/could/if rather than claiming they prove over-forcing trades, bad spacing, or bleeding tempo, keeping your own passive/spell READY separate from enemy mobility/defensive cooldowns being DOWN (use official ability names only when 100% certain), and giving two concrete when/if -> action checks."
+            "cs_farming", "wave_management" -> "Answer concisely (~65–105 words, max 115 words unless expanded) in plain player labels with sample-scoped CS/min and 10:00 lane CS numbers plus eligible game counts (frame 114 Top/Bot and 120 Mid on Patch 26.1+ strictly as the theoretical maximum passive wave spawn by 10:00—not a target or benchmark, and never a missed-CS baseline), and give two concrete wave-crash, bounce, or recall triggers rather than broad wave-manipulation labels."
+            "vision_warding" -> "Answer concisely (~65–105 words, max 115 words unless expanded) in plain player labels using ward counts, ward types, timing buckets, and analyzed game counts only (never claim specific bush or map coordinates), and give two concrete objective-timer warding checks."
+            else -> "Answer concisely (~65–105 words, max 115 words unless expanded) using plain League labels with explicit eligible or analyzed game counts on every rate and count, separate uncollected/rate-limited data from sample size, link aggregate stats to gameplay tentatively with may/could/if, keep own ability readiness separate from enemy cooldowns being down, and finish with at most two concrete when/if -> action checks."
         }
     
     /**
      * Calculate quality score (0-100) based on multiple factors
-     * This weighting system ensures only the best responses become training examples
+     * This weighting system ensures only concise, evidence-grounded responses become training examples
      */
     private fun calculateQualityScore(interaction: AiInteraction): BigDecimal {
         var score = 0.0
@@ -248,22 +258,33 @@ class ExampleCurationService(
             else -> score += 5.0
         }
         
-        // Factor 3: Response length (15 points) - Not too short, not too long
-        val wordCount = interaction.aiResponse.split("\\s+".toRegex()).size
-        when {
-            wordCount in 100..500 -> score += 15.0 // Ideal length
-            wordCount in 50..100 || wordCount in 500..700 -> score += 10.0
-            else -> score += 5.0
+        // Factor 3: Coaching body length (15 points) - Concise ~65-105w (max 115-130w) by default; fuller when expansion was requested
+        val coachingBody = AiAnalysisService.stripSuggestionsBlock(interaction.aiResponse)
+        val wordCount = coachingBody.split(Regex("\\s+")).count { it.isNotBlank() }
+        val expandedRequested = AiAnalysisService.requestsExpandedAnswer(interaction.userQuestion)
+        if (expandedRequested) {
+            when {
+                wordCount in 120..420 -> score += 15.0
+                wordCount in 80..450 -> score += 10.0
+                else -> score += 0.0
+            }
+        } else {
+            when {
+                wordCount in 35..115 -> score += 15.0 // Ideal concise default answer
+                wordCount in 20..130 -> score += 10.0
+                else -> score += 0.0
+            }
         }
         
-        // Factor 4: Contains numerical evidence (10 points) - Good coaching references stats
-        if (interaction.aiResponse.contains(Regex("\\d+\\.\\d+|\\d+%"))) {
+        // Factor 4: Contains numerical evidence in coaching body (10 points) - Good coaching references stats
+        if (coachingBody.contains(Regex("\\d+\\.\\d+|\\d+%"))) {
             score += 10.0
         }
         
-        // Factor 5: Contains actionable advice keywords (15 points)
-        val actionKeywords = listOf("practice", "focus on", "aim for", "try", "drill", "next game", "improve")
-        val hasAction = actionKeywords.any { interaction.aiResponse.lowercase().contains(it) }
+        // Factor 5: Contains actionable advice keywords in coaching body (15 points)
+        val actionKeywords = listOf("practice", "focus on", "aim for", "try", "drill", "next game", "improve", "check", "track", "habit", "review")
+        val lowerBody = coachingBody.lowercase()
+        val hasAction = actionKeywords.any { lowerBody.contains(it) }
         if (hasAction) {
             score += 15.0
         }

@@ -296,6 +296,8 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     "missingLaneCsAt10Matches" to 0,
                     "recentMatches" to listOf(
                         mapOf(
+                            "patch" to "16.1",
+                            "gameDuration" to 30.0,
                             "champion" to "Ahri",
                             "role" to "MIDDLE",
                             "win" to true,
@@ -304,7 +306,7 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                             "laneCsAt10" to mapOf(
                                 "actual" to 81,
                                 "target" to 120,
-                                "targetLabel" to "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
+                                "targetLabel" to "Mid lane target"
                             )
                         )
                     )
@@ -320,11 +322,11 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     null
                 ) as String
 
-                // 1. Softened 150-word rule -> concise-but-natural depth guidance
+                // 1. Short default + at most two controllable actions (expand on request)
                 prompt shouldNotContain "MUST be under 150 words"
                 prompt shouldNotContain "brutally efficient elevator pitch"
-                prompt shouldContain "Concise & Natural Depth"
-                prompt shouldContain "allow longer, fuller explanations when the question needs depth"
+                prompt shouldContain "Short Default, Expand on Request (& At Most Two Actions)"
+                prompt shouldContain "at most two controllable next-game actions"
 
                 // 2. Rank-appropriate persona instead of hardcoded Challenger persona
                 prompt shouldNotContain "Treat the player as a Challenger tier player"
@@ -337,13 +339,14 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "WARD_PLACED"
                 prompt shouldContain "never claim ward placement in specific bushes"
                 prompt shouldContain "assisted deaths are not necessarily jungle ganks"
-                prompt shouldContain "cs10.target"
-                prompt shouldContain "114 for Top/Bot, 120 for Mid on verified patch 26.1+ games only"
-                prompt shouldContain "NEVER subtract `actual` from `target` to claim exact \"missed CS\""
+                prompt shouldContain "cs10.theoreticalMax"
+                prompt shouldContain "114 for Top/Bot, 120 for Mid on verified patch 26.1+ games lasting `>=10:00` only"
+                prompt shouldContain "NEVER subtract `actual` from `theoreticalMax` to claim exact \"missed CS\""
                 prompt shouldContain "laneCs@10=81"
-                prompt shouldContain "cs10.target=120"
-                prompt shouldContain "avgLaneCsAt10: {avgActual=81.0 (matchCount=1), avgTarget=120.0 (targetMatchCount=1, avgSupportedActual=81.0)"
+                prompt shouldContain "cs10.theoreticalMax=120"
+                prompt shouldContain "avgLaneCsAt10: {avgActual=81.0 (matchCount=1), avgTheoreticalMax=120.0 (theoreticalMaxMatchCount=1, avgSupportedActual=81.0)"
                 prompt shouldContain "missingLaneCsAt10Matches: 0"
+                prompt shouldNotContain "cs10.target="
                 prompt shouldNotContain "cs10.spawnedSupply"
                 prompt shouldNotContain "cs10.supplyLabel"
 
@@ -761,7 +764,8 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
 
                 val promptBytes = AiAnalysisService.utf8ByteSize(prompt)
                 val heuristicTokens = AiAnalysisService.heuristicTokenEstimate(prompt)
-                println("MEASURED_20_MATCH_FIXTURE_BYTES: rawContextJsonBytes=$rawContextJsonBytes, groundTruthBytes=$groundTruthBytes, finalPromptBytes=$promptBytes, heuristicTokens=$heuristicTokens")
+                val expandedGameLines = Regex("""^\s{4}Game \d+""", RegexOption.MULTILINE).findAll(prompt).count()
+                println("MEASURED_20_MATCH_FIXTURE_BYTES: rawContextJsonBytes=$rawContextJsonBytes, groundTruthBytes=$groundTruthBytes, finalPromptBytes=$promptBytes, heuristicTokens=$heuristicTokens, expandedGameLines=$expandedGameLines")
 
                 // 1. Hard size budget (strictly under MAX_PROMPT_BYTES = 16,000 bytes, vs old ~46.7k bytes)
                 (groundTruthBytes <= AiAnalysisService.MAX_GROUND_TRUTH_BYTES) shouldBe true
@@ -770,7 +774,6 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "User: $userQuestion"
 
                 // 2. Bounded match count + omitted rollup
-                val expandedGameLines = Regex("""^\s{4}Game \d+""", RegexOption.MULTILINE).findAll(prompt).count()
                 (expandedGameLines <= AiAnalysisService.MAX_SELECTED_MATCHES) shouldBe true
                 (expandedGameLines >= AiAnalysisService.MIN_SELECTED_MATCHES) shouldBe true
                 prompt shouldContain "omittedMatchesRollup:"
@@ -782,10 +785,11 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 prompt shouldContain "Game 20 (Most Recent Match):"
                 prompt shouldContain "opponentDetails={champion=Viktor"
 
-                // 4. Redundant earlyDeaths fields stripped & targetLabel emitted at most once
+                // 4. Redundant earlyDeaths fields stripped & theoreticalMaxLabel emitted at most once
                 prompt shouldNotContain "participants="
                 prompt shouldNotContain "assistantsCount="
-                Regex("cs10\\.targetLabel=").findAll(prompt).count() shouldBe 1
+                Regex("cs10\\.theoreticalMaxLabel=").findAll(prompt).count() shouldBe 1
+                prompt shouldNotContain "cs10.targetLabel="
                 prompt shouldNotContain "cs10.spawnedSupply"
                 prompt shouldNotContain "cs10.supplyLabel"
 
@@ -855,6 +859,7 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                         mapOf(
                             "matchId" to "NA1_5001",
                             "patch" to "16.2",
+                            "gameDuration" to 28.0,
                             "role" to "MIDDLE",
                             "champion" to "Orianna",
                             "win" to true,
@@ -863,12 +868,13 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                             "laneCsAt10" to mapOf(
                                 "actual" to 88,
                                 "target" to 120,
-                                "targetLabel" to "Patch 26.1+ passive wave spawn total by 10:00 (114 Top/Bot, 120 Mid; excludes pets/wards/objectives)"
+                                "targetLabel" to "Mid lane target"
                             )
                         ),
                         mapOf(
                             "matchId" to "NA1_5002",
                             "patch" to "15.24",
+                            "gameDuration" to 31.0,
                             "role" to "TOP",
                             "champion" to "Gnar",
                             "win" to false,
@@ -993,13 +999,14 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                     null
                 ) as String
 
-                // Reconciled laneCsAt10 contract
-                prompt shouldContain "avgLaneCsAt10: {avgActual=80.5 (matchCount=6), avgTarget=118.0 (targetMatchCount=4, avgSupportedActual=82.0)"
-                prompt shouldContain "roleBreakdown=[MIDDLE(actual=82.0 in 4g, target=120.0 in 3g, supportedActual=83.5); TOP(actual=77.5 in 2g, target=114.0 in 1g, supportedActual=79.0)]"
+                // Reconciled fail-closed laneCsAt10 theoreticalMax contract (mixed-patch matchCount=6 > supported=4 -> avgTheoreticalMax=null)
+                prompt shouldContain "avgLaneCsAt10: {avgActual=80.5 (matchCount=6), avgTheoreticalMax=null (theoreticalMaxMatchCount=4, avgSupportedActual=82.0)"
+                prompt shouldContain "roleBreakdown=[MIDDLE(actual=82.0 in 4g, theoreticalMax=null in 3g, supportedActual=83.5); TOP(actual=77.5 in 2g, theoreticalMax=null in 1g, supportedActual=79.0)]"
                 prompt shouldContain "missingLaneCsAt10Matches: 2"
-                prompt shouldContain "cs10.target=120"
-                prompt shouldContain "cs10.target=null"
-                prompt shouldContain "cs10.targetLabel=Patch 26.1+ passive wave spawn total by 10:00"
+                prompt shouldContain "cs10.theoreticalMax=120"
+                prompt shouldContain "cs10.theoreticalMax=null"
+                prompt shouldContain "cs10.theoreticalMaxLabel=Patch 26.1+ theoretical max passive lane minions spawned by 10:00"
+                prompt shouldNotContain "cs10.target="
                 prompt shouldNotContain "cs10.spawnedSupply"
 
                 // All 5 improvementStats groups + denominators + missingness
@@ -1412,12 +1419,13 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
         }
 
         When("checking player-facing coaching prose and follow-up suggestions with containsInternalSchemaLeak") {
-            Then("it flags internal sample keys, schema markers, header labels, and NOT_ANALYZED while passing natural player-facing coaching and suggestions") {
+            Then("it flags internal sample keys, unbackticked 5-stat/challenge camelCase keys, Riot internal enums, and NOT_ANALYZED while passing natural player-facing coaching and suggestions") {
                 val leakyOutputs = listOf(
                     "Across your `recentMatchSample` of 20 games you have a 55.0% win rate.",
                     "Your savedHistory sits at 52.3% across 883 matches, while rankedRecord is 53.6%.",
                     "Your Pantheon averages 2.21 KDA [sample: savedHistory (883g)].",
                     "Because timelineStatus is NOT_ANALYZED, item spike minutes are unavailable.",
+                    "In phaseFarming and deathCost on MonkeyKing UTILITY, BARON_NASHOR and HORDE timings matter.",
                     "---SUGGESTIONS--- [\"Compare recentMatchSample to savedHistory\", \"Check `topChampions`\", \"Why is timeline NOT_ANALYZED?\"]"
                 )
                 leakyOutputs.forEach { sample ->
@@ -1430,7 +1438,134 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 )
                 cleanOutputs.forEach { sample ->
                     AiAnalysisService.containsInternalSchemaLeak(sample) shouldBe false
+                    AiAnalysisService.sanitizePlayerFacingOutput(sample) shouldBe sample
                 }
+            }
+        }
+
+        When("Gemini emits raw variable names, schema keys, Riot enums, and null fields across sync analyze() and split SSE analyzeStream() chunks") {
+            Then("both output surfaces deterministically translate identifiers to plain League terms, never emit raw variable names in any SSE chunk or suggestion, and preserve unavailable vs zero") {
+                val rawModelText =
+                    "Across your `recentMatchSample` (11W-9L) you improved over savedHistory (52.3%) [sample: savedHistory (883g)] and rankedRecord (53.6%). " +
+                        "Because timelineStatus = NOT_ANALYZED, avgGoldLeadAt10 is null, cs10.theoreticalMax=null on MonkeyKing role=UTILITY, and deathCost=null (missingLaneCsAt10Matches: null). " +
+                        "Watch BARON_NASHOR and HORDE timers after WARD_PLACED checks and controlWardTimeCoverageInRiverOrEnemyHalf in wave_management.\n" +
+                        "---SUGGESTIONS--- [\"Compare recentMatchSample to savedHistory\", \"Check `topChampions` and `phaseFarming`\", \"Why is timelineStatus NOT_ANALYZED?\"]"
+
+                val mapper = com.fasterxml.jackson.databind.ObjectMapper()
+                val syncGeminiPayload = mapper.writeValueAsString(
+                    mapOf(
+                        "candidates" to listOf(
+                            mapOf(
+                                "finishReason" to "STOP",
+                                "content" to mapOf("parts" to listOf(mapOf("text" to rawModelText)))
+                            )
+                        )
+                    )
+                )
+
+                // Deliberately split identifiers, brackets, backticks, enums, null assignments, and ---SUGGESTIONS--- across SSE frame boundaries
+                val splitDeltas = listOf(
+                    "Across your `recentMatch",
+                    "Sample` (11W-9L) you improved over saved",
+                    "History (52.3%) [sample: saved",
+                    "History (883g)] and ranked",
+                    "Record (53.6%). Because timelineStatus = ",
+                    "NOT_",
+                    "ANALYZED, avgGoldLead",
+                    "At10 is ",
+                    "null, cs10.theoretical",
+                    "Max=null on Monkey",
+                    "King role=UTIL",
+                    "ITY, and death",
+                    "Cost=null (missingLaneCsAt10",
+                    "Matches: null). Watch BARON_",
+                    "NASHOR and HOR",
+                    "DE timers after WARD_",
+                    "PLACED checks and controlWardTimeCoverage",
+                    "InRiverOrEnemyHalf in wave_",
+                    "management.\n---SUGG",
+                    "ESTIONS--- [\"Compare recentMatch",
+                    "Sample to savedHistory\", \"Check `top",
+                    "Champions` and `phaseFarming`\", \"Why is timeline",
+                    "Status NOT_ANALYZED?\"]"
+                )
+                splitDeltas.joinToString("") shouldBe rawModelText
+
+                val sseBody = splitDeltas.joinToString("\n\n") { delta ->
+                    val frameJson = mapper.writeValueAsString(
+                        mapOf(
+                            "candidates" to listOf(
+                                mapOf("content" to mapOf("parts" to listOf(mapOf("text" to delta))))
+                            )
+                        )
+                    )
+                    "data: $frameJson"
+                } + "\n\n"
+
+                val offlineWebClient = org.springframework.web.reactive.function.client.WebClient.builder()
+                    .baseUrl("https://generativelanguage.googleapis.com/v1beta/")
+                    .exchangeFunction { request ->
+                        val isStream = request.url().toString().contains("streamGenerateContent")
+                        val response = if (isStream) {
+                            org.springframework.web.reactive.function.client.ClientResponse
+                                .create(org.springframework.http.HttpStatus.OK)
+                                .header("Content-Type", "text/event-stream")
+                                .body(sseBody)
+                                .build()
+                        } else {
+                            org.springframework.web.reactive.function.client.ClientResponse
+                                .create(org.springframework.http.HttpStatus.OK)
+                                .header("Content-Type", "application/json")
+                                .body(syncGeminiPayload)
+                                .build()
+                        }
+                        reactor.core.publisher.Mono.just(response)
+                    }
+                    .build()
+
+                val testService = createService()
+                val webClientField = AiAnalysisService::class.java.getDeclaredField("webClient").apply {
+                    isAccessible = true
+                }
+                webClientField.set(testService, offlineWebClient)
+
+                val syncOut = testService.analyze(
+                    context = spearShotContext,
+                    messages = emptyList(),
+                    userMessage = "How is my recent win rate and timeline data?"
+                ).block()!!.response
+
+                val emittedChunks = testService.analyzeStream(
+                    context = spearShotContext,
+                    messages = emptyList(),
+                    userMessage = "How is my recent win rate and timeline data?"
+                ).chunks.collectList().block()!!
+                val streamOut = emittedChunks.joinToString("")
+
+                // Every individual SSE chunk must be free of raw variable/schema/enum identifiers
+                (emittedChunks.size >= 3) shouldBe true
+                emittedChunks.forEach { chunk ->
+                    AiAnalysisService.containsInternalSchemaLeak(chunk) shouldBe false
+                }
+
+                // Sync and streaming surfaces produce identical, plain League language output
+                streamOut shouldBe syncOut
+                AiAnalysisService.containsInternalSchemaLeak(syncOut) shouldBe false
+
+                syncOut shouldContain "Across your recent matches (11W-9L) you improved over your saved match history (52.3%) and your Solo/Duo ranked record (53.6%)."
+                syncOut shouldContain "Because timeline data is not analyzed yet"
+                syncOut shouldContain "average gold lead at 10 minutes is unavailable"
+                syncOut shouldContain "the 10-minute wave spawn ceiling is unavailable on Wukong Support role"
+                syncOut shouldContain "death time and bounty cost is unavailable (unrecorded 10-minute lane CS game count is unavailable)"
+                syncOut shouldContain "Baron Nashor and Voidgrubs timers after ward placement checks"
+                syncOut shouldContain "control ward time coverage in river or enemy half in wave management"
+                syncOut shouldContain "---SUGGESTIONS--- [\"Compare your recent matches to your saved match history\", \"Check most-played champions and mid-to-late game farming\", \"Why is timeline data not analyzed yet?\"]"
+
+                // Missing / null fields stay human unavailable—NEVER coerced to 0
+                syncOut shouldNotContain "= 0"
+                syncOut shouldNotContain "is 0"
+                syncOut shouldNotContain "null"
+                syncOut shouldNotContain "your your"
             }
         }
     }
