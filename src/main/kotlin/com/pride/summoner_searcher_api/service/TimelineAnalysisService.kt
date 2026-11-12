@@ -285,31 +285,56 @@ class TimelineAnalysisService {
         var roleQuestDeltaCount = 0
 
         var validAnalyzedGames = 0
-        var gamesWithEventCoverage = 0
+        var skippedOrMalformedGames = 0
+        var gamesWithCompleteEventCoverage = 0
+        var gamesWithUnrecordedMatchDeaths = 0
 
         for ((matchId, timeline, matchDto) in timelines) {
-            val info = timeline.info ?: continue
-            val matchInfo = matchDto.info ?: continue
+            val info = timeline.info
+            if (info == null) {
+                skippedOrMalformedGames++
+                continue
+            }
+            val matchInfo = matchDto.info
+            if (matchInfo == null) {
+                skippedOrMalformedGames++
+                continue
+            }
 
             // Resolve the tracked player's participantId within the timeline
-            val playerMatchParticipant = matchInfo.participants.find { it.puuid == puuid } ?: continue
+            val playerMatchParticipant = matchInfo.participants.find { it.puuid == puuid }
+            if (playerMatchParticipant == null) {
+                skippedOrMalformedGames++
+                continue
+            }
             val playerParticipantId = (info.participants?.find { it.puuid == puuid }?.participantId
                 ?: playerMatchParticipant.participantId)
                 ?.takeIf { it in 1..10 }
-                ?: continue
+            if (playerParticipantId == null) {
+                skippedOrMalformedGames++
+                continue
+            }
 
-            val frames = info.frames?.takeIf { it.isNotEmpty() } ?: continue
+            val frames = info.frames?.takeIf { it.isNotEmpty() }
+            if (frames == null) {
+                skippedOrMalformedGames++
+                continue
+            }
             val hasPlayerFrames = frames.any { it.participantFrames?.containsKey(playerParticipantId.toString()) == true }
-            val hasEventCoverage = frames.any { it.events != null }
+            val hasAnyEventArray = frames.any { it.events != null }
+            val hasCompleteFrameEventCoverage = frames.all { it.events != null }
             val hasTimelinePlayerEvidence = hasPlayerFrames || (
                 info.participants?.any { it.puuid == puuid || it.participantId == playerParticipantId } == true &&
-                    hasEventCoverage
+                    hasAnyEventArray
             )
-            if (!hasTimelinePlayerEvidence) continue
+            if (!hasTimelinePlayerEvidence) {
+                skippedOrMalformedGames++
+                continue
+            }
 
             validAnalyzedGames++
-            if (hasEventCoverage) {
-                gamesWithEventCoverage++
+            if (hasCompleteFrameEventCoverage) {
+                gamesWithCompleteEventCoverage++
             }
 
             val playerChampion = playerMatchParticipant.championName?.takeIf { it.isNotBlank() } ?: "Unknown Champion"
@@ -381,6 +406,7 @@ class TimelineAnalysisService {
             val seenSkillSlotTimestampPairs = HashSet<Pair<Int, Long>>()
             val matchEvents = mutableListOf<MatchEventEntry>()
             var playerCurrentLevel = 1
+            var matchPlayerDeaths = 0
 
             for (event in allEvents) {
                 val ts = event.timestamp ?: 0L
@@ -473,6 +499,7 @@ class TimelineAnalysisService {
                                     deaths.add(HeatmapPoint(posX!!, posY!!, matchId, minute))
                                 }
                                 totalDeaths++
+                                matchPlayerDeaths++
                                 if (minute < 10) {
                                     totalDeathsBefore10++
                                 }
@@ -617,7 +644,11 @@ class TimelineAnalysisService {
                 }
             }
 
-            // Compute conservative Season 2026 Role Quest timing (null whenever legacy/0/unknown/uncompleted/ambiguous)
+            if ((playerMatchParticipant.deaths ?: 0) > matchPlayerDeaths) {
+                gamesWithUnrecordedMatchDeaths++
+            }
+
+            // Compute conservative Season 2026 Role Quest timing (null whenever legacy/0/unknown/uncompleted/ambiguous/incomplete events)
             val questEval = evaluateMatchRoleQuestTiming(
                 matchId = matchId,
                 matchInfo = matchInfo,
@@ -626,7 +657,8 @@ class TimelineAnalysisService {
                 playerRole = normalizedPlayerRole,
                 opponentParticipant = opponentMatchParticipant,
                 opponentParticipantId = opponentParticipantId,
-                allEvents = allEvents
+                allEvents = allEvents,
+                hasCompleteEventCoverage = hasCompleteFrameEventCoverage
             )
             roleQuestTimings.add(questEval.dto)
             if (questEval.isSeasonQuestEligible) {
@@ -672,18 +704,28 @@ class TimelineAnalysisService {
         }
 
         // ── Aggregate summary ──
-        val deathZone = computeMostDangerousZone(deaths, gamesWithEventCoverage, totalDeaths)
+        // Complete sample event coverage requires >=1 analyzed game, zero malformed/skipped input entries,
+        // and non-null events arrays across every frame of every analyzed game.
+        val hasCompleteSampleEventCoverage = validAnalyzedGames > 0 &&
+            skippedOrMalformedGames == 0 &&
+            gamesWithCompleteEventCoverage == validAnalyzedGames
+        val hasCompleteDeathEventCoverage = hasCompleteSampleEventCoverage && gamesWithUnrecordedMatchDeaths == 0
+
+        val deathZone = computeMostDangerousZone(deaths, hasCompleteDeathEventCoverage, totalDeaths)
         val avgFirstDeath = if (gamesWithDeath > 0) totalFirstDeathMinute / gamesWithDeath else 0.0
         val avgGold10 = if (gamesWithGold10 > 0) totalGoldLeadAt10 / gamesWithGold10 else 0.0
         val avgGold15 = if (gamesWithGold15 > 0) totalGoldLeadAt15 / gamesWithGold15 else 0.0
 
-        // Never compute whole-sample Role Quest timing averages when any eligible match in the sample is ambiguous/unknown
-        val avgQuestMin = if (roleQuestEligibleGames > 0 && roleQuestAmbiguousGames == 0 && roleQuestCompletedGames > 0) {
+        // Never compute whole-sample Role Quest counts or timing averages when any eligible match is ambiguous
+        // or when any requested entry in timelines was malformed/skipped.
+        val hasUnambiguousSampleRoleQuestCoverage = roleQuestEligibleGames > 0 &&
+            roleQuestAmbiguousGames == 0 &&
+            skippedOrMalformedGames == 0
+        val avgQuestMin = if (hasUnambiguousSampleRoleQuestCoverage && roleQuestCompletedGames > 0) {
             round1(sumRoleQuestCompletionMinute / roleQuestCompletedGames)
         } else null
         val avgQuestDeltaSec = if (
-            roleQuestEligibleGames > 0 &&
-            roleQuestAmbiguousGames == 0 &&
+            hasUnambiguousSampleRoleQuestCoverage &&
             roleQuestOpponentAmbiguousOnCompleted == 0 &&
             roleQuestDeltaCount > 0
         ) {
@@ -712,11 +754,11 @@ class TimelineAnalysisService {
                 killsTotal = totalKills,
                 assistsTotal = totalAssists,
                 gamesAnalyzed = validAnalyzedGames,
-                deathsBefore10 = if (gamesWithEventCoverage > 0) totalDeathsBefore10 else null,
-                assistedDeaths = if (gamesWithEventCoverage > 0) totalAssistedDeaths else null,
-                unassistedDeaths = if (gamesWithEventCoverage > 0) totalUnassistedDeaths else null,
-                deathsNearObjectiveWindows = if (gamesWithEventCoverage > 0) totalDeathsNearObjectives else null,
-                wardsByTimeBucket = if (gamesWithEventCoverage > 0) {
+                deathsBefore10 = if (hasCompleteSampleEventCoverage) totalDeathsBefore10 else null,
+                assistedDeaths = if (hasCompleteSampleEventCoverage) totalAssistedDeaths else null,
+                unassistedDeaths = if (hasCompleteSampleEventCoverage) totalUnassistedDeaths else null,
+                deathsNearObjectiveWindows = if (hasCompleteSampleEventCoverage) totalDeathsNearObjectives else null,
+                wardsByTimeBucket = if (hasCompleteSampleEventCoverage) {
                     WardTimeBucketsDto(
                         pre10 = wardsPre10,
                         min10To20 = wardsMin10To20,
@@ -724,7 +766,7 @@ class TimelineAnalysisService {
                     )
                 } else null,
                 roleQuestEligibleGames = if (roleQuestEligibleGames > 0) roleQuestEligibleGames else null,
-                roleQuestCompletedGames = if (roleQuestEligibleGames > 0 && roleQuestAmbiguousGames == 0) roleQuestCompletedGames else null,
+                roleQuestCompletedGames = if (hasUnambiguousSampleRoleQuestCoverage) roleQuestCompletedGames else null,
                 roleQuestAmbiguousGames = if (roleQuestEligibleGames > 0) roleQuestAmbiguousGames else null,
                 avgRoleQuestCompletionMinute = avgQuestMin,
                 avgRoleQuestDeltaSeconds = avgQuestDeltaSec
@@ -934,7 +976,8 @@ class TimelineAnalysisService {
         participant: ParticipantDto?,
         participantId: Int?,
         normalizedRole: String,
-        allEvents: List<TimelineEventDto>
+        allEvents: List<TimelineEventDto>,
+        hasCompleteEventCoverage: Boolean
     ): SingleParticipantQuestEval {
         if (participant == null || participantId == null) {
             return SingleParticipantQuestEval(null, null, null, isAmbiguous = true)
@@ -949,6 +992,10 @@ class TimelineAnalysisService {
         if (!isVerifiedCompleted) {
             // Unseen/unknown positive item ID: preserve ID on DTO, never claim quest completion
             return SingleParticipantQuestEval(null, null, null, isAmbiguous = true)
+        }
+        if (!hasCompleteEventCoverage) {
+            // Missing events array on >=1 frame means we cannot guarantee starter destroy/repurchase uniqueness across the full game
+            return SingleParticipantQuestEval(true, null, null, isAmbiguous = true)
         }
 
         val starterDestroys = allEvents.filter { ev ->
@@ -1019,7 +1066,8 @@ class TimelineAnalysisService {
         playerRole: String,
         opponentParticipant: ParticipantDto?,
         opponentParticipantId: Int?,
-        allEvents: List<TimelineEventDto>
+        allEvents: List<TimelineEventDto>,
+        hasCompleteEventCoverage: Boolean
     ): RoleQuestMatchEvaluation {
         val majorPatch = matchInfo.gameVersion?.trim()?.substringBefore('.')?.toIntOrNull()
         val isEligible = (majorPatch != null && majorPatch >= 16) &&
@@ -1053,12 +1101,24 @@ class TimelineAnalysisService {
             )
         }
 
-        val playerEval = evaluateSingleParticipantRoleQuest(playerParticipant, playerParticipantId, playerRole, allEvents)
+        val playerEval = evaluateSingleParticipantRoleQuest(
+            playerParticipant,
+            playerParticipantId,
+            playerRole,
+            allEvents,
+            hasCompleteEventCoverage
+        )
         val oppRole = normalizeRole(opponentParticipant?.teamPosition ?: opponentParticipant?.individualPosition).let {
             if (it == "UNKNOWN") playerRole else it
         }
         val oppEval = if (opponentParticipant != null && opponentParticipantId != null) {
-            evaluateSingleParticipantRoleQuest(opponentParticipant, opponentParticipantId, oppRole, allEvents)
+            evaluateSingleParticipantRoleQuest(
+                opponentParticipant,
+                opponentParticipantId,
+                oppRole,
+                allEvents,
+                hasCompleteEventCoverage
+            )
         } else {
             SingleParticipantQuestEval(null, null, null, isAmbiguous = false)
         }
@@ -1660,9 +1720,10 @@ class TimelineAnalysisService {
 
             val tInfo = game.timeline?.info
             val frames = tInfo?.frames
+            val hasCompleteFrameEvents = !frames.isNullOrEmpty() && frames.all { it.events != null }
             val playerPid = if (tInfo != null) resolveTimelineParticipantId(tInfo, game.player, game.matchInfo.participants) else null
 
-            if (tInfo == null || frames.isNullOrEmpty() || playerPid == null) {
+            if (tInfo == null || !hasCompleteFrameEvents || playerPid == null) {
                 perMatchList.add(
                     MatchDeathCostDto(
                         matchId = game.matchId,
@@ -1691,7 +1752,7 @@ class TimelineAnalysisService {
                 pidToChamp[pid] = p.championName ?: "Unknown Champion"
             }
 
-            val playerDeathEvents = frames
+            val playerDeathEvents = frames!!
                 .flatMap { it.events ?: emptyList() }
                 .filter { it.type == "CHAMPION_KILL" && it.victimId == playerPid }
 
@@ -1844,6 +1905,7 @@ class TimelineAnalysisService {
     ): UnspentGoldStatsDto {
         val threshold = UnspentGoldStatsDto.HIGH_UNSPENT_GOLD_THRESHOLD
         var eligibleGames = 0
+        var eligibleGamesWithCompleteEvents = 0
         var noCurrentGoldGames = 0
 
         val allGoldSamples = mutableListOf<Int>()
@@ -1874,7 +1936,15 @@ class TimelineAnalysisService {
             }
 
             eligibleGames++
-            val playerPurchases = reconcileParticipantPurchaseEvents(frames, playerPid)
+            val hasCompleteFrameEvents = frames.all { it.events != null }
+            if (hasCompleteFrameEvents) {
+                eligibleGamesWithCompleteEvents++
+            }
+            val playerPurchases = if (hasCompleteFrameEvents) {
+                reconcileParticipantPurchaseEvents(frames, playerPid)
+            } else {
+                emptyList()
+            }
 
             var matchHighCount = 0
             var matchHighBeforePurchaseCount = 0
@@ -1884,23 +1954,25 @@ class TimelineAnalysisService {
                 if (sample.currentGold >= threshold) {
                     highBalanceSamplesTotal++
                     matchHighCount++
-                    val nextPurchase = playerPurchases.firstOrNull { (it.timestamp ?: 0L) > sample.timestampMs }
-                    if (nextPurchase != null) {
-                        matchHighBeforePurchaseCount++
-                        val nextTs = nextPurchase.timestamp!!
-                        highBalanceBeforePurchaseList.add(
-                            UnspentGoldHighBalanceSampleDto(
-                                matchId = game.matchId,
-                                championName = game.championName,
-                                role = game.role,
-                                sampledMinute = sample.minute,
-                                sampledTimestampMs = sample.timestampMs,
-                                currentGoldAtSample = sample.currentGold,
-                                nextPurchaseTimestampMs = nextTs,
-                                nextPurchaseMinute = (nextTs / 60_000L).toInt(),
-                                nextPurchaseItemId = nextPurchase.itemId
+                    if (hasCompleteFrameEvents) {
+                        val nextPurchase = playerPurchases.firstOrNull { (it.timestamp ?: 0L) > sample.timestampMs }
+                        if (nextPurchase != null) {
+                            matchHighBeforePurchaseCount++
+                            val nextTs = nextPurchase.timestamp!!
+                            highBalanceBeforePurchaseList.add(
+                                UnspentGoldHighBalanceSampleDto(
+                                    matchId = game.matchId,
+                                    championName = game.championName,
+                                    role = game.role,
+                                    sampledMinute = sample.minute,
+                                    sampledTimestampMs = sample.timestampMs,
+                                    currentGoldAtSample = sample.currentGold,
+                                    nextPurchaseTimestampMs = nextTs,
+                                    nextPurchaseMinute = (nextTs / 60_000L).toInt(),
+                                    nextPurchaseItemId = nextPurchase.itemId
+                                )
                             )
-                        )
+                        }
                     }
                 }
             }
@@ -1916,12 +1988,13 @@ class TimelineAnalysisService {
                     maxCurrentGold = matchGoldValues.maxOrNull(),
                     avgCurrentGold = round1(matchGoldValues.average()),
                     highBalanceSampleCount = matchHighCount,
-                    highBalanceBeforePurchaseSampleCount = matchHighBeforePurchaseCount
+                    highBalanceBeforePurchaseSampleCount = if (hasCompleteFrameEvents) matchHighBeforePurchaseCount else null
                 )
             )
         }
 
         val totalSamples = allGoldSamples.size
+        val hasCompletePurchaseEventCoverage = totalSamples > 0 && eligibleGamesWithCompleteEvents == eligibleGames
         return UnspentGoldStatsDto(
             totalGamesConsidered = games.size,
             eligibleGames = eligibleGames,
@@ -1933,8 +2006,8 @@ class TimelineAnalysisService {
             avgCurrentGold = if (totalSamples > 0) round1(allGoldSamples.average()) else null,
             highBalanceThresholdGold = threshold,
             highBalanceSampleCount = if (totalSamples > 0) highBalanceSamplesTotal else null,
-            highBalanceBeforePurchaseSampleCount = if (totalSamples > 0) highBalanceBeforePurchaseList.size else null,
-            highBalanceBeforePurchaseSamples = highBalanceBeforePurchaseList,
+            highBalanceBeforePurchaseSampleCount = if (hasCompletePurchaseEventCoverage) highBalanceBeforePurchaseList.size else null,
+            highBalanceBeforePurchaseSamples = if (hasCompletePurchaseEventCoverage) highBalanceBeforePurchaseList else emptyList(),
             perMatch = perMatchList
         )
     }
@@ -2122,7 +2195,7 @@ class TimelineAnalysisService {
             val tInfo = game.timeline?.info
             val frames = tInfo?.frames
             val playerPid = if (tInfo != null) resolveTimelineParticipantId(tInfo, game.player, game.matchInfo.participants) else null
-            if (tInfo != null && !frames.isNullOrEmpty() && playerPid != null) {
+            if (tInfo != null && !frames.isNullOrEmpty() && frames.all { it.events != null } && playerPid != null) {
                 timelineGames++
                 val involvedEvents = frames
                     .flatMap { it.events ?: emptyList() }
@@ -2239,15 +2312,15 @@ class TimelineAnalysisService {
     /**
      * Determines which map quadrant (named) had the most deaths.
      * Map is divided into 4 quadrants based on the 15000x15000 coordinate space.
-     * Distinguishes missing/skipped event coverage or unpositioned deaths ("Not available")
-     * from verified zero deaths ("No deaths recorded").
+     * Distinguishes incomplete/missing/skipped event coverage or unpositioned deaths ("Not available")
+     * from verified complete-sample zero deaths ("No deaths recorded").
      */
     private fun computeMostDangerousZone(
         deathPositions: List<HeatmapPoint>,
-        gamesWithEventCoverage: Int,
+        hasCompleteDeathEventCoverage: Boolean,
         totalDeaths: Int
     ): String {
-        if (gamesWithEventCoverage <= 0) return "Not available"
+        if (!hasCompleteDeathEventCoverage) return "Not available"
         if (totalDeaths <= 0) return "No deaths recorded"
         if (deathPositions.isEmpty()) return "Not available"
 
