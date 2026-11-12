@@ -65,6 +65,9 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
 
     internal fun getActiveBoundedHttpWorkers(): Int = activeBoundedHttpWorkers.get()
 
+    internal fun getActiveRetryAfterWaitMs(region: String): Long =
+        rateLimiter.getActiveRetryAfterWaitMs(region.trim().lowercase())
+
     internal class HttpCancellationHandle {
         private val cancelled = java.util.concurrent.atomic.AtomicBoolean(false)
         private val closeables = java.util.concurrent.CopyOnWriteArrayList<AutoCloseable>()
@@ -1168,7 +1171,7 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
                 // Don't throw an error for 404s on individual matches
                 null
             }
-        }
+        }?.copy(dtoSchemaVersion = MatchDto.CURRENT_DTO_SCHEMA_VERSION)
     }
 
     suspend fun getMatchByIdLowPriority(
@@ -1199,7 +1202,7 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
             } catch (e: HttpClientErrorException.NotFound) {
                 null
             }
-        }
+        }?.copy(dtoSchemaVersion = MatchDto.CURRENT_DTO_SCHEMA_VERSION)
     }
 
     suspend fun getMatchTimeline(matchId: String, region: String): com.pride.summoner_searcher_api.dto.MatchTimelineDto? {

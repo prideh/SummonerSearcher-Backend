@@ -25,7 +25,25 @@ data class TimelineAnalysisDto(
     /** Aggregate summary stats */
     val aggregateSummary: TimelineAggregateSummary,
     /** Nullable documented #18 improvement statistics contract (phaseFarming, leadRetention, deathCost, unspentGold, teamObjectives) */
-    val improvementStats: ImprovementStatsDto? = null
+    val improvementStats: ImprovementStatsDto? = null,
+    /** Per-match Season 2026 Role Quest state & conservative completion timing (null timestamps whenever ambiguous/legacy/uncompleted) */
+    val roleQuestTimings: List<MatchRoleQuestTimingDto> = emptyList()
+)
+
+data class MatchRoleQuestTimingDto(
+    val matchId: String,
+    val role: String,
+    val playerRoleBoundItem: Int? = null,
+    val opponentRoleBoundItem: Int? = null,
+    val playerQuestCompleted: Boolean? = null,
+    val opponentQuestCompleted: Boolean? = null,
+    val playerCompletionTimestampMs: Long? = null,
+    val playerCompletionMinute: Double? = null,
+    val opponentCompletionTimestampMs: Long? = null,
+    val opponentCompletionMinute: Double? = null,
+    val completionDeltaSeconds: Double? = null,
+    val playerQuestStatusLabel: String? = null,
+    val opponentQuestStatusLabel: String? = null
 )
 
 data class HeatmapPoint(
@@ -132,7 +150,12 @@ data class TimelineAggregateSummary(
     val assistedDeaths: Int? = null,
     val unassistedDeaths: Int? = null,
     val deathsNearObjectiveWindows: Int? = null,
-    val wardsByTimeBucket: WardTimeBucketsDto? = null
+    val wardsByTimeBucket: WardTimeBucketsDto? = null,
+    val roleQuestEligibleGames: Int? = null,
+    val roleQuestCompletedGames: Int? = null,
+    val roleQuestAmbiguousGames: Int? = null,
+    val avgRoleQuestCompletionMinute: Double? = null,
+    val avgRoleQuestDeltaSeconds: Double? = null
 )
 
 data class CoachTimelinePreparationRequestDto(

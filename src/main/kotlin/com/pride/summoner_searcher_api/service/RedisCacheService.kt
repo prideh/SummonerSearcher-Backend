@@ -81,6 +81,66 @@ class RedisCacheService(
         redisTemplate.delete(key)
     }
 
+    data class VersionedCacheEntry<T>(
+        val value: T,
+        val rawPayload: String
+    )
+
+    /**
+     * Retrieves and deserializes an object from Redis together with its exact stored raw string payload
+     * for subsequent optimistic compare-and-set updates ([compareAndSetPreservingTtl]).
+     */
+    fun <T> getVersioned(key: String, type: Class<T>): VersionedCacheEntry<T>? {
+        val rawValue = try {
+            redisTemplate.opsForValue().get(key)
+        } catch (_: Exception) {
+            null
+        } ?: return null
+        val parsed = deserializeValue(rawValue, type) ?: return null
+        return VersionedCacheEntry(value = parsed, rawPayload = rawValue)
+    }
+
+    /**
+     * Atomically updates an existing Redis key ONLY when:
+     * 1. [key] still exists in Redis (never resurrects expired keys),
+     * 2. its stored raw string payload still equals [expectedRawPayload] (never overwrites concurrent writers), and
+     * 3. its remaining millisecond `PTTL` is strictly positive (`> 0`, failing closed on persistent `-1`,
+     *    missing `-2`, zero, or Redis errors instead of resetting TTL to full 60d/14d).
+     */
+    fun <T> compareAndSetPreservingTtl(
+        key: String,
+        expectedRawPayload: String,
+        newValue: T
+    ): Boolean {
+        if (expectedRawPayload.isEmpty()) return false
+        return try {
+            val newCompressed = serializeAndCompress(newValue)
+            val result = redisTemplate.execute(
+                CAS_PRESERVE_PTTL_SCRIPT,
+                listOf(key),
+                expectedRawPayload,
+                newCompressed
+            )
+            result == 1L
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Returns the remaining positive TTL of [key] in Redis, or `null` when missing, persistent (`-1`),
+     * unstubbed in mocks, or unavailable. Used by targeted cache updates to preserve remaining TTL
+     * rather than resetting expiration back to full 60d/14d windows.
+     */
+    fun getRemainingTtl(key: String): Duration? {
+        return try {
+            val remainingMs = redisTemplate.getExpire(key, java.util.concurrent.TimeUnit.MILLISECONDS)
+            if (remainingMs != null && remainingMs > 0L) Duration.ofMillis(remainingMs) else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
     /**
      * Bounded cursor-based key scan matching [pattern] (e.g., `match:euw1:*` or `player:profile:euw1:*`).
      * Enforces [maxKeys] (capped at [HARD_MAX_SCAN_KEYS]) so Redis scans are never unbounded.
@@ -675,6 +735,26 @@ class RedisCacheService(
         private const val HARD_MAX_COMPRESSED_BASE64_CHARS = 12 * 1024 * 1024
 
         private val currentThreadInflateContext = ThreadLocal<BoundedInflateContext?>()
+
+        internal val CAS_PRESERVE_PTTL_SCRIPT: org.springframework.data.redis.core.script.DefaultRedisScript<Long> =
+            org.springframework.data.redis.core.script.DefaultRedisScript<Long>(
+                """
+                local cur = redis.call('GET', KEYS[1])
+                if not cur then
+                  return 0
+                end
+                if cur ~= ARGV[1] then
+                  return -1
+                end
+                local pttl = redis.call('PTTL', KEYS[1])
+                if pttl <= 0 then
+                  return -2
+                end
+                redis.call('SET', KEYS[1], ARGV[2], 'PX', pttl)
+                return 1
+                """.trimIndent(),
+                Long::class.java
+            )
 
         internal fun maxCompressedBytesForInflatedCap(maxInflatedBytes: Int): Int {
             val safeInflated = maxInflatedBytes.coerceIn(1_024, HARD_MAX_INFLATED_CACHE_BYTES).toLong()
