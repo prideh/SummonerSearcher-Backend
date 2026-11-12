@@ -971,7 +971,8 @@ class TimelineAnalysisService {
     }
 
     /**
-     * Verifies contiguous timeline frame coverage from match start through [MatchInfo.gameDuration].
+     * Verifies contiguous timeline frame coverage from match start through [MatchInfo.gameDuration] for all
+     * whole-game event-derived consumers in both [analyze] and [computeImprovementStats].
      * Tolerates Patch 16.1 #1129 frame-interval drift (60.5s-71.3s via `frameInterval + 20s`, strictly `< 2 * frameInterval`)
      * and post-nexus integer-second rounding (`15s`), while failing closed on truncated endings, missing opening frames,
      * dropped interior frames, untimestamped frames, or missing `gameDuration`.
@@ -994,20 +995,6 @@ class TimelineAnalysisService {
         }
         val endRoundingToleranceMs = 15_000L
         return sortedTimestamps.last() + endRoundingToleranceMs >= durationMs
-    }
-
-    /**
-     * Verifies that retained timeline frames reach the authoritative [MatchInfo.gameDuration] (within `15s`
-     * integer-second rounding tolerance) before treating event-derived improvement totals as whole-game complete.
-     */
-    private fun reachesMatchEndDuration(
-        frames: List<TimelineFrameDto>,
-        matchInfo: MatchInfo
-    ): Boolean {
-        val durationMs = resolveMatchDurationMs(matchInfo) ?: return false
-        val maxFrameTs = frames.mapNotNull { it.timestamp }.maxOrNull() ?: return false
-        val endRoundingToleranceMs = 15_000L
-        return maxFrameTs + endRoundingToleranceMs >= durationMs
     }
 
     /**
@@ -1821,9 +1808,10 @@ class TimelineAnalysisService {
 
             val tInfo = game.timeline?.info
             val frames = tInfo?.frames
-            val hasCompleteFrameEvents = !frames.isNullOrEmpty() &&
+            val hasCompleteFrameEvents = tInfo != null &&
+                !frames.isNullOrEmpty() &&
                 frames.all { it.events != null } &&
-                reachesMatchEndDuration(frames, game.matchInfo)
+                hasFullDurationFrameCoverage(frames, tInfo, game.matchInfo)
             val playerPid = if (tInfo != null) resolveTimelineParticipantId(tInfo, game.player, game.matchInfo.participants) else null
 
             if (tInfo == null || !hasCompleteFrameEvents || playerPid == null) {
@@ -2040,7 +2028,7 @@ class TimelineAnalysisService {
 
             eligibleGames++
             val hasCompleteFrameEvents = frames.all { it.events != null } &&
-                reachesMatchEndDuration(frames, game.matchInfo)
+                hasFullDurationFrameCoverage(frames, tInfo, game.matchInfo)
             if (hasCompleteFrameEvents) {
                 eligibleGamesWithCompleteEvents++
             }
@@ -2302,7 +2290,7 @@ class TimelineAnalysisService {
             if (tInfo != null &&
                 !frames.isNullOrEmpty() &&
                 frames.all { it.events != null } &&
-                reachesMatchEndDuration(frames, game.matchInfo) &&
+                hasFullDurationFrameCoverage(frames, tInfo, game.matchInfo) &&
                 playerPid != null
             ) {
                 timelineGames++
