@@ -462,8 +462,8 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 sanitizedJargon shouldContain "eliminate unassisted deaths"
                 AiAnalysisService.containsEvidenceBoundaryViolation(sanitizedJargon) shouldBe true
 
-                // All clean exemplars across Fixtures 1, 2, 4, 5, and 6 remain byte-for-byte unchanged
-                listOf("normal", "offtopic", "adversarial", "angry", "roast").forEach { key ->
+                // All clean exemplars across Fixtures 1, 2, 3, 4, 5, and 6 remain byte-for-byte unchanged
+                listOf("normal", "offtopic", "missing", "adversarial", "angry", "roast").forEach { key ->
                     val exemplar = fixtures.getValue(key)["exemplarCleanResponse"] as String
                     AiAnalysisService.sanitizePlayerFacingOutput(exemplar) shouldBe exemplar
                 }
@@ -526,6 +526,112 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 AiAnalysisService.containsInternalSchemaLeak(cleanCalmAngryControl) shouldBe false
                 AiAnalysisService.containsEvidenceBoundaryViolation(cleanCalmAngryControl) shouldBe false
                 AiAnalysisService.isEligibleCuratedExample("How do I reset after a 1W-4L slump?", cleanCalmAngryControl) shouldBe true
+            }
+        }
+    }
+
+    Given("Fixture 10 (live-QA 40ba67f regressions): Sub-metric game-count denominators, data-availability vs sample-size separation, concrete observable checks vs broad wave manipulation, and brief off-topic refusal without unsolicited pivot") {
+        When("evaluating all 4 live-provider 40ba67f findings across prompts, rendered ground-truth lines, curation/history gates, and sharp roast preservation") {
+            Then("every prompt root cause is corrected without hardcoding fixture phrasing, bad outputs are caught, clean controls pass, and budgets remain intact") {
+                @Suppress("UNCHECKED_CAST")
+                val normalFixture = fixtures.getValue("normal")
+                @Suppress("UNCHECKED_CAST")
+                val normalContext = normalFixture["context"] as Map<String, Any?>
+                val normalPrompt = buildPrompt(normalContext, normalFixture["userMessage"] as String)
+                val normalExemplar = normalFixture["exemplarCleanResponse"] as String
+
+                // 1. Sub-metric denominators & analyzed-timeline scope explicitly rendered and required
+                normalPrompt shouldContain "TIMELINE ANALYSIS (across 20 analyzed games)"
+                normalPrompt shouldContain "Deaths before 10min: 18 (across 20 analyzed games)"
+                normalPrompt shouldContain "Deaths near objective windows: 14 (across 20 analyzed games)"
+                normalPrompt shouldContain "Most frequent death zone: Top Side River (across 20 analyzed games)"
+                normalPrompt shouldContain "voidgrubs(elig=19g, miss=0g, first=7/19 [0.368]"
+                normalPrompt shouldContain "Every sub-metric rate, average, or event total"
+                normalPrompt shouldContain "MUST include its own eligible or analyzed game count"
+                normalExemplar shouldContain "7 of 19 games"
+                normalExemplar shouldContain "across 20 analyzed games"
+
+                // 2. Data-availability vs sample-size separation on partial/rate-limited 4-game profile
+                @Suppress("UNCHECKED_CAST")
+                val missingFixture = fixtures.getValue("missing")
+                @Suppress("UNCHECKED_CAST")
+                val missingContext = missingFixture["context"] as Map<String, Any?>
+                val missingQuestion = missingFixture["userMessage"] as String
+                val missingPrompt = buildPrompt(missingContext, missingQuestion)
+                val missingExemplar = missingFixture["exemplarCleanResponse"] as String
+                val missingPlayMoreRegression = missingFixture["live40ba67fPlayMoreGamesRegression"] as String
+
+                missingPrompt shouldNotContain "Recommend playing more games"
+                missingPrompt shouldContain "SAMPLE SIZE vs. DATA AVAILABILITY"
+                missingPrompt shouldContain "NEVER say \"playing more games\" will clarify, unlock, or populate missing, partial, rate-limited, or unanalyzed"
+                missingPrompt shouldContain "Keep **collection/availability limits** (unanalyzed timelines, partial/rate-limited collection, or unrecorded fields) strictly separate from **sample size**"
+
+                AiAnalysisService.containsEvidenceBoundaryViolation(missingPlayMoreRegression) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample(missingQuestion, missingPlayMoreRegression) shouldBe false
+                AiAnalysisService.containsInternalSchemaLeak(missingExemplar) shouldBe false
+                AiAnalysisService.containsEvidenceBoundaryViolation(missingExemplar) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample(missingQuestion, missingExemplar) shouldBe true
+
+                // Poisoned prior assistant turn telling player to play more games to clarify missing telemetry is stripped from history
+                val missingPromptWithHistory = buildPrompt(
+                    missingContext,
+                    missingQuestion,
+                    listOf(
+                        mapOf("role" to "user", "content" to "Why is my grey-screen time missing?"),
+                        mapOf("role" to "assistant", "content" to missingPlayMoreRegression)
+                    )
+                )
+                missingPromptWithHistory shouldNotContain "playing more games may clarify these patterns"
+
+                // 3. Concrete observable checks vs broad "wave manipulation" in Emerald tilted rant
+                @Suppress("UNCHECKED_CAST")
+                val angryFixture = fixtures.getValue("angry")
+                @Suppress("UNCHECKED_CAST")
+                val angryContext = angryFixture["context"] as Map<String, Any?>
+                val angryQuestion = angryFixture["userMessage"] as String
+                val angryPrompt = buildPrompt(angryContext, angryQuestion)
+                val broadWaveRegression = angryFixture["live40ba67fBroadWaveManipulationResponse"] as String
+
+                angryPrompt shouldContain "Rank-Appropriate Persona (EMERALD IV (12 LP))"
+                angryPrompt shouldNotContain "Emphasize tempo resets, wave manipulation for objective priority"
+                angryPrompt shouldContain "specific wave crash/hold/bounce triggers before objectives"
+                angryPrompt shouldContain "concrete, observable `when/if [in-game trigger] -> [specific check/action]` habits"
+
+                AiAnalysisService.containsEvidenceBoundaryViolation(broadWaveRegression) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample(angryQuestion, broadWaveRegression) shouldBe false
+
+                // Concrete trigger->action wave advice passes cleanly without false positives
+                val concreteWaveControl =
+                    "Across your last 5 detailed matches (1W–4L, 20.0% win rate), focus on wave manipulation by crashing the third wave before 3:15 river vision, and if Flash is down on Darius, hold the wave near your tower bounce."
+                AiAnalysisService.containsEvidenceBoundaryViolation(concreteWaveControl) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample("How should I play early Darius waves?", concreteWaveControl) shouldBe true
+
+                // 4. Brief off-topic refusal without unsolicited coaching pivot + sharp invited roast preserved
+                @Suppress("UNCHECKED_CAST")
+                val offtopicFixture = fixtures.getValue("offtopic")
+                @Suppress("UNCHECKED_CAST")
+                val offtopicContext = offtopicFixture["context"] as Map<String, Any?>
+                val offtopicPrompt = buildPrompt(offtopicContext, offtopicFixture["userMessage"] as String)
+                val offtopicExemplar = offtopicFixture["exemplarCleanResponse"] as String
+
+                offtopicPrompt shouldContain "max 35 words before `---SUGGESTIONS---`"
+                offtopicPrompt shouldContain "cite zero profile stats, skip any unsolicited coaching review or next-game habits"
+                val offtopicWords = AiAnalysisService.stripSuggestionsBlock(offtopicExemplar).split(Regex("\\s+")).count { it.isNotBlank() }
+                (offtopicWords <= 35) shouldBe true
+                offtopicExemplar shouldNotContain "53.6%"
+                offtopicExemplar shouldNotContain "55.0%"
+
+                @Suppress("UNCHECKED_CAST")
+                val roastFixture = fixtures.getValue("roast")
+                @Suppress("UNCHECKED_CAST")
+                val roastContext = roastFixture["context"] as Map<String, Any?>
+                val roastPrompt = buildPrompt(roastContext, roastFixture["userMessage"] as String)
+                roastPrompt shouldContain "give sharp playful bite on **observed personal numbers** in human labels with explicit game counts"
+                (AiAnalysisService.utf8ByteSize(normalPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+                (AiAnalysisService.utf8ByteSize(missingPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+                (AiAnalysisService.utf8ByteSize(angryPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+                (AiAnalysisService.utf8ByteSize(offtopicPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+                (AiAnalysisService.utf8ByteSize(roastPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
             }
         }
     }
