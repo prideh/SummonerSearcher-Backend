@@ -1045,6 +1045,69 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
             }
         }
     }
+
+    Given("Fixture 14 (live-QA aae2a392 roast regression): Conditional W-L/CS-to-tempo/spacing inference ('could mean your tempo is bleeding if spacing slips') vs fountain-rent humor + general practice habits") {
+        When("constructing the roast prompt and evaluating the exact live aae2a392 roast failure alongside conditional variants and a fountain-rent + general-habit exemplar") {
+            Then("the roast prompt removes 'may/could/if' stat-to-cause bridging, rejects conditional W-L/CS spacing/tempo inference across curation and history, and preserves fountain-rent humor with general habits") {
+                val roastFixture = fixtures.getValue("roast")
+                @Suppress("UNCHECKED_CAST")
+                val roastContext = roastFixture["context"] as Map<String, Any?>
+                val roastUserMessage = roastFixture["userMessage"] as String
+                val roastPrompt = buildPrompt(roastContext, roastUserMessage)
+
+                // 1. Roast prompt removes conditional stat-to-cause bridging and explicitly forbids summary -> tempo/spacing inference even with "could"/"if"
+                roastPrompt shouldNotContain "bridge stats to gameplay tentatively"
+                roastPrompt shouldNotContain "link stats to play with \"may\"/\"could\"/\"if\""
+                roastPrompt shouldNotContain "link stats with \"may\"/\"could\"/\"if\""
+                roastPrompt shouldContain "fountain rent"
+                roastPrompt shouldContain "NEVER infer tempo-bleed, spacing slips, or trade/wave causes from W-L, CS/min, KDA, or death summaries even conditionally with \"could\"/\"may\"/\"might\"/\"if\""
+                roastPrompt shouldContain "follow directly with two explicitly general `when/if [trigger] -> [action]` practice habits"
+                (AiAnalysisService.utf8ByteSize(roastPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+
+                // 2. Exact live aae2a392 sentence (standalone + full response + post-sanitizer) and conditional variants are deterministically rejected
+                val exactLiveSentence =
+                    "Dropping 4 of those last 5 on Pantheon while averaging 6.7 CS/min across 5 analyzed games could mean your tempo is bleeding if spacing slips."
+                val fullLiveRoastFailure = roastFixture["liveAae2a392ConditionalSpacingTempoRoast"] as String
+                val csToSpacingVariant =
+                    "Averaging 6.7 CS/min across 5 games might indicate spacing slips in lane."
+                val wlToTempoVariant =
+                    "Going 1W-4L across your last 5 detailed matches could suggest your lane tempo is bleeding."
+
+                listOf(exactLiveSentence, fullLiveRoastFailure, csToSpacingVariant, wlToTempoVariant).forEach { bad ->
+                    AiAnalysisService.containsEvidenceBoundaryViolation(bad) shouldBe true
+                    AiAnalysisService.isEligibleCuratedExample(roastUserMessage, bad) shouldBe false
+                    val afterSanitizer = AiAnalysisService.sanitizePlayerFacingOutput(bad, roastContext)
+                    AiAnalysisService.containsEvidenceBoundaryViolation(afterSanitizer) shouldBe true
+                    AiAnalysisService.isEligibleCuratedExample(roastUserMessage, afterSanitizer) shouldBe false
+                }
+
+                // 3. Assistant history containing the exact live aae2a392 roast failure is stripped before prompt assembly
+                val promptWithPoisonedRoastHistory = buildPrompt(
+                    roastContext,
+                    roastUserMessage,
+                    listOf(
+                        mapOf("role" to "user", "content" to "Roast my last 5 Pantheon games"),
+                        mapOf("role" to "assistant", "content" to fullLiveRoastFailure)
+                    )
+                )
+                val previousBlock = promptWithPoisonedRoastHistory.substringAfter("\nPrevious:\n").substringBefore("\n\nUser:")
+                previousBlock shouldContain "user: Roast my last 5 Pantheon games"
+                previousBlock shouldNotContain "assistant:"
+                previousBlock shouldNotContain "tempo is bleeding if spacing slips"
+
+                // 4. Clean fountain-rent humor + honest summary boundary + 2 general Pantheon practice habits + 3 clean suggestions passes cleanly
+                val cleanFountainRentRoast =
+                    "Across **your last 5 detailed matches** on Pantheon (**1W–4L, 20.0%** win rate), you've paid fountain rent for **390 seconds** of gray screen (**78.0s per game across 5 analyzed games**) while averaging **6.7 CS/min**, vs **52.3%** across **your 883 saved matches** (**2.21 KDA**, **4.9 average deaths**). Post-game W–L, CS/min, and death counts don't show how fights or waves played out, so pick two general habits next game: (1) **when looking to W-engage on Pantheon, check your empowered Mortal Will passive is stacked and E (Aegis Assault) is ready while the enemy's dash cooldown is down**, and (2) **crash your top wave before channeling R**.\n" +
+                        "---SUGGESTIONS--- [\"Which Pantheon deaths gave up shutdown gold?\", \"How should I play Pantheon when behind early?\", \"Compare my recent matches to my saved match history\"]"
+                val cleanWords = AiAnalysisService.stripSuggestionsBlock(cleanFountainRentRoast).split(Regex("\\s+")).count { it.isNotBlank() }
+                (cleanWords in 75..115) shouldBe true
+                AiAnalysisService.containsInternalSchemaLeak(cleanFountainRentRoast) shouldBe false
+                AiAnalysisService.containsEvidenceBoundaryViolation(cleanFountainRentRoast) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample(roastUserMessage, cleanFountainRentRoast) shouldBe true
+                AiAnalysisService.ensureSuggestionsBlock(cleanFountainRentRoast, roastContext, roastUserMessage, "general") shouldBe cleanFountainRentRoast
+            }
+        }
+    }
 })
 
 
