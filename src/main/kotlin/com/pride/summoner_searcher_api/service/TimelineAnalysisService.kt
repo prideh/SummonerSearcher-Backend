@@ -286,8 +286,10 @@ class TimelineAnalysisService {
 
         var validAnalyzedGames = 0
         var skippedOrMalformedGames = 0
-        var gamesWithCompleteEventCoverage = 0
+        var gamesWithCompleteEventStream = 0
         var gamesWithUnrecordedMatchDeaths = 0
+        var gamesWithUnrecordedMatchObjectives = 0
+        var gamesWithUnrecordedMatchWards = 0
 
         for ((matchId, timeline, matchDto) in timelines) {
             val info = timeline.info
@@ -333,9 +335,6 @@ class TimelineAnalysisService {
             }
 
             validAnalyzedGames++
-            if (hasCompleteFrameEventCoverage) {
-                gamesWithCompleteEventCoverage++
-            }
 
             val playerChampion = playerMatchParticipant.championName?.takeIf { it.isNotBlank() } ?: "Unknown Champion"
             val playerTeamId = playerMatchParticipant.teamId ?: 100
@@ -398,6 +397,11 @@ class TimelineAnalysisService {
 
             // ── Events: build all structures in one pass ──
             val allEvents = frames.flatMap { it.events ?: emptyList() }
+            val hasFullDurationCoverage = hasFullDurationFrameCoverage(frames, info, matchInfo)
+            val hasCompleteGameEventStream = hasCompleteFrameEventCoverage && hasFullDurationCoverage
+            if (hasCompleteGameEventStream) {
+                gamesWithCompleteEventStream++
+            }
             val objectiveMinutesInMatch = allEvents
                 .filter { it.type == "ELITE_MONSTER_KILL" }
                 .map { (it.timestamp ?: 0L) / 60000.0 }
@@ -407,6 +411,7 @@ class TimelineAnalysisService {
             val matchEvents = mutableListOf<MatchEventEntry>()
             var playerCurrentLevel = 1
             var matchPlayerDeaths = 0
+            var matchPlayerWards = 0
 
             for (event in allEvents) {
                 val ts = event.timestamp ?: 0L
@@ -606,6 +611,7 @@ class TimelineAnalysisService {
 
                             if (isPlayerWard) {
                                 totalWards++
+                                matchPlayerWards++
                                 when {
                                     minute < 10 -> wardsPre10++
                                     minute < 20 -> wardsMin10To20++
@@ -644,11 +650,46 @@ class TimelineAnalysisService {
                 }
             }
 
-            if ((playerMatchParticipant.deaths ?: 0) > matchPlayerDeaths) {
+            val expectedPlayerDeaths = playerMatchParticipant.deaths
+            if (expectedPlayerDeaths == null || expectedPlayerDeaths > matchPlayerDeaths) {
                 gamesWithUnrecordedMatchDeaths++
             }
 
-            // Compute conservative Season 2026 Role Quest timing (null whenever legacy/0/unknown/uncompleted/ambiguous/incomplete events)
+            val teams = matchInfo.teams
+            if (teams != null) {
+                val hasDragonCounts = teams.any { it.objectives?.dragon?.kills != null }
+                val expectedDragons = teams.sumOf { it.objectives?.dragon?.kills ?: 0 }
+                val observedDragons = allEvents.count {
+                    it.type == "ELITE_MONSTER_KILL" && it.monsterType.equals("DRAGON", ignoreCase = true)
+                }
+                val hasBaronCounts = teams.any { it.objectives?.baron?.kills != null }
+                val expectedBarons = teams.sumOf { it.objectives?.baron?.kills ?: 0 }
+                val observedBarons = allEvents.count {
+                    it.type == "ELITE_MONSTER_KILL" && it.monsterType.equals("BARON_NASHOR", ignoreCase = true)
+                }
+                val hasHeraldCounts = teams.any { it.objectives?.riftHerald?.kills != null }
+                val expectedHeralds = teams.sumOf { it.objectives?.riftHerald?.kills ?: 0 }
+                val observedHeralds = allEvents.count {
+                    it.type == "ELITE_MONSTER_KILL" && (
+                        it.monsterType.equals("RIFTHERALD", ignoreCase = true) ||
+                            it.monsterType.equals("RIFT_HERALD", ignoreCase = true)
+                        )
+                }
+                if ((hasDragonCounts && expectedDragons > observedDragons) ||
+                    (hasBaronCounts && expectedBarons > observedBarons) ||
+                    (hasHeraldCounts && expectedHeralds > observedHeralds)
+                ) {
+                    gamesWithUnrecordedMatchObjectives++
+                }
+            }
+
+            val expectedPlayerWards = playerMatchParticipant.wardsPlaced
+            val isFiddlesticksEffigyChampion = playerChampion.equals("FiddleSticks", ignoreCase = true)
+            if (!isFiddlesticksEffigyChampion && expectedPlayerWards != null && expectedPlayerWards > matchPlayerWards) {
+                gamesWithUnrecordedMatchWards++
+            }
+
+            // Compute conservative Season 2026 Role Quest timing (null whenever legacy/0/unknown/uncompleted/ambiguous/incomplete events or truncated duration)
             val questEval = evaluateMatchRoleQuestTiming(
                 matchId = matchId,
                 matchInfo = matchInfo,
@@ -658,7 +699,7 @@ class TimelineAnalysisService {
                 opponentParticipant = opponentMatchParticipant,
                 opponentParticipantId = opponentParticipantId,
                 allEvents = allEvents,
-                hasCompleteEventCoverage = hasCompleteFrameEventCoverage
+                hasCompleteEventCoverage = hasCompleteGameEventStream
             )
             roleQuestTimings.add(questEval.dto)
             if (questEval.isSeasonQuestEligible) {
@@ -704,12 +745,16 @@ class TimelineAnalysisService {
         }
 
         // ── Aggregate summary ──
-        // Complete sample event coverage requires >=1 analyzed game, zero malformed/skipped input entries,
-        // and non-null events arrays across every frame of every analyzed game.
-        val hasCompleteSampleEventCoverage = validAnalyzedGames > 0 &&
+        // Complete sample event-stream coverage requires >=1 analyzed game, zero malformed/skipped input entries,
+        // non-null events arrays across every frame of every analyzed game, AND contiguous frame duration coverage
+        // spanning each match's authoritative gameDuration (never treating non-null event arrays alone as full-game proof).
+        val hasCompleteSampleEventStream = validAnalyzedGames > 0 &&
             skippedOrMalformedGames == 0 &&
-            gamesWithCompleteEventCoverage == validAnalyzedGames
-        val hasCompleteDeathEventCoverage = hasCompleteSampleEventCoverage && gamesWithUnrecordedMatchDeaths == 0
+            gamesWithCompleteEventStream == validAnalyzedGames
+        val hasCompleteDeathEventCoverage = hasCompleteSampleEventStream && gamesWithUnrecordedMatchDeaths == 0
+        val hasCompleteObjectiveWindowDeathCoverage =
+            hasCompleteDeathEventCoverage && gamesWithUnrecordedMatchObjectives == 0
+        val hasCompleteWardEventCoverage = hasCompleteSampleEventStream && gamesWithUnrecordedMatchWards == 0
 
         val deathZone = computeMostDangerousZone(deaths, hasCompleteDeathEventCoverage, totalDeaths)
         val avgFirstDeath = if (gamesWithDeath > 0) totalFirstDeathMinute / gamesWithDeath else 0.0
@@ -721,11 +766,16 @@ class TimelineAnalysisService {
         val hasUnambiguousSampleRoleQuestCoverage = roleQuestEligibleGames > 0 &&
             roleQuestAmbiguousGames == 0 &&
             skippedOrMalformedGames == 0
-        val avgQuestMin = if (hasUnambiguousSampleRoleQuestCoverage && roleQuestCompletedGames > 0) {
+        val avgQuestMin = if (
+            hasUnambiguousSampleRoleQuestCoverage &&
+            hasCompleteSampleEventStream &&
+            roleQuestCompletedGames > 0
+        ) {
             round1(sumRoleQuestCompletionMinute / roleQuestCompletedGames)
         } else null
         val avgQuestDeltaSec = if (
             hasUnambiguousSampleRoleQuestCoverage &&
+            hasCompleteSampleEventStream &&
             roleQuestOpponentAmbiguousOnCompleted == 0 &&
             roleQuestDeltaCount > 0
         ) {
@@ -754,11 +804,11 @@ class TimelineAnalysisService {
                 killsTotal = totalKills,
                 assistsTotal = totalAssists,
                 gamesAnalyzed = validAnalyzedGames,
-                deathsBefore10 = if (hasCompleteSampleEventCoverage) totalDeathsBefore10 else null,
-                assistedDeaths = if (hasCompleteSampleEventCoverage) totalAssistedDeaths else null,
-                unassistedDeaths = if (hasCompleteSampleEventCoverage) totalUnassistedDeaths else null,
-                deathsNearObjectiveWindows = if (hasCompleteSampleEventCoverage) totalDeathsNearObjectives else null,
-                wardsByTimeBucket = if (hasCompleteSampleEventCoverage) {
+                deathsBefore10 = if (hasCompleteDeathEventCoverage) totalDeathsBefore10 else null,
+                assistedDeaths = if (hasCompleteDeathEventCoverage) totalAssistedDeaths else null,
+                unassistedDeaths = if (hasCompleteDeathEventCoverage) totalUnassistedDeaths else null,
+                deathsNearObjectiveWindows = if (hasCompleteObjectiveWindowDeathCoverage) totalDeathsNearObjectives else null,
+                wardsByTimeBucket = if (hasCompleteWardEventCoverage) {
                     WardTimeBucketsDto(
                         pre10 = wardsPre10,
                         min10To20 = wardsMin10To20,
@@ -908,6 +958,57 @@ class TimelineAnalysisService {
     private fun round1(v: Double): Double = (v * 10.0).roundToInt() / 10.0
     private fun round2(v: Double): Double = (v * 100.0).roundToInt() / 100.0
     private fun round4(v: Double): Double = (v * 10000.0).roundToInt() / 10000.0
+
+    /**
+     * Normalizes [MatchInfo.gameDuration] to milliseconds (Riot Match-V5 uses seconds on modern payloads
+     * and milliseconds on legacy pre-11.20 payloads). Returns `null` when missing or non-positive so
+     * non-null `events` arrays alone are never treated as proof of full-game duration.
+     */
+    private fun resolveMatchDurationMs(matchInfo: MatchInfo): Long? {
+        val raw = matchInfo.gameDuration ?: return null
+        if (raw <= 0L) return null
+        return if (raw > 100_000L) raw else raw * 1000L
+    }
+
+    /**
+     * Verifies contiguous timeline frame coverage from match start through [MatchInfo.gameDuration].
+     * Tolerates Patch 16.1 #1129 frame-interval drift (60.5s-71.3s via `frameInterval + 20s`, strictly `< 2 * frameInterval`)
+     * and post-nexus integer-second rounding (`15s`), while failing closed on truncated endings, missing opening frames,
+     * dropped interior frames, untimestamped frames, or missing `gameDuration`.
+     */
+    private fun hasFullDurationFrameCoverage(
+        frames: List<TimelineFrameDto>,
+        timelineInfo: MatchTimelineInfo,
+        matchInfo: MatchInfo
+    ): Boolean {
+        val durationMs = resolveMatchDurationMs(matchInfo) ?: return false
+        if (frames.isEmpty() || frames.any { it.timestamp == null }) return false
+        val sortedTimestamps = frames.mapNotNull { it.timestamp }.sorted()
+        val frameIntervalMs = (timelineInfo.frameInterval ?: 60_000L).takeIf { it > 0L } ?: 60_000L
+        val maxFrameGapMs = frameIntervalMs + 20_000L
+        if (sortedTimestamps.first() > maxFrameGapMs) return false
+        for (i in 1 until sortedTimestamps.size) {
+            if (sortedTimestamps[i] - sortedTimestamps[i - 1] > maxFrameGapMs) {
+                return false
+            }
+        }
+        val endRoundingToleranceMs = 15_000L
+        return sortedTimestamps.last() + endRoundingToleranceMs >= durationMs
+    }
+
+    /**
+     * Verifies that retained timeline frames reach the authoritative [MatchInfo.gameDuration] (within `15s`
+     * integer-second rounding tolerance) before treating event-derived improvement totals as whole-game complete.
+     */
+    private fun reachesMatchEndDuration(
+        frames: List<TimelineFrameDto>,
+        matchInfo: MatchInfo
+    ): Boolean {
+        val durationMs = resolveMatchDurationMs(matchInfo) ?: return false
+        val maxFrameTs = frames.mapNotNull { it.timestamp }.maxOrNull() ?: return false
+        val endRoundingToleranceMs = 15_000L
+        return maxFrameTs + endRoundingToleranceMs >= durationMs
+    }
 
     /**
      * Finds the timeline frame representing [targetMinute] (in minutes) using actual frame timestamps.
@@ -1720,7 +1821,9 @@ class TimelineAnalysisService {
 
             val tInfo = game.timeline?.info
             val frames = tInfo?.frames
-            val hasCompleteFrameEvents = !frames.isNullOrEmpty() && frames.all { it.events != null }
+            val hasCompleteFrameEvents = !frames.isNullOrEmpty() &&
+                frames.all { it.events != null } &&
+                reachesMatchEndDuration(frames, game.matchInfo)
             val playerPid = if (tInfo != null) resolveTimelineParticipantId(tInfo, game.player, game.matchInfo.participants) else null
 
             if (tInfo == null || !hasCompleteFrameEvents || playerPid == null) {
@@ -1936,7 +2039,8 @@ class TimelineAnalysisService {
             }
 
             eligibleGames++
-            val hasCompleteFrameEvents = frames.all { it.events != null }
+            val hasCompleteFrameEvents = frames.all { it.events != null } &&
+                reachesMatchEndDuration(frames, game.matchInfo)
             if (hasCompleteFrameEvents) {
                 eligibleGamesWithCompleteEvents++
             }
@@ -2195,7 +2299,12 @@ class TimelineAnalysisService {
             val tInfo = game.timeline?.info
             val frames = tInfo?.frames
             val playerPid = if (tInfo != null) resolveTimelineParticipantId(tInfo, game.player, game.matchInfo.participants) else null
-            if (tInfo != null && !frames.isNullOrEmpty() && frames.all { it.events != null } && playerPid != null) {
+            if (tInfo != null &&
+                !frames.isNullOrEmpty() &&
+                frames.all { it.events != null } &&
+                reachesMatchEndDuration(frames, game.matchInfo) &&
+                playerPid != null
+            ) {
                 timelineGames++
                 val involvedEvents = frames
                     .flatMap { it.events ?: emptyList() }

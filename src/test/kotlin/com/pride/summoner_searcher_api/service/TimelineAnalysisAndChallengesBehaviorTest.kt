@@ -115,7 +115,15 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
 
         When("TimelineAnalysisService analyzes a timeline containing KILL, DEATH, ASSIST, PLATE, OBJECTIVE, and WARD events (#17)") {
             Then("gold chart points keep combat/objective events without ward clutter, while eventTimelines and aggregateSummary record assistants and ward time buckets") {
-                val matchDto = mapper.readValue(rawJson, MatchDto::class.java)
+                val baseMatchDto = mapper.readValue(rawJson, MatchDto::class.java)
+                val matchDto = baseMatchDto.copy(
+                    info = baseMatchDto.info!!.copy(
+                        gameDuration = 780L,
+                        participants = baseMatchDto.info!!.participants.map { p ->
+                            if (p.puuid == "puuid-1") p.copy(kills = 2, deaths = 1, assists = 0, wardsPlaced = 2) else p
+                        }
+                    )
+                )
                 val timelineJson = """
                     {
                       "metadata": {
@@ -214,7 +222,22 @@ class TimelineAnalysisAndChallengesBehaviorTest : BehaviorSpec({
                       }
                     }
                 """.trimIndent()
-                val timelineDto = mapper.readValue(timelineJson, MatchTimelineDto::class.java)
+                val parsedSingleFrameTl = mapper.readValue(timelineJson, MatchTimelineDto::class.java)
+                val minute5Frame = parsedSingleFrameTl.info!!.frames!!.single()
+                val fullFrames = (0..13).map { minute ->
+                    if (minute == 5) {
+                        minute5Frame
+                    } else {
+                        com.pride.summoner_searcher_api.dto.TimelineFrameDto(
+                            timestamp = minute * 60_000L,
+                            participantFrames = emptyMap(),
+                            events = emptyList()
+                        )
+                    }
+                }
+                val timelineDto = parsedSingleFrameTl.copy(
+                    info = parsedSingleFrameTl.info!!.copy(frames = fullFrames)
+                )
 
                 val analysis = timelineService.analyze(
                     listOf(Triple("EUW1_7000000001", timelineDto, matchDto)),
