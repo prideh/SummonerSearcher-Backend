@@ -1031,7 +1031,11 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 val matchWithMissingChamp = baseMatch.copy(
                     info = baseMatch.info!!.copy(
                         participants = baseMatch.info!!.participants.map { p ->
-                            if (p.participantId == 2) p.copy(championName = null) else p
+                            when (p.participantId) {
+                                2 -> p.copy(championName = null)
+                                3 -> p.copy(deaths = 0)
+                                else -> p
+                            }
                         }
                     )
                 )
@@ -1357,6 +1361,200 @@ class Workstream4QuestsAndCacheBehaviorTest : BehaviorSpec({
                 mixedPosAnalysis.aggregateSummary.deathsTotal shouldBe 3
                 mixedPosAnalysis.deathPositions shouldBe listOf(HeatmapPoint(x = 12000, y = 12000, matchId = "EUW1_MIXED_POS", minute = 7))
                 mixedPosAnalysis.aggregateSummary.mostDangerousZone shouldBe "Red Side Jungle"
+            }
+        }
+
+        When("analyzing timelines where only a subset of frames carry events arrays, mixed batches with malformed/skipped games, or truncated timelines missing MatchDto deaths") {
+            Then("never falsely promises complete game or sample coverage: missing arrays stay unknown (null / Not available) and malformed/skipped entries block whole-sample claims") {
+                val zeroDeathQuestMatch = buildMatchDto("EUW1_COMPLETE_ZERO") { pid ->
+                    when (pid) {
+                        3 -> 1206
+                        8 -> 1206
+                        else -> 1208
+                    }
+                }.let { m ->
+                    m.copy(
+                        info = m.info!!.copy(
+                            participants = m.info!!.participants.map { p ->
+                                if (p.participantId == 3) p.copy(deaths = 0, totalTimeSpentDead = 0) else p
+                            },
+                            teams = listOf(
+                                TeamDto(
+                                    teamId = 100,
+                                    win = true,
+                                    objectives = TeamObjectivesDto(dragon = ObjectiveStatsDto(first = true, kills = 2))
+                                )
+                            )
+                        )
+                    )
+                }
+
+                // 1. Single game with 2 frames where frame 0 has an events array (starter destroy + high unspent gold)
+                //    and frame 1 has events = null (missing array) -> NOT full game coverage!
+                val tlPartialMissingEvents = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata("EUW1_PARTIAL_EVENTS", null),
+                    info = MatchTimelineInfo(
+                        frameInterval = 60_000L,
+                        frames = listOf(
+                            TimelineFrameDto(
+                                timestamp = 780_000L, // 13:00
+                                participantFrames = mapOf(
+                                    "3" to tlPFrame(participantId = 3, totalGold = 4900, currentGold = 1800),
+                                    "8" to tlPFrame(participantId = 8, totalGold = 4600, currentGold = 500)
+                                ),
+                                events = listOf(
+                                    tlEvent(type = "ITEM_DESTROYED", timestamp = 780_000L, participantId = 3, itemId = 1201),
+                                    tlEvent(type = "ITEM_DESTROYED", timestamp = 810_000L, participantId = 8, itemId = 1201)
+                                )
+                            ),
+                            TimelineFrameDto(
+                                timestamp = 840_000L, // 14:00 - missing events array!
+                                participantFrames = mapOf(
+                                    "3" to tlPFrame(participantId = 3, totalGold = 5300, currentGold = 400),
+                                    "8" to tlPFrame(participantId = 8, totalGold = 5000, currentGold = 400)
+                                ),
+                                events = null
+                            )
+                        ),
+                        participants = listOf(TimelineParticipantDto(3, "puuid-3"), TimelineParticipantDto(8, "puuid-8"))
+                    )
+                )
+
+                val partialZeroDeathAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_PARTIAL_EVENTS", tlPartialMissingEvents, zeroDeathQuestMatch)),
+                    "puuid-3"
+                )
+                partialZeroDeathAnalysis.aggregateSummary.gamesAnalyzed shouldBe 1
+                partialZeroDeathAnalysis.aggregateSummary.mostDangerousZone shouldBe "Not available"
+                partialZeroDeathAnalysis.aggregateSummary.deathsBefore10.shouldBeNull()
+                partialZeroDeathAnalysis.aggregateSummary.assistedDeaths.shouldBeNull()
+                partialZeroDeathAnalysis.aggregateSummary.unassistedDeaths.shouldBeNull()
+                partialZeroDeathAnalysis.aggregateSummary.deathsNearObjectiveWindows.shouldBeNull()
+                partialZeroDeathAnalysis.aggregateSummary.wardsByTimeBucket.shouldBeNull()
+
+                // Completed Role Quest on partial event arrays keeps questCompleted=true (from MatchDto) but exact timestamp MUST be null!
+                val partialQt = partialZeroDeathAnalysis.roleQuestTimings.first()
+                partialQt.playerQuestCompleted shouldBe true
+                partialQt.playerCompletionMinute.shouldBeNull()
+                partialQt.playerCompletionTimestampMs.shouldBeNull()
+                partialQt.completionDeltaSeconds.shouldBeNull()
+                partialQt.playerQuestStatusLabel shouldBe "Mid Lane Quest Reward completed (exact time unavailable)"
+                partialZeroDeathAnalysis.aggregateSummary.roleQuestCompletedGames.shouldBeNull()
+                partialZeroDeathAnalysis.aggregateSummary.avgRoleQuestCompletionMinute.shouldBeNull()
+                partialZeroDeathAnalysis.aggregateSummary.avgRoleQuestDeltaSeconds.shouldBeNull()
+
+                // ImprovementStats event-derived counts also stay null (never 0) when any frame events array is missing
+                val partialImp = partialZeroDeathAnalysis.improvementStats.shouldNotBeNull()
+                partialImp.deathCost.perMatch.first().hasTimeline shouldBe false
+                partialImp.deathCost.perMatch.first().recordedDeathsCount.shouldBeNull()
+                partialImp.deathCost.bountyOnPlayerDeaths.totalRecordedDeaths.shouldBeNull()
+                partialImp.deathCost.bountyOnPlayerDeaths.totalCombinedBountyGold.shouldBeNull()
+                partialImp.unspentGold.highBalanceSampleCount shouldBe 1
+                partialImp.unspentGold.highBalanceBeforePurchaseSampleCount.shouldBeNull()
+                partialImp.teamObjectives.dragon.timelineEligibleGames shouldBe 0
+                partialImp.teamObjectives.dragon.timelinePersonalInvolvements.shouldBeNull()
+
+                // Even if a partial frame has a positioned death, missing events on another frame blocks claiming a whole-game quadrant
+                val matchWithOneDeath = zeroDeathQuestMatch.copy(
+                    info = zeroDeathQuestMatch.info!!.copy(
+                        participants = zeroDeathQuestMatch.info!!.participants.map { p ->
+                            if (p.participantId == 3) p.copy(deaths = 1) else p
+                        }
+                    )
+                )
+                val tlPartialWithPositionedDeath = tlPartialMissingEvents.copy(
+                    info = tlPartialMissingEvents.info!!.copy(
+                        frames = listOf(
+                            tlPartialMissingEvents.info!!.frames!![0].copy(
+                                events = listOf(
+                                    tlEvent(
+                                        type = "CHAMPION_KILL",
+                                        timestamp = 420_000L,
+                                        killerId = 8,
+                                        victimId = 3,
+                                        position = TimelinePositionDto(12000, 12000)
+                                    )
+                                )
+                            ),
+                            tlPartialMissingEvents.info!!.frames!![1] // events = null
+                        )
+                    )
+                )
+                val partialDeathAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_PARTIAL_DEATH", tlPartialWithPositionedDeath, matchWithOneDeath)),
+                    "puuid-3"
+                )
+                partialDeathAnalysis.aggregateSummary.deathsTotal shouldBe 1
+                partialDeathAnalysis.aggregateSummary.mostDangerousZone shouldBe "Not available"
+                partialDeathAnalysis.aggregateSummary.deathsBefore10.shouldBeNull()
+
+                // 2. Multi-game batch: 1 completely valid 0-death quest-completed game + 1 malformed/skipped game ->
+                //    gamesAnalyzed == 1, and whole-sample zone/breakdowns/quest averages stay unknown (Not available / null)
+                val tlCompleteValid = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata("EUW1_COMPLETE_ZERO", null),
+                    info = MatchTimelineInfo(
+                        frameInterval = 60_000L,
+                        frames = listOf(
+                            TimelineFrameDto(
+                                timestamp = 780_000L,
+                                participantFrames = mapOf(
+                                    "3" to tlPFrame(participantId = 3, totalGold = 4900),
+                                    "8" to tlPFrame(participantId = 8, totalGold = 4600)
+                                ),
+                                events = listOf(
+                                    tlEvent(type = "ITEM_DESTROYED", timestamp = 780_000L, participantId = 3, itemId = 1201),
+                                    tlEvent(type = "ITEM_DESTROYED", timestamp = 810_000L, participantId = 8, itemId = 1201)
+                                )
+                            )
+                        ),
+                        participants = listOf(TimelineParticipantDto(3, "puuid-3"), TimelineParticipantDto(8, "puuid-8"))
+                    )
+                )
+                val tlMalformedMissingInfo = MatchTimelineDto(
+                    metadata = MatchTimelineMetadata("EUW1_MALFORMED_2", null),
+                    info = null
+                )
+
+                val mixedValidAndMalformed = timelineAnalysisService.analyze(
+                    listOf(
+                        Triple("EUW1_COMPLETE_ZERO", tlCompleteValid, zeroDeathQuestMatch),
+                        Triple("EUW1_MALFORMED_2", tlMalformedMissingInfo, zeroDeathQuestMatch)
+                    ),
+                    "puuid-3"
+                )
+                mixedValidAndMalformed.aggregateSummary.gamesAnalyzed shouldBe 1
+                mixedValidAndMalformed.aggregateSummary.mostDangerousZone shouldBe "Not available"
+                mixedValidAndMalformed.aggregateSummary.deathsBefore10.shouldBeNull()
+                mixedValidAndMalformed.aggregateSummary.wardsByTimeBucket.shouldBeNull()
+                mixedValidAndMalformed.aggregateSummary.roleQuestCompletedGames.shouldBeNull()
+                mixedValidAndMalformed.aggregateSummary.avgRoleQuestCompletionMinute.shouldBeNull()
+                mixedValidAndMalformed.aggregateSummary.avgRoleQuestDeltaSeconds.shouldBeNull()
+
+                // 3. Multi-game batch: 1 completely valid game + 1 game with partial missing events array ->
+                //    gamesAnalyzed == 2, whole-sample zone/breakdowns/quest averages stay unknown
+                val mixedValidAndPartial = timelineAnalysisService.analyze(
+                    listOf(
+                        Triple("EUW1_COMPLETE_ZERO", tlCompleteValid, zeroDeathQuestMatch),
+                        Triple("EUW1_PARTIAL_EVENTS", tlPartialMissingEvents, zeroDeathQuestMatch)
+                    ),
+                    "puuid-3"
+                )
+                mixedValidAndPartial.aggregateSummary.gamesAnalyzed shouldBe 2
+                mixedValidAndPartial.aggregateSummary.mostDangerousZone shouldBe "Not available"
+                mixedValidAndPartial.aggregateSummary.deathsBefore10.shouldBeNull()
+                mixedValidAndPartial.aggregateSummary.wardsByTimeBucket.shouldBeNull()
+                mixedValidAndPartial.aggregateSummary.roleQuestCompletedGames.shouldBeNull()
+                mixedValidAndPartial.aggregateSummary.avgRoleQuestCompletionMinute.shouldBeNull()
+
+                // 4. Truncated timeline where all present frames have non-null empty events (0 timeline deaths),
+                //    yet MatchDto proves player died (deaths = 2) -> NEVER claims "No deaths recorded"!
+                val matchTwoDeaths = buildMatchDto("EUW1_TRUNCATED_TL") // buildTenParticipants defaults deaths = 2
+                val truncatedAnalysis = timelineAnalysisService.analyze(
+                    listOf(Triple("EUW1_TRUNCATED_TL", tlCompleteValid, matchTwoDeaths)),
+                    "puuid-3"
+                )
+                truncatedAnalysis.aggregateSummary.deathsTotal shouldBe 0
+                truncatedAnalysis.aggregateSummary.mostDangerousZone shouldBe "Not available"
             }
         }
     }
