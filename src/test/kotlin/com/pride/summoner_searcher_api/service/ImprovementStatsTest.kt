@@ -248,6 +248,20 @@ class ImprovementStatsTest : DescribeSpec({
                     )
                 )
             )
+            fun withContiguousEmptyMinuteFrames(
+                durationMinutes: Int,
+                explicitFrames: List<TimelineFrameDto>
+            ): List<TimelineFrameDto> {
+                val explicitByMinute = explicitFrames.associateBy { ((it.timestamp ?: 0L) / 60_000L).toInt() }
+                return (0..durationMinutes).map { minute ->
+                    explicitByMinute[minute] ?: TimelineFrameDto(
+                        timestamp = minute * 60_000L,
+                        participantFrames = emptyMap(),
+                        events = emptyList()
+                    )
+                }
+            }
+
             val timeline1 = MatchTimelineDto(
                 metadata = MatchTimelineMetadata("M1", listOf(playerPuuid, "ally-jg", "opp-mid-1")),
                 info = MatchTimelineInfo(
@@ -257,56 +271,59 @@ class ImprovementStatsTest : DescribeSpec({
                         TimelineParticipantDto(2, "ally-jg"),
                         TimelineParticipantDto(6, "opp-mid-1")
                     ),
-                    frames = listOf(
-                        buildFrame(
-                            minute = 0,
-                            playerFrame = pFrame(1, totalGold = 500, xp = 0, currentGold = 500, laneCs = 0, jungleCs = 0),
-                            opponentFrame = pFrame(6, totalGold = 500, xp = 0, currentGold = 500, laneCs = 0, jungleCs = 0)
-                        ),
-                        buildFrame(
-                            minute = 8,
-                            playerFrame = pFrame(1, totalGold = 2800, xp = 3400, currentGold = 700, laneCs = 62, jungleCs = 0),
-                            opponentFrame = pFrame(6, totalGold = 2700, xp = 3300, currentGold = 600, laneCs = 60, jungleCs = 0),
-                            events = listOf(
-                                event("CHAMPION_KILL", 480_000L, killerId = 6, victimId = 1, bounty = 300, shutdownBounty = 150)
+                    frames = withContiguousEmptyMinuteFrames(
+                        durationMinutes = 30,
+                        explicitFrames = listOf(
+                            buildFrame(
+                                minute = 0,
+                                playerFrame = pFrame(1, totalGold = 500, xp = 0, currentGold = 500, laneCs = 0, jungleCs = 0),
+                                opponentFrame = pFrame(6, totalGold = 500, xp = 0, currentGold = 500, laneCs = 0, jungleCs = 0)
+                            ),
+                            buildFrame(
+                                minute = 8,
+                                playerFrame = pFrame(1, totalGold = 2800, xp = 3400, currentGold = 700, laneCs = 62, jungleCs = 0),
+                                opponentFrame = pFrame(6, totalGold = 2700, xp = 3300, currentGold = 600, laneCs = 60, jungleCs = 0),
+                                events = listOf(
+                                    event("CHAMPION_KILL", 480_000L, killerId = 6, victimId = 1, bounty = 300, shutdownBounty = 150)
+                                )
+                            ),
+                            buildFrame(
+                                minute = 10,
+                                playerFrame = pFrame(1, totalGold = 3800, xp = 4600, currentGold = 1600, laneCs = 80, jungleCs = 4),
+                                opponentFrame = pFrame(6, totalGold = 3350, xp = 4280, currentGold = 400, laneCs = 72, jungleCs = 0),
+                                events = listOf(
+                                    event("ITEM_PURCHASED", 630_000L, participantId = 1, itemId = 3157)
+                                )
+                            ),
+                            buildFrame(
+                                minute = 15,
+                                playerFrame = pFrame(1, totalGold = 5800, xp = 7000, currentGold = 800, laneCs = 125, jungleCs = 8),
+                                opponentFrame = pFrame(6, totalGold = 5200, xp = 6600, currentGold = 500, laneCs = 115, jungleCs = 4),
+                                events = listOf(
+                                    // Ally jungler (pid=2) solos dragon at 14:30 (870,000ms) - player NOT in assists
+                                    event("ELITE_MONSTER_KILL", 870_000L, killerId = 2, assists = emptyList(), killerTeamId = 100, monsterType = "DRAGON", monsterSubType = "FIRE_DRAGON"),
+                                    // Enemy mid (pid=6) destroys Blue mid outer tower (teamId=100) at 16:00 (960,000ms)
+                                    event("BUILDING_KILL", 960_000L, killerId = 6, teamId = 100, buildingType = "TOWER_BUILDING", laneType = "MID_LANE", towerType = "OUTER_TURRET")
+                                )
+                            ),
+                            buildFrame(
+                                minute = 20,
+                                playerFrame = pFrame(1, totalGold = 8200, xp = 9800, currentGold = 900, laneCs = 170, jungleCs = 12),
+                                opponentFrame = pFrame(6, totalGold = 7300, xp = 9200, currentGold = 600, laneCs = 155, jungleCs = 4)
+                            ),
+                            buildFrame(
+                                minute = 22,
+                                playerFrame = pFrame(1, totalGold = 9000, xp = 11000, currentGold = 1100, laneCs = 185, jungleCs = 16),
+                                opponentFrame = pFrame(6, totalGold = 8400, xp = 10600, currentGold = 700, laneCs = 170, jungleCs = 8),
+                                events = listOf(
+                                    event("CHAMPION_KILL", 1_320_000L, killerId = 6, victimId = 1, bounty = 300, shutdownBounty = 0)
+                                )
+                            ),
+                            buildFrame(
+                                minute = 30,
+                                playerFrame = pFrame(1, totalGold = 13500, xp = 15500, currentGold = 1500, laneCs = 250, jungleCs = 24),
+                                opponentFrame = pFrame(6, totalGold = 11800, xp = 14200, currentGold = 400, laneCs = 220, jungleCs = 12)
                             )
-                        ),
-                        buildFrame(
-                            minute = 10,
-                            playerFrame = pFrame(1, totalGold = 3800, xp = 4600, currentGold = 1600, laneCs = 80, jungleCs = 4),
-                            opponentFrame = pFrame(6, totalGold = 3350, xp = 4280, currentGold = 400, laneCs = 72, jungleCs = 0),
-                            events = listOf(
-                                event("ITEM_PURCHASED", 630_000L, participantId = 1, itemId = 3157)
-                            )
-                        ),
-                        buildFrame(
-                            minute = 15,
-                            playerFrame = pFrame(1, totalGold = 5800, xp = 7000, currentGold = 800, laneCs = 125, jungleCs = 8),
-                            opponentFrame = pFrame(6, totalGold = 5200, xp = 6600, currentGold = 500, laneCs = 115, jungleCs = 4),
-                            events = listOf(
-                                // Ally jungler (pid=2) solos dragon at 14:30 (870,000ms) - player NOT in assists
-                                event("ELITE_MONSTER_KILL", 870_000L, killerId = 2, assists = emptyList(), killerTeamId = 100, monsterType = "DRAGON", monsterSubType = "FIRE_DRAGON"),
-                                // Enemy mid (pid=6) destroys Blue mid outer tower (teamId=100) at 16:00 (960,000ms)
-                                event("BUILDING_KILL", 960_000L, killerId = 6, teamId = 100, buildingType = "TOWER_BUILDING", laneType = "MID_LANE", towerType = "OUTER_TURRET")
-                            )
-                        ),
-                        buildFrame(
-                            minute = 20,
-                            playerFrame = pFrame(1, totalGold = 8200, xp = 9800, currentGold = 900, laneCs = 170, jungleCs = 12),
-                            opponentFrame = pFrame(6, totalGold = 7300, xp = 9200, currentGold = 600, laneCs = 155, jungleCs = 4)
-                        ),
-                        buildFrame(
-                            minute = 22,
-                            playerFrame = pFrame(1, totalGold = 9000, xp = 11000, currentGold = 1100, laneCs = 185, jungleCs = 16),
-                            opponentFrame = pFrame(6, totalGold = 8400, xp = 10600, currentGold = 700, laneCs = 170, jungleCs = 8),
-                            events = listOf(
-                                event("CHAMPION_KILL", 1_320_000L, killerId = 6, victimId = 1, bounty = 300, shutdownBounty = 0)
-                            )
-                        ),
-                        buildFrame(
-                            minute = 30,
-                            playerFrame = pFrame(1, totalGold = 13500, xp = 15500, currentGold = 1500, laneCs = 250, jungleCs = 24),
-                            opponentFrame = pFrame(6, totalGold = 11800, xp = 14200, currentGold = 400, laneCs = 220, jungleCs = 12)
                         )
                     )
                 )
@@ -364,20 +381,23 @@ class ImprovementStatsTest : DescribeSpec({
                         TimelineParticipantDto(1, playerPuuid),
                         TimelineParticipantDto(6, "opp-mid-2")
                     ),
-                    frames = listOf(
-                        buildFrame(
-                            minute = 10,
-                            playerFrame = pFrame(1, totalGold = 3100, xp = 4100, currentGold = 600, laneCs = 70, jungleCs = 0),
-                            opponentFrame = pFrame(6, totalGold = 3400, xp = 4300, currentGold = 800, laneCs = 82, jungleCs = 0),
-                            events = listOf(
-                                // Death with null bounty & null shutdownBounty
-                                event("CHAMPION_KILL", 540_000L, killerId = 6, victimId = 1, bounty = null, shutdownBounty = null)
+                    frames = withContiguousEmptyMinuteFrames(
+                        durationMinutes = 15,
+                        explicitFrames = listOf(
+                            buildFrame(
+                                minute = 10,
+                                playerFrame = pFrame(1, totalGold = 3100, xp = 4100, currentGold = 600, laneCs = 70, jungleCs = 0),
+                                opponentFrame = pFrame(6, totalGold = 3400, xp = 4300, currentGold = 800, laneCs = 82, jungleCs = 0),
+                                events = listOf(
+                                    // Death with null bounty & null shutdownBounty
+                                    event("CHAMPION_KILL", 540_000L, killerId = 6, victimId = 1, bounty = null, shutdownBounty = null)
+                                )
+                            ),
+                            buildFrame(
+                                minute = 15,
+                                playerFrame = pFrame(1, totalGold = 4500, xp = 6000, currentGold = 400, laneCs = 105, jungleCs = 0),
+                                opponentFrame = pFrame(6, totalGold = 5300, xp = 6700, currentGold = 900, laneCs = 128, jungleCs = 4)
                             )
-                        ),
-                        buildFrame(
-                            minute = 15,
-                            playerFrame = pFrame(1, totalGold = 4500, xp = 6000, currentGold = 400, laneCs = 105, jungleCs = 0),
-                            opponentFrame = pFrame(6, totalGold = 5300, xp = 6700, currentGold = 900, laneCs = 128, jungleCs = 4)
                         )
                     )
                 )
@@ -414,16 +434,19 @@ class ImprovementStatsTest : DescribeSpec({
                         TimelineParticipantDto(1, playerPuuid),
                         TimelineParticipantDto(6, "opp-jg-3")
                     ),
-                    frames = listOf(
-                        buildFrame(
-                            minute = 10,
-                            playerFrame = pFrame(1, totalGold = 3900, xp = 4200, currentGold = 1000, laneCs = 10, jungleCs = 60),
-                            opponentFrame = pFrame(6, totalGold = 3400, xp = 3950, currentGold = 500, laneCs = 8, jungleCs = 52)
-                        ),
-                        buildFrame(
-                            minute = 20,
-                            playerFrame = pFrame(1, totalGold = 6800, xp = 8100, currentGold = 300, laneCs = 25, jungleCs = 130),
-                            opponentFrame = pFrame(6, totalGold = 7400, xp = 8400, currentGold = 900, laneCs = 30, jungleCs = 148)
+                    frames = withContiguousEmptyMinuteFrames(
+                        durationMinutes = 20,
+                        explicitFrames = listOf(
+                            buildFrame(
+                                minute = 10,
+                                playerFrame = pFrame(1, totalGold = 3900, xp = 4200, currentGold = 1000, laneCs = 10, jungleCs = 60),
+                                opponentFrame = pFrame(6, totalGold = 3400, xp = 3950, currentGold = 500, laneCs = 8, jungleCs = 52)
+                            ),
+                            buildFrame(
+                                minute = 20,
+                                playerFrame = pFrame(1, totalGold = 6800, xp = 8100, currentGold = 300, laneCs = 25, jungleCs = 130),
+                                opponentFrame = pFrame(6, totalGold = 7400, xp = 8400, currentGold = 900, laneCs = 30, jungleCs = 148)
+                            )
                         )
                     )
                 )
