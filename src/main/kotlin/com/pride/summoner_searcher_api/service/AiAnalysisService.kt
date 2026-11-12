@@ -1038,14 +1038,60 @@ class AiAnalysisService(
             return cleaned.takeIf { it.isNotEmpty() }
         }
 
+        private fun suggestionDedupKey(item: String): String =
+            item.trim()
+                .trimEnd('?', '.', '!')
+                .lowercase()
+                .replace(Regex("""\s+"""), " ")
+
+        private fun extractFirstBalancedJsonArray(text: String): Pair<String, String>? {
+            val cleanedPrefix = text.replaceFirst(Regex("""^\s*```(?:json)?\s*""", RegexOption.IGNORE_CASE), "")
+            val startIdx = cleanedPrefix.indexOf('[')
+            if (startIdx < 0) return null
+            if (cleanedPrefix.substring(0, startIdx).isNotBlank()) return null
+
+            var inString = false
+            var escaped = false
+            var depth = 0
+            for (i in startIdx until cleanedPrefix.length) {
+                val ch = cleanedPrefix[i]
+                if (escaped) {
+                    escaped = false
+                    continue
+                }
+                if (inString) {
+                    if (ch == '\\') {
+                        escaped = true
+                    } else if (ch == '"') {
+                        inString = false
+                    }
+                    continue
+                }
+                when (ch) {
+                    '"' -> inString = true
+                    '[' -> depth++
+                    ']' -> {
+                        depth--
+                        if (depth == 0) {
+                            val arraySlice = cleanedPrefix.substring(startIdx, i + 1)
+                            val rawTail = cleanedPrefix.substring(i + 1)
+                                .replaceFirst(Regex("""^\s*```\s*"""), "")
+                            return arraySlice to rawTail
+                        }
+                    }
+                }
+            }
+            return null
+        }
+
         private fun parseSuggestionsPayload(
             afterDelimiter: String,
             context: Map<String, Any?>
         ): Pair<List<String>, String> {
-            val jsonArrayMatch = Regex("""^\s*(\[[\s\S]*])""").find(afterDelimiter)
-            if (jsonArrayMatch != null) {
-                val rawJsonArray = jsonArrayMatch.groupValues[1].replace(Regex(""",\s*]"""), "]")
-                val trailing = afterDelimiter.substring(jsonArrayMatch.range.last + 1)
+            val balanced = extractFirstBalancedJsonArray(afterDelimiter)
+            if (balanced != null) {
+                val rawJsonArray = balanced.first.replace(Regex(""",\s*]"""), "]")
+                val trailing = balanced.second
                 val items = try {
                     val parsed = SHARED_OBJECT_MAPPER.readValue(rawJsonArray, List::class.java)
                     parsed.mapNotNull { item -> item?.toString()?.let { cleanSuggestionItem(it, context) } }
@@ -1194,19 +1240,23 @@ class AiAnalysisService(
             candidates.add("Review my recent match performance")
             candidates.add("How can I reduce my early deaths?")
             candidates.add("Check my item choices across recent matches")
+            candidates.add("How do my Blue and Red side win rates compare?")
+            candidates.add("What two habits should I focus on next game?")
 
-            val unique = LinkedHashSet<String>()
+            val unique = mutableListOf<String>()
             for (raw in candidates) {
                 val cleaned = cleanSuggestionItem(raw, context) ?: continue
-                if (!containsInternalSchemaLeak(cleaned) &&
+                val key = suggestionDedupKey(cleaned)
+                if (key.isNotEmpty() &&
+                    !containsInternalSchemaLeak(cleaned) &&
                     !containsEvidenceBoundaryViolation(cleaned) &&
-                    unique.none { it.equals(cleaned, ignoreCase = true) }
+                    unique.none { suggestionDedupKey(it) == key }
                 ) {
                     unique.add(cleaned)
                 }
                 if (unique.size >= 3) break
             }
-            return unique.toList()
+            return unique
         }
 
         /**
@@ -1259,9 +1309,10 @@ class AiAnalysisService(
         }
 
         /**
-         * Ensures every accepted coaching, advice, roast, or refusal response ends with a valid 3-item
-         * `---SUGGESTIONS--- [...]` JSON array, preserving clean model-generated suggestions when present
-         * and deterministically synthesizing context-grounded plain-League suggestions when omitted or truncated.
+         * Ensures every accepted coaching, advice, roast, or refusal response ends with an exact 3-item
+         * distinct clean `---SUGGESTIONS--- [...]` valid JSON array tail (stripping any 4th+ items,
+         * case/punctuation duplicates, or trailing text after the JSON array), while preserving valid
+         * 3-item model suggestions unchanged and synthesizing context-grounded fallbacks when needed.
          */
         fun ensureSuggestionsBlock(
             rawText: String,
@@ -1275,39 +1326,52 @@ class AiAnalysisService(
 
             val delimiterMatch = SUGGESTIONS_DELIMITER_REGEX.find(sanitized)
             val body = (if (delimiterMatch != null) sanitized.substring(0, delimiterMatch.range.first) else sanitized).trimEnd()
-            val (parsedItems, trailing) = if (delimiterMatch != null) {
+            val (parsedItems, _) = if (delimiterMatch != null) {
                 parseSuggestionsPayload(sanitized.substring(delimiterMatch.range.last + 1), context)
             } else {
                 emptyList<String>() to ""
             }
-            val validExisting = parsedItems.filter { item ->
-                item.isNotBlank() &&
+
+            val merged = mutableListOf<String>()
+            for (item in parsedItems) {
+                val key = suggestionDedupKey(item)
+                if (key.isNotBlank() &&
                     !containsInternalSchemaLeak(item) &&
-                    !containsEvidenceBoundaryViolation(item)
-            }
-
-            if (delimiterMatch != null &&
-                validExisting.size >= 3 &&
-                validExisting.size == parsedItems.size &&
-                sanitized.contains("\n---SUGGESTIONS--- [")
-            ) {
-                return sanitized
-            }
-
-            val merged = LinkedHashSet<String>()
-            validExisting.forEach { merged.add(it) }
-            for (fallback in buildFallbackSuggestions(context, userMessage, category)) {
-                if (merged.size >= 3) break
-                if (merged.none { it.equals(fallback, ignoreCase = true) }) {
-                    merged.add(fallback)
+                    !containsEvidenceBoundaryViolation(item) &&
+                    merged.none { suggestionDedupKey(it) == key }
+                ) {
+                    merged.add(item)
+                    if (merged.size >= 3) break
                 }
             }
+
+            if (merged.size < 3) {
+                val fallbackPool = buildFallbackSuggestions(context, userMessage, category) + listOf(
+                    "Review my recent match performance",
+                    "How can I reduce my early deaths?",
+                    "Check my item choices across recent matches",
+                    "How do my Blue and Red side win rates compare?",
+                    "What two habits should I focus on next game?"
+                )
+                for (rawFallback in fallbackPool) {
+                    if (merged.size >= 3) break
+                    val cleaned = cleanSuggestionItem(rawFallback, context) ?: continue
+                    val key = suggestionDedupKey(cleaned)
+                    if (key.isNotEmpty() &&
+                        !containsInternalSchemaLeak(cleaned) &&
+                        !containsEvidenceBoundaryViolation(cleaned) &&
+                        merged.none { suggestionDedupKey(it) == key }
+                    ) {
+                        merged.add(cleaned)
+                    }
+                }
+            }
+
             val json = merged.take(3).joinToString(", ", "[", "]") { SHARED_OBJECT_MAPPER.writeValueAsString(it) }
-            val trailingSanitized = trailing.takeIf { it.isNotBlank() }?.let { " ${it.trim()}" } ?: ""
             return if (body.isNotEmpty()) {
-                "$body\n---SUGGESTIONS--- $json$trailingSanitized"
+                "$body\n---SUGGESTIONS--- $json"
             } else {
-                "---SUGGESTIONS--- $json$trailingSanitized"
+                "---SUGGESTIONS--- $json"
             }
         }
 

@@ -987,6 +987,61 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                     deadlineContext
                 ).collectList().block()!!.joinToString("")
                 streamDeadline shouldBe sanitizedDeadline
+
+                // 4. ensureSuggestionsBlock always normalizes to exact 3 distinct clean items + valid JSON tail (no 4+ items, duplicates, or trailing text)
+                val fourItemsWithTrailing =
+                    "Across your last 5 detailed matches (1W–4L, 20.0% win rate), keep Darius E ready.\n" +
+                        "---SUGGESTIONS--- [\"Compare my Darius and Garen games\", \"When should Darius concede early wave prio?\", \"Check my defensive item choices when behind\", \"Review my vision score in top lane\", \"Analyze my summoner spell usage\"] Extra trailing note [with \"quoted\" bracket text]!"
+                val normalizedFour = AiAnalysisService.ensureSuggestionsBlock(
+                    fourItemsWithTrailing,
+                    angryContext,
+                    angryUserMessage,
+                    "general"
+                )
+                normalizedFour shouldBe
+                    "Across your last 5 detailed matches (1W–4L, 20.0% win rate), keep Darius E ready.\n" +
+                        "---SUGGESTIONS--- [\"Compare my Darius and Garen games\", \"When should Darius concede early wave prio?\", \"Check my defensive item choices when behind\"]"
+                val parsedFourTail = mapper.readValue(
+                    normalizedFour.substringAfter("---SUGGESTIONS---").trim(),
+                    List::class.java
+                )
+                parsedFourTail shouldBe listOf(
+                    "Compare my Darius and Garen games",
+                    "When should Darius concede early wave prio?",
+                    "Check my defensive item choices when behind"
+                )
+                val streamedFour = AiAnalysisService.sanitizePlayerFacingStream(
+                    reactor.core.publisher.Flux.fromIterable(fourItemsWithTrailing.chunked(7)),
+                    angryContext,
+                    ensureSuggestions = true,
+                    userMessage = angryUserMessage,
+                    category = "general"
+                ).collectList().block()!!.joinToString("")
+                streamedFour shouldBe normalizedFour
+
+                // Duplicate items (case/punctuation variants) + trailing text are deduplicated, backfilled to 3 distinct items, and end with clean JSON
+                val duplicateAndTrailing =
+                    "Across your last 5 detailed matches (1W–4L, 20.0% win rate), keep Darius E ready.\n" +
+                        "---SUGGESTIONS--- [\"Compare my Darius and Garen games\", \"compare my darius and garen games?\", \"Compare my Darius and Garen games.\"] Hope that helps!"
+                val normalizedDup = AiAnalysisService.ensureSuggestionsBlock(
+                    duplicateAndTrailing,
+                    angryContext,
+                    angryUserMessage,
+                    "general"
+                )
+                normalizedDup.endsWith("]") shouldBe true
+                normalizedDup shouldNotContain "Hope that helps"
+                val parsedDupTail = mapper.readValue(
+                    normalizedDup.substringAfter("---SUGGESTIONS---").trim(),
+                    List::class.java
+                ).map { it.toString() }
+                parsedDupTail.size shouldBe 3
+                parsedDupTail.first() shouldBe "Compare my Darius and Garen games"
+                parsedDupTail.map { it.trim().trimEnd('?', '.', '!').lowercase() }.distinct().size shouldBe 3
+                parsedDupTail.forEach { item ->
+                    AiAnalysisService.containsInternalSchemaLeak(item) shouldBe false
+                    AiAnalysisService.containsEvidenceBoundaryViolation(item) shouldBe false
+                }
             }
         }
     }
