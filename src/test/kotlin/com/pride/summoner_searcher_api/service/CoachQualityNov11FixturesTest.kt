@@ -635,5 +635,87 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
             }
         }
     }
+
+    Given("Fixture 11 (complete vs incomplete timelineCoverage): Fully collected timelineCoverage objects are not treated as missing or partial") {
+        When("rendering prompts for complete 20/20 timelineCoverage (COMPLETE and ANALYZED) versus partial, stopped, or mismatched-count timelineCoverage") {
+            Then("complete timelineCoverage emits adequate sample wording without uncollected/partial disclaimers, while incomplete status, stopReason, or covered<requested counts still trigger missing-telemetry guidance") {
+                @Suppress("UNCHECKED_CAST")
+                val normalFixture = fixtures.getValue("normal")
+                @Suppress("UNCHECKED_CAST")
+                val normalContext = normalFixture["context"] as Map<String, Any?>
+                val question = normalFixture["userMessage"] as String
+
+                // 1. Frontend-normalized complete coverage (status=COMPLETE, covered=20, requested=20)
+                val completeFrontendContext = normalContext + mapOf(
+                    "timelineCoverage" to mapOf(
+                        "status" to "COMPLETE",
+                        "covered" to 20,
+                        "requested" to 20
+                    )
+                )
+                val completeFrontendPrompt = buildPrompt(completeFrontendContext, question)
+                completeFrontendPrompt shouldContain "Timeline coverage: status=complete, covered=20/20 games"
+                completeFrontendPrompt shouldContain "Sample size is adequate for pattern detection."
+                completeFrontendPrompt shouldNotContain "explain missing, partial, rate-limited, or unanalyzed fields as uncollected"
+                completeFrontendPrompt shouldNotContain "TIMELINE COVERAGE BOUNDARY"
+                (AiAnalysisService.utf8ByteSize(completeFrontendPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+
+                // 2. Complete coverage with status=ANALYZED and missing=0
+                val completeAnalyzedContext = normalContext + mapOf(
+                    "timelineCoverage" to mapOf(
+                        "status" to "ANALYZED",
+                        "covered" to 20,
+                        "requested" to 20,
+                        "missing" to 0
+                    )
+                )
+                val completeAnalyzedPrompt = buildPrompt(completeAnalyzedContext, question)
+                completeAnalyzedPrompt shouldContain "Sample size is adequate for pattern detection."
+                completeAnalyzedPrompt shouldNotContain "explain missing, partial, rate-limited, or unanalyzed fields as uncollected"
+                completeAnalyzedPrompt shouldNotContain "TIMELINE COVERAGE BOUNDARY"
+
+                // 3. Incomplete coverage: status=PARTIAL (12/20, stopReason=RATE_LIMIT_COOLDOWN)
+                val partialCoverageContext = normalContext + mapOf(
+                    "timelineStatus" to "PARTIAL",
+                    "timelineCoverage" to mapOf(
+                        "status" to "PARTIAL",
+                        "covered" to 12,
+                        "requested" to 20,
+                        "missing" to 8,
+                        "stopReason" to "RATE_LIMIT_COOLDOWN"
+                    )
+                )
+                val partialCoveragePrompt = buildPrompt(partialCoverageContext, question)
+                partialCoveragePrompt shouldContain "explain missing, partial, rate-limited, or unanalyzed fields as uncollected—never say playing more games will clarify them."
+                partialCoveragePrompt shouldContain "TIMELINE COVERAGE BOUNDARY"
+
+                // 4. Incomplete coverage: status=COMPLETE but covered < requested (14/20)
+                val mismatchedCountsContext = normalContext + mapOf(
+                    "timelineCoverage" to mapOf(
+                        "status" to "COMPLETE",
+                        "covered" to 14,
+                        "requested" to 20
+                    )
+                )
+                val mismatchedCountsPrompt = buildPrompt(mismatchedCountsContext, question)
+                mismatchedCountsPrompt shouldContain "explain missing, partial, rate-limited, or unanalyzed fields as uncollected—never say playing more games will clarify them."
+                mismatchedCountsPrompt shouldContain "TIMELINE COVERAGE BOUNDARY"
+
+                // 5. Incomplete coverage: active stopReason or zero covered games
+                val stoppedCoverageContext = normalContext + mapOf(
+                    "timelineCoverage" to mapOf(
+                        "status" to "COMPLETE",
+                        "covered" to 0,
+                        "requested" to 20,
+                        "stopReason" to "MEMORY_HEADROOM_STOP"
+                    )
+                )
+                val stoppedCoveragePrompt = buildPrompt(stoppedCoverageContext, question)
+                stoppedCoveragePrompt shouldContain "explain missing, partial, rate-limited, or unanalyzed fields as uncollected—never say playing more games will clarify them."
+                stoppedCoveragePrompt shouldContain "TIMELINE COVERAGE BOUNDARY"
+            }
+        }
+    }
 })
+
 

@@ -2368,7 +2368,7 @@ class AiAnalysisService(
             lines.add("  - Causality boundary: Timeline diffs, death areas, and objective-window death counts show when and where events happened only—never cite them as proven causes of bad engages, greed, or throws.")
         }
 
-        if (coverage != null || rawStatus == "PARTIAL" || rawStatus == "BLOCKED") {
+        if (isIncompleteTimelineCoverage(coverage) || rawStatus == "PARTIAL" || rawStatus == "BLOCKED") {
             lines.add(
                 "\n**⏱️ TIMELINE COVERAGE BOUNDARY:** " +
                     "When match timeline analysis is partial, cite the exact covered/requested game denominator from Timeline coverage in plain player words (for example, \"minute-by-minute timeline data is available for X of your last Y games\"), anchor minute-by-minute claims strictly to those covered games without extrapolating to missing games, and when match timeline analysis is blocked or covered games is 0, state plainly that minute-by-minute timeline data is temporarily unavailable and rely only on match summary stats. Never echo internal schema keys, status codes, or backticks."
@@ -2554,11 +2554,32 @@ class AiAnalysisService(
         return if (lines.size > 1) lines.joinToString("\n") else ""
     }
 
+    private fun parseCoverageInt(value: Any?): Int? = when (value) {
+        is Number -> value.toInt()
+        is String -> value.trim().toIntOrNull()
+        else -> null
+    }
+
+    private fun isIncompleteTimelineCoverage(coverage: Map<*, *>?): Boolean {
+        if (coverage == null) return false
+        val status = coverage["status"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.uppercase()
+        if (status == null || (status != "COMPLETE" && status != "ANALYZED")) return true
+        val stopReason = coverage["stopReason"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.uppercase()
+        if (stopReason != null && stopReason != "NONE" && stopReason != "NULL") return true
+        val missing = parseCoverageInt(coverage["missing"] ?: coverage["missingCount"] ?: coverage["missingMatches"])
+        if (missing != null && missing > 0) return true
+        val covered = parseCoverageInt(coverage["covered"] ?: coverage["coveredCount"] ?: coverage["coveredMatches"])
+        val requested = parseCoverageInt(coverage["requested"] ?: coverage["requestedCount"] ?: coverage["requestedMatches"])
+        if (covered == null || requested == null) return true
+        return covered <= 0 || requested <= 0 || covered < requested
+    }
+
     @Suppress("UNCHECKED_CAST")
     private fun hasPartialOrUncollectedTelemetry(context: Map<String, Any>): Boolean {
         val rawStatus = (context["timelineStatus"]?.toString()?.trim()?.takeIf { it.isNotBlank() }
             ?: if (context["timelineInsights"] != null) "ANALYZED" else "NOT_ANALYZED").uppercase()
-        if (rawStatus != "ANALYZED" || context["timelineCoverage"] != null) return true
+        val coverage = context["timelineCoverage"] as? Map<*, *>
+        if (rawStatus != "ANALYZED" || isIncompleteTimelineCoverage(coverage)) return true
         if (context.containsKey("savedHistory") && context["savedHistory"] == null) return true
         val imp = context["improvementStats"] as? Map<String, Any?> ?: return false
         if (imp["hasTimelineAnalysis"] == false) return true
