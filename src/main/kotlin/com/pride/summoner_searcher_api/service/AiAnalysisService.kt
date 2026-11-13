@@ -2317,18 +2317,24 @@ class AiAnalysisService(
             RegexOption.IGNORE_CASE
         )
 
-        private val LEAGUE_DOMAIN_SIGNAL_REGEX = Regex(
-            """\b(?:league(?:\s+of\s+legends)?|lol|summoner(?:'?s\s+rift)?|solo\s*queue|solo/?duo|flex\s+queue|aram|ranked|elo|mmr|lp|kda|cs\s*@\s*\d+|cs\s*/\s*m(?:in)?|cspm|lane\s+cs|creep\s+score|minions?|last[- ]hit\w*|turrets?|inhibitors?|nexus|baron|nashor|voidgrubs?|grubs?|rift\s+herald|dragons?|drakes?|elder\s+dragon|scuttle|jungl(?:e|er|ing)|ganks?|ganking|roam(?:s|ing)?|matchups?|laning|(?:top|mid|bot|bottom)\s*[- ]?lan(?:e|er)|adc|marksman|champion(?:s|\s+pool)?|summoner\s+spells?|flash|teleport|ignite|exhaust|smite|cleanse|heal|barrier|ghost|runes?|keystone|conqueror|lethal\s+tempo|fleet\s+footwork|grasp|electrocute|arcane\s+comet|phase\s+rush|press\s+the\s+attack|first\s+strike|dark\s+harvest|aftershock|guardian|aery|ward(?:s|ed|ing)?|vision\s+score|control\s+wards?|trinkets?|sweeper|oracle\s+lens|farsight|wave(?:s|\s+state|\s+management|\s+manipulation)?|slow[- ]push\w*|fast[- ]push\w*|freeze|freezing|crash(?:ing)?\s+(?:the\s+)?wave|bounce|bouncing|recall(?:\s+timing)?|reset(?:\s+timing)?|item(?:s|\s+build|\s+path)?|boots|plated\s+steelcaps|mercury'?s\s+treads|trinity\s+force|black\s+cleaver|sterak'?s|sundered\s+sky|stridebreaker|ravenous\s+hydra|titanic\s+hydra|blade\s+of\s+the\s+ruined\s+king|bork|infinity\s+edge|zhonya'?s|rabadon'?s|teamfight\w*|skirmish\w*|split[- ]?push\w*|side[- ]?lan\w*|cooldowns?|ult(?:imate)?|passive|riot(?:\s+games)?|patch\s+\d+|win\s*rate|kill\s+participation|damage\s+share|gold\s+diff|unspent\s+gold|grey\s+screen|fountain)\b""",
+        private val UNAMBIGUOUS_LEAGUE_SIGNAL_REGEX = Regex(
+            """\b(?:league\s+of\s+legends|in\s+(?:league|lol)|lol\s+(?:coach\w*|match\w*|rank\w*|champ\w*|build\w*|lane\w*|patch\w*|gameplay)|summoner'?s\s+rift|summoner\s+spells?|solo\s*queue|solo/?duo|flex\s+queue|aram|ranked\s+(?:games?|matches|record|solo|climb|queue|season|split|ladder|lp|mmr|win\s*rate)|elo|mmr|\d+\s*lp\b|lp\s+(?:gains?|losses)|kda|cs\s*@\s*\d+|cs\s*/\s*m(?:in)?|cspm|lane\s+cs|creep\s+score|minions?|cannon\s+waves?|last[- ]hit\w*|turrets?|turret\s+plates?|inhibitors?|nexus|baron(?:\s+nashor)?|nashor|voidgrubs?|grubs?|rift\s+herald|elder\s+dragon|drakes?|dragon\s+(?:soul|pit|timer|fight|setup|control|spawn)|(?:infernal|mountain|ocean|cloud|hextech|chemtech)\s+dragon|first\s+dragon|scuttle(?:\s+crab)?|jungl(?:e|er|ing)|ganks?|ganking|roam(?:s|ing)?|matchups?|laning|(?:top|mid|bot|bottom)\s*[- ]?lan(?:e|er)|adc|marksman|champion(?:s|\s+pool)|runes?|keystone|conqueror|lethal\s+tempo|fleet\s+footwork|grasp\s+of\s+the\s+undying|electrocute|arcane\s+comet|phase\s+rush|press\s+the\s+attack|first\s+strike|dark\s+harvest|aftershock|guardian\s+(?:angel|rune|keystone)|summon\s+aery|vision\s+score|control\s+wards?|stealth\s+wards?|farsight(?:\s+ward|\s+alteration)?|trinkets?|sweeper|oracle\s+lens|tribush|pixel\s+bush|ward\s+(?:score|timings?|count|coverage|river|tribush|bush|brush|baron|dragon|pit|jungle)|ward(?:ed|ing)\s+(?:river|tribush|bush|brush|pixel|baron|dragon|jungle|lane|early)|wave\s+(?:state|management|manipulation|clear|control)|minion\s+waves?|slow[- ]push\w*|fast[- ]push\w*|(?:crash(?:ing)?|freeze|freezing|bounce|bouncing|thin(?:ning)?|hold(?:ing)?|shov(?:e|ing))\s+(?:the\s+|my\s+|your\s+|a\s+)?(?:top\s+|mid\s+|bot\s+|side\s+|lane\s+|cannon\s+|minion\s+)?waves?|lane\s+freeze|freeze\s+near\s+(?:my\s+|your\s+)?(?:tower|turret)|recall\s+(?:tim(?:ing|er)s?|window|gold)|reset\s+(?:tim(?:ing|er)s?|window|gold)|item\s+(?:build|path|spike|choice|rush|completion|slot|component)s?|mythic\s+items?|legendary\s+items?|starter\s+items?|(?:first|second|third)\s+item|tier\s*2\s+boots|rush(?:ing)?\s+boots|magical\s+footwear|plated\s+steelcaps|mercury'?s\s+treads|ionian\s+boots|sorcerer'?s\s+shoes|berserker'?s\s+greaves|symbiotic\s+soles|trinity\s+force|black\s+cleaver|sterak'?s|sundered\s+sky|stridebreaker|ravenous\s+hydra|titanic\s+hydra|blade\s+of\s+the\s+ruined\s+king|bork|infinity\s+edge|zhonya'?s|rabadon'?s|teamfight\w*|skirmish\w*|split[- ]?push\w*|side[- ]?lan\w*|cooldowns?|ult(?:imate)?|passive\s+(?:stacks?|cooldown|proc|ready|shield)|anti[- ]?heal|grievous\s+wounds|riot\s+games|patch\s+\d+|win\s*rate|kill\s+participation|damage\s+share|gold\s+(?:diff|lead|deficit)|unspent\s+gold|grey\s+screen|fountain\s+(?:laser|dive|rent))\b""",
             RegexOption.IGNORE_CASE
         )
 
-        private val TRAVEL_LANDMARK_SIGNAL_REGEX = Regex(
-            """\b(?:holiday|vacation|itinerary|sightseeing|tourist|travel(?:\s+plan\w*)?|three[- ]day|weekend\s+trip|rome|italy|colosseum|vatican|paris|france|tokyo|japan|london|barcelona|spain|hotel|flights?|airline|airport|restaurants?)\b""",
+        private val CONTEXTUAL_LEAGUE_HOMONYM_REGEX = Regex(
+            """(?:\b(?:flash|ghost|teleport|tp|ignite|exhaust|heal|barrier|cleanse|smite)\b\s+(?:vs\.?|versus|or|and|\+|/|with|into|over|instead\s+of|better\s+than)\s+\b(?:flash|ghost|teleport|tp|ignite|exhaust|heal|barrier|cleanse|smite)\b|\b(?:enemy|opponent'?s?)\s+(?:flash|ghost|teleport|tp|ignite|exhaust|heal|barrier|cleanse|smite)\b|\b(?:take|taking|run|running|bring|bringing|burn|burned|burnt|pop|popped|blow|blew)\s+(?:flash|ghost|teleport|tp|ignite|exhaust|heal|barrier|cleanse|smite)\b(?!(?:\s+(?:photography|camera|story|stories|cms|server|drive|flood|cards?|cleanse|detox|throat|wound)))|\b(?:flash|ghost|teleport|tp|ignite|exhaust|heal|barrier|cleanse|smite)\s+(?:cooldowns?|cd|timers?|engage|all[- ]in|combo|insec|keybind|on\s+[df]\b|over\s+(?:the\s+)?wall)\b)""",
             RegexOption.IGNORE_CASE
+        )
+
+        private val HOMONYM_CHAMPION_NAMES = setOf(
+            "pantheon", "brand", "lux", "karma", "aurora", "poppy", "vi", "diana",
+            "graves", "twitch", "rumble", "annie", "olaf", "camille", "gwen",
+            "leona", "viktor", "jayce", "shen", "sett", "ashe", "jax", "zac", "corki"
         )
 
         private val NON_LEAGUE_OFF_TOPIC_SIGNAL_REGEX = Regex(
-            """(?:\b(?:holiday|vacation|itinerary|sightseeing|tourist|travel(?:\s+plan\w*)?|three[- ]day|weekend\s+trip|rome|italy|colosseum|vatican|paris|france|tokyo|japan|london|barcelona|spain|hotel|flights?|airline|airport|restaurants?|sourdough|bread\s+recipe|pizza|pasta|dough|recipe|cooking|baking|preheat|oven|stock\s+prices?|stocks?|nvidia|nvda|nasdaq|s&p\s*500|bitcoin|ethereum|crypto(?:currency)?|mortgage|tax\s+return|interest\s+rates?|python\s+script|python|javascript|typescript|sql\s+query|leetcode|scrape\s+stock|homework|write\s+(?:an?\s+)?essay|calculus|differential\s+equations|weather\s+(?:forecast|in)|horoscope|astrology|medical\s+diagnosis|legal\s+advice)\b)""",
+            """(?:\b(?:holiday|vacation|itinerary|sightseeing|tourist|travel(?:\s+plan\w*)?|three[- ]day|weekend\s+trip|rome|italy|colosseum|vatican|trevi\s+fountain|paris|france|tokyo|japan|london|barcelona|spain|berlin|hotel|airbnb|flights?|airline|airport|passport|luggage|restaurants?|flash\s+photography|photography|camera|shutter\s+speed|portrait\s+lighting|sore\s+throat|strep\s+throat|cough|runny\s+nose|sinus|flu|cold\s+remed\w*|fever|headache|migraine|toothache|back\s+pain|stomach\s+ache|sprain\w*|sunburn|rash|antibiotics?|ibuprofen|tylenol|paracetamol|vitamins?|calories|weight\s+loss|juice\s+cleanse|skin\s+cleanse|detox|medical\s+(?:diagnosis|advice)|doctor|dentist|ghost\s+stor(?:y|ies)|bedtime\s+stor(?:y|ies)|short\s+stor(?:y|ies)|horror\s+stor(?:y|ies)|fairy\s+tale|(?:tell|write)\s+(?:me\s+)?(?:a|an)\s+(?:[a-z]+\s+){0,2}stor(?:y|ies)|write\s+(?:me\s+)?(?:a|an)\s+(?:poem|haiku|sonnet|limerick|song|essay|cover\s+letter|resume)|sourdough|bread\s+recipe|pizza|pasta|dough|muffin|recipe|cooking|baking|preheat|oven|tablespoons?|teaspoons?|grocery\s+list|meal\s+prep|stock\s+prices?|stocks?|dividend|passive\s+income|index\s+funds?|etfs?|nvidia|nvda|nasdaq|s&p\s*500|bitcoin|ethereum|crypto(?:currency)?|mortgage|real\s+estate|tax\s+return|interest\s+rates?|credit\s+card|401k|legal\s+advice|python(?:\s+script)?|javascript|typescript|sql\s+query|leetcode|scrape\s+stock|homework|calculus|differential\s+equations|linear\s+algebra|factory\s+reset|iphone|ipad|android\s+phone|wifi\s+router|car\s+exhaust|engine\s+oil|tire\s+pressure|hiking\s+boots|walking\s+boots|weather(?:\s+forecast|\s+in)?|horoscope|astrology)\b)""",
             RegexOption.IGNORE_CASE
         )
 
@@ -2415,9 +2421,15 @@ class AiAnalysisService(
             ) {
                 return false
             }
-            if (LEAGUE_DOMAIN_SIGNAL_REGEX.containsMatchIn(question)) return false
+            if (UNAMBIGUOUS_LEAGUE_SIGNAL_REGEX.containsMatchIn(question) ||
+                CONTEXTUAL_LEAGUE_HOMONYM_REGEX.containsMatchIn(question)
+            ) {
+                return false
+            }
+            if (!NON_LEAGUE_OFF_TOPIC_SIGNAL_REGEX.containsMatchIn(question)) {
+                return false
+            }
 
-            val hasTravelLandmarkSignal = TRAVEL_LANDMARK_SIGNAL_REGEX.containsMatchIn(question)
             val contextChampionNames = buildSet {
                 fun collectChamp(raw: Any?) {
                     val cleaned = raw?.toString()?.trim().orEmpty()
@@ -2435,16 +2447,14 @@ class AiAnalysisService(
                     collectChamp((entry as? Map<*, *>)?.get("championName"))
                 }
             }
-            val mentionsContextChampion = contextChampionNames.any { champ ->
-                if (hasTravelLandmarkSignal && champ.equals("Pantheon", ignoreCase = true)) {
+            val mentionsUnambiguousContextChampion = contextChampionNames.any { champ ->
+                if (champ.lowercase() in HOMONYM_CHAMPION_NAMES) {
                     false
                 } else {
                     Regex("""\b${Regex.escape(champ)}\b""", RegexOption.IGNORE_CASE).containsMatchIn(question)
                 }
             }
-            if (mentionsContextChampion) return false
-
-            return NON_LEAGUE_OFF_TOPIC_SIGNAL_REGEX.containsMatchIn(question)
+            return !mentionsUnambiguousContextChampion
         }
 
         fun stripUnsolicitedOffTopicPivot(body: String): String {

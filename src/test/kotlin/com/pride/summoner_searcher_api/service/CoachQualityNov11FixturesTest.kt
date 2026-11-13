@@ -1440,25 +1440,66 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                     streamed shouldBe expectedRepairedRoast
                 }
 
-                // --- 17b. Morning Off-Topic Rome Holiday: Scope-aware concise refusal & ---SUGGESTIONS--- [] ---
+                // --- 17b. Morning Off-Topic Rome Holiday & Homonyms: Scope-aware concise refusal & ---SUGGESTIONS--- [] ---
                 AiAnalysisService.isOffTopicNonLeagueQuestion(romeHolidayQuestion, followUpContext) shouldBe true
-                // Even on a Pantheon-main profile, visiting the Pantheon landmark in Rome stays off-topic, whereas Pantheon gameplay stays League!
-                AiAnalysisService.isOffTopicNonLeagueQuestion(
-                    "What are the top 5 restaurants and hotels in Rome near the Pantheon?",
-                    followUpContext
-                ) shouldBe true
-                AiAnalysisService.isOffTopicNonLeagueQuestion(
+                // Off-topic homonyms (flash photography Rome, heal sore throat, ghost story, Pantheon/fountain/ranked/boots/items/cleanse/passive/freeze/reset/lol)
+                val offTopicHomonymQuestions = listOf(
+                    "Can you give me flash photography tips for my Rome holiday?",
+                    "How can I heal a sore throat before tomorrow?",
+                    "Tell me a spooky ghost story",
+                    "lol can you write me a short ghost story?",
+                    "What are the top 5 ranked restaurants and hotels in Rome near the Pantheon and Trevi Fountain?",
+                    "What walking boots and items should I pack for my Rome vacation?",
+                    "Is a 3-day juice cleanse safe for weight loss?",
+                    "How do I build passive income with dividend stocks?",
+                    "Can I freeze sourdough bread dough overnight?",
+                    "How do I factory reset my iPhone?"
+                )
+                for (homonymQ in offTopicHomonymQuestions) {
+                    AiAnalysisService.isOffTopicNonLeagueQuestion(homonymQ, followUpContext) shouldBe true
+                    val ensuredHomonym = AiAnalysisService.ensureSuggestionsBlock(
+                        rawText = liveRomePivot,
+                        context = followUpContext,
+                        userMessage = homonymQ,
+                        category = "general"
+                    )
+                    ensuredHomonym shouldBe exemplarRomeConcise
+                    val streamedHomonym = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(liveRomePivot.chunked(7)),
+                        context = followUpContext,
+                        ensureSuggestions = true,
+                        userMessage = homonymQ,
+                        category = "general"
+                    ).collectList().block()!!.joinToString("")
+                    streamedHomonym shouldBe exemplarRomeConcise
+                }
+
+                // Real League questions using Flash / Heal / Ghost / Cleanse / Pantheon stay in scope and receive exact 3 suggestions
+                val realLeagueHomonymQuestions = listOf(
+                    "Should I take Flash or Ghost on Darius?",
+                    "When should I take Heal vs Barrier in bot lane?",
+                    "When should I pop Ghost in fights or burn Flash over the wall?",
+                    "How do I track enemy Flash cooldowns?",
+                    "Should I bring Cleanse into Lissandra?",
                     "How should I play Pantheon in lane?",
-                    followUpContext
-                ) shouldBe false
-                AiAnalysisService.isOffTopicNonLeagueQuestion(
                     "Can you give me an example?",
-                    followUpContext
-                ) shouldBe false
-                AiAnalysisService.isOffTopicNonLeagueQuestion(
-                    "What do my 10-minute lane CS and 20-minute gold numbers actually show?",
-                    followUpContext
-                ) shouldBe false
+                    "What do my 10-minute lane CS and 20-minute gold numbers actually show?"
+                )
+                for (leagueQ in realLeagueHomonymQuestions) {
+                    AiAnalysisService.isOffTopicNonLeagueQuestion(leagueQ, followUpContext) shouldBe false
+                    val ensuredLeague = AiAnalysisService.ensureSuggestionsBlock(
+                        rawText = "Check enemy summoner spell timers before committing to an all-in.",
+                        context = followUpContext,
+                        userMessage = leagueQ,
+                        category = "general"
+                    )
+                    @Suppress("UNCHECKED_CAST")
+                    val leagueSugs = mapper.readValue(
+                        ensuredLeague.substringAfter("---SUGGESTIONS---").trim(),
+                        List::class.java
+                    ) as List<String>
+                    leagueSugs.size shouldBe 3
+                }
 
                 val romePrompt = buildPrompt(followUpContext, romeHolidayQuestion)
                 romePrompt shouldContain "OFF-TOPIC REFUSAL ACTIVE"
