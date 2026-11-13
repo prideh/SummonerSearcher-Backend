@@ -677,8 +677,8 @@ class RedisCacheService(
      * Streaming, zero-substring RFC 4648 Base64 decoder that decodes up to 1,024 Base64 characters
      * (768 compressed bytes) per refill into a single reusable buffer, enforcing exact [maxBase64Chars]
      * and [maxCompressedBytes] bounds plus interrupt/deadline checks on every read while sampling
-     * [headroomGuard] at initial entry and every 1 KiB boundary (avoiding `Base64.getDecoder().wrap`
-     * single-byte `read()` amplification).
+     * [headroomGuard] at initial entry and every 2 KiB Base64 boundary ([HEADROOM_CHECK_STRIDE_BYTES],
+     * avoiding `Base64.getDecoder().wrap` single-byte `read()` amplification).
      */
     internal class BoundedBase64DecodingInputStream(
         private val source: String,
@@ -844,7 +844,7 @@ class RedisCacheService(
         private var totalUtf8BytesRead = 0L
         private var pairedLowPending = false
         private var initialHeadroomChecked = false
-        private var nextHeadroomCheckAtBytes = HEADROOM_CHECK_STRIDE_BYTES.toLong()
+        private var nextHeadroomCheckAtBytes = INFLATED_HEADROOM_CHECK_STRIDE_BYTES.toLong()
 
         private fun checkFastGuardsOrThrow() {
             val nowMs = timeProvider?.now() ?: System.currentTimeMillis()
@@ -862,7 +862,7 @@ class RedisCacheService(
             if (headroomGuard != null && (force || !initialHeadroomChecked || totalUtf8BytesRead >= nextHeadroomCheckAtBytes)) {
                 initialHeadroomChecked = true
                 while (nextHeadroomCheckAtBytes <= totalUtf8BytesRead) {
-                    nextHeadroomCheckAtBytes += HEADROOM_CHECK_STRIDE_BYTES.toLong()
+                    nextHeadroomCheckAtBytes += INFLATED_HEADROOM_CHECK_STRIDE_BYTES.toLong()
                 }
                 if (!headroomGuard.invoke()) {
                     failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
@@ -920,7 +920,7 @@ class RedisCacheService(
             checkFastGuardsOrThrow()
             checkHeadroomIfDueOrThrow()
             if (index >= endExclusive) return -1
-            val toRead = minOf(len, 1_024, endExclusive - index)
+            val toRead = minOf(len, 4_096, endExclusive - index)
             accountUtf8Bytes(index, toRead)
             checkFastGuardsOrThrow()
             checkHeadroomIfDueOrThrow()
@@ -940,7 +940,7 @@ class RedisCacheService(
             while (index < endExclusive) {
                 checkFastGuardsOrThrow()
                 checkHeadroomIfDueOrThrow()
-                val step = minOf(1_024, endExclusive - index)
+                val step = minOf(4_096, endExclusive - index)
                 accountUtf8Bytes(index, step)
                 index += step
                 checkFastGuardsOrThrow()
@@ -964,7 +964,7 @@ class RedisCacheService(
     ) : java.io.InputStream() {
         private var totalBytesRead = 0
         private var initialHeadroomChecked = false
-        private var nextHeadroomCheckAtBytes = HEADROOM_CHECK_STRIDE_BYTES
+        private var nextHeadroomCheckAtBytes = INFLATED_HEADROOM_CHECK_STRIDE_BYTES
 
         private fun checkFastGuardsOrThrow() {
             val nowMs = timeProvider?.now() ?: System.currentTimeMillis()
@@ -982,7 +982,7 @@ class RedisCacheService(
             if (headroomGuard != null && (force || !initialHeadroomChecked || totalBytesRead >= nextHeadroomCheckAtBytes)) {
                 initialHeadroomChecked = true
                 while (nextHeadroomCheckAtBytes <= totalBytesRead) {
-                    nextHeadroomCheckAtBytes += HEADROOM_CHECK_STRIDE_BYTES
+                    nextHeadroomCheckAtBytes += INFLATED_HEADROOM_CHECK_STRIDE_BYTES
                 }
                 if (!headroomGuard.invoke()) {
                     failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
@@ -1010,13 +1010,13 @@ class RedisCacheService(
             if (len == 0) return 0
             checkFastGuardsOrThrow()
             checkHeadroomIfDueOrThrow()
-            val boundedLen = len.coerceAtMost(1_024)
+            val boundedLen = len.coerceAtMost(4_096)
             val n = delegate.read(b, off, boundedLen)
             if (n > 0) {
                 totalBytesRead += n
             }
             checkFastGuardsOrThrow()
-            checkHeadroomIfDueOrThrow(force = n in 1 until boundedLen)
+            checkHeadroomIfDueOrThrow()
             return n
         }
 
@@ -1025,7 +1025,7 @@ class RedisCacheService(
             if (first == -1) return
             val scratch = ByteArray(256)
             while (read(scratch, 0, scratch.size) != -1) {
-                // Fast size/deadline guards + 1 KiB headroom cadence enforced inside read(...)
+                // Fast size/deadline guards + 16 KiB headroom cadence enforced inside read(...)
             }
         }
 
@@ -1044,7 +1044,8 @@ class RedisCacheService(
         private const val INITIAL_SLAB_BYTES = 2_048
         private const val MAX_SLAB_BYTES = 8_192
         private const val GZIP_BUFFER_SIZE = 2048
-        internal const val HEADROOM_CHECK_STRIDE_BYTES = 1_024
+        internal const val HEADROOM_CHECK_STRIDE_BYTES = 2_048 // 2 KiB compressed Base64 stride (changed from 1,024)
+        internal const val INFLATED_HEADROOM_CHECK_STRIDE_BYTES = 16_384 // 16 KiB inflated/UTF-8 JSON stride
         private const val BASE64_PAD = -2
         private val BASE64_DECODE_TABLE = IntArray(128) { -1 }.apply {
             for (i in 'A'.code..'Z'.code) this[i] = i - 'A'.code
