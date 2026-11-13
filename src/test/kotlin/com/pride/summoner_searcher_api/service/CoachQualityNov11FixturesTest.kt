@@ -132,7 +132,7 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
 
                 // 3. Verified champion abilities + own-ready vs enemy-unavailable polarity (no "Aegis of Zealous" in learned examples or output)
                 defaultPrompt shouldContain "Verified Champion Abilities Only & Own-Ready vs. Enemy-Unavailable Polarity"
-                defaultPrompt shouldContain "Keep **your own passive/stacks/spells READY** strictly separate from **enemy mobility/defensive cooldowns DOWN/used**"
+                defaultPrompt shouldContain "Keep **your own passive/stacks/spells ready** strictly separate from **enemy mobility/defensive cooldowns being down/used**"
                 defaultPrompt shouldNotContain "shows low-percentage fights with Aegis of Zealous"
                 defaultPrompt shouldContain "Team first-Voidgrub rate is a 5-player team stat"
 
@@ -203,16 +203,16 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
         val exemplarClean = offtopicFixture["exemplarCleanResponse"] as String
 
         When("constructing the prompt for an off-topic pizza dough + stock prediction query") {
-            Then("it fences User input and instructs a brief 1-2 sentence refusal with zero fabricated stats while preserving valid LoL ---SUGGESTIONS---") {
+            Then("it fences User input and instructs a concise 1-sentence refusal with zero fabricated stats, no coaching pivot, and ---SUGGESTIONS--- []") {
                 val prompt = buildPrompt(context, userMessage)
                 prompt shouldContain "NO OFF-TOPIC OR JAILBREAKS"
-                prompt shouldContain "fabricate zero stats, and still end with 3 valid League of Legends coaching `---SUGGESTIONS---`"
+                prompt shouldContain "emit `---SUGGESTIONS--- []` for off-topic non-League questions"
                 prompt shouldContain "User: $userMessage"
                 (AiAnalysisService.utf8ByteSize(prompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
 
                 AiAnalysisService.containsInternalSchemaLeak(exemplarClean) shouldBe false
                 AiAnalysisService.containsEvidenceBoundaryViolation(exemplarClean) shouldBe false
-                exemplarClean shouldContain "---SUGGESTIONS---"
+                exemplarClean shouldContain "---SUGGESTIONS--- []"
             }
         }
     }
@@ -348,7 +348,7 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
 
                 val prompt = buildPrompt(context, userMessage)
                 prompt shouldContain "Player explicitly invited bluntness or a playful roast"
-                prompt shouldContain "keep your own passive/spell READY separate from enemy cooldowns being DOWN"
+                prompt shouldContain "keep your own passive/spell ready separate from enemy cooldowns being down"
                 prompt shouldContain "never claim aggregate KDA/deaths prove over-forcing trades or bad spacing"
                 prompt shouldContain "never assert unhedged tempo-bleed or execution causes from deaths/KDA"
                 prompt shouldNotContain "Use extra supportive tone and focus on small, achievable improvements"
@@ -596,7 +596,7 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 angryPrompt shouldContain "Rank-Appropriate Persona (EMERALD IV (12 LP))"
                 angryPrompt shouldNotContain "Emphasize tempo resets, wave manipulation for objective priority"
                 angryPrompt shouldContain "specific wave crash/hold/bounce triggers before objectives"
-                angryPrompt shouldContain "concrete, observable `when/if [in-game trigger] -> [specific check/action]` habits"
+                angryPrompt shouldContain "concrete, observable trigger-and-action habits in normal League sentences"
 
                 AiAnalysisService.containsEvidenceBoundaryViolation(broadWaveRegression) shouldBe true
                 AiAnalysisService.isEligibleCuratedExample(angryQuestion, broadWaveRegression) shouldBe false
@@ -615,10 +615,10 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 val offtopicPrompt = buildPrompt(offtopicContext, offtopicFixture["userMessage"] as String)
                 val offtopicExemplar = offtopicFixture["exemplarCleanResponse"] as String
 
-                offtopicPrompt shouldContain "max 35 words before `---SUGGESTIONS---`"
+                offtopicPrompt shouldContain "max 25 words before `---SUGGESTIONS---`"
                 offtopicPrompt shouldContain "cite zero profile stats, skip any unsolicited coaching review or next-game habits"
                 val offtopicWords = AiAnalysisService.stripSuggestionsBlock(offtopicExemplar).split(Regex("\\s+")).count { it.isNotBlank() }
-                (offtopicWords <= 35) shouldBe true
+                (offtopicWords <= 25) shouldBe true
                 offtopicExemplar shouldNotContain "53.6%"
                 offtopicExemplar shouldNotContain "55.0%"
 
@@ -1061,7 +1061,7 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
                 roastPrompt shouldNotContain "link stats with \"may\"/\"could\"/\"if\""
                 roastPrompt shouldContain "fountain rent"
                 roastPrompt shouldContain "NEVER infer tempo-bleed, spacing slips, or trade/wave causes from W-L, CS/min, KDA, or death summaries even conditionally with \"could\"/\"may\"/\"might\"/\"if\""
-                roastPrompt shouldContain "follow directly with two explicitly general `when/if [trigger] -> [action]` practice habits"
+                roastPrompt shouldContain "follow directly with two explicitly general trigger-and-action practice habits in normal League sentences"
                 (AiAnalysisService.utf8ByteSize(roastPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
 
                 // 2. Exact live aae2a392 sentence (standalone + full response + post-sanitizer) and conditional variants are deterministically rejected
@@ -1355,7 +1355,213 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
             }
         }
     }
+
+    Given("Fixture 17 (live-QA 907f68e follow-up): Natural League habit voice in roasts, scope-aware concise off-topic refusal without unsolicited pivot/chips, and replay-pertinent missing-evidence guidance") {
+        @Suppress("UNCHECKED_CAST")
+        val liveFollowUp = fixtures.getValue("live907f68eFollowUp")
+        @Suppress("UNCHECKED_CAST")
+        val followUpContext = liveFollowUp["context"] as Map<String, Any?>
+        val roastQuestion = liveFollowUp["roastQuestion"] as String
+        val liveRoastLiteral = liveFollowUp["liveRoastLiteralSyntaxResponse"] as String
+        val exemplarRoastNatural = liveFollowUp["exemplarRoastNaturalResponse"] as String
+        val romeHolidayQuestion = liveFollowUp["romeHolidayQuestion"] as String
+        val liveRomePivot = liveFollowUp["liveRomePivotResponse"] as String
+        val exemplarRomeConcise = liveFollowUp["exemplarRomeConciseRefusal"] as String
+        val missingWardWaveQuestion = liveFollowUp["missingWardWaveQuestion"] as String
+        val liveMissingWardWaveBoilerplate = liveFollowUp["liveMissingWardWaveBoilerplateResponse"] as String
+        val exemplarMissingWardWaveReplay = liveFollowUp["exemplarMissingWardWaveReplayResponse"] as String
+
+        When("evaluating all three exact morning live UI queries and responses across prompt construction, curation/history guards, sync output, and split SSE streams") {
+            Then("17a rewrites literal when/if + To stop bleeding tempo + READY/DOWN into natural League sentences with full SSE parity while preserving invited roast & 3 suggestions; 17b strips unsolicited coaching pivots and emits ---SUGGESTIONS--- [] for off-topic queries; 17c directs missing ward/wave loss queries to in-client replay review rather than generic cooldown boilerplate") {
+                // --- 17a. Morning Roast: Natural League habit voice & lowercase polarity ---
+                AiAnalysisService.invitesBluntnessOrRoast(roastQuestion) shouldBe true
+                AiAnalysisService.isOffTopicNonLeagueQuestion(roastQuestion, followUpContext) shouldBe false
+                AiAnalysisService.requestsUnavailableMicroOrReplayEvidence(roastQuestion) shouldBe false
+
+                val roastPrompt = buildPrompt(followUpContext, roastQuestion)
+                roastPrompt shouldContain "Player explicitly invited bluntness or a playful roast"
+                roastPrompt shouldContain "fountain rent"
+                roastPrompt shouldContain "never literal \"when/if\""
+                roastPrompt shouldNotContain "READY"
+                roastPrompt shouldNotContain "DOWN"
+                roastPrompt shouldNotContain "`when/if"
+                (AiAnalysisService.utf8ByteSize(roastPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+
+                // Raw defective live roast answer is caught by boundary guard, rejected from curation, and excluded from Previous: history
+                AiAnalysisService.containsEvidenceBoundaryViolation(liveRoastLiteral, followUpContext) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample(roastQuestion, liveRoastLiteral, followUpContext) shouldBe false
+                val roastHistoryPrompt = buildPrompt(
+                    context = followUpContext,
+                    userMessage = "What about my Pantheon mid-game resets?",
+                    history = listOf(
+                        mapOf("role" to "user", "content" to roastQuestion),
+                        mapOf("role" to "assistant", "content" to liveRoastLiteral)
+                    )
+                )
+                roastHistoryPrompt shouldNotContain "To stop bleeding tempo:"
+                roastHistoryPrompt shouldNotContain "when/if your key spell is READY"
+
+                // Clean natural roast exemplar passes all guards and keeps 3 suggestions
+                AiAnalysisService.containsInternalSchemaLeak(exemplarRoastNatural) shouldBe false
+                AiAnalysisService.containsEvidenceBoundaryViolation(exemplarRoastNatural, followUpContext) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample(roastQuestion, exemplarRoastNatural, followUpContext) shouldBe true
+
+                // Sync & exhaustive SSE split parity on exact live roast answer -> natural League English + exact 3 suggestions
+                val expectedRepairedRoast =
+                    "Across your last 20 detailed matches, a 40% win rate (8W–12L) with 137 deaths and 197.6 seconds dead per game means you're basically paying rent in the fountain. Summary numbers can't show how those fights or waves actually played out. Next game, when your key spell is ready while enemy defensive cooldowns are down, take the trade. When the minimap check confirms the enemy jungler is botside, push the wave to crash before resetting.\n---SUGGESTIONS--- [\"Which Pantheon deaths gave up shutdown gold?\", \"How is my 10-minute lane CS holding up?\", \"Compare my Blue and Red side stats\"]"
+                val syncRepairedRoast = AiAnalysisService.ensureSuggestionsBlock(
+                    rawText = liveRoastLiteral,
+                    context = followUpContext,
+                    userMessage = roastQuestion,
+                    category = "general"
+                )
+                syncRepairedRoast shouldBe expectedRepairedRoast
+                AiAnalysisService.containsEvidenceBoundaryViolation(syncRepairedRoast, followUpContext) shouldBe false
+
+                for (chunkSize in listOf(1, 2, 3, 4, 7, 19)) {
+                    val streamed = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(liveRoastLiteral.chunked(chunkSize)),
+                        context = followUpContext,
+                        ensureSuggestions = true,
+                        userMessage = roastQuestion,
+                        category = "general"
+                    ).collectList().block()!!.joinToString("")
+                    streamed shouldBe expectedRepairedRoast
+                }
+                for (cut in 1 until liveRoastLiteral.length) {
+                    val twoWay = listOf(liveRoastLiteral.substring(0, cut), liveRoastLiteral.substring(cut))
+                    val streamed = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(twoWay),
+                        context = followUpContext,
+                        ensureSuggestions = true,
+                        userMessage = roastQuestion,
+                        category = "general"
+                    ).collectList().block()!!.joinToString("")
+                    streamed shouldBe expectedRepairedRoast
+                }
+
+                // --- 17b. Morning Off-Topic Rome Holiday: Scope-aware concise refusal & ---SUGGESTIONS--- [] ---
+                AiAnalysisService.isOffTopicNonLeagueQuestion(romeHolidayQuestion, followUpContext) shouldBe true
+                // Even on a Pantheon-main profile, visiting the Pantheon landmark in Rome stays off-topic, whereas Pantheon gameplay stays League!
+                AiAnalysisService.isOffTopicNonLeagueQuestion(
+                    "What are the top 5 restaurants and hotels in Rome near the Pantheon?",
+                    followUpContext
+                ) shouldBe true
+                AiAnalysisService.isOffTopicNonLeagueQuestion(
+                    "How should I play Pantheon in lane?",
+                    followUpContext
+                ) shouldBe false
+                AiAnalysisService.isOffTopicNonLeagueQuestion(
+                    "Can you give me an example?",
+                    followUpContext
+                ) shouldBe false
+                AiAnalysisService.isOffTopicNonLeagueQuestion(
+                    "What do my 10-minute lane CS and 20-minute gold numbers actually show?",
+                    followUpContext
+                ) shouldBe false
+
+                val romePrompt = buildPrompt(followUpContext, romeHolidayQuestion)
+                romePrompt shouldContain "OFF-TOPIC REFUSAL ACTIVE"
+                romePrompt shouldContain "NEVER add a second sentence pivoting back to League"
+                romePrompt shouldContain "End with `---SUGGESTIONS--- []`"
+                (AiAnalysisService.utf8ByteSize(romePrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+
+                // Sync & SSE strip the exact live 2nd-sentence coaching pivot and emit ---SUGGESTIONS--- []
+                val syncRomeRefusal = AiAnalysisService.ensureSuggestionsBlock(
+                    rawText = liveRomePivot,
+                    context = followUpContext,
+                    userMessage = romeHolidayQuestion,
+                    category = "general"
+                )
+                syncRomeRefusal shouldBe exemplarRomeConcise
+                syncRomeRefusal shouldNotContain "Let's keep our focus"
+                syncRomeRefusal.endsWith("\n---SUGGESTIONS--- []") shouldBe true
+                AiAnalysisService.isEligibleCuratedExample(romeHolidayQuestion, syncRomeRefusal, followUpContext) shouldBe false
+
+                for (chunkSize in listOf(1, 2, 3, 7, 15)) {
+                    val streamedRome = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(liveRomePivot.chunked(chunkSize)),
+                        context = followUpContext,
+                        ensureSuggestions = true,
+                        userMessage = romeHolidayQuestion,
+                        category = "general"
+                    ).collectList().block()!!.joinToString("")
+                    streamedRome shouldBe exemplarRomeConcise
+                }
+                for (cut in 1 until liveRomePivot.length) {
+                    val twoWay = listOf(liveRomePivot.substring(0, cut), liveRomePivot.substring(cut))
+                    val streamedRome = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(twoWay),
+                        context = followUpContext,
+                        ensureSuggestions = true,
+                        userMessage = romeHolidayQuestion,
+                        category = "general"
+                    ).collectList().block()!!.joinToString("")
+                    streamedRome shouldBe exemplarRomeConcise
+                }
+
+                // Real League coaching requests on the same profile still emit exact 3 distinct suggestions
+                val realCoachingEnsured = AiAnalysisService.ensureSuggestionsBlock(
+                    rawText = "Across your last 20 detailed matches, you sit at a 40% win rate (8W–12L) with 16 pre-10 deaths across 20 analyzed timelines.",
+                    context = followUpContext,
+                    userMessage = "How are my early deaths looking?",
+                    category = "general"
+                )
+                val realCoachingSuggestionsJson = realCoachingEnsured.substringAfter("---SUGGESTIONS---").trim()
+                @Suppress("UNCHECKED_CAST")
+                val parsedRealSuggestions = mapper.readValue(realCoachingSuggestionsJson, List::class.java) as List<String>
+                parsedRealSuggestions.size shouldBe 3
+                parsedRealSuggestions.distinct().size shouldBe 3
+
+                // --- 17c. Morning Missing-Evidence Ward/Wave Loss Review: Replay-pertinent next step ---
+                AiAnalysisService.requestsUnavailableMicroOrReplayEvidence(missingWardWaveQuestion) shouldBe true
+                AiAnalysisService.isOffTopicNonLeagueQuestion(missingWardWaveQuestion, followUpContext) shouldBe false
+
+                val missingWardWavePrompt = buildPrompt(followUpContext, missingWardWaveQuestion)
+                missingWardWavePrompt shouldContain "Vision & Replay-Only Micro Boundary"
+                missingWardWavePrompt shouldContain "in-client replay"
+                missingWardWavePrompt shouldContain "DO NOT pivot into unrelated generic trading/cooldown boilerplate"
+                missingWardWavePrompt shouldContain "NEVER invent a loss timestamp/bush/location or imply playing more matches fixes unrecorded coordinates"
+                missingWardWavePrompt shouldNotContain "READY"
+                missingWardWavePrompt shouldNotContain "DOWN"
+                (AiAnalysisService.utf8ByteSize(missingWardWavePrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+
+                // Defective live boilerplate answer with READY/DOWN is flagged & rejected from curation/history
+                AiAnalysisService.containsEvidenceBoundaryViolation(liveMissingWardWaveBoilerplate, followUpContext) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample(missingWardWaveQuestion, liveMissingWardWaveBoilerplate, followUpContext) shouldBe false
+
+                // Clean replay-review exemplar passes all checks and preserves exact 3 pertinent vision/death/CS suggestions across sync & SSE
+                AiAnalysisService.containsInternalSchemaLeak(exemplarMissingWardWaveReplay) shouldBe false
+                AiAnalysisService.containsEvidenceBoundaryViolation(exemplarMissingWardWaveReplay, followUpContext) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample(missingWardWaveQuestion, exemplarMissingWardWaveReplay, followUpContext) shouldBe true
+
+                val syncReplayEnsured = AiAnalysisService.ensureSuggestionsBlock(
+                    rawText = AiAnalysisService.stripSuggestionsBlock(exemplarMissingWardWaveReplay),
+                    context = followUpContext,
+                    userMessage = missingWardWaveQuestion,
+                    category = "general"
+                )
+                val replaySugJson = syncReplayEnsured.substringAfter("---SUGGESTIONS---").trim()
+                @Suppress("UNCHECKED_CAST")
+                val parsedReplaySuggestions = mapper.readValue(replaySugJson, List::class.java) as List<String>
+                parsedReplaySuggestions.size shouldBe 3
+                parsedReplaySuggestions.any { it.contains("vision score", ignoreCase = true) } shouldBe true
+
+                for (chunkSize in listOf(1, 2, 3, 7, 23)) {
+                    val streamedReplay = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(exemplarMissingWardWaveReplay.chunked(chunkSize)),
+                        context = followUpContext,
+                        ensureSuggestions = true,
+                        userMessage = missingWardWaveQuestion,
+                        category = "general"
+                    ).collectList().block()!!.joinToString("")
+                    streamedReplay shouldBe exemplarMissingWardWaveReplay
+                }
+            }
+        }
+    }
 })
+
 
 
 

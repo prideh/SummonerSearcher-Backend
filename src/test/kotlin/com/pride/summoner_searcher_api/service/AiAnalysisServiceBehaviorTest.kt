@@ -1568,7 +1568,94 @@ class AiAnalysisServiceBehaviorTest : BehaviorSpec({
                 syncOut shouldNotContain "your your"
             }
         }
+
+        When("analyze() and analyzeStream() handle off-topic Rome holiday refusal vs invited roast with literal habit syntax via offlineWebClient") {
+            Then("off-topic refusal strips unsolicited coaching pivot and emits ---SUGGESTIONS--- [], while real League roast rewrites literal when/if + READY/DOWN to natural sentences and keeps exact 3 suggestions") {
+                val mapper = com.fasterxml.jackson.databind.ObjectMapper()
+                fun buildServiceWithMockText(rawText: String, deltas: List<String>): AiAnalysisService {
+                    val syncPayload = mapper.writeValueAsString(
+                        mapOf(
+                            "candidates" to listOf(
+                                mapOf(
+                                    "finishReason" to "STOP",
+                                    "content" to mapOf("parts" to listOf(mapOf("text" to rawText)))
+                                )
+                            )
+                        )
+                    )
+                    val ssePayload = deltas.joinToString("\n\n") { d ->
+                        val frame = mapper.writeValueAsString(
+                            mapOf("candidates" to listOf(mapOf("content" to mapOf("parts" to listOf(mapOf("text" to d))))))
+                        )
+                        "data: $frame"
+                    } + "\n\n"
+                    val client = org.springframework.web.reactive.function.client.WebClient.builder()
+                        .baseUrl("https://generativelanguage.googleapis.com/v1beta/")
+                        .exchangeFunction { req ->
+                            val isStream = req.url().toString().contains("streamGenerateContent")
+                            val resp = if (isStream) {
+                                org.springframework.web.reactive.function.client.ClientResponse
+                                    .create(org.springframework.http.HttpStatus.OK)
+                                    .header("Content-Type", "text/event-stream")
+                                    .body(ssePayload)
+                                    .build()
+                            } else {
+                                org.springframework.web.reactive.function.client.ClientResponse
+                                    .create(org.springframework.http.HttpStatus.OK)
+                                    .header("Content-Type", "application/json")
+                                    .body(syncPayload)
+                                    .build()
+                            }
+                            reactor.core.publisher.Mono.just(resp)
+                        }
+                        .build()
+                    return createService().also { svc ->
+                        AiAnalysisService::class.java.getDeclaredField("webClient").apply {
+                            isAccessible = true
+                            set(svc, client)
+                        }
+                    }
+                }
+
+                // 1. Off-topic Rome holiday end-to-end
+                val rawRome =
+                    "I focus exclusively on solo queue coaching rather than travel planning. Let's keep our focus on your top lane matchups and solo queue execution instead.\n" +
+                        "---SUGGESTIONS--- [\"Analyze my top Pantheon matchups\", \"How can I reduce early deaths?\", \"Review my item builds\"]"
+                val romeSvc = buildServiceWithMockText(rawRome, rawRome.chunked(9))
+                val romeQuestion = "Can you help me plan a three-day holiday in Rome?"
+                val expectedRome = "I focus exclusively on solo queue coaching rather than travel planning.\n---SUGGESTIONS--- []"
+
+                val syncRome = romeSvc.analyze(spearShotContext, emptyList(), romeQuestion).block()!!.response
+                val streamRome = romeSvc.analyzeStream(spearShotContext, emptyList(), romeQuestion)
+                    .chunks.collectList().block()!!.joinToString("")
+                syncRome shouldBe expectedRome
+                streamRome shouldBe expectedRome
+
+                // 2. Invited roast with literal syntax & ALL-CAPS polarity end-to-end
+                val rawRoast =
+                    "Across your last 20 detailed matches, a 40% win rate (8W–12L) with 137 deaths and 197.6 seconds dead per game means you're basically paying rent in the fountain. Summary numbers can't show how those fights or waves actually played out. To stop bleeding tempo: when/if your key spell is READY while enemy defensive cooldowns are DOWN, take the trade. When/if the minimap check confirms the enemy jungler is botside, push the wave to crash before resetting.\n" +
+                        "---SUGGESTIONS--- [\"Which Pantheon deaths gave up shutdown gold?\", \"How is my 10-minute lane CS holding up?\", \"Compare my Blue and Red side stats\"]"
+                val roastSvc = buildServiceWithMockText(rawRoast, rawRoast.chunked(11))
+                val roastQuestion =
+                    "I'm fed up with losing. Roast my actual performance, then give me two practical habits I can try next game. Don't blame my teammates."
+
+                val syncRoast = roastSvc.analyze(spearShotContext, emptyList(), roastQuestion).block()!!.response
+                val streamRoast = roastSvc.analyzeStream(spearShotContext, emptyList(), roastQuestion)
+                    .chunks.collectList().block()!!.joinToString("")
+                streamRoast shouldBe syncRoast
+                syncRoast shouldContain "Next game, when your key spell is ready while enemy defensive cooldowns are down, take the trade."
+                syncRoast shouldContain "When the minimap check confirms the enemy jungler is botside, push the wave to crash before resetting."
+                syncRoast shouldNotContain "when/if"
+                syncRoast shouldNotContain "To stop bleeding tempo"
+                syncRoast shouldNotContain "READY"
+                syncRoast shouldNotContain "DOWN"
+                @Suppress("UNCHECKED_CAST")
+                val roastSugs = mapper.readValue(syncRoast.substringAfter("---SUGGESTIONS---").trim(), List::class.java) as List<String>
+                roastSugs.size shouldBe 3
+            }
+        }
     }
 })
+
 
 
