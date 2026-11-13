@@ -95,11 +95,13 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
         private val deadlineAtMs: Long?,
         private val maxResponseBytes: Int,
         private val headroomGuard: (() -> Boolean)?,
-        private val failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>?
+        private val failureReasonHolder: java.util.concurrent.atomic.AtomicReference<String?>?,
+        private val headroomCheckStrideBytes: Int = 1_024,
+        private val maxReadChunkBytes: Int = 1_024
     ) : java.io.InputStream() {
         private var totalBytesRead = 0
         private var initialHeadroomChecked = false
-        private var nextHeadroomCheckAtBytes = 1_024
+        private var nextHeadroomCheckAtBytes = headroomCheckStrideBytes
 
         private fun checkFastGuardsOrThrow() {
             if (cancellationHandle?.isCancelled() == true ||
@@ -121,7 +123,7 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
             if (headroomGuard != null && (force || !initialHeadroomChecked || totalBytesRead >= nextHeadroomCheckAtBytes)) {
                 initialHeadroomChecked = true
                 while (nextHeadroomCheckAtBytes <= totalBytesRead) {
-                    nextHeadroomCheckAtBytes += 1_024
+                    nextHeadroomCheckAtBytes += headroomCheckStrideBytes
                 }
                 if (!headroomGuard.invoke()) {
                     failureReasonHolder?.set("MEMORY_HEADROOM_STOP")
@@ -147,13 +149,13 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
             if (len <= 0) return 0
             checkFastGuardsOrThrow()
             checkHeadroomIfDueOrThrow()
-            val boundedLen = len.coerceAtMost(1_024)
+            val boundedLen = len.coerceAtMost(maxReadChunkBytes)
             val n = delegate.read(b, off, boundedLen)
             if (n > 0) {
                 totalBytesRead += n
             }
             checkFastGuardsOrThrow()
-            checkHeadroomIfDueOrThrow(force = n in 1 until boundedLen)
+            checkHeadroomIfDueOrThrow()
             return n
         }
 
@@ -1445,6 +1447,7 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
                         try {
                             riotRestClient.get()
                                 .uri(uri, trimmedMatchId)
+                                .header(org.springframework.http.HttpHeaders.ACCEPT_ENCODING, "gzip")
                                 .exchange { _, clientResponse ->
                                     cancellationHandle.registerCloseable(AutoCloseable {
                                         abortResponseBody(clientResponse)
@@ -1522,7 +1525,9 @@ class RiotApiService @org.springframework.beans.factory.annotation.Autowired con
                                                     deadlineAtMs = deadlineAtMs,
                                                     maxResponseBytes = safeMaxBytes,
                                                     headroomGuard = headroomGuard,
-                                                    failureReasonHolder = failureReasonHolder
+                                                    failureReasonHolder = failureReasonHolder,
+                                                    headroomCheckStrideBytes = 16_384,
+                                                    maxReadChunkBytes = 4_096
                                                 ).also { cancellationHandle.registerCloseable(it) }
                                             } else {
                                                 boundedWireStream

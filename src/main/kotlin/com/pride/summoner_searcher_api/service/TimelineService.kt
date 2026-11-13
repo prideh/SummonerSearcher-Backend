@@ -40,6 +40,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import java.util.zip.GZIPInputStream
 import java.util.zip.GZIPOutputStream
@@ -178,8 +179,37 @@ class TimelineService @Autowired constructor(
         val compressedBytes: ByteArray
     )
 
+    internal data class PartialCompactionSnapshot(
+        val orderedMatchIds: List<String>,
+        val orderedMatchDtos: List<MatchDto>,
+        val compactedTriples: List<Triple<String, MatchTimelineDto, MatchDto>>,
+        val coveredMatchIds: List<String>,
+        val missingPrefix: List<MissingMatchTimelineDto>,
+        val nextMatchIndex: Int,
+        val peakRetainedRawTimelines: Int
+    )
+
+    internal class PrepStageProgress {
+        val subStage = AtomicReference("queued")
+        val warmLookupMs = AtomicLong(0L)
+        val profileDecodeMs = AtomicLong(0L)
+        val riotLoopStartMs = AtomicLong(0L)
+        val riotLoopMs = AtomicLong(0L)
+        val httpAttempts = AtomicInteger(0)
+        val effectiveRequestedIds = AtomicReference<List<String>>(emptyList())
+        val partialSnapshot = AtomicReference<PartialCompactionSnapshot?>(null)
+
+        fun snapshotRiotLoopMs(nowMs: Long): Long {
+            val recorded = riotLoopMs.get()
+            if (recorded > 0L) return recorded
+            val started = riotLoopStartMs.get()
+            return if (started > 0L) (nowMs - started).coerceAtLeast(0L) else 0L
+        }
+    }
+
     private class InFlightEntry<T>(
         val deferred: CompletableDeferred<T> = CompletableDeferred(),
+        val progress: PrepStageProgress = PrepStageProgress(),
         @Volatile var workerJob: Job? = null,
         var activeWaiters: Int = 1
     )
@@ -890,12 +920,69 @@ class TimelineService @Autowired constructor(
         return value
     }
 
+    private fun computeWorkerIoDeadlineMs(hardDeadlineMs: Long, nowMs: Long): Long {
+        val remainingMs = (hardDeadlineMs - nowMs).coerceAtLeast(0L)
+        val completionReserveMs = if (remainingMs >= 2_000L) {
+            (remainingMs / 12L).coerceIn(200L, 500L)
+        } else {
+            0L
+        }
+        return hardDeadlineMs - completionReserveMs
+    }
+
+    private fun buildPartialOrBlockedCallerDeadlineResult(
+        normalizedRegion: String,
+        puuid: String,
+        fallbackOrderedMatchIds: List<String>,
+        analyzerVersion: String,
+        progress: PrepStageProgress
+    ): CoachTimelinePreparationResultDto {
+        val snap = progress.partialSnapshot.get()
+        if (snap != null && snap.compactedTriples.isNotEmpty() && hasCoachContinueHeadroom()) {
+            val missing = ArrayList<MissingMatchTimelineDto>(
+                snap.missingPrefix.size + (snap.orderedMatchIds.size - snap.nextMatchIndex).coerceAtLeast(0)
+            )
+            missing.addAll(snap.missingPrefix)
+            if (snap.nextMatchIndex in 0..snap.orderedMatchIds.size) {
+                for (remainingId in snap.orderedMatchIds.subList(snap.nextMatchIndex, snap.orderedMatchIds.size)) {
+                    missing.add(MissingMatchTimelineDto(remainingId, "DEADLINE_EXCEEDED"))
+                }
+            }
+            val partialAnalysis = runCatching {
+                timelineAnalysisService.analyze(snap.compactedTriples, puuid, snap.orderedMatchDtos)
+            }.getOrNull()
+            if (partialAnalysis != null) {
+                return CoachTimelinePreparationResultDto(
+                    status = "PARTIAL",
+                    region = normalizedRegion,
+                    puuid = puuid,
+                    analyzerVersion = analyzerVersion,
+                    requestedMatchIds = snap.orderedMatchIds,
+                    coveredMatchIds = snap.coveredMatchIds,
+                    missingMatches = missing,
+                    stopReason = "DEADLINE_EXCEEDED",
+                    cacheHit = false,
+                    peakRetainedRawTimelines = snap.peakRetainedRawTimelines,
+                    analysis = partialAnalysis
+                )
+            }
+        }
+        val effectiveIds = progress.effectiveRequestedIds.get().ifEmpty { fallbackOrderedMatchIds }
+        return buildBlockedResult(
+            normalizedRegion = normalizedRegion,
+            puuid = puuid,
+            orderedMatchIds = effectiveIds,
+            stopReason = "DEADLINE_EXCEEDED",
+            analyzerVersion = analyzerVersion
+        )
+    }
+
     private suspend fun <T> coalesceSingleflightWithCallerIsolation(
         key: String,
         map: ConcurrentHashMap<String, InFlightEntry<T>>,
         callerDeadlineMs: Long,
-        onCallerDeadlineExceeded: () -> T,
-        ownerBlock: suspend () -> T
+        onCallerDeadlineExceeded: (PrepStageProgress) -> T,
+        ownerBlock: suspend (PrepStageProgress, Long) -> T
     ): T {
         val entry = singleflightMutex.withLock {
             val existing = map[key]
@@ -907,7 +994,7 @@ class TimelineService @Autowired constructor(
                 map[key] = created
                 created.workerJob = singleflightScope.launch {
                     try {
-                        val outcome = ownerBlock()
+                        val outcome = ownerBlock(created.progress, callerDeadlineMs)
                         created.deferred.complete(outcome)
                     } catch (t: Throwable) {
                         if (t is CancellationException) {
@@ -942,7 +1029,7 @@ class TimelineService @Autowired constructor(
         val remainingMs = callerDeadlineMs - now
         if (remainingMs <= 0L && !entry.deferred.isCompleted) {
             detachWaiterIfUnfinished()
-            return onCallerDeadlineExceeded()
+            return onCallerDeadlineExceeded(entry.progress)
         }
 
         return try {
@@ -951,7 +1038,7 @@ class TimelineService @Autowired constructor(
             }
             if (awaited == null) {
                 detachWaiterIfUnfinished()
-                onCallerDeadlineExceeded()
+                onCallerDeadlineExceeded(entry.progress)
             } else {
                 awaited
             }
@@ -1022,24 +1109,30 @@ class TimelineService @Autowired constructor(
             key = playerCacheKey,
             map = inFlightPlayerPreparations,
             callerDeadlineMs = callerDeadlineMs,
-            onCallerDeadlineExceeded = {
-                val blocked = buildBlockedResult(
+            onCallerDeadlineExceeded = { progress ->
+                val deadlineNow = timeProvider.now()
+                val fallbackResult = buildPartialOrBlockedCallerDeadlineResult(
                     normalizedRegion = normalizedRegion,
                     puuid = trimmedPuuid,
-                    orderedMatchIds = sanitizedRequestedIds,
-                    stopReason = "DEADLINE_EXCEEDED",
-                    analyzerVersion = analyzerVersion
+                    fallbackOrderedMatchIds = sanitizedRequestedIds,
+                    analyzerVersion = analyzerVersion,
+                    progress = progress
                 )
                 logCoachPrepStageSummary(
                     normalizedRegion = normalizedRegion,
                     stage = "singleflight_caller_deadline",
-                    result = blocked,
-                    totalMs = (timeProvider.now() - startMs).coerceAtLeast(0L),
+                    subStage = progress.subStage.get(),
+                    result = fallbackResult,
+                    totalMs = (deadlineNow - startMs).coerceAtLeast(0L),
+                    warmLookupMs = progress.warmLookupMs.get(),
+                    profileDecodeMs = progress.profileDecodeMs.get(),
+                    riotLoopMs = progress.snapshotRiotLoopMs(deadlineNow),
+                    httpAttempts = progress.httpAttempts.get(),
                     preAdmission = preAdmission
                 )
-                PlayerPreparationOutcome.Ready(blocked)
+                PlayerPreparationOutcome.Ready(fallbackResult)
             }
-        ) {
+        ) { progress, ownerHardDeadlineMs ->
             executeSlotGuardedPlayerPreparation(
                 normalizedRegion = normalizedRegion,
                 puuid = trimmedPuuid,
@@ -1048,6 +1141,8 @@ class TimelineService @Autowired constructor(
                 playerCacheKey = playerCacheKey,
                 includeEmptyFallbackAnalysisForLegacyRoute = includeEmptyFallbackAnalysisForLegacyRoute,
                 preAdmission = preAdmission,
+                ownerHardDeadlineMs = ownerHardDeadlineMs,
+                progress = progress,
                 profileLoader = profileLoader
             )
         }
@@ -1063,7 +1158,8 @@ class TimelineService @Autowired constructor(
         riotLoopMs: Long = 0L,
         httpAttempts: Int = 0,
         preAdmission: PreAdmissionCheckResult? = null,
-        captureEndSample: Boolean = true
+        captureEndSample: Boolean = true,
+        subStage: String? = null
     ) {
         val endSample = if (captureEndSample) {
             safeSampleForTelemetry()
@@ -1076,9 +1172,10 @@ class TimelineService @Autowired constructor(
         val gcAttempted = preAdmission?.gcAttempted ?: false
         val gcStatus = preAdmission?.gcStatus ?: "NOT_APPLICABLE"
         val gcMs = preAdmission?.gcDurationMs ?: 0L
+        val subStageToken = subStage?.takeIf { it.isNotBlank() }?.let { " subStage=$it" } ?: ""
 
         if (result.status == "COMPLETE") {
-            val message = "coachTimelinePrep summary region=$normalizedRegion status=${result.status} stage=$stage " +
+            val message = "coachTimelinePrep summary region=$normalizedRegion status=${result.status} stage=$stage$subStageToken " +
                 "covered=${result.coveredMatchIds.size}/${result.requestedMatchIds.size} cacheHit=${result.cacheHit} " +
                 "totalMs=$totalMs warmLookupMs=$warmLookupMs profileDecodeMs=$profileDecodeMs riotLoopMs=$riotLoopMs httpAttempts=$httpAttempts " +
                 "gcEnabled=$preAdmissionGcEnabled gcAttempted=$gcAttempted gcStatus=$gcStatus gcMs=$gcMs " +
@@ -1087,7 +1184,7 @@ class TimelineService @Autowired constructor(
             stageSummaryObserver?.invoke(message)
         } else {
             val stopReason = result.stopReason ?: "NONE"
-            val message = "coachTimelinePrep summary region=$normalizedRegion status=${result.status} stopReason=$stopReason stage=$stage " +
+            val message = "coachTimelinePrep summary region=$normalizedRegion status=${result.status} stopReason=$stopReason stage=$stage$subStageToken " +
                 "covered=${result.coveredMatchIds.size}/${result.requestedMatchIds.size} cacheHit=${result.cacheHit} " +
                 "totalMs=$totalMs warmLookupMs=$warmLookupMs profileDecodeMs=$profileDecodeMs riotLoopMs=$riotLoopMs httpAttempts=$httpAttempts " +
                 "gcEnabled=$preAdmissionGcEnabled gcAttempted=$gcAttempted gcStatus=$gcStatus gcMs=$gcMs " +
@@ -1105,10 +1202,14 @@ class TimelineService @Autowired constructor(
         playerCacheKey: String,
         includeEmptyFallbackAnalysisForLegacyRoute: Boolean,
         preAdmission: PreAdmissionCheckResult,
+        ownerHardDeadlineMs: Long,
+        progress: PrepStageProgress,
         profileLoader: () -> SummonerProfileDto?
     ): PlayerPreparationOutcome {
         val ownerStartMs = timeProvider.now()
-        val ownerDeadlineMs = ownerStartMs + prepDeadlineMs.coerceAtLeast(100L)
+        val ioLoopDeadlineMs = computeWorkerIoDeadlineMs(ownerHardDeadlineMs, ownerStartMs)
+        progress.effectiveRequestedIds.set(sanitizedRequestedIds)
+        progress.subStage.set("slot_admission")
 
         // Re-check 350 MiB admission headroom before slot & before any decode (strictly GC-free post-pre-admission)
         if (!hasCoachAdmissionHeadroom()) {
@@ -1130,6 +1231,7 @@ class TimelineService @Autowired constructor(
         }
 
         // 3. Acquire global concurrency slot BEFORE warm-cache inflate or profile decode
+        progress.subStage.set("concurrency_slot")
         val safeMaxConcurrent = maxConcurrentPreparations.coerceAtLeast(1)
         if (!tryAcquireGlobalSlot(safeMaxConcurrent)) {
             val blocked = buildBlockedResult(
@@ -1153,6 +1255,7 @@ class TimelineService @Autowired constructor(
         var warmLookupMs = 0L
         var profileDecodeMs = 0L
         try {
+            progress.subStage.set("post_slot_admission")
             if (!hasCoachAdmissionHeadroom()) {
                 val blocked = buildBlockedResult(
                     normalizedRegion = normalizedRegion,
@@ -1172,9 +1275,11 @@ class TimelineService @Autowired constructor(
             }
 
             // 4. Bounded warm cache lookup inside the global slot BEFORE SummonerProfileDto decode
+            progress.subStage.set("player_warm_cache")
             val warmStartMs = timeProvider.now()
-            val warmPlayerLookup = readCachedPreparationBounded(playerCacheKey, ownerDeadlineMs, lingeringWorkers)
+            val warmPlayerLookup = readCachedPreparationBounded(playerCacheKey, ownerHardDeadlineMs, lingeringWorkers)
             warmLookupMs += (timeProvider.now() - warmStartMs).coerceAtLeast(0L)
+            progress.warmLookupMs.set(warmLookupMs)
             when (warmPlayerLookup) {
                 is CachedPreparationLookup.Hit -> {
                     logCoachPrepStageSummary(
@@ -1209,16 +1314,18 @@ class TimelineService @Autowired constructor(
             }
 
             // 5. Bounded profile decode + immediate slice to <= 20 recent match IDs/DTOs (releasing 883-ID profile immediately)
+            progress.subStage.set("profile_decode")
             val profileFailure = AtomicReference<String?>(null)
             val profileStartMs = timeProvider.now()
             val slicedProfile = extractBoundedProfileSlice(
                 sanitizedRequestedIds = sanitizedRequestedIds,
-                deadlineAtMs = ownerDeadlineMs,
+                deadlineAtMs = ioLoopDeadlineMs,
                 failureReasonHolder = profileFailure,
                 lingeringWorkers = lingeringWorkers,
                 profileLoader = profileLoader
             )
             profileDecodeMs = (timeProvider.now() - profileStartMs).coerceAtLeast(0L)
+            progress.profileDecodeMs.set(profileDecodeMs)
             val profileAbortReason = profileFailure.get()
             if (profileAbortReason != null) {
                 val mappedReason = when (profileAbortReason) {
@@ -1260,6 +1367,7 @@ class TimelineService @Autowired constructor(
 
             val orderedMatchIds = slicedProfile.effectiveMatchIds
             val orderedMatchDtos = slicedProfile.orderedMatchDtos
+            progress.effectiveRequestedIds.set(orderedMatchIds)
             if (orderedMatchIds.isEmpty()) {
                 val blocked = CoachTimelinePreparationResultDto(
                     status = "BLOCKED",
@@ -1292,9 +1400,11 @@ class TimelineService @Autowired constructor(
                 orderedMatchIds = orderedMatchIds,
                 analyzerVersion = analyzerVersion
             )
+            progress.subStage.set("direct_warm_cache")
             val directWarmStartMs = timeProvider.now()
-            val warmDirectLookup = readCachedPreparationBounded(directCacheKey, ownerDeadlineMs, lingeringWorkers)
+            val warmDirectLookup = readCachedPreparationBounded(directCacheKey, ownerHardDeadlineMs, lingeringWorkers)
             warmLookupMs += (timeProvider.now() - directWarmStartMs).coerceAtLeast(0L)
+            progress.warmLookupMs.set(warmLookupMs)
             when (warmDirectLookup) {
                 is CachedPreparationLookup.Hit -> {
                     logCoachPrepStageSummary(
@@ -1331,8 +1441,9 @@ class TimelineService @Autowired constructor(
             }
 
             val playerScopeKey = "$normalizedRegion:$puuid"
-            val httpAttempts = AtomicInteger(0)
             val riotLoopStartMs = timeProvider.now()
+            progress.riotLoopStartMs.set(riotLoopStartMs)
+            progress.subStage.set("timeline_loop")
             val result = RiotApiService.withLingeringWorkerHook({ handle -> lingeringWorkers.add(handle) }) {
                 executeCoreTimelinePreparation(
                     normalizedRegion = normalizedRegion,
@@ -1342,12 +1453,15 @@ class TimelineService @Autowired constructor(
                     analyzerVersion = analyzerVersion,
                     cacheKeysToPopulate = listOf(directCacheKey, playerCacheKey),
                     playerScopeKey = playerScopeKey,
-                    deadlineAtMs = ownerDeadlineMs,
+                    deadlineAtMs = ioLoopDeadlineMs,
+                    hardCompletionDeadlineMs = ownerHardDeadlineMs,
                     lingeringWorkers = lingeringWorkers,
-                    httpAttemptCounter = httpAttempts
+                    httpAttemptCounter = progress.httpAttempts,
+                    progress = progress
                 )
             }
             val riotLoopMs = (timeProvider.now() - riotLoopStartMs).coerceAtLeast(0L)
+            progress.riotLoopMs.set(riotLoopMs)
             logCoachPrepStageSummary(
                 normalizedRegion = normalizedRegion,
                 stage = "timeline_loop",
@@ -1356,7 +1470,7 @@ class TimelineService @Autowired constructor(
                 warmLookupMs = warmLookupMs,
                 profileDecodeMs = profileDecodeMs,
                 riotLoopMs = riotLoopMs,
-                httpAttempts = httpAttempts.get(),
+                httpAttempts = progress.httpAttempts.get(),
                 preAdmission = preAdmission
             )
 
@@ -1504,18 +1618,20 @@ class TimelineService @Autowired constructor(
             key = cacheKey,
             map = inFlightDirectPreparations,
             callerDeadlineMs = callerDeadlineMs,
-            onCallerDeadlineExceeded = {
-                buildBlockedResult(
+            onCallerDeadlineExceeded = { progress ->
+                buildPartialOrBlockedCallerDeadlineResult(
                     normalizedRegion = normalizedRegion,
                     puuid = trimmedPuuid,
-                    orderedMatchIds = orderedMatchIds,
-                    stopReason = "DEADLINE_EXCEEDED",
-                    analyzerVersion = analyzerVersion
+                    fallbackOrderedMatchIds = orderedMatchIds,
+                    analyzerVersion = analyzerVersion,
+                    progress = progress
                 )
             }
-        ) {
+        ) { progress, ownerHardDeadlineMs ->
             val ownerStartMs = timeProvider.now()
-            val ownerDeadlineMs = ownerStartMs + prepDeadlineMs.coerceAtLeast(100L)
+            val ioLoopDeadlineMs = computeWorkerIoDeadlineMs(ownerHardDeadlineMs, ownerStartMs)
+            progress.effectiveRequestedIds.set(orderedMatchIds)
+            progress.subStage.set("slot_admission")
 
             if (!hasCoachAdmissionHeadroom()) {
                 return@coalesceSingleflightWithCallerIsolation buildBlockedResult(
@@ -1527,6 +1643,7 @@ class TimelineService @Autowired constructor(
                 )
             }
 
+            progress.subStage.set("concurrency_slot")
             val safeMaxConcurrent = maxConcurrentPreparations.coerceAtLeast(1)
             if (!tryAcquireGlobalSlot(safeMaxConcurrent)) {
                 return@coalesceSingleflightWithCallerIsolation buildBlockedResult(
@@ -1540,6 +1657,7 @@ class TimelineService @Autowired constructor(
 
             val lingeringWorkers = Collections.synchronizedList(mutableListOf<RiotApiService.LingeringWorkerHandle>())
             try {
+                progress.subStage.set("post_slot_admission")
                 if (!hasCoachAdmissionHeadroom()) {
                     return@coalesceSingleflightWithCallerIsolation buildBlockedResult(
                         normalizedRegion = normalizedRegion,
@@ -1550,7 +1668,11 @@ class TimelineService @Autowired constructor(
                     )
                 }
 
-                when (val warmLookup = readCachedPreparationBounded(cacheKey, ownerDeadlineMs, lingeringWorkers)) {
+                progress.subStage.set("direct_warm_cache")
+                val warmStartMs = timeProvider.now()
+                val warmLookup = readCachedPreparationBounded(cacheKey, ownerHardDeadlineMs, lingeringWorkers)
+                progress.warmLookupMs.set((timeProvider.now() - warmStartMs).coerceAtLeast(0L))
+                when (warmLookup) {
                     is CachedPreparationLookup.Hit -> return@coalesceSingleflightWithCallerIsolation warmLookup.result
                     is CachedPreparationLookup.Aborted -> return@coalesceSingleflightWithCallerIsolation buildBlockedResult(
                         normalizedRegion = normalizedRegion,
@@ -1562,7 +1684,10 @@ class TimelineService @Autowired constructor(
                     CachedPreparationLookup.Miss -> Unit
                 }
 
-                RiotApiService.withLingeringWorkerHook({ handle -> lingeringWorkers.add(handle) }) {
+                val riotLoopStartMs = timeProvider.now()
+                progress.riotLoopStartMs.set(riotLoopStartMs)
+                progress.subStage.set("timeline_loop")
+                val result = RiotApiService.withLingeringWorkerHook({ handle -> lingeringWorkers.add(handle) }) {
                     executeCoreTimelinePreparation(
                         normalizedRegion = normalizedRegion,
                         puuid = trimmedPuuid,
@@ -1571,10 +1696,15 @@ class TimelineService @Autowired constructor(
                         analyzerVersion = analyzerVersion,
                         cacheKeysToPopulate = listOf(cacheKey),
                         playerScopeKey = playerScopeKey,
-                        deadlineAtMs = ownerDeadlineMs,
-                        lingeringWorkers = lingeringWorkers
+                        deadlineAtMs = ioLoopDeadlineMs,
+                        hardCompletionDeadlineMs = ownerHardDeadlineMs,
+                        lingeringWorkers = lingeringWorkers,
+                        httpAttemptCounter = progress.httpAttempts,
+                        progress = progress
                     )
                 }
+                progress.riotLoopMs.set((timeProvider.now() - riotLoopStartMs).coerceAtLeast(0L))
+                result
             } finally {
                 releaseGlobalSlotAfterWorkers(lingeringWorkers)
             }
@@ -1590,8 +1720,10 @@ class TimelineService @Autowired constructor(
         cacheKeysToPopulate: List<String>,
         playerScopeKey: String,
         deadlineAtMs: Long,
+        hardCompletionDeadlineMs: Long = deadlineAtMs,
         lingeringWorkers: MutableList<RiotApiService.LingeringWorkerHandle>,
-        httpAttemptCounter: AtomicInteger? = null
+        httpAttemptCounter: AtomicInteger? = null,
+        progress: PrepStageProgress? = null
     ): CoachTimelinePreparationResultDto {
         val matchDtosById = matchDtos.mapNotNull { dto ->
             val mid = dto.metadata?.matchId?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
@@ -1630,6 +1762,7 @@ class TimelineService @Autowired constructor(
                 continue
             }
 
+            progress?.subStage?.set("timeline_cache_read")
             val rawCacheKey = getCacheKey(matchId, normalizedRegion)
             val cacheReadOutcome = readAndCompactCachedTimeline(
                 rawCacheKey = rawCacheKey,
@@ -1663,6 +1796,7 @@ class TimelineService @Autowired constructor(
                     !hasCoachContinueHeadroom() -> fetchStopReason = "MEMORY_HEADROOM_STOP"
                     activeCooldownMs > 0L && activeCooldownMs + 10L > remainingMs -> fetchStopReason = "RATE_LIMIT_COOLDOWN"
                     else -> {
+                        progress?.subStage?.set("riot_http_fetch")
                         val failureReason = AtomicReference<String?>(null)
                         val fetched = riotApiService.getMatchTimelineBounded(
                             matchId = matchId,
@@ -1675,9 +1809,10 @@ class TimelineService @Autowired constructor(
                             headroomGuard = ::hasCoachContinueHeadroom
                         )
                         if (fetched != null) {
-                            if (timeProvider.now() >= deadlineAtMs) {
+                            if (timeProvider.now() >= hardCompletionDeadlineMs) {
                                 fetchStopReason = "DEADLINE_EXCEEDED"
                             } else {
+                                progress?.subStage?.set("timeline_compact_cache")
                                 val compactedReplacement = cacheAndCompactFetchedTimeline(
                                     rawCacheKey = rawCacheKey,
                                     fetched = fetched,
@@ -1743,6 +1878,17 @@ class TimelineService @Autowired constructor(
 
             compactedTriples.add(Triple(matchId, compactedTimeline, matchDto))
             coveredMatchIds.add(matchId)
+            progress?.partialSnapshot?.set(
+                PartialCompactionSnapshot(
+                    orderedMatchIds = orderedMatchIds,
+                    orderedMatchDtos = orderedMatchDtos,
+                    compactedTriples = compactedTriples.toList(),
+                    coveredMatchIds = coveredMatchIds.toList(),
+                    missingPrefix = missingMatches.toList(),
+                    nextMatchIndex = index + 1,
+                    peakRetainedRawTimelines = peakRetainedRawTimelines.get()
+                )
+            )
         }
 
         if (coveredMatchIds.isEmpty() && stopReason == null) {
@@ -1755,6 +1901,7 @@ class TimelineService @Autowired constructor(
             else -> "PARTIAL"
         }
 
+        progress?.subStage?.set("analysis_assembly")
         val analysis = if (compactedTriples.isNotEmpty()) {
             timelineAnalysisService.analyze(compactedTriples, puuid, orderedMatchDtos)
         } else {
@@ -1777,6 +1924,7 @@ class TimelineService @Autowired constructor(
 
         // Strictly cache ONLY COMPLETE results so transient/partial states are always immediately retryable
         if (status == "COMPLETE") {
+            progress?.subStage?.set("prepared_cache_write")
             putCachedPreparation(cacheKeysToPopulate, playerScopeKey, finalResult)
         }
 
