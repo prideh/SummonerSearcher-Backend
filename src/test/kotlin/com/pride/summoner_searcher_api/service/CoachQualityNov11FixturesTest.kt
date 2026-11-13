@@ -1108,6 +1108,103 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
             }
         }
     }
+
+    Given("Fixture 15 (live-QA ad7a91aa SpearShot mixed-role CS@10 denominator regression): avgActual=72.9 across 14 mixed laner games (11 Top, 3 Bot) in recentMatchSample (20g) vs savedHistory (883g)") {
+        When("constructing the prompt and evaluating the exact live ad7a91aa failure ('Your saved matches show an average lane CS of 72.9 across 11 top lane games at 10:00...') across sync/SSE sanitizers, curation, and history") {
+            Then("prompt ground truth and rules bind 72.9 strictly to all 14 mixed laner games (11 Top, 3 Bot) in the last 20 detailed matches, sync and 3/4-char SSE sanitizers repair both sample and mixed-role denominator while preserving -305@10m (20g) and -968.3@20m (19g), and poisoned history/examples are rejected") {
+                val spearFixture = fixtures.getValue("spearShotMixedRoleCs10")
+                @Suppress("UNCHECKED_CAST")
+                val spearContext = spearFixture["context"] as Map<String, Any?>
+                val spearQuestion = spearFixture["userMessage"] as String
+                val spearPrompt = buildPrompt(spearContext, spearQuestion)
+
+                // 1. Prompt ground truth explicitly binds avgActual=72.9 to ALL 14 mixed laner games (11 Top, 3 Bot) in last 20 detailed matches (never 11 Top or saved matches)
+                spearPrompt shouldContain "avgLaneCsAt10: {avgActual=72.9 (matchCount=14), avgTheoreticalMax=114.0 (theoreticalMaxMatchCount=14, avgSupportedActual=72.9), theoreticalMaxLabel=\"${AiAnalysisService.DEFAULT_CS10_THEORETICAL_MAX_LABEL}\", roleBreakdown=[TOP(count=11g, theoreticalMax=114); BOTTOM(count=3g, theoreticalMax=114)]}"
+                spearPrompt shouldContain "-> cs10SampleBinding: avgActual=72.9 covers ALL 14 laner games (11 Top, 3 Bot) in last 20 detailed matches (NEVER a single-role subset or saved matches)"
+                spearPrompt shouldContain "bind `avgLaneCsAt10` strictly to `recentMatchSample` (never `savedHistory`) and the full mixed-role `matchCount` (never a single-role subset)"
+                (AiAnalysisService.utf8ByteSize(spearPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+
+                // 2. Raw live ad7a91aa failure and single-role/saved-history variants are flagged by context-aware evidence boundary & curation checks
+                val liveMixedRoleFailure = spearFixture["liveAd7a91aaMixedRoleFailure"] as String
+                val botSubsetVariant =
+                    "In your last 20 detailed matches, your 10-minute lane CS averages 72.9 across 3 bot lane games."
+                val reversedOrderVariant =
+                    "Across 11 top lane games at 10:00, your lane CS averages 72.9 while gold diff is -305 across 20 games."
+                val savedMatchesOnlyVariant =
+                    "Across your saved matches, your 10:00 lane CS is 72.9 across 14 laner games (11 Top, 3 Bot)."
+
+                listOf(liveMixedRoleFailure, botSubsetVariant, reversedOrderVariant, savedMatchesOnlyVariant).forEach { bad ->
+                    AiAnalysisService.containsEvidenceBoundaryViolation(bad, spearContext) shouldBe true
+                    AiAnalysisService.isEligibleCuratedExample(spearQuestion, bad, spearContext) shouldBe false
+                }
+
+                // 3. Deterministic sync + 3-char/4-char SSE stream sanitizers rewrite both 'Your saved matches' and 'across 11 top lane games' identically while leaving gold -305@10m (20g) and -968.3@20m (19g) untouched
+                val sanitizedSync = AiAnalysisService.sanitizePlayerFacingOutput(liveMixedRoleFailure, spearContext)
+                val sanitizedStream3 = AiAnalysisService.sanitizePlayerFacingStream(
+                    rawChunks = reactor.core.publisher.Flux.fromIterable(liveMixedRoleFailure.chunked(3)),
+                    context = spearContext
+                ).collectList().block()!!.joinToString("")
+                val sanitizedStream4 = AiAnalysisService.sanitizePlayerFacingStream(
+                    rawChunks = reactor.core.publisher.Flux.fromIterable(liveMixedRoleFailure.chunked(4)),
+                    context = spearContext,
+                    ensureSuggestions = true,
+                    userMessage = spearQuestion,
+                    category = "cs_farming"
+                ).collectList().block()!!.joinToString("")
+
+                sanitizedStream3 shouldBe sanitizedSync
+                sanitizedStream4 shouldBe AiAnalysisService.ensureSuggestionsBlock(liveMixedRoleFailure, spearContext, spearQuestion, "cs_farming")
+
+                sanitizedSync shouldContain "Your last 20 detailed matches show an average lane CS of 72.9 across 14 laner games (11 Top, 3 Bot) at 10:00"
+                sanitizedSync shouldNotContain "Your saved matches show"
+                sanitizedSync shouldNotContain "across 11 top lane games"
+                sanitizedSync shouldContain "-305 gold at 10:00 (20 games)"
+                sanitizedSync shouldContain "-968.3 gold at 20:00 (19 games)"
+                AiAnalysisService.containsEvidenceBoundaryViolation(sanitizedSync, spearContext) shouldBe false
+                AiAnalysisService.containsInternalSchemaLeak(sanitizedSync) shouldBe false
+
+                // Reversed-order clause ("Across 11 top lane games at 10:00, your lane CS averages 72.9...") also streams identically to sync
+                val reversedSync = AiAnalysisService.sanitizePlayerFacingOutput(reversedOrderVariant, spearContext)
+                val reversedStream4 = AiAnalysisService.sanitizePlayerFacingStream(
+                    rawChunks = reactor.core.publisher.Flux.fromIterable(reversedOrderVariant.chunked(4)),
+                    context = spearContext
+                ).collectList().block()!!.joinToString("")
+                reversedStream4 shouldBe reversedSync
+                reversedSync shouldContain "Across 14 laner games (11 Top, 3 Bot) at 10:00, your lane CS averages 72.9"
+                AiAnalysisService.containsEvidenceBoundaryViolation(reversedSync, spearContext) shouldBe false
+
+                // Unrelated non-CS@10 role win-loss sentences are NOT rewritten
+                val unrelatedTopWl = "Across 11 top lane games, you went 5W-6L."
+                AiAnalysisService.sanitizePlayerFacingOutput(unrelatedTopWl, spearContext) shouldBe unrelatedTopWl
+                AiAnalysisService.sanitizePlayerFacingStream(
+                    rawChunks = reactor.core.publisher.Flux.fromIterable(unrelatedTopWl.chunked(4)),
+                    context = spearContext
+                ).collectList().block()!!.joinToString("") shouldBe unrelatedTopWl
+
+                // 4. Poisoned assistant history containing the live mixed-role failure is stripped from Previous:
+                val promptWithPoisonedHistory = buildPrompt(
+                    spearContext,
+                    spearQuestion,
+                    listOf(
+                        mapOf("role" to "user", "content" to "How is my lane CS at 10?"),
+                        mapOf("role" to "assistant", "content" to liveMixedRoleFailure)
+                    )
+                )
+                val previousSection = promptWithPoisonedHistory.substringAfter("\nPrevious:\n").substringBefore("\n\nUser:")
+                previousSection shouldContain "user: How is my lane CS at 10?"
+                previousSection shouldNotContain "assistant:"
+                previousSection shouldNotContain "across 11 top lane games"
+
+                // 5. Clean SpearShot exemplar passes all checks unchanged
+                val spearExemplar = spearFixture["exemplarCleanResponse"] as String
+                AiAnalysisService.containsInternalSchemaLeak(spearExemplar) shouldBe false
+                AiAnalysisService.containsEvidenceBoundaryViolation(spearExemplar, spearContext) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample(spearQuestion, spearExemplar, spearContext) shouldBe true
+                AiAnalysisService.ensureSuggestionsBlock(spearExemplar, spearContext, spearQuestion, "cs_farming") shouldBe spearExemplar
+            }
+        }
+    }
 })
+
 
 
