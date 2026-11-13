@@ -665,7 +665,20 @@ class ImprovementStatsTest : DescribeSpec({
         it("should lazily backfill cached timelines in TimelineService when CHAMPION_KILL events predate bounty/shutdownBounty") {
             val riotApiService = io.mockk.mockk<RiotApiService>()
             val redisCacheService = io.mockk.mockk<RedisCacheService>(relaxed = true)
-            val timelineService = TimelineService(riotApiService, redisCacheService)
+            val deterministicMemory = object : MemoryStatsProvider {
+                override fun sample(): RawMemorySample = RawMemorySample(
+                    jvmHeapUsedBytes = 92L * 1024L * 1024L,
+                    jvmHeapCommittedBytes = 205L * 1024L * 1024L,
+                    jvmHeapMaxBytes = 205L * 1024L * 1024L,
+                    cgroupMemoryCurrentBytes = 320L * 1024L * 1024L,
+                    cgroupMemoryMaxBytes = 512L * 1024L * 1024L
+                )
+            }
+            val timelineService = TimelineService(
+                riotApiService = riotApiService,
+                redisCacheService = redisCacheService,
+                memoryStatsProvider = deterministicMemory
+            )
 
             val legacyTimeline = MatchTimelineDto(
                 metadata = MatchTimelineMetadata("EUW1_999", listOf(playerPuuid)),
