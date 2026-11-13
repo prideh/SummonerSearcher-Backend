@@ -1108,6 +1108,254 @@ class CoachQualityNov11FixturesTest : BehaviorSpec({
             }
         }
     }
+
+    Given("Fixture 15 (live-QA ad7a91aa SpearShot mixed-role CS@10 denominator regression): avgActual=72.9 across 14 mixed laner games (11 Top, 3 Bot) in recentMatchSample (20g) vs savedHistory (883g)") {
+        When("constructing the prompt and evaluating the exact live ad7a91aa failure ('Your saved matches show an average lane CS of 72.9 across 11 top lane games at 10:00...') across sync/SSE sanitizers, curation, and history") {
+            Then("prompt ground truth and rules bind 72.9 strictly to all 14 mixed laner games (11 Top, 3 Bot) in the last 20 detailed matches, sync and 3/4-char SSE sanitizers repair both sample and mixed-role denominator while preserving -305@10m (20g) and -968.3@20m (19g), and poisoned history/examples are rejected") {
+                val spearFixture = fixtures.getValue("spearShotMixedRoleCs10")
+                @Suppress("UNCHECKED_CAST")
+                val spearContext = spearFixture["context"] as Map<String, Any?>
+                val spearQuestion = spearFixture["userMessage"] as String
+                val spearPrompt = buildPrompt(spearContext, spearQuestion)
+
+                // 1. Prompt ground truth explicitly binds avgActual=72.9 to ALL 14 mixed laner games (11 Top, 3 Bot) in last 20 detailed matches (never 11 Top or saved matches)
+                spearPrompt shouldContain "avgLaneCsAt10: {avgActual=72.9 (matchCount=14), avgTheoreticalMax=114.0 (theoreticalMaxMatchCount=14, avgSupportedActual=72.9), theoreticalMaxLabel=\"${AiAnalysisService.DEFAULT_CS10_THEORETICAL_MAX_LABEL}\", roleBreakdown=[TOP(count=11g, theoreticalMax=114); BOTTOM(count=3g, theoreticalMax=114)]}"
+                spearPrompt shouldContain "-> cs10SampleBinding: avgActual=72.9 covers ALL 14 laner games (11 Top, 3 Bot) in last 20 detailed matches (NEVER a single-role subset or saved matches)"
+                spearPrompt shouldContain "bind `avgLaneCsAt10` strictly to `recentMatchSample` (never `savedHistory`) and the full mixed-role `matchCount` (never a single-role subset)"
+                (AiAnalysisService.utf8ByteSize(spearPrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+
+                // 2. Raw live ad7a91aa failure and single-role/saved-history variants are flagged by context-aware evidence boundary & curation checks
+                val liveMixedRoleFailure = spearFixture["liveAd7a91aaMixedRoleFailure"] as String
+                val botSubsetVariant =
+                    "In your last 20 detailed matches, your 10-minute lane CS averages 72.9 across 3 bot lane games."
+                val reversedOrderVariant =
+                    "Across 11 top lane games at 10:00, your lane CS averages 72.9 while gold diff is -305 across 20 games."
+                val savedMatchesOnlyVariant =
+                    "Across your saved matches, your 10:00 lane CS is 72.9 across 14 laner games (11 Top, 3 Bot)."
+
+                listOf(liveMixedRoleFailure, botSubsetVariant, reversedOrderVariant, savedMatchesOnlyVariant).forEach { bad ->
+                    AiAnalysisService.containsEvidenceBoundaryViolation(bad, spearContext) shouldBe true
+                    AiAnalysisService.isEligibleCuratedExample(spearQuestion, bad, spearContext) shouldBe false
+                }
+
+                // 3. Deterministic sync + ALL SSE chunk sizes (1, 2, 3, 4, 5, 7, 11, 17, 31, 64) + EVERY 2-way split index of the exact live failure rewrite identically
+                val sanitizedSync = AiAnalysisService.sanitizePlayerFacingOutput(liveMixedRoleFailure, spearContext)
+                val ensuredSync = AiAnalysisService.ensureSuggestionsBlock(liveMixedRoleFailure, spearContext, spearQuestion, "cs_farming")
+
+                for (chunkSize in listOf(1, 2, 3, 4, 5, 6, 7, 8, 11, 13, 17, 23, 31, 47, 64, 128)) {
+                    val streamed = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(liveMixedRoleFailure.chunked(chunkSize)),
+                        context = spearContext
+                    ).collectList().block()!!.joinToString("")
+                    streamed shouldBe sanitizedSync
+
+                    val streamedEnsured = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(liveMixedRoleFailure.chunked(chunkSize)),
+                        context = spearContext,
+                        ensureSuggestions = true,
+                        userMessage = spearQuestion,
+                        category = "cs_farming"
+                    ).collectList().block()!!.joinToString("")
+                    streamedEnsured shouldBe ensuredSync
+                }
+
+                // Exhaustive 2-way split parity across EVERY character boundary (1 until length) of liveAd7a91aaMixedRoleFailure
+                for (splitIdx in 1 until liveMixedRoleFailure.length) {
+                    val twoWayChunks = listOf(
+                        liveMixedRoleFailure.substring(0, splitIdx),
+                        liveMixedRoleFailure.substring(splitIdx)
+                    )
+                    val streamedSplit = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(twoWayChunks),
+                        context = spearContext
+                    ).collectList().block()!!.joinToString("")
+                    streamedSplit shouldBe sanitizedSync
+                }
+
+                sanitizedSync shouldContain "Your last 20 detailed matches show an average lane CS of 72.9 across 14 laner games (11 Top, 3 Bot) at 10:00"
+                sanitizedSync shouldNotContain "Your saved matches show"
+                sanitizedSync shouldNotContain "across 11 top lane games"
+                sanitizedSync shouldContain "-305 gold at 10:00 (20 games)"
+                sanitizedSync shouldContain "-968.3 gold at 20:00 (19 games)"
+                AiAnalysisService.containsEvidenceBoundaryViolation(sanitizedSync, spearContext) shouldBe false
+                AiAnalysisService.containsInternalSchemaLeak(sanitizedSync) shouldBe false
+
+                // 3b. Bold markup variants (bold sample, bold numbers, bold role phrase, outer bold, parenthetical bold, and reversed bold) preserve balanced '**' and stream identically across 1-char & all 2-way splits
+                val boldLiveFailure = spearFixture["boldLiveAd7a91aaMixedRoleFailure"] as String
+                AiAnalysisService.containsEvidenceBoundaryViolation(boldLiveFailure, spearContext) shouldBe true
+                val boldSanitizedSync = AiAnalysisService.sanitizePlayerFacingOutput(boldLiveFailure, spearContext)
+                boldSanitizedSync shouldContain "**Your last 20 detailed matches** show an average **lane CS** of **72.9** across **14 laner games (11 Top, 3 Bot)** at **10:00**"
+                (boldSanitizedSync.count { it == '*' } % 2) shouldBe 0
+                AiAnalysisService.containsEvidenceBoundaryViolation(boldSanitizedSync, spearContext) shouldBe false
+
+                for (chunkSize in listOf(1, 2, 3, 4, 7, 13, 29)) {
+                    val boldStreamed = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(boldLiveFailure.chunked(chunkSize)),
+                        context = spearContext
+                    ).collectList().block()!!.joinToString("")
+                    boldStreamed shouldBe boldSanitizedSync
+                }
+                for (splitIdx in 1 until boldLiveFailure.length) {
+                    val twoWayBold = listOf(boldLiveFailure.substring(0, splitIdx), boldLiveFailure.substring(splitIdx))
+                    val streamedBoldSplit = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(twoWayBold),
+                        context = spearContext
+                    ).collectList().block()!!.joinToString("")
+                    streamedBoldSplit shouldBe boldSanitizedSync
+                }
+
+                val extraBoldPermutations = listOf(
+                    "Your **saved matches** show an average lane CS of **72.9** across **11** top lane games at **10:00**." to
+                        "Your **last 20 detailed matches** show an average lane CS of **72.9** across **14 laner games (11 Top, 3 Bot)** at **10:00**.",
+                    "**Your saved matches show an average lane CS of 72.9 across 11 top lane games at 10:00.**" to
+                        "**Your last 20 detailed matches show an average lane CS of 72.9 across 14 laner games (11 Top, 3 Bot) at 10:00.**",
+                    "Your lane CS at 10:00 is **72.9** **across 11 top lane games**." to
+                        "Your lane CS at 10:00 is **72.9** **across 14 laner games (11 Top, 3 Bot)**.",
+                    "Your 10:00 lane CS averages **72.9** (**11 top lane games**)." to
+                        "Your 10:00 lane CS averages **72.9** (**14 laner games (11 Top, 3 Bot)**).",
+                    "Across **11 top lane games** at **10:00**, your **lane CS** averages **72.9**." to
+                        "Across **14 laner games (11 Top, 3 Bot)** at **10:00**, your **lane CS** averages **72.9**."
+                )
+                for ((rawBold, expectedBold) in extraBoldPermutations) {
+                    AiAnalysisService.containsEvidenceBoundaryViolation(rawBold, spearContext) shouldBe true
+                    val syncOut = AiAnalysisService.sanitizePlayerFacingOutput(rawBold, spearContext)
+                    syncOut shouldBe expectedBold
+                    (syncOut.count { it == '*' } % 2) shouldBe 0
+                    AiAnalysisService.containsEvidenceBoundaryViolation(syncOut, spearContext) shouldBe false
+                    val charStreamOut = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(rawBold.chunked(1)),
+                        context = spearContext
+                    ).collectList().block()!!.joinToString("")
+                    charStreamOut shouldBe expectedBold
+                }
+
+                // Reversed-order clause ("Across 11 top lane games at 10:00, your lane CS averages 72.9...") also streams identically across 1-char..4-char chunks
+                val reversedSync = AiAnalysisService.sanitizePlayerFacingOutput(reversedOrderVariant, spearContext)
+                for (cs in listOf(1, 2, 3, 4)) {
+                    val reversedStream = AiAnalysisService.sanitizePlayerFacingStream(
+                        rawChunks = reactor.core.publisher.Flux.fromIterable(reversedOrderVariant.chunked(cs)),
+                        context = spearContext
+                    ).collectList().block()!!.joinToString("")
+                    reversedStream shouldBe reversedSync
+                }
+                reversedSync shouldContain "Across 14 laner games (11 Top, 3 Bot) at 10:00, your lane CS averages 72.9"
+                AiAnalysisService.containsEvidenceBoundaryViolation(reversedSync, spearContext) shouldBe false
+
+                // Unrelated non-CS@10 role win-loss sentences are NOT rewritten
+                val unrelatedTopWl = "Across 11 top lane games, you went 5W-6L."
+                AiAnalysisService.sanitizePlayerFacingOutput(unrelatedTopWl, spearContext) shouldBe unrelatedTopWl
+                AiAnalysisService.sanitizePlayerFacingStream(
+                    rawChunks = reactor.core.publisher.Flux.fromIterable(unrelatedTopWl.chunked(1)),
+                    context = spearContext
+                ).collectList().block()!!.joinToString("") shouldBe unrelatedTopWl
+
+                // Honest missing-per-role boundary response passes cleanly without rewrite
+                val honestBoundary = spearFixture["honestMissingPerRoleBoundaryResponse"] as String
+                AiAnalysisService.sanitizePlayerFacingOutput(honestBoundary, spearContext) shouldBe honestBoundary
+                AiAnalysisService.containsEvidenceBoundaryViolation(honestBoundary, spearContext) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample(spearQuestion, honestBoundary, spearContext) shouldBe true
+
+                // 4. Poisoned assistant history containing the live mixed-role failure is stripped from Previous:
+                val promptWithPoisonedHistory = buildPrompt(
+                    spearContext,
+                    spearQuestion,
+                    listOf(
+                        mapOf("role" to "user", "content" to "How is my lane CS at 10?"),
+                        mapOf("role" to "assistant", "content" to liveMixedRoleFailure)
+                    )
+                )
+                val previousSection = promptWithPoisonedHistory.substringAfter("\nPrevious:\n").substringBefore("\n\nUser:")
+                previousSection shouldContain "user: How is my lane CS at 10?"
+                previousSection shouldNotContain "assistant:"
+                previousSection shouldNotContain "across 11 top lane games"
+
+                // 5. Clean SpearShot exemplar passes all checks unchanged
+                val spearExemplar = spearFixture["exemplarCleanResponse"] as String
+                AiAnalysisService.containsInternalSchemaLeak(spearExemplar) shouldBe false
+                AiAnalysisService.containsEvidenceBoundaryViolation(spearExemplar, spearContext) shouldBe false
+                AiAnalysisService.isEligibleCuratedExample(spearQuestion, spearExemplar, spearContext) shouldBe true
+                AiAnalysisService.ensureSuggestionsBlock(spearExemplar, spearContext, spearQuestion, "cs_farming") shouldBe spearExemplar
+            }
+        }
+    }
+
+    Given("Fixture 16 (negative per-role CS@10 false-binding guard): Legitimate per-role CS@10=80 across 11 Top games & 47 across 3 Bot games (overall avgActual=72.9 across 14 mixed laner games) vs ungrounded numbers") {
+        When("evaluating legitimate game-level per-role CS@10 sentences alongside unverified per-role or saved-history numbers") {
+            Then("legitimate per-role CS@10 values (80 / 80.0 across 11 Top, 47 / 47.0 across 3 Bot) are NEVER rewritten to 14 mixed games and pass curation, while ungrounded numbers are NOT fabricated-relabeled and are caught by the boundary gate") {
+                val perRoleFixture = fixtures.getValue("spearShotMixedRolePerMatchCs10")
+                @Suppress("UNCHECKED_CAST")
+                val perRoleContext = perRoleFixture["context"] as Map<String, Any?>
+                val perRoleQuestion = perRoleFixture["userMessage"] as String
+                val perRoleExemplar = perRoleFixture["exemplarPerRoleCleanResponse"] as String
+
+                // 1. Prompt ground truth exposes verifiedPerRoleCs10=[Top: 80.0 (11g), Bot: 47.0 (3g)] alongside overall 72.9 (14g)
+                val perRolePrompt = buildPrompt(perRoleContext, perRoleQuestion)
+                perRolePrompt shouldContain "verifiedPerRoleCs10=[Top: 80.0 (11g), Bot: 47.0 (3g)]"
+                perRolePrompt shouldContain "cite per-role 10:00 CS only when verified in GROUND TRUTH"
+                (AiAnalysisService.utf8ByteSize(perRolePrompt) <= AiAnalysisService.MAX_PROMPT_BYTES) shouldBe true
+
+                // 2. Legitimate per-role CS@10 sentences (standalone Top=80, standalone Top=80.0, reversed order, multi-clause with 72.9 overall, and full exemplar) are NEVER false-bound to 14 mixed games
+                val standalonePerRoleSentences = listOf(
+                    "In **your last 20 detailed matches**, your 10-minute lane CS averages **80** across **11 top lane games** (where **114** is the passive wave theoretical maximum, not missed CS).",
+                    "In your last 20 detailed matches, your 10:00 lane CS averages 80.0 across 11 top lane games.",
+                    "Across **11 top lane games** at **10:00**, your lane CS averages **80.0**, compared to **72.9** overall.",
+                    "Your 10:00 lane CS averages **80.0** across **11 top lane games**, pulling your overall average to **72.9**.",
+                    "In **your last 20 detailed matches**, you averaged **47** lane CS at 10:00 (**3 bot lane games**).",
+                    perRoleExemplar
+                )
+                for (validPerRole in standalonePerRoleSentences) {
+                    val syncOut = AiAnalysisService.sanitizePlayerFacingOutput(validPerRole, perRoleContext)
+                    syncOut shouldBe validPerRole
+                    for (cs in listOf(1, 3, 4)) {
+                        val streamOut = AiAnalysisService.sanitizePlayerFacingStream(
+                            rawChunks = reactor.core.publisher.Flux.fromIterable(validPerRole.chunked(cs)),
+                            context = perRoleContext
+                        ).collectList().block()!!.joinToString("")
+                        streamOut shouldBe validPerRole
+                    }
+                    AiAnalysisService.containsEvidenceBoundaryViolation(validPerRole, perRoleContext) shouldBe false
+                }
+                AiAnalysisService.isEligibleCuratedExample(perRoleQuestion, perRoleExemplar, perRoleContext) shouldBe true
+
+                // 3. Even when per-role data exists (Top=80.0), misbinding exact overall avgActual=72.9 to 11 top lane games is STILL caught & deterministically repaired
+                val misboundOverallOnPerRoleCtx =
+                    "Your saved matches show an average lane CS of **72.9** across **11 top lane games** at 10:00."
+                AiAnalysisService.containsEvidenceBoundaryViolation(misboundOverallOnPerRoleCtx, perRoleContext) shouldBe true
+                val repairedMisbound = AiAnalysisService.sanitizePlayerFacingOutput(misboundOverallOnPerRoleCtx, perRoleContext)
+                repairedMisbound shouldBe "Your last 20 detailed matches show an average lane CS of **72.9** across **14 laner games (11 Top, 3 Bot)** at 10:00."
+                AiAnalysisService.containsEvidenceBoundaryViolation(repairedMisbound, perRoleContext) shouldBe false
+
+                // 4. Ungrounded / hallucinated numbers (e.g. 85.0 across 11 top lane games, or 80.0 when context lacks per-match CS@10, or 85.0 on saved matches) are NEVER fabricated-relabeled onto 14 laner games or last 20 detailed matches, and are rejected by the boundary gate
+                val hallucinatedPerRole =
+                    "In your last 20 detailed matches, your 10:00 lane CS averages 85.0 across 11 top lane games."
+                AiAnalysisService.sanitizePlayerFacingOutput(hallucinatedPerRole, perRoleContext) shouldBe hallucinatedPerRole
+                AiAnalysisService.sanitizePlayerFacingStream(
+                    rawChunks = reactor.core.publisher.Flux.fromIterable(hallucinatedPerRole.chunked(1)),
+                    context = perRoleContext
+                ).collectList().block()!!.joinToString("") shouldBe hallucinatedPerRole
+                AiAnalysisService.containsEvidenceBoundaryViolation(hallucinatedPerRole, perRoleContext) shouldBe true
+                AiAnalysisService.isEligibleCuratedExample(perRoleQuestion, hallucinatedPerRole, perRoleContext) shouldBe false
+
+                @Suppress("UNCHECKED_CAST")
+                val contextWithoutPerMatchCs10 = fixtures.getValue("spearShotMixedRoleCs10")["context"] as Map<String, Any?>
+                val unverifiedPerRoleOnSummaryOnlyCtx =
+                    "In your last 20 detailed matches, your 10:00 lane CS averages 80.0 across 11 top lane games."
+                AiAnalysisService.sanitizePlayerFacingOutput(unverifiedPerRoleOnSummaryOnlyCtx, contextWithoutPerMatchCs10) shouldBe unverifiedPerRoleOnSummaryOnlyCtx
+                AiAnalysisService.containsEvidenceBoundaryViolation(unverifiedPerRoleOnSummaryOnlyCtx, contextWithoutPerMatchCs10) shouldBe true
+
+                val hallucinatedSavedSample =
+                    "Your saved matches show an average lane CS of 85.0 at 10:00."
+                AiAnalysisService.sanitizePlayerFacingOutput(hallucinatedSavedSample, perRoleContext) shouldBe hallucinatedSavedSample
+                AiAnalysisService.containsEvidenceBoundaryViolation(hallucinatedSavedSample, perRoleContext) shouldBe true
+
+                val multiClauseHallucinatedSaved =
+                    "Your saved matches show an average lane CS of 85.0 across 11 top lane games, compared to 72.9 overall."
+                AiAnalysisService.sanitizePlayerFacingOutput(multiClauseHallucinatedSaved, perRoleContext) shouldBe multiClauseHallucinatedSaved
+                AiAnalysisService.containsEvidenceBoundaryViolation(multiClauseHallucinatedSaved, perRoleContext) shouldBe true
+            }
+        }
+    }
 })
+
 
 

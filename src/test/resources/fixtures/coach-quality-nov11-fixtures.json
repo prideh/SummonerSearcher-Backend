@@ -372,5 +372,142 @@
     ],
     "live9598428MissingSuggestionsRoast": "In your last 5 detailed matches, you are sitting on a 20.0% win rate (1 win and 4 losses) while soaking up 78.0 seconds of gray screen per game across 5 analyzed games. Across your saved matches (883 games), your 4.9 average deaths may be dragging down your map tempo if those aggressive trades misfire. Next game: (1) when looking for a W engage on Pantheon, check that your empowered Mortal Will passive is stacked while the enemy's dash cooldown is down, and (2) crash your top wave fully into tower before channeling R.",
     "liveAae2a392ConditionalSpacingTempoRoast": "Across your last 5 detailed matches, you paid fountain rent for 390 seconds of gray screen (78.0s per game across 5 analyzed games) on a 20.0% win rate (1W–4L). Dropping 4 of those last 5 on Pantheon while averaging 6.7 CS/min across 5 analyzed games could mean your tempo is bleeding if spacing slips. Next game: (1) when looking to W-engage on Pantheon, check your empowered Mortal Will passive is stacked and E (Aegis Assault) is ready while the enemy's dash cooldown is down, and (2) crash your top wave before channeling R.\n---SUGGESTIONS--- [\"Which Pantheon deaths gave up shutdown gold?\", \"How should I play Pantheon when behind early?\", \"Compare my recent matches to my saved match history\"]"
+  },
+  "spearShotMixedRoleCs10": {
+    "userMessage": "What do my 10-minute lane CS and 20-minute gold numbers actually show? Give me one useful habit, and keep observed numbers separate from guesses.",
+    "context": {
+      "summonerName": "Spear Shot#EUW",
+      "rank": "CHALLENGER I (1142 LP)",
+      "primaryRole": "TOP",
+      "totalGamesAnalyzed": 20,
+      "timelineStatus": "ANALYZED",
+      "timelineCoverage": {
+        "status": "COMPLETE",
+        "coveredMatches": 20,
+        "totalMatches": 20,
+        "stopReason": "COMPLETED"
+      },
+      "savedHistory": {
+        "scope": "saved_ranked_matches",
+        "games": 883,
+        "wins": 462,
+        "losses": 421,
+        "winRate": 52.3,
+        "isCompleteSeasonTotal": false
+      },
+      "recentMatchSample": {
+        "scope": "recent_20_detailed_matches",
+        "games": 20,
+        "wins": 9,
+        "losses": 11,
+        "winRate": 45.0
+      },
+      "avgLaneCsAt10": {
+        "avgActual": 72.9,
+        "matchCount": 14,
+        "roleBreakdown": {
+          "BOTTOM": 3,
+          "TOP": 11,
+          "MIDDLE": 0
+        },
+        "targetLabel": "11 Top, 3 Bot",
+        "avgTarget": 114,
+        "targetMatchCount": 14,
+        "avgSupportedActual": 72.9
+      },
+      "missingLaneCsAt10Matches": 0,
+      "improvementStats": {
+        "sampleSize": 20,
+        "hasTimelineAnalysis": true,
+        "leadRetention": {
+          "avgGoldLeadAt10": -305.0,
+          "eligibleGamesAt10": 20,
+          "avgGoldLeadAt20": -968.3,
+          "eligibleGamesAt20": 19,
+          "leadsHeld": 5,
+          "leadsThrown": 2,
+          "comebacks": 4
+        }
+      },
+      "recentMatches": [
+        { "patch": "26.1", "gameDuration": 28, "champion": "Pantheon", "role": "TOP", "win": true, "kda": "7/3/6 (4.33)", "csPerMin": 7.4 },
+        { "patch": "26.1", "gameDuration": 26, "champion": "Pantheon", "role": "TOP", "win": false, "kda": "3/6/4 (1.17)", "csPerMin": 6.8 },
+        { "patch": "26.1", "gameDuration": 29, "champion": "Ezreal", "role": "BOTTOM", "win": false, "kda": "5/5/7 (2.40)", "csPerMin": 7.9 },
+        { "patch": "26.1", "gameDuration": 24, "champion": "Pantheon", "role": "JUNGLE", "win": true, "kda": "8/4/9 (4.25)", "csPerMin": 5.8 }
+      ]
+    },
+    "liveAd7a91aaMixedRoleFailure": "Your saved matches show an average lane CS of 72.9 across 11 top lane games at 10:00 (where 114.0 is the passive wave theoretical maximum, not missed CS). Across your last 20 detailed matches, your average gold difference is -305 gold at 10:00 (20 games) and -968.3 gold at 20:00 (19 games). Timeline checkpoints record those numbers without showing wave states or trade setups, so as one general practice habit: when behind at 10:00, let waves push toward your turret side and last-hit safely before stepping up.\n---SUGGESTIONS--- [\"How is my 10-minute lane CS holding up on Pantheon?\", \"Which Pantheon deaths gave up shutdown gold?\", \"Compare my recent matches to my saved match history\"]",
+    "boldLiveAd7a91aaMixedRoleFailure": "**Your saved matches** show an average **lane CS** of **72.9** across **11 top lane games** at **10:00** (where **114.0** is the passive wave theoretical maximum, not missed CS). Across **your last 20 detailed matches**, your average gold difference is **-305** gold at 10:00 (**20 games**) and **-968.3** gold at 20:00 (**19 games**). Timeline checkpoints record those numbers without showing wave states or trade setups, so as one general practice habit: **when behind at 10:00, let waves push toward your turret side and last-hit safely before stepping up**.\n---SUGGESTIONS--- [\"How is my 10-minute lane CS holding up on Pantheon?\", \"Which Pantheon deaths gave up shutdown gold?\", \"Compare my recent matches to my saved match history\"]",
+    "exemplarCleanResponse": "Across **your last 20 detailed matches**, your 10:00 lane CS averages **72.9** across **14 laner games (11 Top, 3 Bot)** (with **114.0** as the passive wave theoretical maximum, not missed CS), while your gold difference averages **-305** at 10:00 (**20 games**) and **-968.3** at 20:00 (**19 games**). Those checkpoints record your deficit widening between 10:00 and 20:00 without showing wave states or trade causes—as one general habit, **when trailing at 10:00, catch side waves near your turret before rotating to river fights**.\n---SUGGESTIONS--- [\"How is my 10-minute lane CS holding up on Pantheon?\", \"Which Pantheon deaths gave up shutdown gold?\", \"Compare my recent matches to my saved match history\"]",
+    "honestMissingPerRoleBoundaryResponse": "Across **your last 20 detailed matches**, your 10:00 lane CS summary (**72.9**) covers all **14 laner games (11 Top, 3 Bot)**—a separate 10:00 lane CS average across **11 top lane games** alone is not available in this summary, and **your saved matches** (**883 games**) do not record 10-minute lane CS. Next game, **when behind at 10:00, catch waves near your turret before rotating**.\n---SUGGESTIONS--- [\"How is my 10-minute lane CS holding up on Pantheon?\", \"Which Pantheon deaths gave up shutdown gold?\", \"Compare my recent matches to my saved match history\"]"
+  },
+  "spearShotMixedRolePerMatchCs10": {
+    "userMessage": "How did my 10-minute lane CS in my top lane games compare to my overall 10-minute lane CS?",
+    "context": {
+      "summonerName": "Spear Shot#EUW",
+      "rank": "CHALLENGER I (1142 LP)",
+      "primaryRole": "TOP",
+      "totalGamesAnalyzed": 20,
+      "timelineStatus": "ANALYZED",
+      "timelineCoverage": {
+        "status": "COMPLETE",
+        "coveredMatches": 20,
+        "totalMatches": 20,
+        "stopReason": "COMPLETED"
+      },
+      "savedHistory": {
+        "scope": "saved_ranked_matches",
+        "games": 883,
+        "wins": 462,
+        "losses": 421,
+        "winRate": 52.3,
+        "isCompleteSeasonTotal": false
+      },
+      "recentMatchSample": {
+        "scope": "recent_20_detailed_matches",
+        "games": 20,
+        "wins": 9,
+        "losses": 11,
+        "winRate": 45.0
+      },
+      "avgLaneCsAt10": {
+        "avgActual": 72.9,
+        "matchCount": 14,
+        "roleBreakdown": {
+          "BOTTOM": 3,
+          "TOP": 11,
+          "MIDDLE": 0
+        },
+        "targetLabel": "11 Top, 3 Bot",
+        "avgTarget": 114,
+        "targetMatchCount": 14,
+        "avgSupportedActual": 72.9
+      },
+      "missingLaneCsAt10Matches": 0,
+      "recentMatches": [
+        { "patch": "26.1", "gameDuration": 28, "champion": "Pantheon", "role": "TOP", "win": true, "kda": "7/3/6 (4.33)", "csPerMin": 7.4, "laneCsAt10": { "actual": 84, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 26, "champion": "Pantheon", "role": "TOP", "win": false, "kda": "3/6/4 (1.17)", "csPerMin": 6.8, "laneCsAt10": { "actual": 76, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 27, "champion": "Pantheon", "role": "TOP", "win": true, "kda": "6/2/5 (5.50)", "csPerMin": 7.6, "laneCsAt10": { "actual": 82, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 25, "champion": "Pantheon", "role": "TOP", "win": false, "kda": "2/5/4 (1.20)", "csPerMin": 6.9, "laneCsAt10": { "actual": 78, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 30, "champion": "Pantheon", "role": "TOP", "win": true, "kda": "8/4/7 (3.75)", "csPerMin": 7.5, "laneCsAt10": { "actual": 80, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 29, "champion": "Pantheon", "role": "TOP", "win": false, "kda": "4/6/3 (1.17)", "csPerMin": 7.1, "laneCsAt10": { "actual": 85, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 24, "champion": "Pantheon", "role": "TOP", "win": false, "kda": "3/7/2 (0.71)", "csPerMin": 6.7, "laneCsAt10": { "actual": 75, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 31, "champion": "Pantheon", "role": "TOP", "win": true, "kda": "9/3/8 (5.67)", "csPerMin": 7.8, "laneCsAt10": { "actual": 81, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 26, "champion": "Pantheon", "role": "TOP", "win": false, "kda": "2/6/5 (1.17)", "csPerMin": 6.9, "laneCsAt10": { "actual": 79, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 28, "champion": "Pantheon", "role": "TOP", "win": true, "kda": "7/2/6 (6.50)", "csPerMin": 7.7, "laneCsAt10": { "actual": 83, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 25, "champion": "Pantheon", "role": "TOP", "win": false, "kda": "4/5/4 (1.60)", "csPerMin": 7.0, "laneCsAt10": { "actual": 77, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 29, "champion": "Ezreal", "role": "BOTTOM", "win": false, "kda": "5/5/7 (2.40)", "csPerMin": 6.2, "laneCsAt10": { "actual": 49, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 27, "champion": "Ezreal", "role": "BOTTOM", "win": false, "kda": "3/6/4 (1.17)", "csPerMin": 5.9, "laneCsAt10": { "actual": 46, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 26, "champion": "Ezreal", "role": "BOTTOM", "win": false, "kda": "2/7/5 (1.00)", "csPerMin": 5.8, "laneCsAt10": { "actual": 46, "target": 114 } },
+        { "patch": "26.1", "gameDuration": 24, "champion": "Pantheon", "role": "JUNGLE", "win": true, "kda": "8/4/9 (4.25)", "csPerMin": 5.8 },
+        { "patch": "26.1", "gameDuration": 27, "champion": "Pantheon", "role": "JUNGLE", "win": true, "kda": "6/3/10 (5.33)", "csPerMin": 5.9 },
+        { "patch": "26.1", "gameDuration": 25, "champion": "Pantheon", "role": "JUNGLE", "win": false, "kda": "4/6/7 (1.83)", "csPerMin": 5.5 },
+        { "patch": "26.1", "gameDuration": 28, "champion": "Pantheon", "role": "JUNGLE", "win": true, "kda": "9/2/8 (8.50)", "csPerMin": 6.1 },
+        { "patch": "26.1", "gameDuration": 23, "champion": "Pantheon", "role": "JUNGLE", "win": false, "kda": "3/7/5 (1.14)", "csPerMin": 5.4 },
+        { "patch": "26.1", "gameDuration": 29, "champion": "Pantheon", "role": "JUNGLE", "win": true, "kda": "7/4/11 (4.50)", "csPerMin": 6.0 }
+      ]
+    },
+    "exemplarPerRoleCleanResponse": "Across **your last 20 detailed matches**, your 10:00 lane CS averages **80** across **11 top lane games** and **47** across **3 bot lane games**, pulling your overall average to **72.9** across **14 laner games (11 Top, 3 Bot)** (where **114** is the passive wave theoretical maximum, not missed CS). Checkpoints don't show wave states or trade causes—next game, **crash your top wave cleanly before roaming or resetting**.\n---SUGGESTIONS--- [\"How is my 10-minute lane CS holding up on Pantheon?\", \"Which Pantheon deaths gave up shutdown gold?\", \"Compare my recent matches to my saved match history\"]"
   }
 }
+
