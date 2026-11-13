@@ -425,7 +425,7 @@ class AiAnalysisService(
             |- **Deaths & Assist Attribution:** Assisted deaths mean multi-enemy involvement—assisted deaths are not necessarily jungle ganks. Unassisted deaths have zero assists—never equate unassisted deaths with 1v1 duels, never echo "single-enemy kill credit", and give observable habits instead of "eliminate unassisted deaths".
             |- **Observed Facts vs. Hypotheses & Conditional Recommendations:** Death events do **not** prove bad trades, overextension, over-forcing, or spacing errors; aggregate stats (KDA, avg deaths, CS/min, time dead, win rates) and `topStrengths`/`topWeaknesses` (beat/trail counts) support **hypotheses only, NEVER causal micro or macro diagnoses** (never claim stats "point to" over-forcing/bad spacing, say W-L/CS/deaths bleed tempo or show spacing slips, or claim variance/execution drives outcomes). Summary W-L, CS/min, KDA, and deaths CANNOT diagnose tempo-bleed, spacing, or early trading/laning even with "might"/"may"/"could"/"if" (admit summaries can't show how fights/waves played out); frame all coaching recommendations **conditionally** as general controllable habits.
             |- **No Stale Mythic-Era or Unsupported Build-Effect Claims (Including `---SUGGESTIONS---`):** The Mythic item system was removed in Season 14. NEVER propose or mention "Mythic items", "Mythic passives", "Mythic paths/rushes", or removed Mythics (Divine Sunderer, Everfrost, Galeforce, Goredrinker, Duskblade, Prowler's Claw). Do not claim specific patch-dependent item stats, gold costs, or build-effect numbers unless the supplied patch/context data explicitly supports them.
-            |- **10:00 Lane CS Ceiling (`cs10.theoreticalMax`, `avgLaneCsAt10`, `missingLaneCsAt10Matches`):** `cs10.theoreticalMax` (114 for Top/Bot, 120 for Mid on verified patch 26.1+ games lasting `>=10:00` only; `null` for `JUNGLE`/`UTILITY`/`<600s`/pre-26.1 or mixed patches) is strictly the **theoretical maximum** passive wave spawn ceiling—NOT a target, benchmark, or missed-CS baseline. NEVER subtract `actual` from `theoreticalMax` to claim exact "missed CS" or call 114/120 a target/benchmark${if (context["avgLaneCsAt10"] != null) "; bind `avgLaneCsAt10` strictly to `recentMatchSample` (never `savedHistory`) and the full mixed-role `matchCount` (never a single-role subset)" else ""}.
+            |- **10:00 Lane CS Ceiling (`cs10.theoreticalMax`, `avgLaneCsAt10`, `missingLaneCsAt10Matches`):** `cs10.theoreticalMax` (114 for Top/Bot, 120 for Mid on verified patch 26.1+ games lasting `>=10:00` only; `null` for `JUNGLE`/`UTILITY`/`<600s`/pre-26.1 or mixed patches) is strictly the **theoretical maximum** passive wave spawn ceiling—NOT a target, benchmark, or missed-CS baseline. NEVER subtract `actual` from `theoreticalMax` to claim exact "missed CS" or call 114/120 a target/benchmark${if (context["avgLaneCsAt10"] != null) "; bind `avgLaneCsAt10` strictly to `recentMatchSample` (never `savedHistory`) and the full mixed-role `matchCount` (never a single-role subset); cite per-role 10:00 CS only when verified in GROUND TRUTH" else ""}.
             |- **5-Stat Evidence (`phaseFarming`, `leadRetention`, `deathCost`, `unspentGold`, `teamObjectives`):** State exact eligible-game counts on every cited rate/count/avg (e.g., "36.8% (7 of 19 games)"); never claim missed CS, death avoidability, or recalls from `>=1600g` 1-min checkpoints; treat `teamObjectives` (`firstRate`, `firstCount`, `teamKills`, `teamAvg`) strictly as **5-player team outcomes**—NEVER praise or blame them as personal player performance or weakness.
             |- **Incomplete Legacy Cache Fields, Missing != Zero & Availability vs. Sample Size:** Treat `null`, `unavailable`, or `incomplete` strictly as unavailable—**NEVER** as `0`. Keep **collection/availability limits** (unanalyzed timelines, partial/rate-limited collection, or unrecorded fields) strictly separate from **sample size**—NEVER say "playing more games" will clarify, unlock, or populate missing or rate-limited stats.
             |- **Matchups:** State trade windows as **your** passive/spell READY while **enemy** mobility/defensive cooldown is DOWN, plus wave state and jungler vision.
@@ -866,12 +866,32 @@ class AiAnalysisService(
         private val LEADING_SENTENCE_CAPITAL_REGEX = Regex("""^(\s*\*{0,2})([a-z])""")
 
         private val STREAM_HOLD_TAIL_REGEX = Regex(
-            """(?:\b(?:your|the|my|this|these|those|a|an|its|their|our)\b|\b[A-Za-z][A-Za-z0-9_.@]*\s+(?:is|are|was|were)\b|\b(?:is|are|was|were)\b|(?:\b[A-Za-z][A-Za-z0-9_.@]*\s*)?[=:]|\btimelineStatus(?:\s*(?:=|:|\bis\b))?|\btimeline(?:\s+(?:data|checkpoints?|analysis|insights?|summary))?(?:\s+(?:is|are|was|were))?(?:\s+temporarily)?|\btemporarily|\bincomplete(?:\s*\((?:legacy)?)?|\bsolo(?:/duo(?:\s+queue)?)?\b|(?:\b(?:(?:across|in|over|from)\s+)?your\s+)?\bsaved(?:\s+match(?:es|\s+history)?(?:\s+(?:show|shows|have|has|record|records)(?:\s+(?:an?|your)(?:\s+average(?:\s+(?:10(?::00|[- ]minute)\s+)?(?:lane)?)?)?)?)?)?\b|\b(?:across|over|in|from)(?:\s+\*{0,2}\d+\*{0,2}(?:\s+(?:top|mid|middle|bot|bottom|adc)(?:\s*[- ]\s*lane)?(?:\s+(?:games?|matches)(?:\s+(?:and|\+|&)(?:\s+\*{0,2}\d+\*{0,2})?)?)?)?)?\b|\bdetailed(?:\s+match)?\b|\b(?:unassisted(?:\s+single(?:[- ]enemy(?:\s+kill(?:\s+credit)?)?)?)?|single(?:[- ]enemy(?:\s+kill(?:\s+credit)?)?)?|multi(?:[- ]enemy(?:\s+kill)?)?)\b|\b(?:spatial|temporal)(?:\s*(?:/|\b(?:and|or)\b)(?:\s+(?:spatial|temporal))?)?(?:\s+timeline)?|\bjungle(?:\s+tracking(?:\s+(?:is|was))?)?|\babsent(?:\s+jungle)?|\bearly(?:\s+(?:river|trading|laning))?|\briver|\b(?:trading|laning)|\b(?:personal|individual|mechanical|player)(?:\s+execution)?|\bexecution|\bclear(?:ing)?(?:\s+(?:the|your)(?:\s+wave)?(?:\s+bounce)?)?)\s+$""",
+            """(?:\*{0,2}\b(?:your|the|my|this|these|those|a|an|its|their|our)\b|\b[A-Za-z][A-Za-z0-9_.@]*\s+(?:is|are|was|were)\b|\b(?:is|are|was|were)\b|(?:\b[A-Za-z][A-Za-z0-9_.@]*\s*)?[=:]|\btimelineStatus(?:\s*(?:=|:|\bis\b))?|\btimeline(?:\s+(?:data|checkpoints?|analysis|insights?|summary))?(?:\s+(?:is|are|was|were))?(?:\s+temporarily)?|\btemporarily|\bincomplete(?:\s*\((?:legacy)?)?|\bsolo(?:/duo(?:\s+queue)?)?\b|(?:\*{0,2}\b(?:(?:across|in|over|from)\s+)?\*{0,2}your\s+)?\*{0,2}\bsaved(?:\s+match(?:es|\s+history)?\*{0,2}(?:\s+(?:show|shows|have|has|record|records)(?:\s+(?:an?|your)(?:\s+\*{0,2}average(?:\s+\*{0,2}(?:10(?::00|[- ]minute)\s+)?\*{0,2}(?:lane)?)?)?)?)?)?|\*{0,2}\b(?:across|over|in|from)(?:\s+\*{0,2}\d+\*{0,2}(?:\s+\*{0,2}(?:top|mid|middle|bot|bottom|adc)(?:\s*[- ]\s*lane)?\*{0,2}(?:\s+(?:games?|matches)\*{0,2}(?:\s*(?:,|\band\b|\+|&)(?:\s*\*{0,2}\d+\*{0,2})?)?)?)?)?|\bdetailed(?:\s+match)?\b|\b(?:unassisted(?:\s+single(?:[- ]enemy(?:\s+kill(?:\s+credit)?)?)?)?|single(?:[- ]enemy(?:\s+kill(?:\s+credit)?)?)?|multi(?:[- ]enemy(?:\s+kill)?)?)\b|\b(?:spatial|temporal)(?:\s*(?:/|\b(?:and|or)\b)(?:\s+(?:spatial|temporal))?)?(?:\s+timeline)?|\bjungle(?:\s+tracking(?:\s+(?:is|was))?)?|\babsent(?:\s+jungle)?|\bearly(?:\s+(?:river|trading|laning))?|\briver|\b(?:trading|laning)|\b(?:personal|individual|mechanical|player)(?:\s+execution)?|\bexecution|\bclear(?:ing)?(?:\s+(?:the|your)(?:\s+wave)?(?:\s+bounce)?)?)\s+$""",
             RegexOption.IGNORE_CASE
         )
 
         private val LANE_CS10_TOPIC_REGEX = Regex(
-            """\b(?:lane\s+cs|cs\s*(?:@\s*10|at\s+10(?::00|\s*m(?:in(?:ute)?s?)?)?)|10(?::00|\s*[- ]?m(?:in(?:ute)?s?)?)\s+(?:lane\s+)?cs)\b""",
+            """\b(?:lane\s+cs|cs\s*(?:@\s*\*{0,2}10|at\s+\*{0,2}10(?::00|\s*m(?:in(?:ute)?s?)?)?)|10(?::00|\s*[- ]?m(?:in(?:ute)?s?)?)\*{0,2}\s+\*{0,2}(?:lane\s+)?cs)\b""",
+            RegexOption.IGNORE_CASE
+        )
+
+        private val CS10_SENTENCE_SPLIT_REGEX = Regex(
+            """(?<!\bvs)\.(?!\d)|[!?\n]+""",
+            RegexOption.IGNORE_CASE
+        )
+
+        private val CLAUSE_BOUNDARY_FOR_CS10_REGEX = Regex(
+            """(?:[;—–]|\b(?:while|whereas|however|but|yet|although|though)\b|,\s*(?:and|or|compared\s+to|versus|vs\.?|pulling|bringing)\b)""",
+            RegexOption.IGNORE_CASE
+        )
+
+        private val BENIGN_CS10_CONTEXT_NUMBER_REGEX = Regex(
+            """(?:\b(?:at|@)\s*\*{0,2}10(?::00)?\*{0,2}\b|\*{0,2}\b10(?::00\b|\s*[- ]?\s*m(?:in(?:ute)?s?)?\b)\*{0,2}|@\s*10\b|\bpatch\s+\*{0,2}\d+(?:\.\d+)?\+?\*{0,2}|\b(?:last|recent)\s+\*{0,2}\d+\*{0,2}\s+(?:detailed\s+)?(?:matches|games)\b|\*{0,2}\b\d+\*{0,2}\s+saved\s+(?:matches|games|match\s+history)\b|\*{0,2}\b(?:114|120)(?:\.0)?\*{0,2}(?=\s*(?:cs\s+)?(?:is\s+|as\s+)?(?:the\s+)?(?:passive\s+wave\s+)?theoretical\s+maximum\b))""",
+            RegexOption.IGNORE_CASE
+        )
+
+        private val STANDALONE_CS_NUMBER_REGEX = Regex(
+            """(?<![\d.-])(\d+(?:\.\d+)?)(?!(?:[\d%]|\.\d|\s*\*{0,2}\s*(?:%|w\b|l\b|g\b|games?\b|matches\b|s\b|sec|m\b|min|cs\s*/\s*m|/\s*m)))""",
             RegexOption.IGNORE_CASE
         )
 
@@ -880,6 +900,8 @@ class AiAnalysisService(
             val avgActualTokens: Set<String>,
             val matchCount: Int,
             val activeRoles: List<Pair<String, Int>>,
+            val verifiedRoleActuals: Map<String, Double>,
+            val verifiedRoleActualTokens: Map<String, Set<String>>,
             val recentGames: Int,
             val savedGames: Int?
         ) {
@@ -890,6 +912,27 @@ class AiAnalysisService(
                 get() = "$matchCount laner games ($roleMixHumanLabel)"
             val savedDiffersFromRecent: Boolean
                 get() = recentGames > 0 && (savedGames == null || savedGames != recentGames)
+
+            fun roleActualMatchesOverall(roleLabel: String): Boolean {
+                val roleAvg = verifiedRoleActuals[roleLabel] ?: return false
+                return kotlin.math.abs(roleAvg - avgActual) < 0.05
+            }
+        }
+
+        private fun formatCs10NumericTokens(value: Double, rawStr: String? = null): Set<String> {
+            val tokens = linkedSetOf<String>()
+            val oneDec = String.format(java.util.Locale.US, "%.1f", value)
+            tokens.add(oneDec)
+            rawStr?.trim()?.takeIf { it.isNotEmpty() && it.toDoubleOrNull() != null }?.let { tokens.add(it) }
+            val roundedOneDec = oneDec.toDouble()
+            if (kotlin.math.abs(value - roundedOneDec) > 1e-4) {
+                tokens.add(String.format(java.util.Locale.US, "%.2f", value))
+            }
+            val nearestInt = kotlin.math.round(roundedOneDec)
+            if (kotlin.math.abs(roundedOneDec - nearestInt) < 1e-6) {
+                tokens.add(nearestInt.toLong().toString())
+            }
+            return tokens
         }
 
         private fun normalizeCanonicalLanerLabel(rawRole: Any?): String? =
@@ -917,15 +960,12 @@ class AiAnalysisService(
                 ?: return null
             if (matchCount <= 0) return null
 
-            val tokens = linkedSetOf<String>()
-            tokens.add(String.format(java.util.Locale.US, "%.1f", avgActual))
-            cs10["avgActual"]?.toString()?.trim()?.takeIf { it.isNotEmpty() }?.let { tokens.add(it) }
-            val rounded = kotlin.math.round(avgActual)
-            if (kotlin.math.abs(avgActual - rounded) < 1e-6) {
-                tokens.add(rounded.toLong().toString())
-            }
+            val tokens = formatCs10NumericTokens(avgActual, cs10["avgActual"]?.toString())
 
             val roleCounts = linkedMapOf("Mid" to 0, "Top" to 0, "Bot" to 0)
+            val verifiedRoleActuals = linkedMapOf<String, Double>()
+            val verifiedRoleActualTokens = linkedMapOf<String, Set<String>>()
+
             when (val rawBreakdown = cs10["roleBreakdown"]) {
                 is Map<*, *> -> {
                     for ((k, v) in rawBreakdown) {
@@ -941,7 +981,19 @@ class AiAnalysisService(
                         val cnt = (rm["matchCount"] as? Number)?.toInt()
                             ?: rm["matchCount"]?.toString()?.toDoubleOrNull()?.toInt()
                             ?: 0
-                        if (cnt > 0) roleCounts[label] = (roleCounts[label] ?: 0) + cnt
+                        if (cnt > 0) {
+                            val prevCnt = roleCounts[label] ?: 0
+                            roleCounts[label] = prevCnt + cnt
+                            val aaRaw = rm["avgActual"]
+                            val aa = aaRaw?.toString()?.toDoubleOrNull()?.takeIf { it.isFinite() && it >= 0.0 }
+                            if (prevCnt == 0 && aa != null) {
+                                verifiedRoleActuals[label] = kotlin.math.round(aa * 10.0) / 10.0
+                                verifiedRoleActualTokens[label] = formatCs10NumericTokens(aa, aaRaw.toString())
+                            } else if (prevCnt > 0) {
+                                verifiedRoleActuals.remove(label)
+                                verifiedRoleActualTokens.remove(label)
+                            }
+                        }
                     }
                 }
             }
@@ -952,6 +1004,33 @@ class AiAnalysisService(
                     .mapNotNull { label -> roleCounts[label]?.takeIf { it > 0 }?.let { label to it } }
             } else {
                 emptyList()
+            }
+
+            if (orderedActiveRoles.isNotEmpty()) {
+                val perRoleMatchActuals = linkedMapOf<String, MutableList<Double>>()
+                for (entry in (context["recentMatches"] as? List<*>).orEmpty()) {
+                    val m = entry as? Map<*, *> ?: continue
+                    if (m["gameEndedInEarlySurrender"] == true) continue
+                    val mRole = normalizeCanonicalLanerLabel(m["role"] ?: m["teamPosition"]) ?: continue
+                    val rawDur = m["gameDuration"] ?: m["duration"]
+                    if (rawDur != null) {
+                        val durSec = parseMatchDurationSeconds(rawDur)
+                        if (durSec == null || durSec < 600.0) continue
+                    }
+                    val cs10Sub = (m["laneCsAt10"] ?: m["cs10"]) as? Map<*, *>
+                    val rawActual = cs10Sub?.get("actual") ?: m["laneMinionsFirst10Minutes"] ?: continue
+                    val actualVal = rawActual.toString().toDoubleOrNull()?.takeIf { it.isFinite() && it >= 0.0 } ?: continue
+                    perRoleMatchActuals.getOrPut(mRole) { mutableListOf() }.add(actualVal)
+                }
+                for ((label, expectedCnt) in orderedActiveRoles) {
+                    if (label in verifiedRoleActuals) continue
+                    val vals = perRoleMatchActuals[label]
+                    if (vals != null && vals.size == expectedCnt && expectedCnt > 0) {
+                        val rawMean = vals.sum() / expectedCnt.toDouble()
+                        verifiedRoleActuals[label] = kotlin.math.round(rawMean * 10.0) / 10.0
+                        verifiedRoleActualTokens[label] = formatCs10NumericTokens(rawMean)
+                    }
+                }
             }
 
             val recentSampleMap = context["recentMatchSample"] as? Map<*, *>
@@ -980,26 +1059,64 @@ class AiAnalysisService(
                 avgActualTokens = tokens,
                 matchCount = matchCount,
                 activeRoles = orderedActiveRoles,
+                verifiedRoleActuals = verifiedRoleActuals,
+                verifiedRoleActualTokens = verifiedRoleActualTokens,
                 recentGames = recentGames,
                 savedGames = savedGames
             )
         }
 
-        private fun isSentenceAboutLaneCs10(sentence: String, binding: LaneCs10SampleRoleBinding): Boolean {
-            if (LANE_CS10_TOPIC_REGEX.containsMatchIn(sentence)) return true
-            if (!Regex("""\b(?:cs|minions?|last[- ]hits?)\b""", RegexOption.IGNORE_CASE).containsMatchIn(sentence)) {
-                return false
-            }
-            return binding.avgActualTokens.any { token ->
-                Regex("""(?<!\d)${Regex.escape(token)}(?!\d)""").containsMatchIn(sentence)
-            }
+        private fun sentenceContainsExactCs10Token(sentence: String, tokens: Set<String>): Boolean {
+            if (tokens.isEmpty()) return false
+            val masked = BENIGN_CS10_CONTEXT_NUMBER_REGEX.replace(sentence, " ")
+            return STANDALONE_CS_NUMBER_REGEX.findAll(masked).any { it.groupValues[1] in tokens }
         }
 
-        private fun sentenceAlreadyHasFullCs10Denominator(sentence: String, binding: LaneCs10SampleRoleBinding): Boolean =
-            Regex(
-                """\b${binding.matchCount}\s+(?:(?:mixed|eligible|laner|lane|detailed|recent)\s+){0,2}(?:games?|matches|g)\b""",
-                RegexOption.IGNORE_CASE
-            ).containsMatchIn(sentence)
+        private fun findBoundCsNumberForPartialRoleClause(
+            fullSentence: String,
+            beforeRaw: String,
+            afterRaw: String,
+            isParenthetical: Boolean,
+            binding: LaneCs10SampleRoleBinding
+        ): String? {
+            val hasExplicitCs10Topic = LANE_CS10_TOPIC_REGEX.containsMatchIn(fullSentence)
+            val hasGenericCsWord = Regex("""\b(?:cs|minions?|last[- ]hits?)\b""", RegexOption.IGNORE_CASE)
+                .containsMatchIn(fullSentence)
+            if (!hasExplicitCs10Topic && !hasGenericCsWord) return null
+
+            if (Regex("""\b(?:not|never|nor|neither)\s+\*{0,2}$""", RegexOption.IGNORE_CASE)
+                    .containsMatchIn(beforeRaw.trimEnd())
+            ) {
+                return null
+            }
+
+            val beforeClause = beforeRaw.split(CLAUSE_BOUNDARY_FOR_CS10_REGEX).last()
+            val maskedBefore = BENIGN_CS10_CONTEXT_NUMBER_REGEX.replace(beforeClause, " ")
+            val lastBeforeNum = STANDALONE_CS_NUMBER_REGEX.findAll(maskedBefore).lastOrNull()
+            if (lastBeforeNum != null) {
+                val tailAfterNum = maskedBefore.substring(lastBeforeNum.range.last + 1)
+                if (lastBeforeNum.groupValues[1] == binding.matchCount.toString() &&
+                    Regex("""^\*{0,2}\s+(?:(?:mixed|eligible|laner|lane)\s+){1,2}""", RegexOption.IGNORE_CASE)
+                        .containsMatchIn(tailAfterNum)
+                ) {
+                    return null
+                }
+                val candidate = lastBeforeNum.groupValues[1]
+                return if (hasExplicitCs10Topic || candidate in binding.avgActualTokens) candidate else null
+            }
+
+            if (isParenthetical) return null
+
+            val afterClause = afterRaw.split(CLAUSE_BOUNDARY_FOR_CS10_REGEX).first()
+            if (NEGATION_TOKEN_REGEX.containsMatchIn(afterClause) &&
+                !STANDALONE_CS_NUMBER_REGEX.containsMatchIn(BENIGN_CS10_CONTEXT_NUMBER_REGEX.replace(afterClause, " "))
+            ) {
+                return null
+            }
+            val maskedAfter = BENIGN_CS10_CONTEXT_NUMBER_REGEX.replace(afterClause, " ")
+            val firstAfterNum = STANDALONE_CS_NUMBER_REGEX.find(maskedAfter)?.groupValues?.get(1) ?: return null
+            return if (hasExplicitCs10Topic || firstAfterNum in binding.avgActualTokens) firstAfterNum else null
+        }
 
         private fun repairLaneCs10SampleAndDenominatorBinding(
             text: String,
@@ -1013,57 +1130,129 @@ class AiAnalysisService(
             var cursor = 0
             var sentenceIdx = 0
 
-            fun transformSentence(rawSentence: String, fullSentenceForCheck: String): String {
+            fun transformSentence(rawSentence: String, prefixContext: String): String {
                 var s = rawSentence
+                val initialFull = prefixContext + s
+
                 if (binding.savedDiffersFromRecent) {
+                    fun localClauseCitesAvgActual(src: String, matchRange: IntRange): Boolean {
+                        val beforeLocal = (prefixContext + src.substring(0, matchRange.first))
+                            .split(CLAUSE_BOUNDARY_FOR_CS10_REGEX).last()
+                        if (Regex("""\b(?:not|never|nor|neither)\s+\*{0,2}$""", RegexOption.IGNORE_CASE)
+                                .containsMatchIn(beforeLocal.trimEnd())
+                        ) {
+                            return false
+                        }
+                        val afterLocal = src.substring(matchRange.first)
+                            .split(CLAUSE_BOUNDARY_FOR_CS10_REGEX).first()
+                        val localClause = beforeLocal + afterLocal
+                        val affirmativeLocal = CLAUSE_SPLIT_REGEX
+                            .split(RATHER_THAN_SPAN_REGEX.replace(localClause, " "))
+                            .filterNot { sub -> NEGATION_TOKEN_REGEX.containsMatchIn(sub) }
+                            .joinToString(" ")
+                        return affirmativeLocal.isNotBlank() &&
+                            sentenceContainsExactCs10Token(affirmativeLocal, binding.avgActualTokens)
+                    }
+
                     val savedShowRegex = Regex(
-                        """\b(your\s+)saved\s+match(?:es|\s+history)(\s+(?:show|shows|have|has|record|records)\s+(?:an?\s+|your\s+)?(?:average\s+)?(?:10(?::00|\s*[- ]?m(?:in(?:ute)?s?)?)\s+)?lane\s+cs\b)""",
+                        """(?:(\*{1,2})(\byour\s+)(?:saved\s+match(?:es|\s+history))\1|(\byour\s+)(\*{1,2})(?:saved\s+match(?:es|\s+history))\4|(\byour\s+)(?:saved\s+match(?:es|\s+history))\b)(?=\s+(?:show|shows|have|has|record|records)\s+(?:an?\s+|your\s+)?\*{0,2}(?:average\s+)?\*{0,2}(?:10(?::00|\s*[- ]?m(?:in(?:ute)?s?)?)\*{0,2}\s+)?\*{0,2}(?:lane\s+)?cs\b)""",
                         RegexOption.IGNORE_CASE
                     )
-                    s = savedShowRegex.replace(s) { m ->
-                        "${m.groupValues[1]}last ${binding.recentGames} detailed matches${m.groupValues[2]}"
+                    val snapSavedShow = s
+                    s = savedShowRegex.replace(snapSavedShow) { m ->
+                        if (!localClauseCitesAvgActual(snapSavedShow, m.range)) {
+                            m.value
+                        } else {
+                            when {
+                                m.groupValues[1].isNotEmpty() ->
+                                    "${m.groupValues[1]}${m.groupValues[2]}last ${binding.recentGames} detailed matches${m.groupValues[1]}"
+                                m.groupValues[4].isNotEmpty() ->
+                                    "${m.groupValues[3]}${m.groupValues[4]}last ${binding.recentGames} detailed matches${m.groupValues[4]}"
+                                else ->
+                                    "${m.groupValues[5]}last ${binding.recentGames} detailed matches"
+                            }
+                        }
                     }
                     val acrossSavedRegex = Regex(
-                        """\b((?:across|in|over|from)\s+your\s+)saved\s+match(?:es|\s+history)\b(?=[^.!?\n]{0,65}\b(?:lane\s+cs|10(?::00|\s*[- ]?m(?:in(?:ute)?s?)?)\s+(?:lane\s+)?cs)\b)""",
+                        """(\b(?:across|in|over|from)\s+)(?:(\*{1,2})(your\s+)(?:saved\s+match(?:es|\s+history))\2|(your\s+)(\*{1,2})(?:saved\s+match(?:es|\s+history))\5|(your\s+)(?:saved\s+match(?:es|\s+history))\b)(?=[^.!?\n]{0,75}\b(?:lane\s+cs|cs\s*(?:@\s*\*{0,2}10|at\s+\*{0,2}10)|10(?::00|\s*[- ]?m(?:in(?:ute)?s?)?)\*{0,2}\s+\*{0,2}(?:lane\s+)?cs)\b)""",
                         RegexOption.IGNORE_CASE
                     )
-                    s = acrossSavedRegex.replace(s) { m ->
-                        "${m.groupValues[1]}last ${binding.recentGames} detailed matches"
+                    val snapAcrossSaved = s
+                    s = acrossSavedRegex.replace(snapAcrossSaved) { m ->
+                        if (!localClauseCitesAvgActual(snapAcrossSaved, m.range)) {
+                            m.value
+                        } else {
+                            val prep = m.groupValues[1]
+                            when {
+                                m.groupValues[2].isNotEmpty() ->
+                                    "$prep${m.groupValues[2]}${m.groupValues[3]}last ${binding.recentGames} detailed matches${m.groupValues[2]}"
+                                m.groupValues[5].isNotEmpty() ->
+                                    "$prep${m.groupValues[4]}${m.groupValues[5]}last ${binding.recentGames} detailed matches${m.groupValues[5]}"
+                                else ->
+                                    "$prep${m.groupValues[6]}last ${binding.recentGames} detailed matches"
+                            }
+                        }
                     }
                 }
 
-                if (binding.isMixedRole &&
-                    isSentenceAboutLaneCs10(fullSentenceForCheck, binding) &&
-                    !sentenceAlreadyHasFullCs10Denominator(fullSentenceForCheck, binding)
-                ) {
+                if (binding.isMixedRole && !binding.activeRoles.isEmpty()) {
                     for ((roleLabel, roleCnt) in binding.activeRoles) {
-                        if (roleCnt <= 0 || roleCnt >= binding.matchCount) continue
+                        if (roleCnt <= 0 || roleCnt >= binding.matchCount || binding.roleActualMatchesOverall(roleLabel)) {
+                            continue
+                        }
                         val rolePat = roleWordPatternForLabel(roleLabel)
                         val prepPartialRegex = Regex(
-                            """(\b(?:across|over|in|from)\s+)(\*{0,2})$roleCnt(\*{0,2})\s+$rolePat\s+(?:games?|matches)(\*{0,2})\b(?!\s*(?:,\s*|\s+and\s+|\s*\+\s*|\s*&\s*)\*{0,2}\d+\*{0,2}\s*(?:top|mid|middle|bot|bottom|adc)\b)""",
+                            """(\b(?:across|over|in|from)\s+)(?:(\*{1,2})$roleCnt\s+$rolePat\s+(?:games?|matches)\2|(\*{1,2})$roleCnt\3\s+$rolePat\s+(?:games?|matches)\b|\b$roleCnt\s+$rolePat\s+(?:games?|matches)\b)(?!\s*(?:,\s*|\s+and\s+|\s*\+\s*|\s*&\s*)\*{0,2}\d+\*{0,2}\s*(?:top|mid|middle|bot|bottom|adc)\b)""",
                             RegexOption.IGNORE_CASE
                         )
-                        s = prepPartialRegex.replace(s) { m ->
-                            val pre = m.groupValues[1]
-                            val openBold = m.groupValues[2]
-                            val closeBold = m.groupValues[4]
-                            if (openBold.isNotEmpty() && closeBold.isNotEmpty()) {
-                                "$pre$openBold${binding.mixedDenominatorPhrase}$closeBold"
+                        val snapshotForPrep = s
+                        s = prepPartialRegex.replace(snapshotForPrep) { m ->
+                            val beforeRaw = prefixContext + snapshotForPrep.substring(0, m.range.first)
+                            val afterRaw = snapshotForPrep.substring(m.range.last + 1)
+                            val boundNum = findBoundCsNumberForPartialRoleClause(
+                                fullSentence = prefixContext + snapshotForPrep,
+                                beforeRaw = beforeRaw,
+                                afterRaw = afterRaw,
+                                isParenthetical = false,
+                                binding = binding
+                            )
+                            if (boundNum == null || boundNum !in binding.avgActualTokens) {
+                                m.value
                             } else {
-                                "$pre${binding.mixedDenominatorPhrase}"
+                                val pre = m.groupValues[1]
+                                val stars = m.groupValues[2].ifEmpty { m.groupValues[3] }
+                                if (stars.isNotEmpty()) {
+                                    "$pre$stars${binding.mixedDenominatorPhrase}$stars"
+                                } else {
+                                    "$pre${binding.mixedDenominatorPhrase}"
+                                }
                             }
                         }
+
                         val parenPartialRegex = Regex(
-                            """\(\s*(\*{0,2})$roleCnt(\*{0,2})\s+$rolePat\s+(?:games?|matches)(\*{0,2})\s*\)""",
+                            """\(\s*(?:(\*{1,2})$roleCnt\s+$rolePat\s+(?:games?|matches)\1|(\*{1,2})$roleCnt\2\s+$rolePat\s+(?:games?|matches)\b|\b$roleCnt\s+$rolePat\s+(?:games?|matches)\b)\s*\)""",
                             RegexOption.IGNORE_CASE
                         )
-                        s = parenPartialRegex.replace(s) { m ->
-                            val openBold = m.groupValues[1]
-                            val closeBold = m.groupValues[3]
-                            if (openBold.isNotEmpty() && closeBold.isNotEmpty()) {
-                                "($openBold${binding.mixedDenominatorPhrase}$closeBold)"
+                        val snapshotForParen = s
+                        s = parenPartialRegex.replace(snapshotForParen) { m ->
+                            val beforeRaw = prefixContext + snapshotForParen.substring(0, m.range.first)
+                            val afterRaw = snapshotForParen.substring(m.range.last + 1)
+                            val boundNum = findBoundCsNumberForPartialRoleClause(
+                                fullSentence = prefixContext + snapshotForParen,
+                                beforeRaw = beforeRaw,
+                                afterRaw = afterRaw,
+                                isParenthetical = true,
+                                binding = binding
+                            )
+                            if (boundNum == null || boundNum !in binding.avgActualTokens) {
+                                m.value
                             } else {
-                                "(${binding.mixedDenominatorPhrase})"
+                                val stars = m.groupValues[1].ifEmpty { m.groupValues[2] }
+                                if (stars.isNotEmpty()) {
+                                    "($stars${binding.mixedDenominatorPhrase}$stars)"
+                                } else {
+                                    "(${binding.mixedDenominatorPhrase})"
+                                }
                             }
                         }
                     }
@@ -1071,18 +1260,18 @@ class AiAnalysisService(
                 return s
             }
 
-            for (delim in SENTENCE_SPLIT_REGEX.findAll(text)) {
+            for (delim in CS10_SENTENCE_SPLIT_REGEX.findAll(text)) {
                 val seg = text.substring(cursor, delim.range.first)
-                val fullCheck = if (sentenceIdx == 0 && priorSentenceTail.isNotEmpty()) priorSentenceTail + seg else seg
-                sb.append(transformSentence(seg, fullCheck))
+                val prefix = if (sentenceIdx == 0) priorSentenceTail else ""
+                sb.append(transformSentence(seg, prefix))
                 sb.append(delim.value)
                 cursor = delim.range.last + 1
                 sentenceIdx++
             }
             if (cursor < text.length) {
                 val seg = text.substring(cursor)
-                val fullCheck = if (sentenceIdx == 0 && priorSentenceTail.isNotEmpty()) priorSentenceTail + seg else seg
-                sb.append(transformSentence(seg, fullCheck))
+                val prefix = if (sentenceIdx == 0) priorSentenceTail else ""
+                sb.append(transformSentence(seg, prefix))
             }
             return sb.toString()
         }
@@ -1095,27 +1284,59 @@ class AiAnalysisService(
             val body = stripSuggestionsBlock(text)
             if (body.isBlank()) return false
 
-            for (sentence in SENTENCE_SPLIT_REGEX.split(body)) {
+            for (sentence in CS10_SENTENCE_SPLIT_REGEX.split(body)) {
                 if (sentence.isBlank()) continue
                 if (binding.savedDiffersFromRecent) {
                     val wrongSavedSample = Regex(
-                        """\byour\s+saved\s+match(?:es|\s+history)\s+(?:show|shows|have|has|record|records)\s+(?:an?\s+|your\s+)?(?:average\s+)?(?:10(?::00|\s*[- ]?m(?:in(?:ute)?s?)?)\s+)?lane\s+cs\b|\b(?:across|in|over|from)\s+your\s+saved\s+match(?:es|\s+history)\b[^.!?\n]{0,65}\b(?:lane\s+cs|10(?::00|\s*[- ]?m(?:in(?:ute)?s?)?)\s+(?:lane\s+)?cs)\b""",
+                        """\byour\s+\*{0,2}(?:saved\s+match(?:es|\s+history)|savedHistory)\*{0,2}\s+(?:show|shows|have|has|record|records)\s+(?:an?\s+|your\s+)?\*{0,2}(?:average\s+)?\*{0,2}(?:10(?::00|\s*[- ]?m(?:in(?:ute)?s?)?)\*{0,2}\s+)?\*{0,2}(?:lane\s+)?cs\b|\b(?:across|in|over|from)\s+\*{0,2}your\s+\*{0,2}(?:saved\s+match(?:es|\s+history)|savedHistory)\*{0,2}[^.!?\n]{0,75}\b(?:lane\s+cs|cs\s*(?:@\s*\*{0,2}10|at\s+\*{0,2}10)|10(?::00|\s*[- ]?m(?:in(?:ute)?s?)?)\*{0,2}\s+\*{0,2}(?:lane\s+)?cs)\b""",
                         RegexOption.IGNORE_CASE
                     )
-                    if (wrongSavedSample.containsMatchIn(sentence)) return true
+                    val affirmativeSentence = CLAUSE_SPLIT_REGEX
+                        .split(RATHER_THAN_SPAN_REGEX.replace(sentence, " "))
+                        .filterNot { sub -> NEGATION_TOKEN_REGEX.containsMatchIn(sub) }
+                        .joinToString(" ")
+                    if (affirmativeSentence.isNotBlank() && wrongSavedSample.containsMatchIn(affirmativeSentence)) {
+                        return true
+                    }
                 }
-                if (binding.isMixedRole &&
-                    isSentenceAboutLaneCs10(sentence, binding) &&
-                    !sentenceAlreadyHasFullCs10Denominator(sentence, binding)
-                ) {
+                if (binding.isMixedRole) {
                     for ((roleLabel, roleCnt) in binding.activeRoles) {
                         if (roleCnt <= 0 || roleCnt >= binding.matchCount) continue
                         val rolePat = roleWordPatternForLabel(roleLabel)
-                        val partialRegex = Regex(
-                            """(?:\b(?:across|over|in|from)\s+|\(\s*)\*{0,2}$roleCnt\*{0,2}\s+$rolePat\s+(?:games?|matches)\b(?!\s*(?:,\s*|\s+and\s+|\s*\+\s*|\s*&\s*)\*{0,2}\d+\*{0,2}\s*(?:top|mid|middle|bot|bottom|adc)\b)""",
+                        val prepCheckRegex = Regex(
+                            """\b(?:across|over|in|from)\s+\*{0,2}$roleCnt\*{0,2}\s+$rolePat\s+(?:games?|matches)\*{0,2}(?!\s*(?:,\s*|\s+and\s+|\s*\+\s*|\s*&\s*)\*{0,2}\d+\*{0,2}\s*(?:top|mid|middle|bot|bottom|adc)\b)""",
                             RegexOption.IGNORE_CASE
                         )
-                        if (partialRegex.containsMatchIn(sentence)) return true
+                        for (m in prepCheckRegex.findAll(sentence)) {
+                            val boundNum = findBoundCsNumberForPartialRoleClause(
+                                fullSentence = sentence,
+                                beforeRaw = sentence.substring(0, m.range.first),
+                                afterRaw = sentence.substring(m.range.last + 1),
+                                isParenthetical = false,
+                                binding = binding
+                            )
+                            val allowedRoleTokens = binding.verifiedRoleActualTokens[roleLabel].orEmpty()
+                            if (boundNum != null && boundNum !in allowedRoleTokens) {
+                                return true
+                            }
+                        }
+                        val parenCheckRegex = Regex(
+                            """\(\s*\*{0,2}$roleCnt\*{0,2}\s+$rolePat\s+(?:games?|matches)\*{0,2}\s*\)""",
+                            RegexOption.IGNORE_CASE
+                        )
+                        for (m in parenCheckRegex.findAll(sentence)) {
+                            val boundNum = findBoundCsNumberForPartialRoleClause(
+                                fullSentence = sentence,
+                                beforeRaw = sentence.substring(0, m.range.first),
+                                afterRaw = sentence.substring(m.range.last + 1),
+                                isParenthetical = true,
+                                binding = binding
+                            )
+                            val allowedRoleTokens = binding.verifiedRoleActualTokens[roleLabel].orEmpty()
+                            if (boundNum != null && boundNum !in allowedRoleTokens) {
+                                return true
+                            }
+                        }
                     }
                 }
             }
@@ -1197,9 +1418,6 @@ class AiAnalysisService(
             result = SAMPLE_BRACKET_TAG_REGEX.replace(result, "")
             result = result.replace("`", "")
 
-            // 1b. Context-aware 10:00 lane CS sample & mixed-role denominator binding
-            result = repairLaneCs10SampleAndDenominatorBinding(result, context, priorSentenceTail)
-
             // 2. Preserve unknown/missing vs zero and truthful timeline state in plain human language
             val fallbackTimelineUnavailable = resolveContextUnavailableTimelinePhrase(context)
             result = TIMELINE_STATUS_ASSIGNMENT_REGEX.replace(result) { match ->
@@ -1243,6 +1461,9 @@ class AiAnalysisService(
                     }
                 }
             }
+
+            // 3b. Context-aware 10:00 lane CS sample & mixed-role denominator binding (strictly when bound to exact avgActual)
+            result = repairLaneCs10SampleAndDenominatorBinding(result, context, priorSentenceTail)
 
             // 4. Official Riot internal champion IDs -> player-facing League champion names
             for ((regex, replacement) in RIOT_INTERNAL_CHAMPION_RULES) {
@@ -1517,8 +1738,17 @@ class AiAnalysisService(
         }
 
         private val STREAM_PARTIAL_ROLE_CLAUSE_REGEX = Regex(
-            """(?:\b(?:across|over|in|from)\s+|\(\s*)\*{0,2}\d+\*{0,2}\s+(?:top|mid|middle|bot|bottom|adc)(?:\s*[- ]\s*lane)?\s+(?:games?|matches)\b""",
+            """\*{0,2}\b(?:across|over|in|from)\s+\*{0,2}\d+\*{0,2}\s+\*{0,2}(?:top|mid|middle|bot|bottom|adc)(?:\s*[- ]\s*lane)?\*{0,2}\s+(?:games?|matches)\*{0,2}""",
             RegexOption.IGNORE_CASE
+        )
+
+        private val STREAM_SAVED_MATCHES_CLAUSE_REGEX = Regex(
+            """(?:\b(?:across|in|over|from)\s+)?\*{0,2}\byour\s+\*{0,2}(?:saved\s+match(?:es|\s+history)|savedHistory)\*{0,2}""",
+            RegexOption.IGNORE_CASE
+        )
+
+        private val RESOLVED_CS_NUMBER_IN_STREAM_REGEX = Regex(
+            """(?<![\d.-])\d+(?:\.\d+)?\*{0,2}(?:\s|[.,;:!?)])"""
         )
 
         /**
@@ -1670,14 +1900,40 @@ class AiAnalysisService(
                 limit = minOf(limit, holdAt)
             }
 
-            // Hold short unclosed [sample: ...] brackets along with immediately preceding horizontal spaces
+            // Hold short unclosed (or not-yet-whitespace-terminated) [sample: ...] brackets along with preceding spaces
             val lastOpenBracket = pending.lastIndexOf('[', limit - 1)
-            if (lastOpenBracket >= 0 && pending.indexOf(']', lastOpenBracket) < 0 && (limit - lastOpenBracket) < 128) {
-                var holdIdx = lastOpenBracket
-                while (holdIdx > 0 && (pending[holdIdx - 1] == ' ' || pending[holdIdx - 1] == '\t')) {
-                    holdIdx--
+            if (lastOpenBracket >= 0 && (limit - lastOpenBracket) < 128) {
+                val closeBracket = pending.subSequence(0, limit).indexOf(']', lastOpenBracket)
+                val terminatedAfterClose = closeBracket >= 0 &&
+                    pending.subSequence(closeBracket + 1, limit).any { it.isWhitespace() }
+                if (!terminatedAfterClose) {
+                    var holdIdx = lastOpenBracket
+                    while (holdIdx > 0 && (pending[holdIdx - 1] == ' ' || pending[holdIdx - 1] == '\t')) {
+                        holdIdx--
+                    }
+                    limit = minOf(limit, holdIdx)
                 }
-                limit = minOf(limit, holdIdx)
+            }
+
+            // Hold short unclosed (or not-yet-whitespace-terminated) numeric parentheticals such as
+            // "(11 top lane games)" / "(**11 top lane games**)" so trailing-whitespace cuts never split mid-parenthetical
+            if (limit > 0) {
+                val lastOpenParen = pending.lastIndexOf('(', limit - 1)
+                if (lastOpenParen >= 0 && (limit - lastOpenParen) < 64) {
+                    val closeParen = pending.subSequence(0, limit).indexOf(')', lastOpenParen)
+                    val terminatedAfterClose = closeParen >= 0 &&
+                        pending.subSequence(closeParen + 1, limit).any { it.isWhitespace() }
+                    if (!terminatedAfterClose) {
+                        val parenTail = pending.subSequence(lastOpenParen, limit)
+                        if (Regex("""^\(\s*(?:$|\*+$|\*{0,2}\d)""").containsMatchIn(parenTail)) {
+                            var holdIdx = lastOpenParen
+                            while (holdIdx > 0 && (pending[holdIdx - 1] == ' ' || pending[holdIdx - 1] == '\t')) {
+                                holdIdx--
+                            }
+                            limit = minOf(limit, holdIdx)
+                        }
+                    }
+                }
             }
 
             // Hold short unclosed inline backtick spans
@@ -1693,41 +1949,80 @@ class AiAnalysisService(
                 limit = minOf(limit, lastBacktickIdx)
             }
 
-            // Hold reversed-order partial laner denominator clause ("Across 11 top lane games...") up to 112 chars
-            // until either a sentence boundary or 10:00 lane CS topic arrives when priorSentenceTail has not yet
-            // established lane CS@10 context
-            if (limit > 0 && !LANE_CS10_TOPIC_REGEX.containsMatchIn(priorSentenceTail)) {
-                val slice = pending.subSequence(0, limit)
-                val roleClauseMatch = STREAM_PARTIAL_ROLE_CLAUSE_REGEX.find(slice)
-                if (roleClauseMatch != null) {
-                    val afterMatch = slice.subSequence(roleClauseMatch.range.first, slice.length)
-                    if ((limit - roleClauseMatch.range.first) < 112 &&
-                        !SENTENCE_SPLIT_REGEX.containsMatchIn(afterMatch) &&
-                        !LANE_CS10_TOPIC_REGEX.containsMatchIn(afterMatch)
-                    ) {
-                        var holdIdx = roleClauseMatch.range.first
-                        while (holdIdx > 0 && (pending[holdIdx - 1] == ' ' || pending[holdIdx - 1] == '\t')) {
-                            holdIdx--
-                        }
-                        limit = minOf(limit, holdIdx)
+            // Trim to last whitespace first so all candidate checks below inspect only complete whitespace-terminated tokens
+            // (preventing a partial trailing decimal like "72." or "72.9" from releasing an upstream clause early)
+            while (limit > 0 && !pending[limit - 1].isWhitespace()) {
+                limit--
+            }
+            if (limit <= 0) return 0
+
+            // Hold "Your saved matches ..." up to 120 chars until either a sentence/clause boundary or BOTH CS topic +
+            // resolved metric number arrive inside the whitespace-terminated candidate
+            val sliceForSaved = pending.subSequence(0, limit)
+            val savedMatch = STREAM_SAVED_MATCHES_CLAUSE_REGEX.find(sliceForSaved)
+            if (savedMatch != null && (pending.length - savedMatch.range.first) < 120) {
+                val afterSaved = sliceForSaved.subSequence(savedMatch.range.last + 1, sliceForSaved.length)
+                val spanFromSaved = sliceForSaved.subSequence(savedMatch.range.first, sliceForSaved.length)
+                val maskedAfterSaved = BENIGN_CS10_CONTEXT_NUMBER_REGEX.replace(afterSaved, " ")
+                val hasCsTopicInSpan = LANE_CS10_TOPIC_REGEX.containsMatchIn(spanFromSaved) ||
+                    Regex("""\b(?:cs|minions?|last[- ]hits?)\b""", RegexOption.IGNORE_CASE).containsMatchIn(spanFromSaved)
+                val hasResolvedCsMetric = hasCsTopicInSpan &&
+                    RESOLVED_CS_NUMBER_IN_STREAM_REGEX.containsMatchIn(maskedAfterSaved)
+                if (!CS10_SENTENCE_SPLIT_REGEX.containsMatchIn(afterSaved) &&
+                    !CLAUSE_BOUNDARY_FOR_CS10_REGEX.containsMatchIn(afterSaved) &&
+                    !hasResolvedCsMetric
+                ) {
+                    var holdIdx = savedMatch.range.first
+                    while (holdIdx > 0 && pending[holdIdx - 1] == '*') holdIdx--
+                    limit = minOf(limit, holdIdx)
+                    while (limit > 0 && !pending[limit - 1].isWhitespace()) {
+                        limit--
                     }
                 }
             }
-
             if (limit <= 0) return 0
-            val bounded = pending.subSequence(0, limit)
 
-            // Require at least one trailing whitespace so partial identifiers split across SSE deltas are never cut mid-token
-            var lastWs = -1
-            for (i in bounded.length - 1 downTo 0) {
-                if (bounded[i].isWhitespace()) {
-                    lastWs = i
-                    break
+            // Hold reversed-order partial laner denominator clause ("Across 11 top lane games...") up to 128 chars
+            // until either a sentence/clause boundary or CS topic + resolved CS number arrive when no prior CS number
+            // precedes the partial-role clause in the current local clause
+            val priorLocalClause = priorSentenceTail.split(CLAUSE_BOUNDARY_FOR_CS10_REGEX).last()
+            val hasPriorCsNumber = STANDALONE_CS_NUMBER_REGEX.containsMatchIn(
+                BENIGN_CS10_CONTEXT_NUMBER_REGEX.replace(priorLocalClause, " ")
+            )
+            if (!hasPriorCsNumber) {
+                val sliceForRole = pending.subSequence(0, limit)
+                val roleClauseMatch = STREAM_PARTIAL_ROLE_CLAUSE_REGEX.find(sliceForRole)
+                if (roleClauseMatch != null) {
+                    val beforeInSlice = sliceForRole.subSequence(0, roleClauseMatch.range.first).toString()
+                    val localBefore = (priorLocalClause + beforeInSlice).split(CLAUSE_BOUNDARY_FOR_CS10_REGEX).last()
+                    val hasLocalBeforeNum = STANDALONE_CS_NUMBER_REGEX.containsMatchIn(
+                        BENIGN_CS10_CONTEXT_NUMBER_REGEX.replace(localBefore, " ")
+                    )
+                    if (!hasLocalBeforeNum && (pending.length - roleClauseMatch.range.first) < 128) {
+                        val afterRole = sliceForRole.subSequence(roleClauseMatch.range.last + 1, sliceForRole.length)
+                        val fullLocal = localBefore + sliceForRole.subSequence(roleClauseMatch.range.first, sliceForRole.length)
+                        val maskedAfterRole = BENIGN_CS10_CONTEXT_NUMBER_REGEX.replace(afterRole, " ")
+                        val hasCsTopicInLocal = LANE_CS10_TOPIC_REGEX.containsMatchIn(fullLocal) ||
+                            Regex("""\b(?:cs|minions?|last[- ]hits?)\b""", RegexOption.IGNORE_CASE).containsMatchIn(fullLocal)
+                        val hasResolvedRoleMetric = hasCsTopicInLocal &&
+                            RESOLVED_CS_NUMBER_IN_STREAM_REGEX.containsMatchIn(maskedAfterRole)
+                        if (!CS10_SENTENCE_SPLIT_REGEX.containsMatchIn(afterRole) &&
+                            !CLAUSE_BOUNDARY_FOR_CS10_REGEX.containsMatchIn(afterRole) &&
+                            !hasResolvedRoleMetric
+                        ) {
+                            var holdIdx = roleClauseMatch.range.first
+                            while (holdIdx > 0 && pending[holdIdx - 1] == '*') holdIdx--
+                            limit = minOf(limit, holdIdx)
+                            while (limit > 0 && !pending[limit - 1].isWhitespace()) {
+                                limit--
+                            }
+                        }
+                    }
                 }
             }
-            if (lastWs < 0) return 0
+            if (limit <= 0) return 0
 
-            val candidate = bounded.substring(0, lastWs + 1)
+            val candidate = pending.substring(0, limit)
             val holdMatch = STREAM_HOLD_TAIL_REGEX.find(candidate)
             return holdMatch?.range?.first ?: candidate.length
         }
@@ -1780,7 +2075,7 @@ class AiAnalysisService(
             fun currentSentenceTail(): String {
                 if (emittedSoFar.isEmpty()) return ""
                 val s = emittedSoFar.toString()
-                val lastBoundary = SENTENCE_SPLIT_REGEX.findAll(s).lastOrNull()
+                val lastBoundary = CS10_SENTENCE_SPLIT_REGEX.findAll(s).lastOrNull()
                 return if (lastBoundary != null) s.substring(lastBoundary.range.last + 1) else s
             }
 
@@ -2579,8 +2874,18 @@ class AiAnalysisService(
                     "recent detailed matches"
                 }
                 if (cs10Binding.isMixedRole) {
+                    val perRoleSuffix = if (cs10Binding.verifiedRoleActuals.isNotEmpty()) {
+                        val renderedRoles = cs10Binding.activeRoles.mapNotNull { (label, cnt) ->
+                            cs10Binding.verifiedRoleActuals[label]?.let { v ->
+                                "$label: ${String.format(java.util.Locale.US, "%.1f", v)} (${cnt}g)"
+                            }
+                        }
+                        if (renderedRoles.isNotEmpty()) "; verifiedPerRoleCs10=[${renderedRoles.joinToString(", ")}]" else ""
+                    } else {
+                        ""
+                    }
                     headerLines.add(
-                        "    -> cs10SampleBinding: avgActual=$avgActual covers ALL ${cs10Binding.mixedDenominatorPhrase} in $sampleLabel (NEVER a single-role subset or saved matches)"
+                        "    -> cs10SampleBinding: avgActual=$avgActual covers ALL ${cs10Binding.mixedDenominatorPhrase} in $sampleLabel (NEVER a single-role subset or saved matches)$perRoleSuffix"
                     )
                 } else if (cs10Binding.savedDiffersFromRecent) {
                     headerLines.add(
