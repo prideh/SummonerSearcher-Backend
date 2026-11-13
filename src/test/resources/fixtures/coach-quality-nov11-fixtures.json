@@ -183,7 +183,7 @@
       "rankedRecord": { "wins": 1020, "losses": 884, "games": 1904, "winRate": "53.6" },
       "recentMatchSample": { "games": 20, "wins": 11, "losses": 9, "winRate": "55.0" }
     },
-    "exemplarCleanResponse": "I only coach **League of Legends** gameplay, builds, matchups, and match performance, so I can't help with non-League topics. Ask a League coaching question anytime.\n---SUGGESTIONS--- [\"Review my recent top lane matchups\", \"How can I cut down early river deaths?\", \"Check my item choices\"]",
+    "exemplarCleanResponse": "I focus exclusively on **League of Legends** coaching, so I can't help with recipes, coding scripts, or stock predictions.\n---SUGGESTIONS--- []",
     "live40ba67fUnsolicitedPivotResponse": "I only coach League of Legends gameplay, so I cannot write a sourdough hydration script or predict stock prices. However, looking at your ranked record this split, you hold a 53.6% win rate across 1,904 games (1,020W–884L) and a 55.0% win rate across your last 20 detailed matches (11W–9L), so next game focus on crashing your top wave before roaming and tracking enemy jungle timers.\n---SUGGESTIONS--- [\"Review my recent top lane matchups\", \"How can I cut down early river deaths?\", \"Check my item choices\"]"
   },
   "missing": {
@@ -508,6 +508,61 @@
       ]
     },
     "exemplarPerRoleCleanResponse": "Across **your last 20 detailed matches**, your 10:00 lane CS averages **80** across **11 top lane games** and **47** across **3 bot lane games**, pulling your overall average to **72.9** across **14 laner games (11 Top, 3 Bot)** (where **114** is the passive wave theoretical maximum, not missed CS). Checkpoints don't show wave states or trade causes—next game, **crash your top wave cleanly before roaming or resetting**.\n---SUGGESTIONS--- [\"How is my 10-minute lane CS holding up on Pantheon?\", \"Which Pantheon deaths gave up shutdown gold?\", \"Compare my recent matches to my saved match history\"]"
+  },
+  "live907f68eFollowUp": {
+    "context": {
+      "summonerName": "Spear Shot#EUW",
+      "rank": "CHALLENGER I (1142 LP)",
+      "primaryRole": "TOP",
+      "totalGamesAnalyzed": 20,
+      "timelineStatus": "ANALYZED",
+      "timelineCoverage": {
+        "status": "COMPLETE",
+        "coveredMatches": 20,
+        "totalMatches": 20,
+        "stopReason": "COMPLETED"
+      },
+      "recentMatchSample": {
+        "scope": "recent_20_detailed_matches",
+        "games": 20,
+        "wins": 8,
+        "losses": 12,
+        "winRate": 40.0
+      },
+      "championPool": [
+        { "championName": "Pantheon", "games": 17, "wins": 7, "winRate": 41.2, "kda": "5.8/6.8/6.4" },
+        { "championName": "Ezreal", "games": 3, "wins": 1, "winRate": 33.3, "kda": "4.0/7.0/5.3" }
+      ],
+      "improvementStats": {
+        "sampleSize": 20,
+        "hasTimelineAnalysis": true,
+        "deathCost": {
+          "totalDeaths": 137,
+          "avgSecondsDeadPerGame": 197.6,
+          "eligibleGames": 20
+        }
+      },
+      "timelineInsights": {
+        "analyzedGames": 20,
+        "earlyDeathsBefore10": 16,
+        "deathsNearObjectiveWindows": 12,
+        "mostFrequentDeathZone": "Top Side River"
+      },
+      "recentMatches": [
+        { "patch": "26.1", "gameDuration": 28, "championName": "Pantheon", "champion": "Pantheon", "role": "TOP", "win": false, "kda": "3/8/4 (0.88)", "csPerMin": 6.9, "visionScore": 18, "controlWardsBought": 1 },
+        { "patch": "26.1", "gameDuration": 25, "championName": "Pantheon", "champion": "Pantheon", "role": "TOP", "win": false, "kda": "4/7/5 (1.29)", "csPerMin": 7.1, "visionScore": 16, "controlWardsBought": 1 }
+      ]
+    },
+    "roastQuestion": "I'm fed up with losing. Roast my actual performance, then give me two practical habits I can try next game. Don't blame my teammates.",
+    "liveRoastLiteralSyntaxResponse": "Across your last 20 detailed matches, a 40% win rate (8W–12L) with 137 deaths and 197.6 seconds dead per game means you're basically paying rent in the fountain. Summary numbers can't show how those fights or waves actually played out. To stop bleeding tempo: when/if your key spell is READY while enemy defensive cooldowns are DOWN, take the trade. When/if the minimap check confirms the enemy jungler is botside, push the wave to crash before resetting.\n---SUGGESTIONS--- [\"Which Pantheon deaths gave up shutdown gold?\", \"How is my 10-minute lane CS holding up?\", \"Compare my Blue and Red side stats\"]",
+    "exemplarRoastNaturalResponse": "Across **your last 20 detailed matches**, a **40% win rate** (**8W–12L**) with **137 deaths** and **197.6 seconds dead per game** means you're basically paying rent in the fountain. Summary numbers can't show how those fights or waves actually played out. Next game, **when your key spell is ready while enemy defensive cooldowns are down, step up for the trade**, and **once a quick minimap check confirms the enemy jungler is botside, crash the wave before resetting**.\n---SUGGESTIONS--- [\"Which Pantheon deaths gave up shutdown gold?\", \"How is my 10-minute lane CS holding up?\", \"Compare my Blue and Red side stats\"]",
+    "romeHolidayQuestion": "Can you help me plan a three-day holiday in Rome?",
+    "liveRomePivotResponse": "I focus exclusively on solo queue coaching rather than travel planning. Let's keep our focus on your top lane matchups and solo queue execution instead.\n---SUGGESTIONS--- [\"Analyze my top Pantheon matchups\", \"How can I reduce early deaths?\", \"Review my item builds\"]",
+    "exemplarRomeConciseRefusal": "I focus exclusively on solo queue coaching rather than travel planning.\n---SUGGESTIONS--- []",
+    "missingWardWaveQuestion": "Tell me exactly where I warded badly and which wave-management mistake caused my last loss. Be specific about the location and minute.",
+    "liveMissingWardWaveBoilerplateResponse": "Match summaries and timeline data don't record exact ward coordinates or prove which wave-management mistake caused your last loss. When tracking enemy jungler proximity, if your key spell is READY and enemy defensive cooldowns are DOWN, step up to trade. When your wave crashes, check the minimap before deciding to reset.\n---SUGGESTIONS--- [\"Analyze my Pantheon matchups\", \"Review my item builds\", \"Compare Blue and Red side win rates\"]",
+    "exemplarMissingWardWaveReplayResponse": "Saved match summaries and Riot timelines don't store ward map coordinates or wave-state snapshots, so I can't identify an exact bad ward spot, minute, or wave mistake that caused your last loss (**3/8/4 on Pantheon**, **18 vision score**, **1 control ward**). Open that match's **in-client replay** and check the **30 seconds before your first pre-10 death** to see whether your ward covered river/tribush and whether the wave was pushing away from your tower before you stepped up.\n---SUGGESTIONS--- [\"How do my vision score and control wards look across my last 20 matches?\", \"When and where are my pre-10 deaths happening across analyzed timelines?\", \"How is my 10-minute lane CS holding up across recent games?\"]"
   }
 }
+
 
