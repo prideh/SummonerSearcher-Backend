@@ -7,7 +7,12 @@ import com.sun.net.httpserver.HttpServer
 import io.mockk.coEvery
 import io.mockk.every
 import io.mockk.mockk
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
+import org.junit.jupiter.api.Assertions.assertEquals
+import org.junit.jupiter.api.Assertions.assertSame
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 import org.springframework.data.redis.core.StringRedisTemplate
@@ -251,7 +256,7 @@ class CoachPrepRealProfileBaselineReproTest {
 
     private fun buildRepresentative108MbProfile(matchIds20: List<String>, targetJsonBytes: Int = 1_076_586): SummonerProfileDto {
         val allMatchIds = (1..883).map { idx ->
-            if (idx <= 20) matchIds20[idx - 1] else "EUW1_${7_709_999_999L - idx}"
+            if (idx <= matchIds20.size) matchIds20[idx - 1] else "EUW1_${7_709_999_999L - idx}"
         }
         val champStats = (1..75).map { idx ->
             val games = (900 / (idx + 1)).coerceAtLeast(1)
@@ -814,6 +819,13 @@ class CoachPrepRealProfileBaselineReproTest {
             assertTrue(callerDeadlineLog.contains("httpAttempts=5"), "Must report live httpAttempts instead of hardcoded 0: $callerDeadlineLog")
             assertTrue(!callerDeadlineLog.contains("riotLoopMs=0 "), "Must report live non-zero riotLoopMs: $callerDeadlineLog")
 
+            // Exact worker I/O completion reserve & cache stride invariants
+            assertEquals(11_500L, timelineService.computeWorkerIoDeadlineMs(12_000L, 0L), "12,000ms budget must reserve (12000/12).coerceIn(200,500) = 500ms")
+            assertEquals(2_292L, timelineService.computeWorkerIoDeadlineMs(2_500L, 0L), "2,500ms budget must reserve 2500/12 = 208ms")
+            assertEquals(1_500L, timelineService.computeWorkerIoDeadlineMs(1_500L, 0L), "<2,000ms budget must reserve 0ms")
+            assertEquals(2_048, RedisCacheService.HEADROOM_CHECK_STRIDE_BYTES, "Compressed Base64 headroom stride is 2 KiB (changed from 1,024)")
+            assertEquals(16_384, RedisCacheService.INFLATED_HEADROOM_CHECK_STRIDE_BYTES, "Inflated/UTF-8 JSON headroom stride is 16 KiB")
+
             // Wait briefly for detached worker stall to exit, clear stall, and verify Retry #2 reuses the 4 Redis-cached timelines -> COMPLETE 20/20
             Thread.sleep(450L)
             shouldStallMatch5.set(false)
@@ -831,6 +843,278 @@ class CoachPrepRealProfileBaselineReproTest {
             assertTrue(callerDeadlineRetry2Log.contains("httpAttempts=16"), "Retry #2 must fetch only remaining 16 timelines: $callerDeadlineRetry2Log")
         } finally {
             server.stop(0)
+        }
+    }
+
+    @Test
+    fun callerDeadlineFallbackNeverRunsUnboundedAnalyzeOutsideSlotAndBoundsWallElapsedUnderSlowAnalysisAndConcurrentWaiters() = runBlocking {
+        val deterministicMemory = object : MemoryStatsProvider {
+            override fun sample(): RawMemorySample = RawMemorySample(
+                jvmHeapUsedBytes = 92L * 1024L * 1024L,
+                jvmHeapCommittedBytes = 205L * 1024L * 1024L,
+                jvmHeapMaxBytes = 205L * 1024L * 1024L,
+                cgroupMemoryCurrentBytes = 330L * 1024L * 1024L,
+                cgroupMemoryMaxBytes = 536_870_912L
+            )
+        }
+
+        // Subtest A: 900ms slow analyze() during analysis_assembly + 4 concurrent singleflight waiters (prepDeadlineMs=450ms, maxConcurrent=1).
+        // Proves:
+        //  - analyze() runs ONLY ONCE inside the single admitted worker (never on timeout callers/waiters),
+        //  - wallElapsed across all 4 callers covers fallback + telemetry logging and finishes well before 450+900ms,
+        //  - global concurrency slot stays held while detached worker finishes analyze() (blocking a 2nd player with CONCURRENCY_LIMIT_REACHED),
+        //  - logged totalMs is captured AFTER fallback construction.
+        run {
+            val matchId = "EUW1_SLOW_ANALYZE_1"
+            val profile = buildRepresentative108MbProfile(listOf(matchId), targetJsonBytes = 32_000).copy(
+                allMatchIds = listOf(matchId),
+                recentMatches = listOf(buildRichMatchDto(matchId, 0, 0))
+            )
+            val cachedTimeline = objectMapper.readValue(buildRealisticTimelineBytes(matchId, 1), MatchTimelineDto::class.java)
+            val redisCacheService = mockk<RedisCacheService>(relaxed = true)
+            every { redisCacheService.get("timeline:euw1:$matchId", MatchTimelineDto::class.java) } returns cachedTimeline
+
+            val analyzeCalls = AtomicInteger(0)
+            val concurrentAnalyze = AtomicInteger(0)
+            val maxConcurrentAnalyze = AtomicInteger(0)
+            val postDeadlineAnalyzeStarts = AtomicInteger(0)
+            val callStartRef = AtomicLong(0L)
+
+            val slowAnalyzer = object : TimelineAnalysisService() {
+                override fun analyze(
+                    timelines: List<Triple<String, MatchTimelineDto, MatchDto>>,
+                    puuid: String,
+                    allMatches: List<MatchDto>?
+                ): TimelineAnalysisDto {
+                    if (System.currentTimeMillis() - callStartRef.get() >= 500L) {
+                        postDeadlineAnalyzeStarts.incrementAndGet()
+                    }
+                    analyzeCalls.incrementAndGet()
+                    val active = concurrentAnalyze.incrementAndGet()
+                    maxConcurrentAnalyze.accumulateAndGet(active, ::maxOf)
+                    try {
+                        try {
+                            Thread.sleep(900L)
+                        } catch (_: InterruptedException) {
+                            // Simulate CPU-bound uninterruptible analysis
+                            val remain = 900L - (System.currentTimeMillis() - callStartRef.get()).coerceIn(0L, 900L)
+                            if (remain > 0L) Thread.sleep(remain)
+                        }
+                        return super.analyze(timelines, puuid, allMatches)
+                    } finally {
+                        concurrentAnalyze.decrementAndGet()
+                    }
+                }
+            }
+
+            val summaries = CopyOnWriteArrayList<String>()
+            val service = TimelineService(
+                riotApiService = mockk(relaxed = true),
+                redisCacheService = redisCacheService,
+                timelineAnalysisService = slowAnalyzer,
+                timeProvider = SystemTimeProvider(),
+                memoryStatsProvider = deterministicMemory,
+                prepDeadlineMs = 450L,
+                maxConcurrentPreparations = 1
+            ).apply {
+                stageSummaryObserver = { summaries.add(it) }
+            }
+
+            val wallStart = System.currentTimeMillis()
+            callStartRef.set(wallStart)
+            val waiterOutcomes = (1..4).map {
+                async(Dispatchers.IO) {
+                    service.prepareCoachTimelinesForPlayer(
+                        region = "euw1",
+                        puuid = targetPuuid,
+                        requestedMatchIds = listOf(matchId),
+                        includeEmptyFallbackAnalysisForLegacyRoute = false,
+                        profileLoader = { profile }
+                    ) as TimelineService.PlayerPreparationOutcome.Ready
+                }
+            }.awaitAll()
+            val wallElapsed = System.currentTimeMillis() - wallStart
+
+            assertTrue(waiterOutcomes.all { it.result.status == "BLOCKED" && it.result.stopReason == "DEADLINE_EXCEEDED" })
+            assertEquals(1, analyzeCalls.get(), "Timeout callers must NEVER invoke fresh analyze(); expected only 1 worker call")
+            assertEquals(1, maxConcurrentAnalyze.get(), "Concurrent waiters must never fan out parallel analyze() calls")
+            assertEquals(0, postDeadlineAnalyzeStarts.get(), "Zero analyze() calls may start after callerDeadlineMs + 75ms")
+            assertTrue(wallElapsed in 450L..820L, "Fallback return must stay bounded near 450ms+75ms despite 900ms analyzer, took ${wallElapsed}ms")
+
+            val deadlineLogs = summaries.filter { it.contains("stage=singleflight_caller_deadline") }
+            assertEquals(4, deadlineLogs.size)
+            assertTrue(deadlineLogs.all { it.contains("subStage=analysis_assembly") }, "Expected subStage=analysis_assembly: $deadlineLogs")
+            for (logLine in deadlineLogs) {
+                val loggedTotalMs = Regex("totalMs=(\\d+)").find(logLine)!!.groupValues[1].toLong()
+                assertTrue(loggedTotalMs in 450L..wallElapsed, "Logged totalMs=$loggedTotalMs must cover fallback within wallElapsed=$wallElapsed")
+            }
+
+            // Global slot must remain held while detached worker finishes its 900ms analyze()
+            assertEquals(1, service.getActiveGlobalPreparations(), "Global slot must stay held while detached worker is still in analyze()")
+            val secondPlayerWhileBusy = service.prepareCoachTimelinesForPlayer(
+                region = "euw1",
+                puuid = "second-player-puuid",
+                requestedMatchIds = listOf(matchId),
+                includeEmptyFallbackAnalysisForLegacyRoute = false,
+                profileLoader = { profile.copy(puuid = "second-player-puuid") }
+            ) as TimelineService.PlayerPreparationOutcome.Ready
+            assertEquals("CONCURRENCY_LIMIT_REACHED", secondPlayerWhileBusy.result.stopReason)
+
+            Thread.sleep(500L)
+            assertEquals(0, service.getActiveGlobalPreparations(), "Global slot must release cleanly once worker finishes analyze()")
+            assertEquals(1, analyzeCalls.get())
+        }
+
+        // Subtest B: Worker's single-claim salvageWatcherJob publishes ready immutable 1/3 partial snapshot (55ms analyze inside 100ms lead window),
+        // while match #2 stalls 900ms. 4 concurrent waiters hit callerDeadlineMs + 75ms (600ms + 75ms) -> ALL 4 return PARTIAL 1/3 in O(1)
+        // (0ms fallback analyze), sharing the exact immutable TimelineAnalysisDto reference with analyzeCalls == 1!
+        run {
+            val ids3 = listOf("EUW1_SLOW_SNAP_1", "EUW1_SLOW_SNAP_2", "EUW1_SLOW_SNAP_3")
+            val dtos3 = ids3.mapIndexed { idx, id -> buildRichMatchDto(id, idx, 0) }
+            val profile3 = buildRepresentative108MbProfile(ids3, targetJsonBytes = 48_000).copy(
+                allMatchIds = ids3,
+                recentMatches = dtos3
+            )
+            val tl1 = objectMapper.readValue(buildRealisticTimelineBytes(ids3[0], 1), MatchTimelineDto::class.java)
+            val redisCacheService = mockk<RedisCacheService>(relaxed = true)
+            every { redisCacheService.get(any(), MatchTimelineDto::class.java) } returns null
+
+            val riotApi = mockk<RiotApiService>()
+            coEvery {
+                riotApi.getMatchTimelineBounded(any(), any(), any(), any(), any(), any(), any(), any())
+            } answers {
+                val mid = firstArg<String>()
+                arg<AtomicInteger?>(4)?.incrementAndGet()
+                if (mid == ids3[0]) {
+                    tl1
+                } else {
+                    val end = System.currentTimeMillis() + 900L
+                    while (System.currentTimeMillis() < end) {
+                        try {
+                            Thread.sleep(25L)
+                        } catch (_: InterruptedException) {
+                            // Uninterruptible stall to force singleflight_caller_deadline
+                        }
+                    }
+                    null
+                }
+            }
+
+            val analyzeCalls = AtomicInteger(0)
+            val postDeadlineAnalyzeStarts = AtomicInteger(0)
+            val callStartRef = AtomicLong(0L)
+            val slowSnapshotAnalyzer = object : TimelineAnalysisService() {
+                override fun analyze(
+                    timelines: List<Triple<String, MatchTimelineDto, MatchDto>>,
+                    puuid: String,
+                    allMatches: List<MatchDto>?
+                ): TimelineAnalysisDto {
+                    if (System.currentTimeMillis() - callStartRef.get() >= 650L) {
+                        postDeadlineAnalyzeStarts.incrementAndGet()
+                    }
+                    analyzeCalls.incrementAndGet()
+                    Thread.sleep(55L)
+                    return super.analyze(timelines, puuid, allMatches)
+                }
+            }
+
+            val summaries = CopyOnWriteArrayList<String>()
+            val service = TimelineService(
+                riotApiService = riotApi,
+                redisCacheService = redisCacheService,
+                timelineAnalysisService = slowSnapshotAnalyzer,
+                timeProvider = SystemTimeProvider(),
+                memoryStatsProvider = deterministicMemory,
+                prepDeadlineMs = 600L
+            ).apply {
+                stageSummaryObserver = { summaries.add(it) }
+            }
+
+            val wallStart = System.currentTimeMillis()
+            callStartRef.set(wallStart)
+            val results = (1..4).map {
+                async(Dispatchers.IO) {
+                    service.prepareCoachTimelinesForPlayer(
+                        region = "euw1",
+                        puuid = targetPuuid,
+                        requestedMatchIds = ids3,
+                        includeEmptyFallbackAnalysisForLegacyRoute = false,
+                        profileLoader = { profile3 }
+                    ) as TimelineService.PlayerPreparationOutcome.Ready
+                }
+            }.awaitAll()
+            val wallElapsed = System.currentTimeMillis() - wallStart
+
+            assertTrue(results.all { it.result.status == "PARTIAL" && it.result.coveredMatchIds == listOf(ids3[0]) })
+            val sharedAnalysis = results.first().result.analysis!!
+            assertTrue(results.all { it.result.analysis === sharedAnalysis }, "All waiters must share the worker's immutable TimelineAnalysisDto")
+            assertEquals(1, analyzeCalls.get(), "Expected exactly 1 worker snapshot analyze() call and 0 caller fallback calls")
+            assertEquals(0, postDeadlineAnalyzeStarts.get(), "Zero analyze() calls may start on timeout fallback")
+            assertTrue(wallElapsed in 600L..880L, "O(1) ready partial snapshot fallback must not add 220ms after 675ms cutoff, took ${wallElapsed}ms")
+
+            val deadlineLogs = summaries.filter { it.contains("stage=singleflight_caller_deadline") }
+            assertEquals(4, deadlineLogs.size)
+            assertTrue(deadlineLogs.all { it.contains("subStage=riot_http_fetch") })
+            for (logLine in deadlineLogs) {
+                val loggedTotalMs = Regex("totalMs=(\\d+)").find(logLine)!!.groupValues[1].toLong()
+                assertTrue(loggedTotalMs in 600L..wallElapsed, "Logged totalMs=$loggedTotalMs must cover fallback within wallElapsed=$wallElapsed")
+            }
+
+            Thread.sleep(550L)
+            assertEquals(0, service.getActiveGlobalPreparations())
+            assertEquals(1, analyzeCalls.get(), "Worker exiting after hardCompletionDeadlineMs must not run a redundant post-deadline analyze()")
+        }
+
+        // Subtest C: Direct prepareCoachTimelines entrypoint with 3 concurrent waiters + 900ms slow analyze() (prepDeadlineMs=400ms)
+        run {
+            val matchId = "EUW1_DIRECT_SLOW_1"
+            val matchDto = buildRichMatchDto(matchId, 0, 0)
+            val cachedTimeline = objectMapper.readValue(buildRealisticTimelineBytes(matchId, 2), MatchTimelineDto::class.java)
+            val redisCacheService = mockk<RedisCacheService>(relaxed = true)
+            every { redisCacheService.get("timeline:euw1:$matchId", MatchTimelineDto::class.java) } returns cachedTimeline
+
+            val analyzeCalls = AtomicInteger(0)
+            val callStartRef = AtomicLong(0L)
+            val slowAnalyzer = object : TimelineAnalysisService() {
+                override fun analyze(
+                    timelines: List<Triple<String, MatchTimelineDto, MatchDto>>,
+                    puuid: String,
+                    allMatches: List<MatchDto>?
+                ): TimelineAnalysisDto {
+                    analyzeCalls.incrementAndGet()
+                    try {
+                        Thread.sleep(900L)
+                    } catch (_: InterruptedException) {
+                        val remain = 900L - (System.currentTimeMillis() - callStartRef.get()).coerceIn(0L, 900L)
+                        if (remain > 0L) Thread.sleep(remain)
+                    }
+                    return super.analyze(timelines, puuid, allMatches)
+                }
+            }
+
+            val service = TimelineService(
+                riotApiService = mockk(relaxed = true),
+                redisCacheService = redisCacheService,
+                timelineAnalysisService = slowAnalyzer,
+                timeProvider = SystemTimeProvider(),
+                memoryStatsProvider = deterministicMemory,
+                prepDeadlineMs = 400L
+            )
+
+            val wallStart = System.currentTimeMillis()
+            callStartRef.set(wallStart)
+            val directResults = (1..3).map {
+                async(Dispatchers.IO) {
+                    service.prepareCoachTimelines("euw1", targetPuuid, listOf(matchId), listOf(matchDto))
+                }
+            }.awaitAll()
+            val wallElapsed = System.currentTimeMillis() - wallStart
+
+            assertTrue(directResults.all { it.status == "BLOCKED" && it.stopReason == "DEADLINE_EXCEEDED" })
+            assertEquals(1, analyzeCalls.get(), "Direct entrypoint timeout waiters must never invoke fresh analyze()")
+            assertTrue(wallElapsed in 400L..760L, "Direct entrypoint fallback must stay bounded near 400ms+75ms, took ${wallElapsed}ms")
+            Thread.sleep(550L)
+            assertEquals(0, service.getActiveGlobalPreparations())
         }
     }
 }

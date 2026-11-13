@@ -179,14 +179,12 @@ class TimelineService @Autowired constructor(
         val compressedBytes: ByteArray
     )
 
-    internal data class PartialCompactionSnapshot(
+    internal data class ReadyPartialPreparationSnapshot(
         val orderedMatchIds: List<String>,
-        val orderedMatchDtos: List<MatchDto>,
-        val compactedTriples: List<Triple<String, MatchTimelineDto, MatchDto>>,
         val coveredMatchIds: List<String>,
-        val missingPrefix: List<MissingMatchTimelineDto>,
-        val nextMatchIndex: Int,
-        val peakRetainedRawTimelines: Int
+        val missingMatchesOnDeadline: List<MissingMatchTimelineDto>,
+        val peakRetainedRawTimelines: Int,
+        val analysis: TimelineAnalysisDto
     )
 
     internal class PrepStageProgress {
@@ -197,7 +195,7 @@ class TimelineService @Autowired constructor(
         val riotLoopMs = AtomicLong(0L)
         val httpAttempts = AtomicInteger(0)
         val effectiveRequestedIds = AtomicReference<List<String>>(emptyList())
-        val partialSnapshot = AtomicReference<PartialCompactionSnapshot?>(null)
+        val readyPartialSnapshot = AtomicReference<ReadyPartialPreparationSnapshot?>(null)
 
         fun snapshotRiotLoopMs(nowMs: Long): Long {
             val recorded = riotLoopMs.get()
@@ -920,7 +918,12 @@ class TimelineService @Autowired constructor(
         return value
     }
 
-    private fun computeWorkerIoDeadlineMs(hardDeadlineMs: Long, nowMs: Long): Long {
+    /**
+     * Reserves `(remainingMs / 12L).coerceIn(200L, 500L)` when `remainingMs >= 2_000L`
+     * (`500ms` at default `12,000ms` budget -> `11,500ms` I/O cutoff; `208ms` at `2,500ms`;
+     * `0ms` below `2,000ms`) so slow-network workers complete aggregation inside the caller's budget.
+     */
+    internal fun computeWorkerIoDeadlineMs(hardDeadlineMs: Long, nowMs: Long): Long {
         val remainingMs = (hardDeadlineMs - nowMs).coerceAtLeast(0L)
         val completionReserveMs = if (remainingMs >= 2_000L) {
             (remainingMs / 12L).coerceIn(200L, 500L)
@@ -930,6 +933,11 @@ class TimelineService @Autowired constructor(
         return hardDeadlineMs - completionReserveMs
     }
 
+    /**
+     * O(1) caller-deadline fallback that reads ONLY an already-assembled, immutable
+     * [ReadyPartialPreparationSnapshot] published inside the admitted, slot-guarded worker.
+     * Never invokes [TimelineAnalysisService.analyze] on timeout callers or concurrent waiters.
+     */
     private fun buildPartialOrBlockedCallerDeadlineResult(
         normalizedRegion: String,
         puuid: String,
@@ -937,35 +945,21 @@ class TimelineService @Autowired constructor(
         analyzerVersion: String,
         progress: PrepStageProgress
     ): CoachTimelinePreparationResultDto {
-        val snap = progress.partialSnapshot.get()
-        if (snap != null && snap.compactedTriples.isNotEmpty() && hasCoachContinueHeadroom()) {
-            val missing = ArrayList<MissingMatchTimelineDto>(
-                snap.missingPrefix.size + (snap.orderedMatchIds.size - snap.nextMatchIndex).coerceAtLeast(0)
+        val readySnap = progress.readyPartialSnapshot.get()
+        if (readySnap != null && readySnap.coveredMatchIds.isNotEmpty() && hasCoachContinueHeadroom()) {
+            return CoachTimelinePreparationResultDto(
+                status = "PARTIAL",
+                region = normalizedRegion,
+                puuid = puuid,
+                analyzerVersion = analyzerVersion,
+                requestedMatchIds = readySnap.orderedMatchIds,
+                coveredMatchIds = readySnap.coveredMatchIds,
+                missingMatches = readySnap.missingMatchesOnDeadline,
+                stopReason = "DEADLINE_EXCEEDED",
+                cacheHit = false,
+                peakRetainedRawTimelines = readySnap.peakRetainedRawTimelines,
+                analysis = readySnap.analysis
             )
-            missing.addAll(snap.missingPrefix)
-            if (snap.nextMatchIndex in 0..snap.orderedMatchIds.size) {
-                for (remainingId in snap.orderedMatchIds.subList(snap.nextMatchIndex, snap.orderedMatchIds.size)) {
-                    missing.add(MissingMatchTimelineDto(remainingId, "DEADLINE_EXCEEDED"))
-                }
-            }
-            val partialAnalysis = runCatching {
-                timelineAnalysisService.analyze(snap.compactedTriples, puuid, snap.orderedMatchDtos)
-            }.getOrNull()
-            if (partialAnalysis != null) {
-                return CoachTimelinePreparationResultDto(
-                    status = "PARTIAL",
-                    region = normalizedRegion,
-                    puuid = puuid,
-                    analyzerVersion = analyzerVersion,
-                    requestedMatchIds = snap.orderedMatchIds,
-                    coveredMatchIds = snap.coveredMatchIds,
-                    missingMatches = missing,
-                    stopReason = "DEADLINE_EXCEEDED",
-                    cacheHit = false,
-                    peakRetainedRawTimelines = snap.peakRetainedRawTimelines,
-                    analysis = partialAnalysis
-                )
-            }
         }
         val effectiveIds = progress.effectiveRequestedIds.get().ifEmpty { fallbackOrderedMatchIds }
         return buildBlockedResult(
@@ -1110,7 +1104,7 @@ class TimelineService @Autowired constructor(
             map = inFlightPlayerPreparations,
             callerDeadlineMs = callerDeadlineMs,
             onCallerDeadlineExceeded = { progress ->
-                val deadlineNow = timeProvider.now()
+                val observedSubStage = progress.subStage.get()
                 val fallbackResult = buildPartialOrBlockedCallerDeadlineResult(
                     normalizedRegion = normalizedRegion,
                     puuid = trimmedPuuid,
@@ -1118,15 +1112,16 @@ class TimelineService @Autowired constructor(
                     analyzerVersion = analyzerVersion,
                     progress = progress
                 )
+                val completionNow = timeProvider.now()
                 logCoachPrepStageSummary(
                     normalizedRegion = normalizedRegion,
                     stage = "singleflight_caller_deadline",
-                    subStage = progress.subStage.get(),
+                    subStage = observedSubStage,
                     result = fallbackResult,
-                    totalMs = (deadlineNow - startMs).coerceAtLeast(0L),
+                    totalMs = (completionNow - startMs).coerceAtLeast(0L),
                     warmLookupMs = progress.warmLookupMs.get(),
                     profileDecodeMs = progress.profileDecodeMs.get(),
-                    riotLoopMs = progress.snapshotRiotLoopMs(deadlineNow),
+                    riotLoopMs = progress.snapshotRiotLoopMs(completionNow),
                     httpAttempts = progress.httpAttempts.get(),
                     preAdmission = preAdmission
                 )
@@ -1724,7 +1719,7 @@ class TimelineService @Autowired constructor(
         lingeringWorkers: MutableList<RiotApiService.LingeringWorkerHandle>,
         httpAttemptCounter: AtomicInteger? = null,
         progress: PrepStageProgress? = null
-    ): CoachTimelinePreparationResultDto {
+    ): CoachTimelinePreparationResultDto = kotlinx.coroutines.coroutineScope {
         val matchDtosById = matchDtos.mapNotNull { dto ->
             val mid = dto.metadata?.matchId?.trim()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
             mid to dto
@@ -1738,157 +1733,212 @@ class TimelineService @Autowired constructor(
         val peakRetainedRawTimelines = AtomicInteger(0)
         var stopReason: String? = null
 
-        for ((index, matchId) in orderedMatchIds.withIndex()) {
-            val nowMs = timeProvider.now()
-            if (nowMs >= deadlineAtMs) {
-                stopReason = "DEADLINE_EXCEEDED"
-                for (remainingId in orderedMatchIds.subList(index, orderedMatchIds.size)) {
-                    missingMatches.add(MissingMatchTimelineDto(remainingId, "DEADLINE_EXCEEDED"))
-                }
-                break
-            }
+        class CompactedPrefixState(
+            val triples: List<Triple<String, MatchTimelineDto, MatchDto>>,
+            val coveredIds: List<String>,
+            val missingPrefix: List<MissingMatchTimelineDto>,
+            val nextMatchIndex: Int,
+            val peakRaw: Int
+        )
 
-            if (!hasCoachContinueHeadroom()) {
-                stopReason = "MEMORY_HEADROOM_STOP"
-                for (remainingId in orderedMatchIds.subList(index, orderedMatchIds.size)) {
-                    missingMatches.add(MissingMatchTimelineDto(remainingId, "MEMORY_HEADROOM_STOP"))
-                }
-                break
-            }
+        val latestCompactedState = AtomicReference<CompactedPrefixState?>(null)
+        val analysisClaimed = AtomicBoolean(false)
 
-            val matchDto = matchDtosById[matchId]
-            if (matchDto == null) {
-                missingMatches.add(MissingMatchTimelineDto(matchId, "MISSING_MATCH_DTO"))
-                continue
-            }
-
-            progress?.subStage?.set("timeline_cache_read")
-            val rawCacheKey = getCacheKey(matchId, normalizedRegion)
-            val cacheReadOutcome = readAndCompactCachedTimeline(
-                rawCacheKey = rawCacheKey,
-                matchDto = matchDto,
-                puuid = puuid,
-                deadlineAtMs = deadlineAtMs,
-                liveRawTimelines = liveRawTimelines,
-                peakRetainedRawTimelines = peakRetainedRawTimelines,
-                lingeringWorkers = lingeringWorkers
-            )
-            if (cacheReadOutcome.abortStopReason != null) {
-                stopReason = cacheReadOutcome.abortStopReason
-                for (remainingId in orderedMatchIds.subList(index, orderedMatchIds.size)) {
-                    missingMatches.add(MissingMatchTimelineDto(remainingId, cacheReadOutcome.abortStopReason))
-                }
-                break
-            }
-
-            var compactedTimeline: MatchTimelineDto? = cacheReadOutcome.compactedTimeline
-            val needsNetworkFetch = !cacheReadOutcome.hadCachedRaw || cacheReadOutcome.legacyNeedsBackfill
-            var itemMissingReason: String? = null
-            var fetchStopReason: String? = null
-
-            if (needsNetworkFetch) {
-                val nowBeforeFetch = timeProvider.now()
-                val remainingMs = deadlineAtMs - nowBeforeFetch
-                val activeCooldownMs = rateLimiter?.getActiveRetryAfterWaitMs(normalizedRegion) ?: 0L
-
-                when {
-                    remainingMs <= 0L -> fetchStopReason = "DEADLINE_EXCEEDED"
-                    !hasCoachContinueHeadroom() -> fetchStopReason = "MEMORY_HEADROOM_STOP"
-                    activeCooldownMs > 0L && activeCooldownMs + 10L > remainingMs -> fetchStopReason = "RATE_LIMIT_COOLDOWN"
-                    else -> {
-                        progress?.subStage?.set("riot_http_fetch")
-                        val failureReason = AtomicReference<String?>(null)
-                        val fetched = riotApiService.getMatchTimelineBounded(
-                            matchId = matchId,
-                            region = normalizedRegion,
-                            priority = ApiPriority.LOW,
-                            maxRetries = 0,
-                            httpAttemptCounter = httpAttemptCounter,
-                            failureReasonHolder = failureReason,
-                            maxTotalDurationMs = remainingMs,
-                            headroomGuard = ::hasCoachContinueHeadroom
+        val salvageWatcherJob = if (progress != null) {
+            launch {
+                val budgetMs = (hardCompletionDeadlineMs - timeProvider.now()).coerceAtLeast(0L)
+                val salvageLeadMs = (budgetMs / 6L).coerceIn(50L, 200L)
+                val waitMs = (budgetMs - salvageLeadMs).coerceAtLeast(1L)
+                kotlinx.coroutines.delay(waitMs)
+                val prefix = latestCompactedState.get()
+                if (prefix != null &&
+                    prefix.triples.isNotEmpty() &&
+                    timeProvider.now() < hardCompletionDeadlineMs &&
+                    hasCoachContinueHeadroom() &&
+                    analysisClaimed.compareAndSet(false, true)
+                ) {
+                    val partialAnalysis = timelineAnalysisService.analyze(prefix.triples, puuid, orderedMatchDtos)
+                    if (timeProvider.now() < hardCompletionDeadlineMs && hasCoachContinueHeadroom()) {
+                        val deadlineMissing = ArrayList<MissingMatchTimelineDto>(
+                            prefix.missingPrefix.size + (orderedMatchIds.size - prefix.nextMatchIndex).coerceAtLeast(0)
                         )
-                        if (fetched != null) {
-                            if (timeProvider.now() >= hardCompletionDeadlineMs) {
-                                fetchStopReason = "DEADLINE_EXCEEDED"
-                            } else {
-                                progress?.subStage?.set("timeline_compact_cache")
-                                val compactedReplacement = cacheAndCompactFetchedTimeline(
-                                    rawCacheKey = rawCacheKey,
-                                    fetched = fetched,
-                                    matchDto = matchDto,
-                                    puuid = puuid,
-                                    liveRawTimelines = liveRawTimelines,
-                                    peakRetainedRawTimelines = peakRetainedRawTimelines
-                                )
-                                if (compactedReplacement != null) {
-                                    compactedTimeline = compactedReplacement
-                                } else if (compactedTimeline == null) {
-                                    itemMissingReason = "TIMELINE_UNAVAILABLE"
-                                }
+                        deadlineMissing.addAll(prefix.missingPrefix)
+                        if (prefix.nextMatchIndex in 0..orderedMatchIds.size) {
+                            for (remainingId in orderedMatchIds.subList(prefix.nextMatchIndex, orderedMatchIds.size)) {
+                                deadlineMissing.add(MissingMatchTimelineDto(remainingId, "DEADLINE_EXCEEDED"))
                             }
-                        } else {
-                            when (failureReason.get()) {
-                                "DEADLINE_EXCEEDED" -> fetchStopReason = "DEADLINE_EXCEEDED"
-                                "MEMORY_HEADROOM_STOP" -> fetchStopReason = "MEMORY_HEADROOM_STOP"
-                                "HTTP_429_TOO_MANY_REQUESTS" -> fetchStopReason = "RATE_LIMIT_429"
-                                "RATE_LIMIT_COOLDOWN" -> fetchStopReason = "RATE_LIMIT_COOLDOWN"
-                                "NETWORK_TIMEOUT" -> fetchStopReason = "NETWORK_TIMEOUT"
-                                "HTTP_EXECUTOR_SATURATED" -> fetchStopReason = "HTTP_EXECUTOR_SATURATED"
-                                "UPSTREAM_5XX", "HTTP_ERROR" -> fetchStopReason = "UPSTREAM_ERROR"
-                                "HTTP_404_NOT_FOUND" -> {
-                                    if (compactedTimeline == null) {
-                                        itemMissingReason = "TIMELINE_NOT_FOUND"
-                                    }
-                                }
-                                "RESPONSE_TOO_LARGE" -> {
-                                    if (compactedTimeline == null) {
-                                        itemMissingReason = "OVERSIZED_TIMELINE"
-                                    }
-                                }
-                                else -> {
-                                    if (compactedTimeline == null) {
+                        }
+                        progress.readyPartialSnapshot.set(
+                            ReadyPartialPreparationSnapshot(
+                                orderedMatchIds = orderedMatchIds,
+                                coveredMatchIds = prefix.coveredIds,
+                                missingMatchesOnDeadline = Collections.unmodifiableList(deadlineMissing),
+                                peakRetainedRawTimelines = prefix.peakRaw,
+                                analysis = partialAnalysis
+                            )
+                        )
+                    }
+                }
+            }
+        } else {
+            null
+        }
+
+        try {
+            for ((index, matchId) in orderedMatchIds.withIndex()) {
+                val nowMs = timeProvider.now()
+                if (nowMs >= deadlineAtMs) {
+                    stopReason = "DEADLINE_EXCEEDED"
+                    for (remainingId in orderedMatchIds.subList(index, orderedMatchIds.size)) {
+                        missingMatches.add(MissingMatchTimelineDto(remainingId, "DEADLINE_EXCEEDED"))
+                    }
+                    break
+                }
+
+                if (!hasCoachContinueHeadroom()) {
+                    stopReason = "MEMORY_HEADROOM_STOP"
+                    for (remainingId in orderedMatchIds.subList(index, orderedMatchIds.size)) {
+                        missingMatches.add(MissingMatchTimelineDto(remainingId, "MEMORY_HEADROOM_STOP"))
+                    }
+                    break
+                }
+
+                val matchDto = matchDtosById[matchId]
+                if (matchDto == null) {
+                    missingMatches.add(MissingMatchTimelineDto(matchId, "MISSING_MATCH_DTO"))
+                    continue
+                }
+
+                progress?.subStage?.set("timeline_cache_read")
+                val rawCacheKey = getCacheKey(matchId, normalizedRegion)
+                val cacheReadOutcome = readAndCompactCachedTimeline(
+                    rawCacheKey = rawCacheKey,
+                    matchDto = matchDto,
+                    puuid = puuid,
+                    deadlineAtMs = deadlineAtMs,
+                    liveRawTimelines = liveRawTimelines,
+                    peakRetainedRawTimelines = peakRetainedRawTimelines,
+                    lingeringWorkers = lingeringWorkers
+                )
+                if (cacheReadOutcome.abortStopReason != null) {
+                    stopReason = cacheReadOutcome.abortStopReason
+                    for (remainingId in orderedMatchIds.subList(index, orderedMatchIds.size)) {
+                        missingMatches.add(MissingMatchTimelineDto(remainingId, cacheReadOutcome.abortStopReason))
+                    }
+                    break
+                }
+
+                var compactedTimeline: MatchTimelineDto? = cacheReadOutcome.compactedTimeline
+                val needsNetworkFetch = !cacheReadOutcome.hadCachedRaw || cacheReadOutcome.legacyNeedsBackfill
+                var itemMissingReason: String? = null
+                var fetchStopReason: String? = null
+
+                if (needsNetworkFetch) {
+                    val nowBeforeFetch = timeProvider.now()
+                    val remainingMs = deadlineAtMs - nowBeforeFetch
+                    val activeCooldownMs = rateLimiter?.getActiveRetryAfterWaitMs(normalizedRegion) ?: 0L
+
+                    when {
+                        remainingMs <= 0L -> fetchStopReason = "DEADLINE_EXCEEDED"
+                        !hasCoachContinueHeadroom() -> fetchStopReason = "MEMORY_HEADROOM_STOP"
+                        activeCooldownMs > 0L && activeCooldownMs + 10L > remainingMs -> fetchStopReason = "RATE_LIMIT_COOLDOWN"
+                        else -> {
+                            progress?.subStage?.set("riot_http_fetch")
+                            val failureReason = AtomicReference<String?>(null)
+                            val fetched = riotApiService.getMatchTimelineBounded(
+                                matchId = matchId,
+                                region = normalizedRegion,
+                                priority = ApiPriority.LOW,
+                                maxRetries = 0,
+                                httpAttemptCounter = httpAttemptCounter,
+                                failureReasonHolder = failureReason,
+                                maxTotalDurationMs = remainingMs,
+                                headroomGuard = ::hasCoachContinueHeadroom
+                            )
+                            if (fetched != null) {
+                                if (timeProvider.now() >= hardCompletionDeadlineMs) {
+                                    fetchStopReason = "DEADLINE_EXCEEDED"
+                                } else {
+                                    progress?.subStage?.set("timeline_compact_cache")
+                                    val compactedReplacement = cacheAndCompactFetchedTimeline(
+                                        rawCacheKey = rawCacheKey,
+                                        fetched = fetched,
+                                        matchDto = matchDto,
+                                        puuid = puuid,
+                                        liveRawTimelines = liveRawTimelines,
+                                        peakRetainedRawTimelines = peakRetainedRawTimelines
+                                    )
+                                    if (compactedReplacement != null) {
+                                        compactedTimeline = compactedReplacement
+                                    } else if (compactedTimeline == null) {
                                         itemMissingReason = "TIMELINE_UNAVAILABLE"
+                                    }
+                                }
+                            } else {
+                                when (failureReason.get()) {
+                                    "DEADLINE_EXCEEDED" -> fetchStopReason = "DEADLINE_EXCEEDED"
+                                    "MEMORY_HEADROOM_STOP" -> fetchStopReason = "MEMORY_HEADROOM_STOP"
+                                    "HTTP_429_TOO_MANY_REQUESTS" -> fetchStopReason = "RATE_LIMIT_429"
+                                    "RATE_LIMIT_COOLDOWN" -> fetchStopReason = "RATE_LIMIT_COOLDOWN"
+                                    "NETWORK_TIMEOUT" -> fetchStopReason = "NETWORK_TIMEOUT"
+                                    "HTTP_EXECUTOR_SATURATED" -> fetchStopReason = "HTTP_EXECUTOR_SATURATED"
+                                    "UPSTREAM_5XX", "HTTP_ERROR" -> fetchStopReason = "UPSTREAM_ERROR"
+                                    "HTTP_404_NOT_FOUND" -> {
+                                        if (compactedTimeline == null) {
+                                            itemMissingReason = "TIMELINE_NOT_FOUND"
+                                        }
+                                    }
+                                    "RESPONSE_TOO_LARGE" -> {
+                                        if (compactedTimeline == null) {
+                                            itemMissingReason = "OVERSIZED_TIMELINE"
+                                        }
+                                    }
+                                    else -> {
+                                        if (compactedTimeline == null) {
+                                            itemMissingReason = "TIMELINE_UNAVAILABLE"
+                                        }
                                     }
                                 }
                             }
                         }
                     }
+                } else if (compactedTimeline == null) {
+                    itemMissingReason = cacheReadOutcome.invalidItemReason ?: "TIMELINE_UNAVAILABLE"
                 }
-            } else if (compactedTimeline == null) {
-                itemMissingReason = cacheReadOutcome.invalidItemReason ?: "TIMELINE_UNAVAILABLE"
-            }
 
-            if (fetchStopReason != null) {
-                compactedTimeline = null
-                stopReason = fetchStopReason
-                val currentReason = fetchStopReason
-                val subsequentReason = if (fetchStopReason == "RATE_LIMIT_429") "RATE_LIMIT_COOLDOWN" else fetchStopReason
-                missingMatches.add(MissingMatchTimelineDto(matchId, currentReason))
-                for (remainingId in orderedMatchIds.subList(index + 1, orderedMatchIds.size)) {
-                    missingMatches.add(MissingMatchTimelineDto(remainingId, subsequentReason))
+                if (fetchStopReason != null) {
+                    compactedTimeline = null
+                    stopReason = fetchStopReason
+                    val currentReason = fetchStopReason
+                    val subsequentReason = if (fetchStopReason == "RATE_LIMIT_429") "RATE_LIMIT_COOLDOWN" else fetchStopReason
+                    missingMatches.add(MissingMatchTimelineDto(matchId, currentReason))
+                    for (remainingId in orderedMatchIds.subList(index + 1, orderedMatchIds.size)) {
+                        missingMatches.add(MissingMatchTimelineDto(remainingId, subsequentReason))
+                    }
+                    break
                 }
-                break
-            }
 
-            if (compactedTimeline == null) {
-                missingMatches.add(MissingMatchTimelineDto(matchId, itemMissingReason ?: "TIMELINE_UNAVAILABLE"))
-                continue
-            }
+                if (compactedTimeline == null) {
+                    missingMatches.add(MissingMatchTimelineDto(matchId, itemMissingReason ?: "TIMELINE_UNAVAILABLE"))
+                    continue
+                }
 
-            compactedTriples.add(Triple(matchId, compactedTimeline, matchDto))
-            coveredMatchIds.add(matchId)
-            progress?.partialSnapshot?.set(
-                PartialCompactionSnapshot(
-                    orderedMatchIds = orderedMatchIds,
-                    orderedMatchDtos = orderedMatchDtos,
-                    compactedTriples = compactedTriples.toList(),
-                    coveredMatchIds = coveredMatchIds.toList(),
-                    missingPrefix = missingMatches.toList(),
-                    nextMatchIndex = index + 1,
-                    peakRetainedRawTimelines = peakRetainedRawTimelines.get()
-                )
-            )
+                compactedTriples.add(Triple(matchId, compactedTimeline, matchDto))
+                coveredMatchIds.add(matchId)
+                if (progress != null) {
+                    latestCompactedState.set(
+                        CompactedPrefixState(
+                            triples = compactedTriples.toList(),
+                            coveredIds = coveredMatchIds.toList(),
+                            missingPrefix = missingMatches.toList(),
+                            nextMatchIndex = index + 1,
+                            peakRaw = peakRetainedRawTimelines.get()
+                        )
+                    )
+                }
+            }
+        } finally {
+            salvageWatcherJob?.cancel()
         }
 
         if (coveredMatchIds.isEmpty() && stopReason == null) {
@@ -1902,10 +1952,51 @@ class TimelineService @Autowired constructor(
         }
 
         progress?.subStage?.set("analysis_assembly")
-        val analysis = if (compactedTriples.isNotEmpty()) {
-            timelineAnalysisService.analyze(compactedTriples, puuid, orderedMatchDtos)
-        } else {
-            null
+        val analysis = when {
+            compactedTriples.isEmpty() -> null
+            analysisClaimed.compareAndSet(false, true) -> {
+                if (stopReason == "DEADLINE_EXCEEDED" && timeProvider.now() >= hardCompletionDeadlineMs) {
+                    return@coroutineScope buildBlockedResult(
+                        normalizedRegion = normalizedRegion,
+                        puuid = puuid,
+                        orderedMatchIds = orderedMatchIds,
+                        stopReason = "DEADLINE_EXCEEDED",
+                        analyzerVersion = analyzerVersion,
+                        peakRetainedRawTimelines = peakRetainedRawTimelines.get()
+                    )
+                }
+                timelineAnalysisService.analyze(compactedTriples, puuid, orderedMatchDtos)
+            }
+            else -> {
+                salvageWatcherJob?.join()
+                val readySnap = progress?.readyPartialSnapshot?.get()
+                if (readySnap != null && readySnap.coveredMatchIds.size == coveredMatchIds.size) {
+                    readySnap.analysis
+                } else if (readySnap != null && readySnap.coveredMatchIds.isNotEmpty() && hasCoachContinueHeadroom()) {
+                    return@coroutineScope CoachTimelinePreparationResultDto(
+                        status = "PARTIAL",
+                        region = normalizedRegion,
+                        puuid = puuid,
+                        analyzerVersion = analyzerVersion,
+                        requestedMatchIds = readySnap.orderedMatchIds,
+                        coveredMatchIds = readySnap.coveredMatchIds,
+                        missingMatches = readySnap.missingMatchesOnDeadline,
+                        stopReason = stopReason ?: "DEADLINE_EXCEEDED",
+                        cacheHit = false,
+                        peakRetainedRawTimelines = maxOf(peakRetainedRawTimelines.get(), readySnap.peakRetainedRawTimelines),
+                        analysis = readySnap.analysis
+                    )
+                } else {
+                    return@coroutineScope buildBlockedResult(
+                        normalizedRegion = normalizedRegion,
+                        puuid = puuid,
+                        orderedMatchIds = orderedMatchIds,
+                        stopReason = stopReason ?: "DEADLINE_EXCEEDED",
+                        analyzerVersion = analyzerVersion,
+                        peakRetainedRawTimelines = peakRetainedRawTimelines.get()
+                    )
+                }
+            }
         }
 
         val finalResult = CoachTimelinePreparationResultDto(
@@ -1928,7 +2019,7 @@ class TimelineService @Autowired constructor(
             putCachedPreparation(cacheKeysToPopulate, playerScopeKey, finalResult)
         }
 
-        return finalResult
+        finalResult
     }
 
     internal fun isNonTransientPerMatchMissingStopReason(reason: String?): Boolean {

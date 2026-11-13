@@ -617,8 +617,8 @@ class RedisCacheService(
      * Streaming, zero-substring RFC 4648 Base64 decoder that decodes up to 1,024 Base64 characters
      * (768 compressed bytes) per refill into a single reusable buffer, enforcing exact [maxBase64Chars]
      * and [maxCompressedBytes] bounds plus interrupt/deadline checks on every read while sampling
-     * [headroomGuard] at initial entry and every 1 KiB boundary (avoiding `Base64.getDecoder().wrap`
-     * single-byte `read()` amplification).
+     * [headroomGuard] at initial entry and every 2 KiB Base64 boundary ([HEADROOM_CHECK_STRIDE_BYTES],
+     * avoiding `Base64.getDecoder().wrap` single-byte `read()` amplification).
      */
     internal class BoundedBase64DecodingInputStream(
         private val source: String,
@@ -984,8 +984,8 @@ class RedisCacheService(
         private const val INITIAL_SLAB_BYTES = 2_048
         private const val MAX_SLAB_BYTES = 8_192
         private const val GZIP_BUFFER_SIZE = 2048
-        internal const val HEADROOM_CHECK_STRIDE_BYTES = 2_048
-        internal const val INFLATED_HEADROOM_CHECK_STRIDE_BYTES = 16_384
+        internal const val HEADROOM_CHECK_STRIDE_BYTES = 2_048 // 2 KiB compressed Base64 stride (changed from 1,024)
+        internal const val INFLATED_HEADROOM_CHECK_STRIDE_BYTES = 16_384 // 16 KiB inflated/UTF-8 JSON stride
         private const val BASE64_PAD = -2
         private val BASE64_DECODE_TABLE = IntArray(128) { -1 }.apply {
             for (i in 'A'.code..'Z'.code) this[i] = i - 'A'.code
